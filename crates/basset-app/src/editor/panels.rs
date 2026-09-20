@@ -11,6 +11,12 @@ use super::sketch_mode::{self, SketchTool, ToolGroup, edit_text, parse_value};
 use super::tools::{self, ToolKind};
 use super::{Editor, Mode, SelectMode};
 
+/// The blue the viewport draws under-constrained geometry in, so the words that explain it
+/// match what the user is looking at.
+const LOOSE_LABEL: egui::Color32 = egui::Color32::from_rgb(140, 184, 255);
+/// Amber for a feature that built but warns about its result, matching the timeline chip.
+const WARNING_LABEL: egui::Color32 = egui::Color32::from_rgb(235, 190, 90);
+
 /// Deferred commands, so panel code never needs `&mut Editor` while it borrows state.
 enum Command {
     Tool(ToolKind),
@@ -37,6 +43,7 @@ enum Command {
     FinishSketch(bool),
     SketchTool(SketchTool),
     SketchConstraint(basset_sketch::Constraint),
+    SketchSelect(Vec<basset_sketch::EntityId>),
     SketchDimension(basset_sketch::ConstraintId, f64),
     SketchRemoveConstraint(basset_sketch::ConstraintId),
     SketchDelete,
@@ -68,6 +75,7 @@ pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
     egui::Panel::bottom("status").show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(&editor.status);
+            warning_summary(editor, ui, &mut commands);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(egui::RichText::new(editor.selection.summary()).weak());
             });
@@ -91,6 +99,7 @@ pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
     tools::dialog(editor, &ctx);
     entry_overlay(editor, &ctx, &mut commands);
     dimension_overlay(editor, &ctx, &mut commands);
+    constraint_overlay(editor, &ctx, &mut commands);
     error_popup(editor, &ctx);
     rename_popup(editor, &ctx);
 
@@ -155,6 +164,11 @@ fn run(editor: &mut Editor, c: Command) {
                     Ok(()) => editor.commit_sketch(),
                     Err(e) => editor.report_error(e),
                 }
+            }
+        }
+        Command::SketchSelect(entities) => {
+            if let Mode::Sketch(s) = &mut editor.mode {
+                s.select_only(entities);
             }
         }
         Command::SketchDimension(id, v) => {
@@ -464,6 +478,23 @@ fn sketch_toolbar(s: &super::SketchEditor, ui: &mut egui::Ui, commands: &mut Vec
             }
         }
         ui.separator();
+        // Constraints live in the toolbar, as they do in Fusion: this is where the user
+        // looks after selecting something, and it is always in view, which the palette's
+        // lower reaches are not. The whole set is shown so the user can see what exists;
+        // only what the selection supports is enabled.
+        let applicable = s.applicable_constraints();
+        for name in super::SketchEditor::CONSTRAINT_NAMES {
+            let offered = applicable.iter().find(|(n, _)| *n == name);
+            let response = ui
+                .add_enabled(offered.is_some(), egui::Button::new(name))
+                .on_disabled_hover_text("Select the geometry this applies to");
+            if response.clicked()
+                && let Some((_, c)) = offered
+            {
+                commands.push(Command::SketchConstraint(c.clone()));
+            }
+        }
+        ui.separator();
         let construction =
             egui::Button::new("Construction (X)").selected(s.selection_is_construction());
         if ui
@@ -487,6 +518,54 @@ fn sketch_toolbar(s: &super::SketchEditor, ui: &mut egui::Ui, commands: &mut Vec
             commands.push(Command::FinishSketch(false));
         }
     });
+}
+
+/// An amber note in the status bar for features that built but warn about something.
+///
+/// The degrees-of-freedom readout used to live only at the bottom of the sketch palette,
+/// which is open only while sketching — so the moment it matters most, when an edit
+/// propagates through the timeline and the loose geometry actually moves, nothing said a
+/// word. This is always in view, and clicking it selects the feature that warned.
+fn warning_summary(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
+    let name_of = |id: FeatureId| {
+        editor
+            .doc
+            .timeline()
+            .features()
+            .iter()
+            .find(|f| f.id == id)
+            .map_or("feature", |f| f.name.as_str())
+    };
+    let warned: Vec<(FeatureId, String)> = editor
+        .cached_statuses
+        .iter()
+        .filter_map(|(id, s)| match s {
+            FeatureStatus::Warned(msg) => Some((*id, msg.clone())),
+            _ => None,
+        })
+        .collect();
+    let Some((first, _)) = warned.first() else {
+        return;
+    };
+    // One warning is named outright, because the name is what the user needs to act on
+    // and there is room for it; several are counted, and the click takes them to the
+    // first, which the hover text says so that it is not a surprise.
+    let text = match warned.len() {
+        1 => format!("\u{26a0} {}", name_of(*first)),
+        n => format!("\u{26a0} {n} features need attention"),
+    };
+    let response = ui
+        .add(egui::Button::new(egui::RichText::new(text).color(WARNING_LABEL)).frame(false))
+        .on_hover_ui(|ui| {
+            for (id, msg) in &warned {
+                ui.colored_label(WARNING_LABEL, format!("{}: {msg}", name_of(*id)));
+            }
+            let goes_to = name_of(*first);
+            ui.label(egui::RichText::new(format!("Click selects {goes_to}")).weak());
+        });
+    if response.clicked() {
+        commands.push(Command::SelectFeature(*first));
+    }
 }
 
 /// A tool button with its icon painted rather than typed: the default fonts have no
@@ -809,6 +888,9 @@ fn timeline(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
                         Some(FeatureStatus::Failed(_)) => {
                             Some(egui::Color32::from_rgb(120, 50, 40))
                         }
+                        Some(FeatureStatus::Warned(_)) => {
+                            Some(egui::Color32::from_rgb(110, 85, 30))
+                        }
                         _ => None,
                     };
                     let mut button =
@@ -821,6 +903,9 @@ fn timeline(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
                         match status {
                             Some(FeatureStatus::Failed(msg)) => {
                                 ui.colored_label(egui::Color32::from_rgb(230, 120, 100), msg);
+                            }
+                            Some(FeatureStatus::Warned(msg)) => {
+                                ui.colored_label(WARNING_LABEL, msg);
                             }
                             Some(FeatureStatus::Suppressed) => {
                                 ui.label("suppressed");
@@ -906,230 +991,301 @@ fn sketch_palette(editor: &mut Editor, ui: &mut egui::Ui, commands: &mut Vec<Com
         return;
     };
     let mut centre_on_selection = false;
-    ui.heading("Sketch");
-    ui.label(egui::RichText::new("Click points; snap to existing points to join").weak());
-    ui.separator();
-    ui.horizontal(|ui| {
-        ui.checkbox(&mut s.snap_to_grid, "Snap to grid");
-        if s.snap_to_grid {
-            let label = match s.fixed_grid_step {
-                Some(step) => format!("{step} mm"),
-                None => format!("{} mm (auto)", s.grid_step),
-            };
-            ui.label(egui::RichText::new(label).weak());
-        }
-    });
-    if s.snap_to_grid {
-        // Pinning the step is what a drawing with a stated increment needs; leaving it
-        // automatic keeps the snap matched to what the grid is actually showing.
-        let mut pinned = s.fixed_grid_step.is_some();
+    // The palette is taller than the panel on an ordinary window, and without a scroll
+    // area whatever overflowed was simply unreachable — which is how a sketch could end
+    // up with no way to apply a constraint at all.
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        ui.heading("Sketch");
+        ui.label(egui::RichText::new("Click points; snap to existing points to join").weak());
+        ui.separator();
         ui.horizontal(|ui| {
-            if ui.checkbox(&mut pinned, "Fixed step").changed() {
-                s.fixed_grid_step = pinned.then_some(s.grid_step);
-            }
-            if let Some(step) = s.fixed_grid_step.as_mut() {
-                ui.add(
-                    egui::DragValue::new(step)
-                        .speed(0.1)
-                        .range(1e-3..=1e4)
-                        .suffix(" mm"),
-                );
+            ui.checkbox(&mut s.snap_to_grid, "Snap to grid");
+            if s.snap_to_grid {
+                let label = match s.fixed_grid_step {
+                    Some(step) => format!("{step} mm"),
+                    None => format!("{} mm (auto)", s.grid_step),
+                };
+                ui.label(egui::RichText::new(label).weak());
             }
         });
-    }
-    ui.separator();
-    ui.label(s.tool.name());
-    if s.tool == SketchTool::Select {
-        ui.label(
-            egui::RichText::new(
-                "Click inside a closed region to select its curves. Drag geometry to move \
-                 it. Drag on empty space to box-select: right encloses, left touches",
-            )
-            .weak(),
-        );
-        if s.has_region_selection() {
-            ui.colored_label(
-                egui::Color32::from_rgb(140, 200, 255),
-                "Press E to extrude this region",
+        if s.snap_to_grid {
+            // Pinning the step is what a drawing with a stated increment needs; leaving it
+            // automatic keeps the snap matched to what the grid is actually showing.
+            let mut pinned = s.fixed_grid_step.is_some();
+            ui.horizontal(|ui| {
+                if ui.checkbox(&mut pinned, "Fixed step").changed() {
+                    s.fixed_grid_step = pinned.then_some(s.grid_step);
+                }
+                if let Some(step) = s.fixed_grid_step.as_mut() {
+                    ui.add(
+                        egui::DragValue::new(step)
+                            .speed(0.1)
+                            .range(1e-3..=1e4)
+                            .suffix(" mm"),
+                    );
+                }
+            });
+        }
+        ui.separator();
+        ui.label(s.tool.name());
+        if s.tool == SketchTool::Select {
+            ui.label(
+                egui::RichText::new(
+                    "Click inside a closed region to select its curves. Drag geometry to move \
+                     it. Drag on empty space to box-select: right encloses, left touches",
+                )
+                .weak(),
             );
-        }
-    } else if matches!(s.tool, SketchTool::Trim | SketchTool::Break) {
-        let hint = if s.tool == SketchTool::Trim {
-            "Click the piece to remove: it is cut at the curves that cross it, and the \
-             piece under the pointer is drawn in red. A curve nothing crosses goes whole"
-        } else {
-            "Click a curve to cut it at every crossing, keeping both sides joined"
-        };
-        ui.label(egui::RichText::new(hint).weak());
-    } else if !s.tool.dims().is_empty() {
-        ui.label(
-            egui::RichText::new(
-                "After the first click the boxes follow the pointer; typing locks a size, Tab \
-                 moves to the next, Enter places the shape",
-            )
-            .weak(),
-        );
-    }
-    ui.separator();
-    match s.tool {
-        SketchTool::Polygon => {
-            ui.add(egui::Slider::new(&mut s.polygon_sides, 3..=24).text("sides"));
-        }
-        SketchTool::Dimension => {
-            let hint = if s.dim_first.is_some() {
-                "Pick a second entity, or click empty space to dimension the first alone"
+            if s.has_region_selection() {
+                ui.colored_label(
+                    egui::Color32::from_rgb(140, 200, 255),
+                    "Press E to extrude this region",
+                );
+            }
+        } else if matches!(s.tool, SketchTool::Trim | SketchTool::Break) {
+            let hint = if s.tool == SketchTool::Trim {
+                "Click the piece to remove: it is cut at the curves that cross it, and the \
+                 piece under the pointer is drawn in red. A curve nothing crosses goes whole"
             } else {
-                "Pick a line, circle, arc or point. Two parallel lines: distance; two \
-                 others: angle; a circle with a line or point: distance from its centre"
+                "Click a curve to cut it at every crossing, keeping both sides joined"
             };
             ui.label(egui::RichText::new(hint).weak());
-        }
-        SketchTool::Text => {
-            ui.text_edit_singleline(&mut s.text);
-            ui.add(
-                egui::DragValue::new(&mut s.text_height)
-                    .speed(0.5)
-                    .prefix("height ")
-                    .suffix(" mm"),
-            );
-            if s.sketch.font().is_none() {
-                ui.colored_label(
-                    egui::Color32::YELLOW,
-                    "No font found: text will not produce profiles",
-                );
-            }
-        }
-        _ => {}
-    }
-    if let Some(op) = s.move_op.as_mut() {
-        ui.separator();
-        ui.label("Move (M)");
-        let mut changed = false;
-        for (value, label, unit) in [
-            (&mut op.dx, "dX ", " mm"),
-            (&mut op.dy, "dY ", " mm"),
-            (&mut op.angle_deg, "rotate ", "°"),
-        ] {
-            changed |= ui
-                .add(
-                    egui::DragValue::new(value)
-                        .speed(0.5)
-                        .prefix(label)
-                        .suffix(unit),
+        } else if !s.tool.dims().is_empty() {
+            ui.label(
+                egui::RichText::new(
+                    "After the first click the boxes follow the pointer; typing locks a size, Tab \
+                     moves to the next, Enter places the shape",
                 )
-                .changed();
+                .weak(),
+            );
         }
-        ui.label(
-            egui::RichText::new("Enter applies, Esc puts it back. Constraints still hold").weak(),
-        );
-        ui.horizontal(|ui| {
-            if ui.button("Apply").clicked() {
-                commands.push(Command::SketchMoveFinish(true));
+        ui.separator();
+        match s.tool {
+            SketchTool::Polygon => {
+                ui.add(egui::Slider::new(&mut s.polygon_sides, 3..=24).text("sides"));
             }
-            if ui.button("Cancel").clicked() {
-                commands.push(Command::SketchMoveFinish(false));
+            SketchTool::Dimension => {
+                let hint = if s.dim_first.is_some() {
+                    "Pick a second entity, or click empty space to dimension the first alone"
+                } else {
+                    "Pick a line, circle, arc or point. Two parallel lines: distance; two \
+                     others: angle; a circle with a line or point: distance from its centre"
+                };
+                ui.label(egui::RichText::new(hint).weak());
             }
-        });
-        if changed {
-            commands.push(Command::SketchMoveUpdate);
-        }
-    }
-    ui.separator();
-    egui::CollapsingHeader::new("Pattern")
-        .default_open(false)
-        .show(ui, |ui| {
-            let p = &mut s.pattern;
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut p.circular, false, "Rectangular");
-                ui.selectable_value(&mut p.circular, true, "Circular");
-            });
-            if p.circular {
-                ui.add(egui::Slider::new(&mut p.count, 2..=64).text("instances"));
+            SketchTool::Text => {
+                ui.text_edit_singleline(&mut s.text);
                 ui.add(
-                    egui::DragValue::new(&mut p.angle_deg)
-                        .speed(1.0)
-                        .range(-360.0..=360.0)
-                        .suffix("° total"),
+                    egui::DragValue::new(&mut s.text_height)
+                        .speed(0.5)
+                        .prefix("height ")
+                        .suffix(" mm"),
                 );
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::DragValue::new(&mut p.center.x)
-                            .speed(0.5)
-                            .prefix("x "),
+                if s.sketch.font().is_none() {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "No font found: text will not produce profiles",
                     );
-                    ui.add(
-                        egui::DragValue::new(&mut p.center.y)
-                            .speed(0.5)
-                            .prefix("y "),
-                    );
-                });
-                if ui.button("Centre on selection").clicked() {
-                    centre_on_selection = true;
                 }
-            } else {
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::DragValue::new(&mut p.cols)
-                            .range(1..=64)
-                            .prefix("cols "),
+            }
+            _ => {}
+        }
+        ui.separator();
+        ui.label(
+            egui::RichText::new("Constraints are in the toolbar; select 1–3 entities first").weak(),
+        );
+        ui.separator();
+        match &s.report {
+            Some(Ok(r)) => {
+                let dof = r.degrees_of_freedom;
+                if dof == 0 {
+                    ui.label("Fully constrained");
+                } else {
+                    // Blue is the readout the user actually reads: it is on the geometry
+                    // they are looking at, not in a corner of a palette.
+                    ui.colored_label(LOOSE_LABEL, format!("{dof} degrees of freedom"));
+                    ui.label(
+                        egui::RichText::new(
+                            "Blue geometry is still free to move: a later dimension change \
+                             can drag it off what it was drawn against",
+                        )
+                        .weak(),
                     );
-                    ui.add(egui::DragValue::new(&mut p.dx).speed(0.5).prefix("dX "));
-                });
+                }
+                if !r.converged {
+                    ui.colored_label(egui::Color32::YELLOW, "Constraints conflict");
+                }
+            }
+            Some(Err(e)) => {
+                ui.colored_label(egui::Color32::from_rgb(230, 120, 100), e);
+            }
+            None => {}
+        }
+        // Directly under the degrees-of-freedom readout, because that is the line that
+        // prompts the question the list answers: what *is* holding this sketch?
+        constraint_list(s, ui, commands);
+        if let Some(op) = s.move_op.as_mut() {
+            ui.separator();
+            ui.label("Move (M)");
+            let mut changed = false;
+            for (value, label, unit) in [
+                (&mut op.dx, "dX ", " mm"),
+                (&mut op.dy, "dY ", " mm"),
+                (&mut op.angle_deg, "rotate ", "°"),
+            ] {
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(value)
+                            .speed(0.5)
+                            .prefix(label)
+                            .suffix(unit),
+                    )
+                    .changed();
+            }
+            ui.label(
+                egui::RichText::new("Enter applies, Esc puts it back. Constraints still hold")
+                    .weak(),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Apply").clicked() {
+                    commands.push(Command::SketchMoveFinish(true));
+                }
+                if ui.button("Cancel").clicked() {
+                    commands.push(Command::SketchMoveFinish(false));
+                }
+            });
+            if changed {
+                commands.push(Command::SketchMoveUpdate);
+            }
+        }
+        ui.separator();
+        egui::CollapsingHeader::new("Pattern")
+            .default_open(false)
+            .show(ui, |ui| {
+                let p = &mut s.pattern;
                 ui.horizontal(|ui| {
-                    ui.add(
-                        egui::DragValue::new(&mut p.rows)
-                            .range(1..=64)
-                            .prefix("rows "),
-                    );
-                    ui.add(egui::DragValue::new(&mut p.dy).speed(0.5).prefix("dY "));
+                    ui.selectable_value(&mut p.circular, false, "Rectangular");
+                    ui.selectable_value(&mut p.circular, true, "Circular");
                 });
-            }
-            let enabled = !s.selected.is_empty();
-            if ui
-                .add_enabled(enabled, egui::Button::new("Repeat selection"))
-                .on_disabled_hover_text("Select the geometry to repeat first")
-                .clicked()
-            {
-                commands.push(Command::SketchPattern);
-            }
-        });
-    ui.separator();
-    egui::CollapsingHeader::new("Parameters")
-        .default_open(false)
-        .show(ui, |ui| parameters_panel(s, ui, commands));
-    ui.separator();
-    ui.label("Constraints");
-    let applicable = s.applicable_constraints();
-    if applicable.is_empty() {
-        ui.label(egui::RichText::new("Select 1–3 entities (shift-click)").weak());
-    }
-    for (name, c) in applicable {
-        if ui.button(name).clicked() {
-            commands.push(Command::SketchConstraint(c));
-        }
-    }
-    ui.separator();
-    match &s.report {
-        Some(Ok(r)) => {
-            let dof = r.degrees_of_freedom;
-            let text = if dof == 0 {
-                "Fully constrained".to_string()
-            } else {
-                format!("{dof} degrees of freedom")
-            };
-            ui.label(text);
-            if !r.converged {
-                ui.colored_label(egui::Color32::YELLOW, "Constraints conflict");
-            }
-        }
-        Some(Err(e)) => {
-            ui.colored_label(egui::Color32::from_rgb(230, 120, 100), e);
-        }
-        None => {}
-    }
+                if p.circular {
+                    ui.add(egui::Slider::new(&mut p.count, 2..=64).text("instances"));
+                    ui.add(
+                        egui::DragValue::new(&mut p.angle_deg)
+                            .speed(1.0)
+                            .range(-360.0..=360.0)
+                            .suffix("° total"),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut p.center.x)
+                                .speed(0.5)
+                                .prefix("x "),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut p.center.y)
+                                .speed(0.5)
+                                .prefix("y "),
+                        );
+                    });
+                    if ui.button("Centre on selection").clicked() {
+                        centre_on_selection = true;
+                    }
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut p.cols)
+                                .range(1..=64)
+                                .prefix("cols "),
+                        );
+                        ui.add(egui::DragValue::new(&mut p.dx).speed(0.5).prefix("dX "));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut p.rows)
+                                .range(1..=64)
+                                .prefix("rows "),
+                        );
+                        ui.add(egui::DragValue::new(&mut p.dy).speed(0.5).prefix("dY "));
+                    });
+                }
+                let enabled = !s.selected.is_empty();
+                if ui
+                    .add_enabled(enabled, egui::Button::new("Repeat selection"))
+                    .on_disabled_hover_text("Select the geometry to repeat first")
+                    .clicked()
+                {
+                    commands.push(Command::SketchPattern);
+                }
+            });
+        ui.separator();
+        egui::CollapsingHeader::new("Parameters")
+            .default_open(false)
+            .show(ui, |ui| parameters_panel(s, ui, commands));
+    });
     if centre_on_selection {
         s.pattern_center_from_selection();
     }
+}
+
+/// Every constraint in the sketch, as a list.
+///
+/// The badges in the viewport are the primary way to see and delete a constraint, but a
+/// badge can sit under other geometry, and a sketch that has gone wrong is exactly the
+/// one whose badges are hard to read. The list is the fallback that always works:
+/// hovering a row lights up the geometry the constraint holds, and every row can be
+/// deleted from here.
+fn constraint_list(s: &mut super::SketchEditor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
+    let rows: Vec<(
+        basset_sketch::ConstraintId,
+        String,
+        Vec<basset_sketch::EntityId>,
+    )> = s
+        .sketch
+        .constraints()
+        .map(|(id, c)| {
+            let label = match c.dimension_value() {
+                // Angles are stored in radians and shown in degrees, as everywhere else.
+                Some(v) if matches!(c, basset_sketch::Constraint::Angle { .. }) => {
+                    format!("{} {:.2}\u{b0}", constraint_name(c), v.to_degrees())
+                }
+                Some(v) => format!("{} {v:.3} mm", constraint_name(c)),
+                None => constraint_name(c).to_string(),
+            };
+            (id, label, c.references())
+        })
+        .collect();
+    let mut highlight = Vec::new();
+    egui::CollapsingHeader::new(format!("Constraints ({})", rows.len()))
+        .default_open(false)
+        .show(ui, |ui| {
+            if rows.is_empty() {
+                ui.label(
+                    egui::RichText::new("Nothing holds this sketch yet: every point is free")
+                        .weak(),
+                );
+            }
+            for (id, label, entities) in &rows {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(egui::Button::new("\u{2715}").frame(false))
+                        .on_hover_text("Delete")
+                        .clicked()
+                    {
+                        commands.push(Command::SketchRemoveConstraint(*id));
+                    }
+                    // Clicking selects what the constraint holds, so the toolbar and the
+                    // keyboard act on that geometry without hunting for it in the viewport.
+                    let response = ui.add(egui::Label::new(label).sense(egui::Sense::click()));
+                    if response.contains_pointer() {
+                        highlight = entities.clone();
+                    }
+                    if response.clicked() {
+                        commands.push(Command::SketchSelect(entities.clone()));
+                    }
+                });
+            }
+        });
+    s.highlighted = highlight;
 }
 
 /// The named constants of the sketch: name, expression, and what it currently works out
@@ -1296,6 +1452,72 @@ fn entry_overlay(editor: &mut Editor, ctx: &egui::Context, commands: &mut Vec<Co
     }
     if submit {
         commands.push(Command::SketchSubmitEntry);
+    }
+}
+
+/// A hit area over every constraint badge, so a constraint can be named and removed.
+///
+/// The badge itself is drawn with the sketch geometry; this puts an invisible button on
+/// top of it. Without one a geometric constraint could be applied but never inspected or
+/// undone, because it has no value text to click the way a dimension does.
+fn constraint_overlay(editor: &mut Editor, ctx: &egui::Context, commands: &mut Vec<Command>) {
+    let camera = editor.camera;
+    let window = editor.window_px;
+    let Mode::Sketch(s) = &mut editor.mode else {
+        return;
+    };
+    let ppp = ctx.pixels_per_point();
+    for g in &s.constraint_glyphs() {
+        let Some(px) = camera.world_to_screen(g.center, window) else {
+            continue;
+        };
+        let Some(name) = s.sketch.constraint(g.id).map(constraint_name) else {
+            continue;
+        };
+        let pos = egui::pos2(px[0] as f32 / ppp, px[1] as f32 / ppp);
+        let size = egui::vec2(16.0, 16.0);
+        egui::Area::new(egui::Id::new(("constraint", g.id, g.target)))
+            .fixed_pos(pos - size * 0.5)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let response = ui.allocate_response(size, egui::Sense::click());
+                response
+                    .clone()
+                    .on_hover_text(format!("{name} \u{2014} right-click to delete"));
+                response.context_menu(|ui| {
+                    if ui
+                        .button(format!("Delete {}", name.to_lowercase()))
+                        .clicked()
+                    {
+                        commands.push(Command::SketchRemoveConstraint(g.id));
+                        ui.close();
+                    }
+                });
+            });
+    }
+}
+
+/// What a constraint is called, for the badge tooltip and its delete entry.
+fn constraint_name(c: &basset_sketch::Constraint) -> &'static str {
+    use basset_sketch::Constraint as C;
+    match c {
+        C::Coincident { .. } => "Coincident",
+        C::Horizontal(_) => "Horizontal",
+        C::Vertical(_) => "Vertical",
+        C::Parallel(..) => "Parallel",
+        C::Perpendicular(..) => "Perpendicular",
+        C::Equal(..) => "Equal",
+        C::Tangent(..) => "Tangent",
+        C::Fix(_) => "Fix",
+        C::Midpoint { .. } => "Midpoint",
+        C::Symmetric { .. } => "Symmetric",
+        C::Concentric(..) => "Concentric",
+        C::Distance { .. } => "Distance",
+        C::HorizontalDistance { .. } => "Horizontal distance",
+        C::VerticalDistance { .. } => "Vertical distance",
+        C::Radius { .. } => "Radius",
+        C::Diameter { .. } => "Diameter",
+        C::Angle { .. } => "Angle",
     }
 }
 

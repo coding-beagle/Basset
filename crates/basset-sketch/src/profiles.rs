@@ -336,6 +336,7 @@ fn crossings(flats: &[Flat]) -> Vec<Vec<Split>> {
             }
         }
     }
+    t_junctions(flats, &mut splits);
     for (flat, list) in flats.iter().zip(&mut splits) {
         list.sort_by(|a, b| a.at.total_cmp(&b.at));
         let ends = [flat.points[0], *flat.points.last().unwrap()];
@@ -355,6 +356,72 @@ fn crossings(flats: &[Flat]) -> Vec<Vec<Split>> {
         *list = kept;
     }
     splits
+}
+
+/// Splits where one curve's endpoint lands on another curve's interior without quite
+/// reaching it.
+///
+/// [`segment_crossing`] is exact, so an endpoint that stops short of the curve it was
+/// drawn to meet crosses nothing and that curve is never cut there. The regions either
+/// side of the endpoint then merge into one self-overlapping loop, and the extrude built
+/// from it is silently wrong. Solver output is only accurate to its convergence
+/// tolerance, so a near miss is the ordinary state of any sketch whose geometry is not
+/// pinned to the boundary it meets — which is why this has to be tolerant where the
+/// crossing test is exact. The kernel's `Solid::heal` does the same job for T-junctions
+/// in 3D.
+///
+/// The endpoint's own coordinates become the split point, as in [`segment_overlap`], so
+/// both curves are cut at identical coordinates and share one graph node.
+fn t_junctions(flats: &[Flat], splits: &mut [Vec<Split>]) {
+    for (i, a) in flats.iter().enumerate() {
+        // A closed curve has no loose end to land on anything.
+        if a.closed {
+            continue;
+        }
+        for end in [a.points[0], *a.points.last().unwrap()] {
+            for (j, b) in flats.iter().enumerate() {
+                if i == j
+                    || end.x < b.min.x - JOIN_TOL
+                    || end.x > b.max.x + JOIN_TOL
+                    || end.y < b.min.y - JOIN_TOL
+                    || end.y > b.max.y + JOIN_TOL
+                {
+                    continue;
+                }
+                // Meeting b at one of its own ends needs no cut: merging nodes joins them.
+                // A closed curve's seam is an ordinary interior point, so it is exempt.
+                if !b.closed
+                    && [b.points[0], *b.points.last().unwrap()]
+                        .iter()
+                        .any(|p| p.distance(end) <= JOIN_TOL)
+                {
+                    continue;
+                }
+                if let Some(at) = nearest_on_polyline(&b.points, end) {
+                    splits[j].push(Split { at, point: end });
+                }
+            }
+        }
+    }
+}
+
+/// Position along `points` nearest to `p`, as `segment index + fraction`, if `p` lies
+/// within [`JOIN_TOL`] of the polyline.
+fn nearest_on_polyline(points: &[Vec2], p: Vec2) -> Option<f64> {
+    let mut best: Option<(f64, f64)> = None;
+    for (i, w) in points.windows(2).enumerate() {
+        let d = w[1] - w[0];
+        let len2 = d.length_squared();
+        if len2 == 0.0 {
+            continue;
+        }
+        let t = ((p - w[0]).dot(d) / len2).clamp(0.0, 1.0);
+        let distance = p.distance(w[0] + d * t);
+        if best.is_none_or(|(best, _)| distance < best) {
+            best = Some((distance, i as f64 + t));
+        }
+    }
+    best.filter(|(d, _)| *d <= JOIN_TOL).map(|(_, at)| at)
 }
 
 /// Parameters `(ta, tb)` in `[0, 1]` where the two segments meet, or `None` if they are

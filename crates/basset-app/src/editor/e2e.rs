@@ -11,6 +11,7 @@ use winit::keyboard::NamedKey;
 
 use super::harness::{Harness, TempDir};
 use super::selection::SelectMode;
+use super::sketch_mode::{SketchEditor, SketchTool};
 use super::tools::ToolKind;
 
 #[test]
@@ -235,4 +236,253 @@ fn a_dimension_typed_into_a_reopened_sketch_re_drives_the_body() {
         "the extrude replayed over the re-driven sketch: {}",
         h.volume(body)
     );
+}
+
+/// Sets up a sketch with two loose endpoints selected, which is what Coincident applies
+/// to, and leaves the Select tool active — the tool you must be in to pick geometry, and
+/// the one whose hint makes the palette longest.
+fn palette_with_a_selection(height: u32) -> Harness {
+    let mut h = Harness::new();
+    h.editor.set_window_size([800, height]);
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    h.line(Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0));
+    h.line(Vec2::new(0.0, 5.0), Vec2::new(10.0, 6.0));
+    h.sketch().set_tool(SketchTool::Select);
+    let points: Vec<_> = {
+        let s = h.sketch();
+        let mut ids: Vec<_> = s
+            .sketch
+            .entities()
+            .filter(|(_, d)| d.entity.is_point())
+            .map(|(id, _)| id)
+            .collect();
+        ids.truncate(2);
+        ids
+    };
+    assert_eq!(points.len(), 2);
+    h.sketch().selected = points;
+    // egui settles a wrapped layout over two frames, and `click_ui` resolves against the
+    // last one, so the caller needs a frame that already knows where everything sits.
+    h.frame();
+    h.frame();
+    h
+}
+
+/// Scrolls the sketch palette, which sits against the right edge.
+fn scroll_palette(h: &mut Harness, by: f32) {
+    let height = h.editor.window_px[1] as f32;
+    h.frame_with(vec![egui::Event::PointerMoved(egui::pos2(
+        800.0 - 60.0,
+        height / 2.0,
+    ))]);
+    h.frame_with(vec![egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, by),
+        modifiers: egui::Modifiers::default(),
+        phase: egui::TouchPhase::Move,
+    }]);
+}
+
+/// The constraint buttons are in the sketch toolbar, where Fusion puts them.
+///
+/// They used to live only at the bottom of the side palette, below the tool hints, the
+/// Move box and the Pattern and Parameters headers, in a panel that could not scroll —
+/// so on a short window there was no way to constrain a sketch at all. The toolbar is
+/// always in view, whatever the window is doing.
+#[test]
+fn the_toolbar_constrains_the_selection() {
+    // Short enough that the palette's lower reaches are off screen.
+    let mut h = palette_with_a_selection(360);
+    let before = h.sketch().sketch.constraints().count();
+    assert!(
+        h.click_ui("Coincident"),
+        "the toolbar offers Coincident for two selected points: {:?}",
+        h.frame().text()
+    );
+    assert_eq!(
+        h.sketch().sketch.constraints().count(),
+        before + 1,
+        "clicking it applies the constraint"
+    );
+}
+
+/// The whole set is on show, so what exists is discoverable before anything is selected;
+/// only what the selection supports can be clicked.
+#[test]
+fn the_toolbar_shows_every_constraint_and_enables_the_ones_that_apply() {
+    let mut h = palette_with_a_selection(600);
+    h.sketch().selected.clear();
+    h.frame();
+    let frame = h.frame();
+    for name in SketchEditor::CONSTRAINT_NAMES {
+        assert!(
+            frame.has_text(name),
+            "{name} is listed even with nothing selected"
+        );
+    }
+    // Nothing applies to an empty selection, so nothing can be applied.
+    let before = h.sketch().sketch.constraints().count();
+    h.click_ui("Perpendicular");
+    assert_eq!(h.sketch().sketch.constraints().count(), before);
+}
+
+/// Whatever does not fit in the palette can still be scrolled to.
+///
+/// Without a scroll area the overflow was simply unreachable, however long you looked.
+#[test]
+fn the_sketch_palette_scrolls_to_what_does_not_fit() {
+    let mut h = palette_with_a_selection(360);
+    assert!(
+        !h.frame().has_text("degrees of freedom"),
+        "this window is too short to show the readout outright"
+    );
+    scroll_palette(&mut h, -600.0);
+    assert!(
+        h.frame().has_text("degrees of freedom"),
+        "scrolling brings it into reach: {:?}",
+        h.frame().text()
+    );
+}
+
+/// Geometry drawn onto the edges it meets survives the edit that broke the old file.
+///
+/// This is the whole cascade end to end: a divider attached by clicking the edge keeps a
+/// `Coincident` onto it, so re-dimensioning moves it with the edge instead of leaving it
+/// a few 1e-7 short, and the regions either side stay separate.
+#[test]
+fn geometry_drawn_onto_its_edges_survives_a_dimension_change() {
+    let mut h = Harness::new();
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    // Off the grid, so the sizes below are the ones asserted rather than the nearest
+    // grid multiple; attaching to an edge is the curve snap's job, not the grid's.
+    h.sketch().snap_to_grid = false;
+    h.rectangle(Vec2::new(0.0, 0.0), Vec2::new(40.0, 8.0));
+    // Two dividers, each drawn from the bottom edge to the top edge.
+    h.line(Vec2::new(10.0, 0.0), Vec2::new(10.0, 8.0));
+    h.line(Vec2::new(30.0, 0.0), Vec2::new(30.0, 8.0));
+    let areas = |h: &mut Harness| -> Vec<f64> {
+        let mut a: Vec<f64> = h
+            .sketch()
+            .sketch
+            .profiles(&Default::default())
+            .iter()
+            .map(|p| p.area())
+            .collect();
+        a.sort_by(f64::total_cmp);
+        a
+    };
+    let before = areas(&mut h);
+    assert_eq!(before.len(), 3, "three strips: {before:?}");
+
+    // Dimension the left edge and double it — the edit that merged the regions before.
+    let (cid, _) = h.dimension(Vec2::new(0.0, 4.0), Vec2::new(-6.0, 4.0));
+    h.sketch().set_dimension(cid, 16.0);
+
+    let after = areas(&mut h);
+    assert_eq!(
+        after.len(),
+        3,
+        "still three strips after the change: {after:?}"
+    );
+    for (was, now) in before.iter().zip(&after) {
+        // The solver lands within its convergence tolerance, not on the exact number;
+        // that residue is precisely what used to open the regions and no longer does.
+        assert!(
+            (now - was * 2.0).abs() < 1e-3,
+            "each strip doubled with the height: {was} -> {now}"
+        );
+    }
+}
+
+/// Under-constrained geometry announces itself, both while drawing and afterwards.
+///
+/// A sketch with 26 free parameters used to look exactly like a finished one: the only
+/// hint was a line of grey text at the foot of a palette that is open only while
+/// sketching. So the moment it mattered — a dimension change propagating through the
+/// timeline and dragging loose geometry off the edges it was drawn against — nothing said
+/// a word, and the extrude silently built the wrong body.
+#[test]
+fn an_under_constrained_sketch_says_so_while_drawing_and_after_it_propagates() {
+    let mut h = Harness::new();
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    h.rectangle(Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+    let frame = h.frame();
+    assert!(
+        frame.has_text("degrees of freedom") && frame.has_text("Blue geometry"),
+        "the palette names the freedom and the colour it is drawn in: {:?}",
+        frame.text()
+    );
+    // The solver agrees with what is being drawn: every line of a free rectangle is free.
+    assert_eq!(
+        h.sketch().under_constrained().len(),
+        8,
+        "4 corners + 4 lines"
+    );
+
+    // Out of the sketch and into the model, where the warning has to survive.
+    h.finish_sketch(true);
+    let body = h.extrude(Vec2::new(10.0, 5.0), 4.0);
+    assert!((h.volume(body) - 800.0).abs() < 1e-6);
+    let chip = {
+        let frame = h.frame();
+        frame.rect_of("\u{26a0}").unwrap_or_else(|| {
+            panic!(
+                "the status bar warns once a feature builds from the sketch: {:?}",
+                frame.text()
+            )
+        })
+    };
+    // It names the feature, and hovering it says what is wrong.
+    assert!(h.frame().has_text("\u{26a0} Sketch1"));
+    h.frame_with(vec![egui::Event::PointerMoved(chip.center())]);
+    // Tooltips wait out a hover delay before they appear, which costs a few frames.
+    for _ in 0..30 {
+        h.frame();
+    }
+    let frame = h.frame();
+    assert!(
+        frame.has_text("degrees of freedom"),
+        "the hover text gives the reason: {:?}",
+        frame.text()
+    );
+}
+
+/// Every constraint is listed by name, as the fallback for the badges in the viewport:
+/// a badge can end up under other geometry, and the sketch whose badges are hardest to
+/// read is exactly the one that has gone wrong.
+#[test]
+fn the_palette_lists_the_constraints_and_lights_up_what_they_hold() {
+    let mut h = Harness::new();
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    h.rectangle(Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+    let (_, _) = h.dimension(Vec2::new(10.0, 0.0), Vec2::new(10.0, -6.0));
+    let constraints = h.sketch().sketch.constraints().count();
+    assert!(constraints > 0);
+    assert!(
+        h.frame().has_text(&format!("Constraints ({constraints})")),
+        "the list is headed by the count: {:?}",
+        h.frame().text()
+    );
+    assert!(
+        h.click_ui(&format!("Constraints ({constraints})")),
+        "expand"
+    );
+    // The header opens with an animation, and egui only paints the rows it has room for
+    // as it grows, so let it settle before looking for one.
+    for _ in 0..30 {
+        h.frame();
+    }
+    // The rows sit below the fold on an ordinary window, so scroll to them as a user would.
+    scroll_palette(&mut h, -240.0);
+    let row = {
+        let frame = h.frame();
+        frame
+            .rect_of("Distance")
+            .unwrap_or_else(|| panic!("a dimension row names its value: {:?}", frame.text()))
+    };
+    // Hovering a row lights up the geometry that constraint holds, which is how the list
+    // points back at the drawing.
+    h.frame_with(vec![egui::Event::PointerMoved(row.center())]);
+    let highlighted = h.sketch().highlighted.clone();
+    assert_eq!(highlighted.len(), 2, "the two points the distance spans");
 }

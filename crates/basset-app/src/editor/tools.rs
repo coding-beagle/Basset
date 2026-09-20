@@ -693,9 +693,16 @@ pub fn dialog(editor: &mut Editor, ctx: &egui::Context) {
                 }
                 ToolKind::Sketch => {}
             }
-            if let Some(FeatureStatus::Failed(msg)) = &status {
-                ui.separator();
-                ui.colored_label(egui::Color32::from_rgb(230, 120, 100), msg);
+            match &status {
+                Some(FeatureStatus::Failed(msg)) => {
+                    ui.separator();
+                    ui.colored_label(egui::Color32::from_rgb(230, 120, 100), msg);
+                }
+                Some(FeatureStatus::Warned(msg)) => {
+                    ui.separator();
+                    ui.colored_label(egui::Color32::from_rgb(235, 190, 90), msg);
+                }
+                _ => {}
             }
             ui.separator();
             ui.horizontal(|ui| {

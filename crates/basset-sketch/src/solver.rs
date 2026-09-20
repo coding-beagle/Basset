@@ -21,7 +21,8 @@
 //! where `extent` is the sketch's bounding size, so tolerance scales with the model.
 //! Soft equations (the drag goal) are included in the least-squares objective but not in
 //! the convergence test or the rank estimate. Remaining degrees of freedom are
-//! `free parameters − rank(J_hard)`.
+//! `free parameters − rank(J_hard)`, and the null space of `J_hard` says which parameters
+//! they belong to (see [`SolveReport::under_constrained`]).
 
 use std::collections::HashMap;
 use std::f64::consts::PI;
@@ -33,14 +34,27 @@ use crate::dual::{DVec, Dual, MAX_LOCAL_VARS};
 use crate::linalg::{Mat, solve_spd};
 use crate::{Constraint, Entity, EntityId, Sketch, SolveError};
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// Not `Copy`: it carries the list of loose entities, which is the whole point of
+/// reporting more than a count.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SolveReport {
     pub iterations: usize,
     /// Norm of the hard-constraint residual vector at the end of the solve.
     pub residual: f64,
     pub converged: bool,
     /// Remaining degrees of freedom, estimated from the Jacobian rank.
+    ///
+    /// The estimate is *instantaneous*: it counts directions the constraints do not
+    /// resist to first order. A configuration that is pinned only at second order — a
+    /// point tied to another by a zero-length distance, or one held by two distance
+    /// dimensions from either side exactly on the line between them — therefore reports a
+    /// freedom it cannot actually use. Both are degenerate states of a re-dimensioned
+    /// sketch, and erring towards "this can move" is the safer way round for a warning.
     pub degrees_of_freedom: usize,
+    /// The points and circles those degrees of freedom belong to, so the editor can show
+    /// *which* geometry is still loose rather than only how much of it is. Never empty
+    /// while [`Self::degrees_of_freedom`] is non-zero, and always empty when it is zero.
+    pub under_constrained: Vec<EntityId>,
 }
 
 /// Relative pivot tolerance for the rank estimate. Rows of the Jacobian are either
@@ -336,6 +350,10 @@ impl Locals {
 /// Flattened parameter vector plus the map from entities to parameter indices.
 pub(crate) struct System {
     params: Vec<f64>,
+    /// Which entity each parameter belongs to, parallel to `params`. Reporting *which*
+    /// geometry a remaining degree of freedom belongs to means going back from a column
+    /// of the Jacobian to the entity that put it there.
+    owners: Vec<EntityId>,
     /// Base index of a point's `x` (y follows) or a circle's radius; absent for fixed points.
     index: HashMap<EntityId, usize>,
     /// Current value of every point, including fixed ones, for constant lookup.
@@ -359,6 +377,7 @@ impl System {
             .collect();
         let mut sys = System {
             params: Vec::new(),
+            owners: Vec::new(),
             index: HashMap::new(),
             point_values: HashMap::new(),
             equations: Vec::new(),
@@ -375,11 +394,13 @@ impl System {
                     if !fixed.contains(&id) {
                         sys.index.insert(id, sys.params.len());
                         sys.params.extend([pos.x, pos.y]);
+                        sys.owners.extend([id, id]);
                     }
                 }
                 Entity::Circle { radius, .. } => {
                     sys.index.insert(id, sys.params.len());
                     sys.params.push(radius);
+                    sys.owners.push(id);
                 }
                 _ => {}
             }
@@ -1023,14 +1044,33 @@ impl System {
         }
     }
 
-    fn degrees_of_freedom(&self, j: &Mat) -> usize {
+    /// The degrees of freedom left, and the entities they belong to: every point or
+    /// circle with a parameter the constraints do not pin down.
+    ///
+    /// A count alone tells the user that something can still move but not what, and an
+    /// under-constrained sketch looks exactly like a finished one — which is how geometry
+    /// ends up drifting off the edge it was drawn against when an unrelated dimension
+    /// changes. Naming the loose entities is what lets the editor draw them differently.
+    fn freedom(&self, j: &Mat) -> (usize, Vec<EntityId>) {
+        let (rank, free) = self.hard_rows(j).freedom(RANK_TOL);
+        let mut out = Vec::new();
+        for (slot, owner) in self.owners.iter().enumerate() {
+            if free[slot] && !out.contains(owner) {
+                out.push(*owner);
+            }
+        }
+        (self.params.len().saturating_sub(rank), out)
+    }
+
+    /// The hard rows of `j`. Soft rows are the drag goal, which is a preference rather
+    /// than a constraint and so must not count toward what the sketch holds fixed.
+    fn hard_rows(&self, j: &Mat) -> Mat {
         let hard = self.hard_row_count();
-        let sub = Mat {
+        Mat {
             rows: hard,
             cols: j.cols,
             data: j.data[..hard * j.cols].to_vec(),
-        };
-        self.params.len().saturating_sub(sub.rank(RANK_TOL))
+        }
     }
 
     /// Writes solved parameters back into the sketch.
@@ -1116,11 +1156,13 @@ fn finish(sketch: &mut Sketch, sys: &System, out: LmOutcome) -> Result<SolveRepo
         });
     }
     sys.write_back(sketch);
+    let (degrees_of_freedom, under_constrained) = sys.freedom(&out.rank_matrix);
     Ok(SolveReport {
         iterations: out.iterations,
         residual: out.residual,
         converged: true,
-        degrees_of_freedom: sys.degrees_of_freedom(&out.rank_matrix),
+        degrees_of_freedom,
+        under_constrained,
     })
 }
 

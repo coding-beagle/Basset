@@ -331,7 +331,14 @@ impl Node {
         if polygons.is_empty() {
             return;
         }
-        let plane = *self.plane.get_or_insert_with(|| choose_plane(&polygons));
+        // Whether the plane comes from this very set of polygons, which is what the
+        // progress check below relies on; a node that already had a plane got it from a
+        // different set and a one-sided split there is ordinary.
+        let mut chosen_here = false;
+        let plane = *self.plane.get_or_insert_with(|| {
+            chosen_here = true;
+            choose_plane(&polygons)
+        });
         let mut front = Vec::new();
         let mut back = Vec::new();
         let (mut coplanar_front, mut coplanar_back) = (Vec::new(), Vec::new());
@@ -343,6 +350,22 @@ impl Node {
                 &mut front,
                 &mut back,
             );
+        }
+        // The recursion shrinks only because a plane taken from these polygons consumes
+        // at least the polygon it came from. A polygon whose vertices stray further from
+        // its own plane than EPSILON — healing inserts a T-junction vertex within
+        // MERGE_TOL of an edge without projecting it onto the face, and `Polygon::new`
+        // then centres the plane on a centroid that the stray vertex has pulled off it —
+        // fails that test against its own plane and lands whole on one side. The child
+        // would get an identical set, deterministically choose the same plane, and
+        // recurse until the stack ran out. Keep the set here instead: it is within a
+        // hair of the plane, so coplanar is also the right answer geometrically.
+        let made_progress = !coplanar_front.is_empty()
+            || !coplanar_back.is_empty()
+            || (!front.is_empty() && !back.is_empty());
+        if chosen_here && !made_progress {
+            self.polygons.extend(polygons);
+            return;
         }
         self.polygons.extend(coplanar_front);
         self.polygons.extend(coplanar_back);
@@ -433,6 +456,66 @@ mod tests {
             d.face(crate::ids::FaceKey::new(OpId::new(1), FaceRole::EndCap))
                 .is_some()
         );
+    }
+
+    /// A polygon further from its own plane than `EPSILON` used to hang the builder.
+    ///
+    /// `heal` inserts a T-junction vertex that lies within `MERGE_TOL` (1e-6) of an edge
+    /// without projecting it onto the face, and `Polygon::new` centres the plane on the
+    /// vertex centroid, so a healed face polygon can stray from its own plane by more
+    /// than the 1e-7 the classifier allows. It then lands whole on one side of a plane
+    /// taken from itself, the child node receives an identical set, `choose_plane` is
+    /// deterministic and picks the same plane again, and the recursion never ends.
+    #[test]
+    fn build_terminates_on_a_polygon_that_misses_its_own_plane() {
+        // A plane at y = 8 facing -y, and a polygon with two vertices nudged behind it by
+        // more than the classifier's tolerance.
+        let normal = Vec3::new(0.0, -1.0, 0.0);
+        let w = -8.0;
+        let off = 2.0 * EPSILON;
+        let poly = CsgPolygon {
+            vertices: vec![
+                Vec3::new(0.0, 8.0, 0.0),
+                Vec3::new(1.0, 8.0 + off, 0.0),
+                Vec3::new(1.0, 8.0 + off, 1.0),
+                Vec3::new(0.0, 8.0, 1.0),
+            ],
+            normal,
+            w,
+            source: (0, 0),
+            flipped: false,
+        };
+        // The premise: against its own plane the polygon is behind, never coplanar, so
+        // the split consumes nothing.
+        let plane = SplitPlane { normal, w };
+        let types: Vec<u8> = poly.vertices.iter().map(|v| plane.classify(*v)).collect();
+        assert!(types.contains(&BACK), "{types:?}");
+        assert!(
+            !types.contains(&FRONT),
+            "must not span, or it would be split"
+        );
+
+        let node = Node::new(vec![poly]);
+        // Kept at the node rather than pushed into a child that could not shrink it.
+        assert_eq!(node.all_polygons().len(), 1);
+        assert!(node.front.is_none() && node.back.is_none());
+    }
+
+    /// The same degeneracy reaching `boolean`: the union must still terminate and report
+    /// the right volume.
+    #[test]
+    fn union_survives_a_face_polygon_that_misses_its_own_plane() {
+        let mut a = cube(1, Vec3::ZERO, 2.0);
+        let b = cube(2, Vec3::splat(1.0), 2.0);
+        // Nudge one vertex of every polygon off its face by less than MERGE_TOL, which is
+        // what healing is entitled to leave behind.
+        for f in &mut a.faces {
+            for p in &mut f.polygons {
+                p.vertices[0] += p.plane.normal * (2.0 * EPSILON);
+            }
+        }
+        let u = boolean(&a, &b, BoolOp::Union).unwrap();
+        assert_relative_eq!(u.volume(), 8.0 + 8.0 - 1.0, epsilon = 1e-5);
     }
 
     #[test]

@@ -222,6 +222,52 @@ fn suppressing_a_feature_skips_it_and_fails_dependants() {
 }
 
 #[test]
+fn an_under_constrained_sketch_that_something_builds_from_warns_without_failing() {
+    // `rect_sketch` pins one corner and dimensions both sides, so nothing about it is
+    // loose. Replacing it with a rectangle held only by its width leaves it free to
+    // translate and resize, and an extrude builds from it — which must warn, and only
+    // warn: the feature still builds, and so does everything after it.
+    let (mut doc, sk, ex, _, _) = block_with_fillet();
+    assert_eq!(doc.state().status(sk), Some(&FeatureStatus::Ok));
+
+    let mut loose = Sketch::new();
+    let r = shapes::rectangle_two_point(&mut loose, Vec2::ZERO, Vec2::new(10.0, 5.0));
+    loose
+        .add_constraint(Constraint::HorizontalDistance {
+            a: r.corners[0],
+            b: r.corners[1],
+            value: 10.0,
+        })
+        .unwrap();
+    doc.edit_feature_kind(sk, |kind| {
+        if let FeatureKind::Sketch { sketch, .. } = kind {
+            *sketch = loose;
+        }
+    })
+    .unwrap();
+
+    let state = doc.state();
+    let warned: Vec<FeatureId> = state.warned_features().map(|(id, _)| id).collect();
+    assert_eq!(warned, vec![sk]);
+    let (_, message) = state.warned_features().next().unwrap();
+    assert!(message.contains("degrees of freedom"), "{message}");
+    assert!(state.failed_features().next().is_none());
+    assert!(state.body(BodyRef(ex)).is_some(), "extrude still builds");
+
+    // Take the consumer away and the warning goes with it: a loose sketch that nothing
+    // builds from is an ordinary drawing in progress, not something to nag about.
+    // Suppressing the extrude is enough, since a suppressed feature builds nothing.
+    doc.set_suppressed(ex, true).unwrap();
+    assert_eq!(doc.state().warned_features().count(), 0);
+    doc.set_suppressed(ex, false).unwrap();
+    assert_eq!(doc.state().warned_features().count(), 1);
+    doc.remove_feature(ex).unwrap();
+    let state = doc.state();
+    assert_eq!(state.warned_features().count(), 0);
+    assert_eq!(state.status(sk), Some(&FeatureStatus::Ok));
+}
+
+#[test]
 fn deleting_a_referenced_sketch_marks_extrude_failed_but_keeps_replaying() {
     let (mut doc, sk, ex, fi, _) = block_with_fillet();
     // An independent feature after the failure point must still evaluate.

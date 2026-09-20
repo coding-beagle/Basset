@@ -66,3 +66,52 @@ fn a_sketch_with_geometry_drawn_twice_encloses_every_region() {
         assert!(region.outer.signed_area() > 0.0, "traced counter-clockwise");
     }
 }
+
+/// The same bar drawn a second way: the compartment verticals were drawn to the bar's
+/// long edges but land a couple of 1e-7 short of them, because the solver leaves 26
+/// degrees of freedom and nothing pins those endpoints to the edge. The tracer used to
+/// see no crossing there at all, merge the compartments either side into one
+/// self-overlapping loop, and hand the extrude the wrong profile without a word. Now the
+/// near miss is healed into a shared node.
+#[test]
+fn a_bar_whose_dividers_nearly_touch_still_traces_every_compartment() {
+    use basset_core::{FeatureKind, FeatureStatus};
+
+    let mut doc = open("crashes_when_sketch_changes_propagate.bass");
+    let fid = *doc.state().sketches.keys().next().expect("one sketch");
+
+    // Nine regions: the bar, four compartments and the four corner holes, through every
+    // dimension change that used to break the trace.
+    for length in [78.0, 90.0, 60.0] {
+        doc.edit_feature_kind(fid, |kind| {
+            if let FeatureKind::Sketch { sketch, .. } = kind {
+                let (id, _) = sketch
+                    .constraints()
+                    .find(|(_, c)| matches!(c.dimension_value(), Some(v) if v > 40.0))
+                    .expect("the bar's length dimension");
+                sketch.set_dimension_value(id, length).unwrap();
+            }
+        })
+        .unwrap();
+        let state = doc.state();
+        let solved = state.sketches.get(&fid).expect("sketch evaluated");
+        assert_eq!(solved.profiles.len(), 9, "at length {length}");
+        for p in &solved.profiles {
+            assert!(p.outer.signed_area() > 0.0, "traced counter-clockwise");
+        }
+        // The bar is symmetric about both axes, so its regions come in equal pairs: the
+        // four holes, the two end compartments and the two middle ones. Merging two
+        // regions into one self-overlapping loop breaks that pairing, and nothing else in
+        // the file would have shown it.
+        let mut areas: Vec<f64> = solved.profiles.iter().map(|p| p.area()).collect();
+        areas.sort_by(|a, b| a.total_cmp(b));
+        for (a, b) in [(0, 1), (1, 2), (2, 3), (4, 5), (6, 7)] {
+            assert_relative_eq!(areas[a], areas[b], epsilon = 1e-5);
+        }
+        assert!(areas[8] > areas[7], "the bar encloses the compartments");
+        // The sketch is wildly under-constrained, but nothing builds from it in this
+        // file, so it is a drawing in progress rather than a fault: no warning.
+        assert_eq!(state.status(fid), Some(&FeatureStatus::Ok));
+        assert!(solved.report.degrees_of_freedom > 0, "and it is loose");
+    }
+}

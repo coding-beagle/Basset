@@ -92,7 +92,10 @@ impl Regenerator {
         // Nothing before the first feature: hand out the shared empty state.
         match count {
             0 => &EMPTY_STATE,
-            n => &self.snapshots[n - 1],
+            n => {
+                flag_under_constrained(&mut self.snapshots[n - 1], &active[..n]);
+                &self.snapshots[n - 1]
+            }
         }
     }
 
@@ -140,7 +143,7 @@ impl Regenerator {
                 }
                 let mut solved = sketch.clone();
                 solved.set_font(self.font.clone());
-                solved
+                let report = solved
                     .solve()
                     .map_err(|e| RegenError::Sketch(e.to_string()))?;
                 let profiles = solved
@@ -155,6 +158,7 @@ impl Regenerator {
                         component: *component,
                         sketch: solved,
                         profiles,
+                        report,
                     }),
                 );
             }
@@ -345,6 +349,52 @@ impl Regenerator {
 
 static EMPTY_STATE: std::sync::LazyLock<ModelState> =
     std::sync::LazyLock::new(ModelState::with_root);
+
+/// Flags the sketches whose remaining degrees of freedom can actually damage the model.
+///
+/// An under-constrained sketch on its own is an ordinary state of a drawing — Fusion
+/// colours it and says nothing more, and a warning on every such sketch would be
+/// permanent furniture that nobody reads. It becomes a fault the moment a *later* feature
+/// builds from it: an edit anywhere in the timeline is then free to slide the loose
+/// geometry off the edges it was drawn against, which changes what the profiles enclose
+/// and so what that feature builds, silently.
+///
+/// It is computed over the finished state rather than while replaying, because whether a
+/// sketch is consumed depends on features that come after it, and it is recomputed from
+/// scratch each time so that deleting the consumer takes the warning away again.
+fn flag_under_constrained(state: &mut ModelState, active: &[Feature]) {
+    let consumed: Vec<FeatureId> = active
+        .iter()
+        // A suppressed feature builds nothing, so it puts nothing at risk either.
+        .filter(|f| !f.suppressed)
+        .flat_map(|f| f.kind.dependencies())
+        .filter(|id| state.sketches.contains_key(id))
+        .collect();
+    for feature in active {
+        let Some(solved) = state.sketches.get(&feature.id) else {
+            continue;
+        };
+        // A failed or suppressed feature has more urgent news, so only `Ok` is
+        // overwritten; `Warned` is recomputed so the flag can be taken away as well.
+        if !matches!(
+            state.statuses.get(&feature.id),
+            Some(FeatureStatus::Ok | FeatureStatus::Warned(_))
+        ) {
+            continue;
+        }
+        let dof = solved.report.degrees_of_freedom;
+        let status = if dof > 0 && consumed.contains(&feature.id) {
+            let plural = if dof == 1 { "" } else { "s" };
+            FeatureStatus::Warned(format!(
+                "under-constrained: {dof} degree{plural} of freedom, and a feature builds \
+                 from it \u{2014} an edit elsewhere can move this geometry"
+            ))
+        } else {
+            FeatureStatus::Ok
+        };
+        state.statuses.insert(feature.id, status);
+    }
+}
 
 /// Kernel operation id for the `k`-th solid a feature produces. Separate sub-ids keep the
 /// caps of two profiles extruded by one feature from sharing a face key.

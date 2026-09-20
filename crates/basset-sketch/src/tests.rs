@@ -515,6 +515,65 @@ fn under_constrained_rectangle_reports_remaining_dof() {
 }
 
 #[test]
+fn free_entities_are_named_not_just_counted() {
+    // A rectangle pinned by one corner and two dimensions has nothing loose left, even
+    // though every other corner still owns parameters: they are determined through the
+    // constraint chain, which is exactly what the null space has to see.
+    let (mut s, _) = dimensioned_rectangle(true);
+    assert!(s.solve().unwrap().under_constrained.is_empty());
+
+    // Without the fix, the whole rectangle can translate: every corner is loose.
+    let (mut s, loose) = dimensioned_rectangle(false);
+    let free = s.solve().unwrap().under_constrained;
+    for corner in loose.corners {
+        assert!(free.contains(&corner), "corner should be free to translate");
+    }
+
+    // A stray point added to the pinned rectangle is the only thing free.
+    let (mut s2, _) = dimensioned_rectangle(true);
+    let stray = s2.add_point(v(3.0, 3.0));
+    assert_eq!(s2.solve().unwrap().under_constrained, vec![stray]);
+}
+
+#[test]
+fn free_entities_include_an_undimensioned_radius_only() {
+    // The circle's centre is fixed and its radius is not, so the report must name the
+    // circle (which owns the radius) and not its centre point.
+    let mut s = Sketch::new();
+    let c = s.add_point(v(0.0, 0.0));
+    let circle = s.add_circle(c, 4.0).unwrap();
+    s.add_constraint(Constraint::Fix(c)).unwrap();
+    assert_eq!(s.solve().unwrap().under_constrained, vec![circle]);
+    s.add_constraint(Constraint::Radius {
+        curve: circle,
+        value: 4.0,
+    })
+    .unwrap();
+    let report = s.solve().unwrap();
+    assert_eq!(report.degrees_of_freedom, 0);
+    assert!(report.under_constrained.is_empty());
+}
+
+#[test]
+fn a_point_on_a_line_is_free_along_it() {
+    // One degree of freedom, and it belongs to the point that slides: the line's own ends
+    // are fixed, so naming them would send the user after the wrong geometry.
+    let mut s = Sketch::new();
+    let (l, a, b) = line(&mut s, v(0.0, 0.0), v(10.0, 0.0));
+    s.add_constraint(Constraint::Fix(a)).unwrap();
+    s.add_constraint(Constraint::Fix(b)).unwrap();
+    let p = s.add_point(v(5.0, 0.0));
+    s.add_constraint(Constraint::Coincident {
+        point: p,
+        target: l,
+    })
+    .unwrap();
+    let report = s.solve().unwrap();
+    assert_eq!(report.degrees_of_freedom, 1);
+    assert_eq!(report.under_constrained, vec![p]);
+}
+
+#[test]
 fn redundant_but_consistent_constraints_still_solve() {
     let (mut s, r) = dimensioned_rectangle(true);
     s.add_constraint(Constraint::Horizontal(r.lines[0]))
@@ -1008,6 +1067,42 @@ fn a_curve_overlapping_part_of_another_splits_both() {
     let p = s.profiles(&tess());
     assert_eq!(p.len(), 1);
     assert_relative_eq!(p[0].area(), 100.0, epsilon = 1e-9);
+}
+
+/// A divider that stops fractionally short of the edge it was drawn to meet still
+/// splits the region in two.
+///
+/// `segment_crossing` is exact, so without the T-junction pass the top edge is never cut
+/// and the two halves trace as one self-overlapping loop whose area means nothing. The
+/// solver only converges to its tolerance, so a near miss like this is the ordinary
+/// state of a re-dimensioned sketch, not a pathological case.
+#[test]
+fn a_divider_stopping_short_of_an_edge_still_splits_the_region() {
+    for gap in [5e-7, -5e-7] {
+        let mut s = Sketch::new();
+        shapes::rectangle_two_point(&mut s, v(0.0, 0.0), v(10.0, 4.0));
+        // Short of the top edge (or through it) by far less than JOIN_TOL, and far more
+        // than the exact crossing test tolerates — which is nothing.
+        line(&mut s, v(5.0, 0.0), v(5.0, 4.0 - gap));
+        let p = s.profiles(&tess());
+        assert_eq!(p.len(), 2, "both halves are regions (gap {gap:e})");
+        assert_relative_eq!(total_area(&p), 40.0, epsilon = 1e-4);
+        for half in &p {
+            assert_relative_eq!(half.area(), 20.0, epsilon = 1e-4);
+        }
+    }
+}
+
+/// The snap is a tolerance, not a repair: a divider that genuinely falls short leaves the
+/// region open, because closing a visible gap would invent geometry the user did not draw.
+#[test]
+fn a_divider_with_a_real_gap_does_not_split_the_region() {
+    let mut s = Sketch::new();
+    shapes::rectangle_two_point(&mut s, v(0.0, 0.0), v(10.0, 4.0));
+    line(&mut s, v(5.0, 0.0), v(5.0, 3.99));
+    let p = s.profiles(&tess());
+    assert_eq!(p.len(), 1, "the rectangle is still one region");
+    assert_relative_eq!(p[0].area(), 40.0, epsilon = 1e-9);
 }
 
 #[test]
