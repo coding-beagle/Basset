@@ -15,8 +15,6 @@ value boxes are drawn red.
 
 What is left here:
 
-- Clicking on tool symbol doesn't select it (in the variant dropdown), only the text (IMPORTANT!) - this is bad and misleading, make it so the tool symbol can be clicked to change tool as well.
-- Patterns don't make sense. Make it closer to fusion.
 - Badge placement declutters: greedy ranked-slot placement in pixels on the sketch plane,
   five rings by eight directions about the entity's normal, ranked so that half a turn
   costs about one ring — a badge crosses to the far side of its line before walking out
@@ -64,11 +62,7 @@ What is left here:
 
 Sketch:
 
-- Profile tracer near-miss T-junctions are healed (`t_junctions` in profiles.rs splits a
-  curve where another curve's endpoint lands within `JOIN_TOL` of its interior, the 2D
-  equivalent of `Solid::heal`). testcases/crashes_when_sketch_changes_propagate.bass is
-  the regression test. Still exact rather than tolerant: `segment_crossing`'s `0..=1`
-  test, which is why the healing pass exists alongside it rather than instead of it
+- Off plane sketch faces are unselectable outside of the sketch.
 - DXF import
 - Trim/break: no Extend (dragging a curve out to meet another one) yet
 - Sketch patterns are plain copies: there is no pattern entity to re-generate from, so
@@ -78,17 +72,6 @@ Sketch:
 
 Extrude tool:
 
-- Draggable arrow in the viewport for the distance: done (`tools::handle`), and the dialog
-  has the distance entry box beside it
-- The geometry an extrude creates is clean: what the user sees as an edge comes from
-  `Solid::display_edges` (topology) rather than from the triangles, so faces read as flat
-  shapes and arcs as curves, and two faces on one surface — a sketch line cut in two —
-  meet at a smooth edge that is neither drawn nor pickable. Generators heal and validate
-  what they return, so a profile that doubles back on itself is repaired or fails its own
-  feature instead of seeding a leaking shell
-- Booleans still heal without validating, so a leak from the BSP splitter is now neither
-  drawn nor reported (it used to show as stray triangle edges). Validating there would
-  fail features that presently work, so it wants measuring before it is turned on
 - Still open there: a silhouette is not drawn, so a cylinder standing against the
   background is bounded only by its shading; and `DISPLAY_CREASE_COS` (45°) is shared with
   the shading cut-off, which is right for a fold but arbitrary for a tangent edge, where
@@ -96,11 +79,7 @@ Extrude tool:
 
 Fillet tool:
 
-- Fillet arrow should go other way around.
-- Multiple edges select reliably: picking runs against the state *before* the running
-  feature (`Editor::refresh_pick_bodies` via `Document::state_before`), so a second pick
-  lands on the unfilleted body while the preview shows. Covered by
-  `fillet_picks_faces_as_edge_rings_and_edges_of_the_unfilleted_body`
+- Still needs optimisation fixes
 - Slow for some geometries, needs optimisation. Worse than slow on a finely tessellated
   one: filleting both rims of a cylinder built at `chord_tolerance` 1e-4 and a 2° segment
   angle allocated ~25 GB before the OOM killer took the whole session with it, so the
@@ -114,7 +93,3 @@ Fillet tool:
   MemoryMax=12G`) while this stands
 - Where several blended edges meet, the result is the intersection of their tools rather
   than a corner patch, and a radius larger than the neighbouring face is not detected
-
-Export:
-
-"Error 330 non manifold edges" - fix?
