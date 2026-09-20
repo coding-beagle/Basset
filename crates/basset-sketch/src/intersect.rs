@@ -178,7 +178,7 @@ pub fn intersections(a: &CurveGeom, b: &CurveGeom) -> Vec<Vec2> {
 
 /// Intersection of two infinite lines. Parallel lines, including collinear ones, yield
 /// nothing.
-fn line_line(p0: Vec2, p1: Vec2, q0: Vec2, q1: Vec2) -> Option<Vec2> {
+pub(crate) fn line_line(p0: Vec2, p1: Vec2, q0: Vec2, q1: Vec2) -> Option<Vec2> {
     let (r, s) = (p1 - p0, q1 - q0);
     let denom = r.perp_dot(s);
     // Scale the parallelism test by the lengths involved so it means an angle, not a
@@ -190,7 +190,7 @@ fn line_line(p0: Vec2, p1: Vec2, q0: Vec2, q1: Vec2) -> Option<Vec2> {
 }
 
 /// Intersections of an infinite line with a full circle.
-fn line_circle(p0: Vec2, p1: Vec2, center: Vec2, radius: f64) -> Vec<Vec2> {
+pub(crate) fn line_circle(p0: Vec2, p1: Vec2, center: Vec2, radius: f64) -> Vec<Vec2> {
     let d = p1 - p0;
     let len = d.length();
     if len <= f64::EPSILON || radius <= 0.0 {
@@ -213,7 +213,7 @@ fn line_circle(p0: Vec2, p1: Vec2, center: Vec2, radius: f64) -> Vec<Vec2> {
 }
 
 /// Intersections of two full circles. Concentric or identical circles yield nothing.
-fn circle_circle(c0: Vec2, r0: f64, c1: Vec2, r1: f64) -> Vec<Vec2> {
+pub(crate) fn circle_circle(c0: Vec2, r0: f64, c1: Vec2, r1: f64) -> Vec<Vec2> {
     let d = c1 - c0;
     let dist = d.length();
     if dist <= JOIN_TOL || dist > r0 + r1 + JOIN_TOL || dist < (r0 - r1).abs() - JOIN_TOL {

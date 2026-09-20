@@ -28,7 +28,9 @@
 //! **Editing** ([`edit`]) trims and breaks existing curves at the points where other
 //! curves cross them, found analytically by [`intersect`]. [`pattern`] repeats geometry
 //! in a grid or around a centre, copying the constraints written between the copied
-//! entities so each copy holds its shape.
+//! entities so each copy holds its shape. [`offset`] draws a chain of curves alongside
+//! an existing one, either rounding the corners so every point is the same distance
+//! from the source or mitring them so every edge is.
 //!
 //! **Parameters** ([`parameters`]) are named constants, written as expressions over each
 //! other, that can drive dimensions; solving re-evaluates them first.
@@ -46,6 +48,7 @@ pub mod expr;
 pub mod geometry;
 pub mod intersect;
 pub mod linalg;
+pub mod offset;
 pub mod parameters;
 pub mod pattern;
 pub mod profiles;
@@ -65,6 +68,7 @@ pub use contour::{Contour, Profile, Segment, SegmentKind};
 pub use entity::{Entity, EntityData};
 pub use error::{SketchError, SolveError};
 pub use intersect::CurveGeom;
+pub use offset::Corner;
 pub use parameters::Parameter;
 pub use sketch::{Hit, JOIN_TOL, Sketch};
 pub use solver::SolveReport;

@@ -68,7 +68,7 @@ pub(crate) struct GpuMesh {
     pub vertices: wgpu::Buffer,
     pub indices: wgpu::Buffer,
     pub index_count: u32,
-    /// Feature edges for [`crate::MeshStyle::ShadedWithEdges`]; `None` when the mesh has none.
+    /// Feature edges for the styles that draw them; `None` when the mesh has none.
     pub edges: Option<wgpu::Buffer>,
     pub edge_count: u32,
     /// Number of `u32` words needed to hold one highlight bit per face id.

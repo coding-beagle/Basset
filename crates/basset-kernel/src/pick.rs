@@ -33,8 +33,14 @@ pub fn pick_face(tess: &Tessellated, ray: &Ray) -> Option<FacePick> {
     })
 }
 
-/// Nearest edge within `tolerance` (world units) of the ray. Among edges within
-/// tolerance the closest to the ray origin wins, so foreground edges beat hidden ones.
+/// Nearest edge within `tolerance` (world units) of the ray.
+///
+/// Two edges within tolerance are separated by aim first and by depth second, with the
+/// aim read in bands half a tolerance wide: an edge the cursor is clearly nearer to wins,
+/// and edges the cursor cannot be said to favour go to whichever is in front, so a hidden
+/// edge never steals a click from the one drawn over it. Adding the two together, as this
+/// used to, measures a millimetre of depth against a millimetre sideways, so on a body a
+/// few hundred millimetres away the depths swamped the aim entirely.
 ///
 /// Smooth edges are not targets: nothing is drawn along them, so aiming at one would be
 /// aiming at nothing, and a fillet across a surface that does not fold has no radius to
@@ -52,8 +58,8 @@ pub fn pick_edge(edges: &[Edge], ray: &Ray, tolerance: f64) -> Option<EdgePick> 
             if distance > tolerance {
                 continue;
             }
-            // Prefer nearer edges; break near-ties by closeness to the ray.
-            let better = best.is_none_or(|b| t + distance < b.t + b.distance);
+            let band = |d: f64| (d / (tolerance * 0.5).max(f64::MIN_POSITIVE)).floor();
+            let better = best.is_none_or(|b| (band(distance), t) < (band(b.distance), b.t));
             if better {
                 best = Some(EdgePick {
                     key: e.key,
@@ -153,6 +159,83 @@ pub fn pick_vertex(edges: &[Edge], ray: &Ray, tolerance: f64) -> Option<VertexPi
     best
 }
 
+/// How far two edges' tangents may disagree and still read as one smooth run. A
+/// tessellated arc's end chord leaves the true tangent by half a facet, and
+/// [`Tessellation`](crate::Tessellation) allows a facet 10°, so anything tighter would
+/// break a chain at the very joins it exists for. It stays well inside the 45° at which
+/// a fold stops being drawn as an edge at all.
+const TANGENT_COS: f64 = 0.966; // 15°
+
+/// Every edge that runs tangentially on from `seed`, `seed` first.
+///
+/// This is Fusion's tangent chain, and it is what makes rounding the rim of a slotted
+/// plate one click rather than eight: the straight stretches and the arcs between them
+/// are separate faces, so separate edges, but the user drew one outline and means all of
+/// it. The walk stops where the run forks — more than one tangent continuation at a
+/// vertex has no single answer, and blending an edge the user did not mean is worse than
+/// making them pick it.
+///
+/// Smooth edges are skipped for the same reason [`pick_edge`] will not aim at one.
+pub fn tangent_chain(edges: &[Edge], seed: EdgeKey) -> Vec<EdgeKey> {
+    let ends = chain_ends(edges);
+    let mut chain = vec![seed];
+    let mut frontier = vec![seed];
+    while let Some(key) = frontier.pop() {
+        for end in ends.iter().filter(|e| e.key == key) {
+            let mut tangent = ends.iter().filter(|o| {
+                o.key != key
+                    && o.point.distance(end.point) <= MERGE_TOL
+                    // Both directions lead away from the shared vertex, so continuing
+                    // each other means facing opposite ways.
+                    && o.direction.dot(end.direction) <= -TANGENT_COS
+            });
+            let (Some(next), None) = (tangent.next(), tangent.next()) else {
+                continue;
+            };
+            if !chain.contains(&next.key) {
+                chain.push(next.key);
+                frontier.push(next.key);
+            }
+        }
+    }
+    chain
+}
+
+/// One end of one polyline of one edge: where it stops and which way it leaves that
+/// vertex.
+struct ChainEnd {
+    key: EdgeKey,
+    point: Vec3,
+    direction: Vec3,
+}
+
+/// The ends of every visible edge polyline. A closed polyline — a cylinder's rim — has
+/// none, which is right: it is already the whole chain.
+fn chain_ends(edges: &[Edge]) -> Vec<ChainEnd> {
+    let mut out = Vec::new();
+    for e in edges.iter().filter(|e| !e.smooth) {
+        for chain in e.chains() {
+            let (first, last) = (chain[0], *chain.last().expect("a chain has a segment"));
+            if first.start.distance(last.end) <= MERGE_TOL {
+                continue;
+            }
+            for (point, along) in [
+                (first.start, first.end - first.start),
+                (last.end, last.start - last.end),
+            ] {
+                if let Some(direction) = along.try_normalize() {
+                    out.push(ChainEnd {
+                        key: e.key,
+                        point,
+                        direction,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Parameters `(t, u)` of the closest points between the ray (`origin + t·dir`) and the
 /// segment `a + u·(b − a)`, `u` clamped to the segment.
 fn closest_params(ray: &Ray, a: Vec3, b: Vec3) -> (f64, f64) {
@@ -211,6 +294,119 @@ mod tests {
         let ray = Ray::new(Vec3::new(5.0, 10.0, 20.0), -Vec3::Z);
         assert!(pick_edge(&edges, &ray, 0.5).is_some());
         assert!(pick_vertex(&edges, &ray, 0.5).is_none());
+    }
+
+    /// A slot-shaped plate: straight sides joined by semicircular ends, so the rim of
+    /// its top face is four edges that the user drew as one outline. Picking any of them
+    /// offers all four; picking an edge of a cube, where every join is a corner, offers
+    /// only itself.
+    #[test]
+    fn a_tangent_run_is_one_chain_and_a_corner_is_not() {
+        use crate::geometry::{Contour, Extent, Profile, Segment, SegmentKind};
+        use basset_math::{Frame, Vec2};
+
+        let (half, r) = (10.0, 5.0);
+        let arc = |centre: Vec2, curve: u32| Segment {
+            curve,
+            kind: SegmentKind::Arc {
+                center: centre,
+                radius: r,
+                ccw: true,
+            },
+        };
+        // Counter-clockwise from the bottom-left: straight, right cap, straight, left cap.
+        let mut points = vec![Vec2::new(-half, -r)];
+        let mut segments = vec![Segment::line(0)];
+        let facets = 8;
+        for (centre, base, curve, closes) in [
+            (Vec2::new(half, 0.0), -90.0_f64, 1, Some(Segment::line(2))),
+            (Vec2::new(-half, 0.0), 90.0_f64, 3, None),
+        ] {
+            points.push(centre + Vec2::from_angle(base.to_radians()) * r);
+            for i in 1..facets {
+                segments.push(arc(centre, curve));
+                let a = (base + 180.0 * i as f64 / facets as f64).to_radians();
+                points.push(centre + Vec2::from_angle(a) * r);
+            }
+            segments.push(arc(centre, curve));
+            if let Some(next) = closes {
+                points.push(centre + Vec2::from_angle((base + 180.0).to_radians()) * r);
+                segments.push(next);
+            }
+        }
+        let profile = Profile::new(
+            Frame::XY,
+            Contour {
+                points,
+                segments,
+                closed: true,
+            },
+        );
+        let solid = crate::generate::extrude(OpId::new(1), &profile, Extent::OneSide(4.0)).unwrap();
+        let edges = solid.edges();
+        let top = |curve: u32| {
+            EdgeKey::new(
+                FaceKey::new(OpId::new(1), FaceRole::EndCap),
+                FaceKey::new(OpId::new(1), FaceRole::Side(curve)),
+            )
+        };
+        assert!(
+            edges.iter().any(|e| e.key == top(0) && !e.smooth),
+            "the straight side's top edge is drawn"
+        );
+        let mut chain = tangent_chain(&edges, top(0));
+        chain.sort();
+        let mut expected = vec![top(0), top(1), top(2), top(3)];
+        expected.sort();
+        assert_eq!(chain, expected, "the whole rim runs on tangentially");
+        // The vertical seams between the flats and the round ends are tangent, so they
+        // are smooth and no chain ever runs down one onto the bottom rim.
+        assert!(
+            chain
+                .iter()
+                .all(|k| k.touches(FaceKey::new(OpId::new(1), FaceRole::EndCap))),
+            "{chain:?}"
+        );
+
+        let c = cuboid(OpId::new(2), Vec3::ZERO, Vec3::splat(10.0));
+        let key = EdgeKey::new(
+            FaceKey::new(OpId::new(2), FaceRole::EndCap),
+            FaceKey::new(OpId::new(2), FaceRole::Side(0)),
+        );
+        assert_eq!(
+            tangent_chain(&c.edges(), key),
+            vec![key],
+            "a cube's edges meet at corners, not tangents"
+        );
+    }
+
+    /// Two edges the same distance from the cursor but at different depths: the near one
+    /// wins. Two at the same depth: the one the cursor is nearer to.
+    #[test]
+    fn picks_the_near_edge_and_then_the_closer_one() {
+        let near = cuboid(OpId::new(1), Vec3::ZERO, Vec3::splat(10.0));
+        let far = cuboid(
+            OpId::new(2),
+            Vec3::new(0.0, 0.0, -30.0),
+            Vec3::new(10.0, 10.0, -20.0),
+        );
+        let mut edges = near.edges();
+        edges.extend(far.edges());
+        // Down the shared (x = 0, y = 5) line: the near block's side edge is at z = 10,
+        // the far block's at z = −20.
+        let ray = Ray::new(Vec3::new(0.1, 5.0, 40.0), -Vec3::Z);
+        let hit = pick_edge(&edges, &ray, 0.5).unwrap();
+        assert_relative_eq!(hit.t, 30.0, epsilon = 1e-6);
+
+        // Straight down between two top edges of one block, nearer the y = 0 one.
+        let c = cuboid(OpId::new(1), Vec3::new(0.0, 0.0, 0.0), Vec3::splat(1.0));
+        let edges = c.edges();
+        let ray = Ray::new(Vec3::new(0.5, 0.2, 5.0), -Vec3::Z);
+        let hit = pick_edge(&edges, &ray, 0.5).unwrap();
+        assert_relative_eq!(hit.point.y, 0.0, epsilon = 1e-9);
+        let ray = Ray::new(Vec3::new(0.5, 0.8, 5.0), -Vec3::Z);
+        let hit = pick_edge(&edges, &ray, 0.5).unwrap();
+        assert_relative_eq!(hit.point.y, 1.0, epsilon = 1e-9);
     }
 
     /// Where two faces of one plane meet there is nothing drawn, so there is nothing to

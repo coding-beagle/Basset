@@ -22,7 +22,10 @@
 //! Soft equations (the drag goal) are included in the least-squares objective but not in
 //! the convergence test or the rank estimate. Remaining degrees of freedom are
 //! `free parameters − rank(J_hard)`, and the null space of `J_hard` says which parameters
-//! they belong to (see [`SolveReport::under_constrained`]).
+//! they belong to (see [`SolveReport::under_constrained`]). The other side of the same
+//! rank question is which constraints the rest of the sketch already implies, which is
+//! [`SolveReport::redundant`]; both analyses equilibrate the Jacobian's columns first so
+//! that their tolerances mean the same thing at every feature size.
 
 use std::collections::HashMap;
 use std::f64::consts::PI;
@@ -55,11 +58,21 @@ pub struct SolveReport {
     /// *which* geometry is still loose rather than only how much of it is. Never empty
     /// while [`Self::degrees_of_freedom`] is non-zero, and always empty when it is zero.
     pub under_constrained: Vec<EntityId>,
+    /// The constraints the rest of the sketch already implies: deleting one would change
+    /// neither the geometry nor [`Self::degrees_of_freedom`]. See [`System::redundant`]
+    /// for the exact test and for how this differs from the conflicting constraints of a
+    /// solve that failed.
+    ///
+    /// Defaulted on deserialisation so a document saved before the check existed still
+    /// loads; it is re-derived on the next solve anyway.
+    #[serde(default)]
+    pub redundant: Vec<ConstraintId>,
 }
 
-/// Relative pivot tolerance for the rank estimate. Rows of the Jacobian are either
-/// lengths (mm) or dimensionless ratios, so entries are O(1) and 1e-9 separates genuine
-/// dependence from rounding noise comfortably.
+/// Relative tolerance for the rank estimate and for the dependence test behind
+/// [`SolveReport::redundant`]. Both run on a column-equilibrated Jacobian, so every entry
+/// is at most one whatever the sketch is drawn at, and 1e-9 separates genuine dependence
+/// from rounding noise comfortably.
 const RANK_TOL: f64 = 1e-9;
 const MAX_ITERATIONS: usize = 200;
 /// Weight of the drag goal relative to hard constraints. It only biases the solution
@@ -961,6 +974,25 @@ impl System {
         Ok((r, j))
     }
 
+    /// The rows of the hard Jacobian each equation owns, paired with the constraint that
+    /// compiled it (`None` for equations the sketch implies rather than the user wrote:
+    /// an arc's second radius). Rows follow [`Self::evaluate`]'s order, hard first.
+    ///
+    /// Attributing a row back to a constraint is the one piece both the conflicting and
+    /// the redundant report need, so it is counted in one place: a second walk that
+    /// disagreed about row numbering would name the wrong constraint, and only for the
+    /// sketches with an implied equation in them.
+    fn hard_row_spans(
+        &self,
+    ) -> impl Iterator<Item = (Option<ConstraintId>, std::ops::Range<usize>)> {
+        let mut row = 0;
+        self.equations.iter().filter(|e| e.hard).map(move |eq| {
+            let start = row;
+            row += eq.residual_count();
+            (eq.source, start..row)
+        })
+    }
+
     /// The constraints still unsatisfied at the end of a solve, worst first.
     ///
     /// A sketch that will not solve is usually two or three constraints asking for
@@ -970,16 +1002,9 @@ impl System {
     fn conflicts(&self, r: &[f64]) -> Vec<ConstraintId> {
         let tol = self.convergence_tolerance();
         let mut worst: Vec<(ConstraintId, f64)> = Vec::new();
-        let mut row = 0;
-        for eq in self.equations.iter().filter(|e| e.hard) {
-            let count = eq.residual_count();
-            let norm = r[row..row + count]
-                .iter()
-                .map(|v| v * v)
-                .sum::<f64>()
-                .sqrt();
-            row += count;
-            let Some(id) = eq.source else { continue };
+        for (source, rows) in self.hard_row_spans() {
+            let norm = r[rows].iter().map(|v| v * v).sum::<f64>().sqrt();
+            let Some(id) = source else { continue };
             if norm <= tol {
                 continue;
             }
@@ -1109,6 +1134,56 @@ impl System {
         (self.params.len().saturating_sub(rank), out)
     }
 
+    /// The constraints that hold nothing the rest of the sketch does not already hold,
+    /// in the order they were written.
+    ///
+    /// *Redundant* here means: every equation the constraint compiled is linearly
+    /// dependent, at the solution, on the equations of the constraints ahead of it, while
+    /// the sketch as a whole is satisfied. Deleting it therefore changes neither the
+    /// geometry nor the degrees of freedom — it is over-constraint of the harmless kind,
+    /// the sort a user creates by dimensioning a rectangle's fourth side or writing
+    /// `Parallel` across a pair of sides already held by two `Horizontal`s.
+    ///
+    /// That is a different fault from `SolveError::DidNotConverge::conflicting`, and the
+    /// two are mutually exclusive by construction. Conflicting constraints are
+    /// *inconsistent*: the residual cannot be driven to zero, so there is no solution and
+    /// the offenders are the rows still unsatisfied when the solver gave up. Redundant
+    /// constraints are *consistent*: the residual is zero and the rows agree exactly —
+    /// which is why the dependence has to be measured on the Jacobian rather than the
+    /// residual, since a satisfied duplicate is invisible in the residual. A solve
+    /// reports one or the other and never both: `conflicting` only ever reaches the user
+    /// through the error of a solve that failed, `redundant` only through the report of
+    /// one that succeeded. Note that the *same* duplicated dimension is conflicting when
+    /// its two values differ and redundant when they agree.
+    ///
+    /// Which member of a dependent family gets named is decided by order: the equations
+    /// the sketch implies rather than the user wrote (an arc's second radius) go in
+    /// first and so are always driving, then the constraints in the order they were
+    /// added, so it is the later of two interchangeable constraints that is reported.
+    fn redundant(&self, j: &Mat) -> Vec<ConstraintId> {
+        let hard = self.hard_rows(j);
+        let mut spans: Vec<(Option<ConstraintId>, std::ops::Range<usize>)> = Vec::new();
+        for (source, rows) in self.hard_row_spans() {
+            // One group per constraint, not per equation: a constraint's own equations
+            // must not be measured against each other.
+            match spans.last_mut() {
+                Some((s, prev)) if *s == source && prev.end == rows.start => prev.end = rows.end,
+                _ => spans.push((source, rows)),
+            }
+        }
+        let groups: Vec<std::ops::Range<usize>> = spans
+            .iter()
+            .filter(|(s, _)| s.is_none())
+            .chain(spans.iter().filter(|(s, _)| s.is_some()))
+            .map(|(_, rows)| rows.clone())
+            .collect();
+        let dependent = hard.dependent_rows(&groups, RANK_TOL);
+        spans
+            .into_iter()
+            .filter_map(|(source, mut rows)| source.filter(|_| rows.all(|r| dependent[r])))
+            .collect()
+    }
+
     /// The hard rows of `j`. Soft rows are the drag goal, which is a preference rather
     /// than a constraint and so must not count toward what the sketch holds fixed.
     fn hard_rows(&self, j: &Mat) -> Mat {
@@ -1213,6 +1288,7 @@ fn finish(sketch: &mut Sketch, sys: &System, out: LmOutcome) -> Result<SolveRepo
         converged: true,
         degrees_of_freedom,
         under_constrained,
+        redundant: sys.redundant(&out.rank_matrix),
     })
 }
 

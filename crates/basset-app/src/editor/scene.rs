@@ -6,10 +6,11 @@
 
 use basset_math::{Vec2, Vec3};
 use basset_sketch::{Entity, Tessellation};
-use basset_viewport::{LineBatch, MeshInstance, MeshStyle, PointBatch, Scene, TriBatch};
+use basset_viewport::{LineBatch, MeshInstance, PointBatch, Scene, TriBatch};
 
 use super::selection::Pick;
-use super::{Editor, Mode};
+use super::tools;
+use super::{DisplayMode, Editor, Mode};
 
 const SELECT: [f32; 4] = [0.25, 0.6, 1.0, 1.0];
 const HOVER: [f32; 4] = [1.0, 0.85, 0.3, 1.0];
@@ -20,6 +21,10 @@ const PLANE: [f32; 4] = [0.6, 0.7, 0.9, 0.6];
 /// surface to the user, and an outline alone reads as "these curves are selected".
 const SELECT_FILL: [f32; 4] = [0.25, 0.6, 1.0, 0.28];
 const HOVER_FILL: [f32; 4] = [1.0, 0.85, 0.3, 0.22];
+/// Feature edges in the modes that draw them without a lit face behind them. The renderer's
+/// default edge colour is near-black, which is right on a shaded face and invisible against
+/// the background a wireframe body stands on.
+const BARE_EDGE: [f32; 4] = [0.80, 0.84, 0.90, 1.0];
 
 pub fn build(editor: &Editor) -> Scene<'_> {
     let mut scene = Scene::new(&editor.camera);
@@ -31,11 +36,20 @@ pub fn build(editor: &Editor) -> Scene<'_> {
             continue;
         }
         let mut instance = MeshInstance::new(mesh.handle);
-        instance.style = MeshStyle::ShadedWithEdges;
+        instance.style = editor.display.mesh_style();
+        let bare = matches!(editor.display, DisplayMode::Wireframe | DisplayMode::XRay);
+        if bare {
+            instance.edge_color = BARE_EDGE;
+        }
         let selected_body = editor.selection.bodies.contains(&id)
             && editor.selection.faces.iter().all(|f| f.body != id);
         if selected_body {
             instance.color = [0.45, 0.6, 0.85, 1.0];
+            // Wireframe draws no faces, so the tint that normally says "selected" has
+            // nothing to land on and the edges have to carry it instead.
+            if bare {
+                instance.edge_color = SELECT;
+            }
         }
         let face_index = |key| {
             mesh.tess
@@ -66,7 +80,22 @@ pub fn build(editor: &Editor) -> Scene<'_> {
         push_edge(editor, &mut selected_edges, e);
     }
     if let Some(Pick::Edge(e, _)) = &editor.hover {
-        push_edge(editor, &mut hovered_edges, e);
+        // A blend tool takes the whole tangent chain from one click, so the hover has to
+        // show the chain too: highlighting the single edge under the cursor and then
+        // selecting four is the surprise the chain was added to remove. Same condition
+        // as `tools::expand_face_pick`, Ctrl and the dialog checkbox included, so what
+        // lights up is always what a click would take.
+        let chaining = editor
+            .tool
+            .as_ref()
+            .is_some_and(|t| t.prefers_edges() && t.params.tangent_chain && !editor.pointer.ctrl);
+        if chaining {
+            for edge in tools::tangent_chain(editor, e) {
+                push_edge(editor, &mut hovered_edges, &edge);
+            }
+        } else {
+            push_edge(editor, &mut hovered_edges, e);
+        }
     }
 
     // Planes and axes.
@@ -290,6 +319,17 @@ pub fn build(editor: &Editor) -> Scene<'_> {
         }
     }
 
+    // The offset's handle: a leader from the geometry out to the grip, so the gap the
+    // user is dragging reads as the distance it is.
+    if let Some(slider) = super::gizmo::slider(editor) {
+        let mut leader = LineBatch::new(slider.color);
+        leader.width_px = 1.5;
+        leader.dashed = true;
+        leader.depth_test = false;
+        leader.segments.push([slider.anchor, slider.grip()]);
+        scene.lines.push(leader);
+    }
+
     // The running tool's size, as an arrow from where it grows to where it reaches. The
     // grip at the tip is an egui widget drawn over this.
     if let Some(h) = super::tools::handle(editor) {
@@ -332,5 +372,139 @@ fn push_edge(editor: &Editor, batch: &mut LineBatch, e: &basset_core::EdgeRef) {
         for s in &edge.segments {
             batch.segments.push([s.start, s.end]);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use basset_viewport::MeshStyle;
+    use winit::keyboard::Key;
+
+    use super::*;
+    use crate::editor::harness::{Harness, click_at};
+    use crate::editor::sketch_mode::SketchTool;
+    use crate::editor::tools::ToolKind;
+    use basset_core::{EdgeRef, OriginPlane, PlaneRef};
+
+    /// The segments the hover highlight would draw: the one batch in the hover colour
+    /// that edges are pushed into.
+    fn hovered_segments(editor: &Editor) -> usize {
+        build(editor)
+            .lines
+            .iter()
+            .filter(|l| l.color == HOVER && l.width_px == 3.0)
+            .map(|l| l.segments.len())
+            .sum()
+    }
+
+    /// Hovering one edge of a slot's rim lights the whole chain, because that is what the
+    /// click takes; Ctrl narrows the highlight to the single edge in the same breath as
+    /// it narrows the pick. The two must not disagree.
+    #[test]
+    fn the_hover_lights_the_chain_a_click_would_take() {
+        let mut h = Harness::new();
+        h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+        let camera = h.editor.camera;
+        let window = h.editor.window_px;
+        let s = h.sketch();
+        s.snap_to_grid = false;
+        s.set_tool(SketchTool::SlotOverall);
+        for p in [Vec2::ZERO, Vec2::new(20.0, 0.0), Vec2::new(10.0, 2.0)] {
+            s.pointer_up(&click_at(p.x, p.y), &camera, window, true, false);
+        }
+        h.editor.commit_sketch();
+        h.finish_sketch(true);
+        let body = h.extrude(Vec2::new(10.0, 0.0), 3.0);
+
+        h.start_tool(ToolKind::Fillet);
+        // An edge that something runs on from: the rim of the slot, not one of its sides.
+        let edges = h.editor.pick_body(body).unwrap().edges.clone();
+        let chained = edges
+            .iter()
+            .map(|e| EdgeRef { body, key: e.key })
+            .find(|e| tools::tangent_chain(&h.editor, e).len() > 1)
+            .expect("the slot's rim is a tangent chain");
+
+        h.editor.hover = Some(Pick::Edge(chained, 0.0));
+        let whole_chain = hovered_segments(&h.editor);
+
+        h.set_modifiers(false, true);
+        let single = hovered_segments(&h.editor);
+        assert!(
+            whole_chain > single,
+            "the chain hover ({whole_chain}) must outdraw the single edge ({single})"
+        );
+
+        // The dialog's checkbox is the same choice made once and for all.
+        h.set_modifiers(false, false);
+        h.editor.tool.as_mut().unwrap().params.tangent_chain = false;
+        assert_eq!(hovered_segments(&h.editor), single);
+    }
+
+    #[test]
+    fn every_display_mode_names_itself_and_maps_to_a_style() {
+        let styles: Vec<MeshStyle> = DisplayMode::ALL.iter().map(|m| m.mesh_style()).collect();
+        for (i, mode) in DisplayMode::ALL.iter().enumerate() {
+            assert!(!mode.title().is_empty(), "{mode:?} has no menu label");
+            assert!(
+                !styles[..i].contains(&styles[i]),
+                "{mode:?} draws the same as an earlier mode"
+            );
+        }
+        assert_eq!(DisplayMode::default(), DisplayMode::Shaded);
+        // The shaded modes differ only in their edges; the other two are see-through.
+        assert!(DisplayMode::Shaded.mesh_style().draws_edges());
+        assert!(!DisplayMode::NoEdges.mesh_style().draws_edges());
+        assert!(!DisplayMode::Wireframe.mesh_style().draws_faces());
+        assert!(DisplayMode::XRay.mesh_style().is_translucent());
+    }
+
+    #[test]
+    fn cycling_visits_every_mode_and_returns() {
+        let mut mode = DisplayMode::default();
+        let mut seen = vec![mode];
+        for _ in 0..DisplayMode::ALL.len() - 1 {
+            mode = mode.next();
+            assert!(!seen.contains(&mode), "{mode:?} came round twice");
+            seen.push(mode);
+        }
+        assert_eq!(mode.next(), DisplayMode::default(), "the cycle wraps");
+    }
+
+    #[test]
+    fn the_d_key_cycles_the_display_mode() {
+        let mut editor = Editor::new(None);
+        for expected in [
+            DisplayMode::NoEdges,
+            DisplayMode::Wireframe,
+            DisplayMode::XRay,
+            DisplayMode::Shaded,
+        ] {
+            editor.on_key(&Key::Character("d".into()));
+            assert_eq!(editor.display, expected);
+        }
+        assert!(
+            editor.status.contains("Shaded"),
+            "status: {}",
+            editor.status
+        );
+    }
+
+    #[test]
+    fn the_scene_follows_the_grid_and_origin_toggles() {
+        let mut editor = Editor::new(None);
+        editor.window_px = [800, 600];
+        editor.refresh_cache();
+        assert!(build(&editor).show_grid);
+
+        editor.show_grid = false;
+        let plain = build(&editor);
+        assert!(!plain.show_grid);
+        let without_origin = plain.lines.len();
+        drop(plain);
+
+        // One axis batch per direction, plus the batch holding the three plane outlines.
+        editor.show_origin = true;
+        assert_eq!(build(&editor).lines.len(), without_origin + 4);
     }
 }

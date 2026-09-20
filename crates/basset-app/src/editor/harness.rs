@@ -64,10 +64,16 @@ impl Frame {
     }
 
     /// Where a piece of text sits on screen, so a test can click the widget showing it.
+    ///
+    /// An exact match wins over one merely
+    /// containing it, because a hint that mentions the OK button in its prose is not the
+    /// OK button, and clicking the paragraph would silently do nothing while the test
+    /// reported that it had pressed the button.
     pub fn rect_of(&self, needle: &str) -> Option<egui::Rect> {
         self.texts
             .iter()
-            .find(|(_, t)| t.contains(needle))
+            .find(|(_, t)| t.trim() == needle)
+            .or_else(|| self.texts.iter().find(|(_, t)| t.contains(needle)))
             .map(|(r, _)| *r)
     }
 }
@@ -180,6 +186,51 @@ impl Harness {
     /// Right-clicks a widget by its label, which is how the variant menus are opened.
     pub fn right_click_ui(&mut self, pos: egui::Pos2) {
         self.press_ui(pos, egui::PointerButton::Secondary);
+    }
+
+    /// Drags in egui's coordinates from `from` to `to`, which is how a viewport handle
+    /// is grabbed: the press lands on the widget under the pointer and the move that
+    /// follows is the drag it reports.
+    ///
+    /// Modifiers are a standing state in egui, set by `ModifiersChanged` and read by
+    /// whatever asks during the frames that follow — which is what lets a widget know
+    /// shift is down *while* it is being dragged. The per-event `modifiers` field does
+    /// not update it, so a drag that only tagged its button events would be reported as
+    /// unmodified. `egui_winit` forwards winit's own `ModifiersChanged` the same way.
+    pub fn drag_ui(&mut self, from: egui::Pos2, to: egui::Pos2, modifiers: egui::Modifiers) {
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers,
+        };
+        self.frame_with(vec![
+            egui::Event::ModifiersChanged(modifiers),
+            egui::Event::PointerMoved(from),
+        ]);
+        self.frame_with(vec![button(from, true)]);
+        self.frame_with(vec![egui::Event::PointerMoved(to)]);
+        self.frame_with(vec![button(to, false)]);
+        self.frame_with(vec![egui::Event::ModifiersChanged(
+            egui::Modifiers::default(),
+        )]);
+    }
+
+    /// Where a point of the model sits in egui's coordinates, for grabbing a handle that
+    /// is drawn on the geometry rather than in a panel.
+    pub fn at_world(&self, at: Vec3, ppp: f32) -> Option<egui::Pos2> {
+        let px = self
+            .editor
+            .camera
+            .world_to_screen(at, self.editor.window_px)?;
+        Some(egui::pos2(
+            (px[0] / f64::from(ppp)) as f32,
+            (px[1] / f64::from(ppp)) as f32,
+        ))
+    }
+
+    pub fn points_per_pixel(&self) -> f32 {
+        self.egui.pixels_per_point()
     }
 
     fn press_ui(&mut self, pos: egui::Pos2, button: egui::PointerButton) {

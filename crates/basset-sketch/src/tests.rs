@@ -573,6 +573,70 @@ fn a_point_on_a_line_is_free_along_it() {
     assert_eq!(report.under_constrained, vec![p]);
 }
 
+/// A sketch that mixes a 3000 mm frame with 1 mm details: the loose end of the frame
+/// drives the detail through two point-on-line levers, each of which divides the motion
+/// by the size ratio, so the detail moves about 1e-7 mm per millimetre of the frame.
+///
+/// It moves all the same, and nothing about the sketch says it is pinned — the freedom is
+/// under-reported purely because the number came out small in millimetres, which is what
+/// an absolute threshold on the null-space component reads. Equilibrating the Jacobian's
+/// columns first measures each unknown against how hard the constraints hold it, which is
+/// the same answer whatever the sketch is drawn at.
+#[test]
+fn freedom_is_reported_across_feature_sizes_that_span_a_thousandfold() {
+    let mut s = Sketch::new();
+    // A long lever, pinned at one end and loose at the other.
+    let (frame, anchor, loose) = line(&mut s, v(0.0, 0.0), v(3000.0, 0.0));
+    s.add_constraint(Constraint::Fix(anchor)).unwrap();
+
+    // A point on the lever 1 mm from the anchor, held across it by a fixed guide: it can
+    // only follow the lever's swing, 1/3000 of it.
+    let near_anchor = s.add_point(v(1.0, 0.0));
+    let (guide, g0, g1) = line(&mut s, v(1.0, -5.0), v(1.0, 5.0));
+    s.add_constraint(Constraint::Fix(g0)).unwrap();
+    s.add_constraint(Constraint::Fix(g1)).unwrap();
+    for target in [frame, guide] {
+        s.add_constraint(Constraint::Coincident {
+            point: near_anchor,
+            target,
+        })
+        .unwrap();
+    }
+
+    // The same arrangement again, hung off that point: a second 3000 mm lever pinned at
+    // its far end, with a 1 mm detail beside the pin.
+    let far = s.add_point(v(1801.0, 2400.0));
+    s.add_constraint(Constraint::Fix(far)).unwrap();
+    let lever = s.add_line(near_anchor, far).unwrap();
+    let detail = s.add_point(v(1800.4, 2399.2));
+    let (rail, r0, r1) = line(&mut s, v(1700.0, 2399.2), v(1900.0, 2399.2));
+    s.add_constraint(Constraint::Fix(r0)).unwrap();
+    s.add_constraint(Constraint::Fix(r1)).unwrap();
+    for target in [lever, rail] {
+        s.add_constraint(Constraint::Coincident {
+            point: detail,
+            target,
+        })
+        .unwrap();
+    }
+
+    let rep = s.solve().unwrap();
+    assert_eq!(
+        rep.degrees_of_freedom, 2,
+        "the lever's loose end, in x and y"
+    );
+    for (id, name) in [
+        (loose, "lever end"),
+        (near_anchor, "mid point"),
+        (detail, "detail"),
+    ] {
+        assert!(
+            rep.under_constrained.contains(&id),
+            "{name} can still move and must be reported as loose"
+        );
+    }
+}
+
 #[test]
 fn redundant_but_consistent_constraints_still_solve() {
     let (mut s, r) = dimensioned_rectangle(true);
@@ -582,6 +646,90 @@ fn redundant_but_consistent_constraints_still_solve() {
         .unwrap();
     let rep = s.solve().unwrap();
     assert_eq!(rep.degrees_of_freedom, 0);
+}
+
+/// A sketch can be over-constrained and perfectly consistent, and then nothing about the
+/// geometry gives the user a clue: the extra constraints are satisfied, so they draw and
+/// solve like the driving ones while quietly refusing every later edit that would break
+/// them.
+#[test]
+fn redundant_constraints_are_named_and_driving_ones_are_not() {
+    let (mut s, r) = dimensioned_rectangle(true);
+    assert!(
+        s.solve().unwrap().redundant.is_empty(),
+        "a rectangle's own constraints all drive something"
+    );
+
+    // The rectangle already holds its first side horizontal and its third parallel to it,
+    // so both of these say something the rest of the sketch has said already.
+    let horizontal = s
+        .add_constraint(Constraint::Horizontal(r.lines[0]))
+        .unwrap();
+    let parallel = s
+        .add_constraint(Constraint::Parallel(r.lines[0], r.lines[2]))
+        .unwrap();
+    let rep = s.solve().unwrap();
+    assert_eq!(rep.redundant, vec![horizontal, parallel]);
+    assert_eq!(rep.degrees_of_freedom, 0);
+
+    // The point of the name is that deleting what it names costs nothing: same geometry,
+    // same freedom. That is what tells the two kinds of over-constraint apart, and it is
+    // the later of two interchangeable constraints that is offered.
+    let corner = pos(&s, r.corners[2]);
+    s.remove_constraint(horizontal);
+    s.remove_constraint(parallel);
+    let rep = s.solve().unwrap();
+    assert!(rep.redundant.is_empty());
+    assert_eq!(rep.degrees_of_freedom, 0);
+    near(pos(&s, r.corners[2]), corner);
+}
+
+/// The same duplicated dimension is redundant when the two values agree and conflicting
+/// when they do not: consistency is the whole difference between the two reports.
+#[test]
+fn a_duplicated_dimension_is_redundant_when_it_agrees_and_conflicting_when_it_does_not() {
+    let mut s = Sketch::new();
+    let a = s.add_point(v(0.0, 0.0));
+    let b = s.add_point(v(3.0, 0.0));
+    s.add_constraint(Constraint::Fix(a)).unwrap();
+    let first = s
+        .add_constraint(Constraint::Distance { a, b, value: 3.0 })
+        .unwrap();
+    let second = s
+        .add_constraint(Constraint::Distance { a, b, value: 3.0 })
+        .unwrap();
+    let rep = s.solve().unwrap();
+    assert_eq!(rep.redundant, vec![second], "the first one is the driver");
+    assert_eq!(rep.degrees_of_freedom, 1, "b still swings about a");
+
+    let mut disagreeing = s.clone();
+    disagreeing.set_dimension_value(second, 5.0).unwrap();
+    match disagreeing.solve() {
+        Err(SolveError::DidNotConverge { conflicting, .. }) => {
+            assert!(conflicting.contains(&first) && conflicting.contains(&second));
+        }
+        other => panic!("expected a conflict, got {other:?}"),
+    }
+}
+
+/// An equation the sketch implies rather than the user wrote must be treated as driving,
+/// or the constraint that duplicates it goes unreported: an arc whose end is dimensioned
+/// to its centre says exactly what the arc's own second radius says.
+#[test]
+fn a_constraint_duplicating_an_implied_equation_is_the_one_named() {
+    let mut s = Sketch::new();
+    let arc = shapes::arc_center(&mut s, v(0.0, 0.0), v(2.0, 0.0), v(0.0, 2.0));
+    s.add_constraint(Constraint::Fix(arc.center)).unwrap();
+    s.add_constraint(Constraint::Fix(arc.start)).unwrap();
+    let dimension = s
+        .add_constraint(Constraint::Distance {
+            a: arc.center,
+            b: arc.end,
+            value: 2.0,
+        })
+        .unwrap();
+    let rep = s.solve().unwrap();
+    assert_eq!(rep.redundant, vec![dimension]);
 }
 
 #[test]

@@ -17,20 +17,50 @@ What is left here:
 
 - Clicking on tool symbol doesn't select it (in the variant dropdown), only the text (IMPORTANT!) - this is bad and misleading, make it so the tool symbol can be clicked to change tool as well.
 - Patterns don't make sense. Make it closer to fusion.
-- Badge placement is naive: several constraints on one entity stack outwards from its
-  midpoint, which is enough for a tidy sketch and will collide on a dense one. No
-  decluttering, and badges do not dodge the geometry or each other
-- Nothing distinguishes a *redundant* constraint from a driving one, so a sketch can be
-  quietly over-constrained but consistent
+- Badge placement declutters: greedy ranked-slot placement in pixels on the sketch plane,
+  five rings by eight directions about the entity's normal, ranked so that half a turn
+  costs about one ring — a badge crosses to the far side of its line before walking out
+  along the near one. Obstacles (curves, points, other badges, dimension value boxes) live
+  in a hash grid, and a badge more than 22 px from its anchor grows a leader. Stability is
+  ranked above packing: offsets are stored in pixels so a pan or zoom rescales the overlay
+  without moving anything, and each badge is re-offered the slot it held last. Still open:
+  leader lines are not themselves obstacles, so a long leader can cross a curve, and the
+  collision space is the sketch plane rather than the true screen projection, so an
+  orbited camera's foreshortening is ignored (the same approximation the sizing already
+  made)
+- Redundant constraints are now named: `SolveReport::redundant` lists the constraints
+  whose every equation is linearly dependent, at the solution, on the equations ahead of
+  them while the system is satisfied — deleting one changes neither the geometry nor the
+  degrees of freedom. Distinct from conflicting, which is inconsistency rather than
+  dependence and so only ever appears on a failed solve. The later of two interchangeable
+  constraints is the one named, because implied equations go into the basis first.
+  **No UI yet: nothing draws or lists them.** Also populated on every drag frame, and the
+  grouped Gram–Schmidt behind it is O(rows²·cols), worth revisiting before sketches grow
 - The degrees-of-freedom estimate is instantaneous (first order), so a point pinned only
   at second order — a zero-length distance, or two distance dimensions with the point
-  exactly between them — is drawn blue although it cannot move. Erring this way is the
-  safe direction for a warning, but it is a lie in the colour
-- `FREE_TOL` in linalg.rs is an absolute threshold on a ratio, so a sketch whose feature
-  sizes span more than ~1e3 can under-report a genuinely free unknown. Fixing it properly
-  means scaling the Jacobian's columns, not moving the tolerance
-- Badges and the constraint overlay are rebuilt every frame, one egui area per badge. Fine
-  for the sketches drawn so far; a few hundred constraints would want caching
+  exactly between them — is drawn blue although it cannot move. The fix is not a better
+  tolerance: for each null-space direction `v` of `J_hard` the sketch is genuinely free
+  along `v` only if the curvature term vanishes too, i.e. `vᵀ(∂²rₖ/∂x²)v == 0` for every
+  hard equation `k`, which is exactly what those two cases fail. The Hessians are
+  reachable — `dual::Dual` carrying second derivatives, or differencing the existing exact
+  Jacobian along `v` at one extra `evaluate` per null direction, which is the cheap way.
+  The hard part is not the test but the conclusion: a direction killed at second order
+  still moves under the *solver*, so attribution needs a third state between "cannot move"
+  and "can only move if something else moves first", not a yes/no. Until then the colour
+  over-reports freedom, which is the safe direction
+- `FREE_TOL`: done. `Mat::freedom` and `dependent_rows` equilibrate the Jacobian's columns
+  to unit norm first, so full pivoting follows dependence rather than whichever feature is
+  drawn largest and the tolerance thresholds a scale-invariant quantity. Regression test
+  `freedom_is_reported_across_feature_sizes_that_span_a_thousandfold` (a 3000 mm lever
+  driving a 1 mm detail) fails without it
+- The badge layout is cached, keyed on a hash of point positions, radii, constraint ids,
+  references and kinds, dimension label positions, the conflicting list and the view scale
+  quantised to four steps per e-fold. A revision counter would be cheaper but would go
+  stale, because `sketch` is a public field the panels, tools and tests all write to
+  directly. Badges are hit-tested in `pointer_moved` rather than through one egui area
+  each, which is also what lets a hovered badge light its geometry and the reverse.
+  Measured at 319 constraints / 637 badges: laid out once, 200 further overlay reads
+  from the cache
 
 Sketch:
 
@@ -71,7 +101,17 @@ Fillet tool:
   feature (`Editor::refresh_pick_bodies` via `Document::state_before`), so a second pick
   lands on the unfilleted body while the preview shows. Covered by
   `fillet_picks_faces_as_edge_rings_and_edges_of_the_unfilleted_body`
-- Slow for some geometries, needs optimisation
+- Slow for some geometries, needs optimisation. Worse than slow on a finely tessellated
+  one: filleting both rims of a cylinder built at `chord_tolerance` 1e-4 and a 2° segment
+  angle allocated ~25 GB before the OOM killer took the whole session with it, so the
+  growth in the BSP boolean is superlinear in the tool's polygon count rather than merely
+  steep. The fillet is applied as one boolean per edge chain against the accumulating
+  result, so each rim's tool is split against every fragment the previous one made. Wants
+  measuring — polygon count per boolean, against tessellation density — before it is
+  optimised, and a guard that refuses or coarsens a blend whose tool would exceed some
+  polygon budget, because a modeller must not be able to exhaust the machine from a
+  radius box. Run `cargo test` under a memory cap (`systemd-run --user --scope -p
+  MemoryMax=12G`) while this stands
 - Where several blended edges meet, the result is the intersection of their tools rather
   than a corner patch, and a radius larger than the neighbouring face is not detected
 

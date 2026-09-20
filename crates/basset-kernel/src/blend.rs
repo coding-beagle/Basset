@@ -104,6 +104,23 @@ fn dihedral(seg: &EdgeSegment) -> (Vec3, Vec3, Vec3, f64) {
     (t, da, db, phi)
 }
 
+/// Which way the blend leaves the edge: into the material for a convex edge, out into
+/// the open for a concave one. It is the same in-face bisector [`section`] puts the
+/// fillet's centre along, which is why an arrow drawn along it reads as the radius —
+/// pointing it the other way, out of a corner the fillet is cutting into, says the
+/// opposite of what the tool does.
+///
+/// `None` where the two faces do not fold: their in-face directions are then opposite
+/// and there is no corner to blend, the condition [`Edge::smooth`](crate::Edge) reports.
+pub fn blend_direction(seg: &EdgeSegment) -> Option<Vec3> {
+    // Not `dihedral`: this one is handed whatever edge the pointer landed on, including
+    // a degenerate segment left by a boolean, and must answer rather than produce NaN.
+    let t = (seg.end - seg.start).try_normalize()?;
+    let da = seg.normal_a.cross(t).try_normalize()?;
+    let db = (-seg.normal_b.cross(t)).try_normalize()?;
+    (da + db).try_normalize()
+}
+
 /// `arc_segments` is fixed per chain: every ring must have the same vertex count for the
 /// quads between them to make sense, and rounding noise in the dihedral angle would
 /// otherwise let neighbouring segments round the count differently.
@@ -473,6 +490,29 @@ mod tests {
                 .surface,
             SurfaceKind::Freeform
         ));
+    }
+
+    /// The direction the radius is measured along points into the body at a convex edge
+    /// and out of it at a concave one: towards the centre of the blend either way.
+    #[test]
+    fn blend_direction_follows_the_material() {
+        let c = cube();
+        let key = edge_between(FaceRole::EndCap, FaceRole::Side(0));
+        let edge = c.edges().into_iter().find(|e| e.key == key).unwrap();
+        let seg = edge.segments[0];
+        let dir = blend_direction(&seg).unwrap();
+        // Half a step along it from the edge is inside a solid cube.
+        let midpoint = (seg.start + seg.end) * 0.5;
+        let inside = midpoint + dir;
+        assert!(
+            inside.x > 0.0 && inside.x < 10.0 && inside.y > 0.0 && inside.y < 10.0,
+            "{inside}"
+        );
+        assert!(inside.z < 10.0, "{inside}");
+        assert!(
+            dir.dot(seg.normal_a + seg.normal_b) < 0.0,
+            "and so away from the outward bisector it used to be drawn along"
+        );
     }
 
     #[test]

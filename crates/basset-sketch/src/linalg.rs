@@ -6,12 +6,19 @@
 /// count as free in [`Mat::freedom`].
 ///
 /// The null-space vector is built with the driving column set to exactly one, so this
-/// thresholds a ratio: "millimetres this unknown moves per millimetre of that one". A
+/// thresholds a ratio: "how much this unknown moves per unit of motion of that one". A
 /// component below it is elimination noise rather than a direction the geometry can
-/// really take. It is not invariant to column scaling, so a sketch mixing features whose
-/// sizes differ by more than ~1e3 — which shows up in the Jacobian through residuals
-/// normalised by length, such as `Angle` — can under-report a genuinely free unknown
-/// whose motion is that much smaller than its neighbour's.
+/// really take.
+///
+/// The ratio is measured on the *column-equilibrated* matrix (see [`Mat::equilibrate`]),
+/// which is what makes the threshold mean the same thing whatever units and feature sizes
+/// the sketch mixes. Raw columns do not: a residual normalised by a length, such as
+/// `Angle` or `Parallel`, writes entries of order `1/L`, so a chain running from a 1000 mm
+/// line down to a 1 mm detail divides a perfectly genuine motion by the size ratio at
+/// every link, and a long enough chain pushes it under any absolute tolerance. Dividing
+/// each column by its norm first cancels exactly that factor, because the product
+/// `|xᵢ| · ‖Aᵢ‖` — motion times how hard the constraints resist it — is invariant when the
+/// unknowns are rescaled.
 const FREE_TOL: f64 = 1e-6;
 
 /// Dense row-major matrix.
@@ -88,7 +95,13 @@ impl Mat {
     /// unknown forces the pivot ones to follow. Both answers come out of one elimination
     /// because this runs on every solve, and a solve runs on every frame of a drag.
     pub fn freedom(&self, rel_tol: f64) -> (usize, Vec<bool>) {
-        let e = self.eliminate(rel_tol);
+        // Equilibrated, so that both the pivot choice and the null-space threshold see a
+        // matrix whose columns are all the same size: the answer is then a property of
+        // the geometry rather than of the units and feature sizes it is drawn at. Rank is
+        // unaffected (scaling a column by a non-zero factor cannot change it); what
+        // changes is which column full pivoting reaches for, which now follows dependence
+        // rather than whichever feature happens to be drawn largest.
+        let e = self.equilibrate().eliminate(rel_tol);
         let mut pivot_col = vec![false; self.cols];
         for &(_, c) in &e.pivots {
             pivot_col[c] = true;
@@ -113,6 +126,81 @@ impl Mat {
             }
         }
         (e.pivots.len(), free)
+    }
+
+    /// The same matrix with every non-zero column scaled to unit norm.
+    ///
+    /// Column equilibration is the standard cure for a Jacobian whose unknowns are in
+    /// wildly different units or at wildly different sizes: it leaves the null space and
+    /// the rank alone (up to the same scaling of each component) while putting every
+    /// entry on one footing, so a magnitude comparison anywhere downstream — a pivot
+    /// search, a tolerance — compares dependence rather than size. An all-zero column has
+    /// no scale to normalise by and is left as it is; it is unconstrained, which the rank
+    /// analysis already reads correctly.
+    pub fn equilibrate(&self) -> Mat {
+        let mut m = self.clone();
+        for c in 0..self.cols {
+            let norm = (0..self.rows)
+                .map(|r| self.at(r, c) * self.at(r, c))
+                .sum::<f64>()
+                .sqrt();
+            if norm == 0.0 || !norm.is_finite() {
+                continue;
+            }
+            for r in 0..self.rows {
+                *m.at_mut(r, c) /= norm;
+            }
+        }
+        m
+    }
+
+    /// Which rows add nothing to the span of the groups of rows *before* them, i.e. are
+    /// linearly dependent on them.
+    ///
+    /// Groups are taken in the caller's order; each row is orthogonalised against the
+    /// basis as it stood before its own group started (modified Gram–Schmidt, run twice,
+    /// because one pass loses orthogonality exactly when the rows are nearly dependent —
+    /// the case being measured) and reported when the remainder has shrunk below
+    /// `rel_tol` of its own norm. Rows are grouped rather than taken one by one so that a
+    /// group is never measured against itself: two rows of one constraint that happen to
+    /// agree make that constraint degenerate, not redundant against its neighbours.
+    /// Within a group, only the rows that survive join the basis for later groups.
+    ///
+    /// Order decides *which* of a dependent set is named, and that is deliberate: the
+    /// caller puts first the rows it wants treated as driving, so a family of
+    /// interchangeable rows names every copy after the first rather than all of them.
+    /// Rows outside every group take no part, in the basis or in the result.
+    ///
+    /// Works on the equilibrated matrix for the reason [`Self::freedom`] does: dependence
+    /// is a property of the geometry, and a row scaled down by a long feature's length
+    /// must not look dependent because of it.
+    pub fn dependent_rows(&self, groups: &[std::ops::Range<usize>], rel_tol: f64) -> Vec<bool> {
+        let m = self.equilibrate();
+        let mut basis: Vec<Vec<f64>> = Vec::new();
+        let mut dependent = vec![false; self.rows];
+        for group in groups {
+            let before = basis.len();
+            for r in group.clone() {
+                let row = &m.data[r * m.cols..(r + 1) * m.cols];
+                let norm0 = norm(row);
+                // A zero row constrains nothing, so it adds nothing to the span either:
+                // dependent on whatever came before, vacuously.
+                dependent[r] =
+                    norm0 == 0.0 || norm(&reduce(row, &basis[..before])) <= rel_tol * norm0;
+            }
+            for r in group.clone().filter(|r| !dependent[*r]) {
+                let mut row = reduce(&m.data[r * m.cols..(r + 1) * m.cols], &basis);
+                let left = norm(&row);
+                if left == 0.0 {
+                    continue;
+                }
+                for a in row.iter_mut() {
+                    *a /= left;
+                }
+                basis.push(row);
+            }
+        }
+        dependent
     }
 
     /// Gaussian elimination with full pivoting: the reduced matrix and the
@@ -156,6 +244,24 @@ impl Mat {
         }
         Elimination { m, pivots }
     }
+}
+
+fn norm(v: &[f64]) -> f64 {
+    v.iter().map(|a| a * a).sum::<f64>().sqrt()
+}
+
+/// `v` with its component along each (unit) basis vector removed, twice over.
+fn reduce(v: &[f64], basis: &[Vec<f64>]) -> Vec<f64> {
+    let mut out = v.to_vec();
+    for _ in 0..2 {
+        for b in basis {
+            let d: f64 = out.iter().zip(b).map(|(a, c)| a * c).sum();
+            for (a, c) in out.iter_mut().zip(b) {
+                *a -= d * c;
+            }
+        }
+    }
+    out
 }
 
 /// The result of [`Mat::eliminate`], kept together because the pivot positions are
@@ -250,6 +356,80 @@ mod tests {
         assert_eq!(dep.freedom(1e-9).0, 2);
         let zero = Mat::zeros(2, 2);
         assert_eq!(zero.freedom(1e-9).0, 0);
+    }
+
+    #[test]
+    fn freedom_survives_a_thousandfold_rescaling_of_one_unknown() {
+        // x1 is pinned to x0 (row 1) and x2 to x1 (row 2), each through a lever with a
+        // 1e3 size ratio, so x2 moves 1e-6 per unit of x0 — under the raw threshold, and
+        // not under one that measures each column against its own norm.
+        let chain = Mat {
+            rows: 2,
+            cols: 3,
+            data: vec![1e-3, 1.0, 0.0, 0.0, 1e-3, 1.0],
+        };
+        assert_eq!(chain.freedom(1e-9), (2, vec![true, true, true]));
+
+        // The same system with the middle unknown measured in a different unit: a
+        // different matrix, the same geometry, and so the same answer.
+        let mut rescaled = chain.clone();
+        for r in 0..rescaled.rows {
+            *rescaled.at_mut(r, 1) *= 1e4;
+        }
+        assert_eq!(rescaled.freedom(1e-9), chain.freedom(1e-9));
+    }
+
+    #[test]
+    fn dependent_rows_names_the_copy_and_not_the_original() {
+        // Row 2 is row 0 doubled and row 3 is row 1 negated: both say what an earlier row
+        // said, and it is the later of each pair that is named.
+        let m = Mat {
+            rows: 4,
+            cols: 2,
+            data: vec![1.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, -1.0],
+        };
+        let one_by_one: Vec<_> = (0..4).map(|r| r..r + 1).collect();
+        assert_eq!(
+            m.dependent_rows(&one_by_one, 1e-9),
+            vec![false, false, true, true]
+        );
+
+        // Put the copies first and they become the drivers instead.
+        let reversed: Vec<_> = (0..4).rev().map(|r| r..r + 1).collect();
+        assert_eq!(
+            m.dependent_rows(&reversed, 1e-9),
+            vec![true, true, false, false]
+        );
+
+        // Grouped, the pair 2..4 is measured against 0..2 only, never against itself.
+        assert_eq!(
+            m.dependent_rows(&[0..2, 2..4], 1e-9),
+            vec![false, false, true, true]
+        );
+        // A group whose second row repeats its first is degenerate in itself, not
+        // dependent on what came before: nothing in the group is named, and the group
+        // contributes the one direction it actually spans.
+        let pair = Mat {
+            rows: 4,
+            cols: 2,
+            data: vec![1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 2.0],
+        };
+        assert_eq!(
+            pair.dependent_rows(&[0..1, 1..3, 3..4], 1e-9),
+            vec![false, false, false, true]
+        );
+    }
+
+    #[test]
+    fn dependence_is_not_a_matter_of_how_big_the_columns_are() {
+        // Two rows saying the same thing about unknowns a thousand apart in scale: the
+        // rows are proportional whatever the columns weigh.
+        let m = Mat {
+            rows: 2,
+            cols: 2,
+            data: vec![1e-3, 1e3, 2e-3, 2e3],
+        };
+        assert_eq!(m.dependent_rows(&[0..1, 1..2], 1e-9), vec![false, true]);
     }
 
     #[test]

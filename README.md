@@ -11,7 +11,7 @@ rewritten when the next tool arrives.
 | Area | What exists |
 | --- | --- |
 | Object model | Document, Components, origin & construction Planes/Axes, Sketches, Bodies |
-| Sketching | points, lines, arcs, circles, construction geometry, text; rectangles (2-point, centre), circles (centre, 2-point, 3-point), polygons, slots, arcs; geometric constraints and driving dimensions; Levenberg–Marquardt solver that names both the loose geometry and, when a sketch will not solve, the constraints that disagree; selection / hit testing including box select; grid snapping; closed-region detection with curves split at their crossings; trim and break; rectangular and circular patterns with a live preview; named parameters driving dimensions |
+| Sketching | points, lines, arcs, circles, construction geometry, text; rectangles (2-point, centre), circles (centre, 2-point, 3-point), polygons, slots, arcs; geometric constraints and driving dimensions; Levenberg–Marquardt solver that names both the loose geometry and, when a sketch will not solve, the constraints that disagree; selection / hit testing including box select; grid snapping; closed-region detection with curves split at their crossings; trim and break; rectangular and circular patterns with a live preview; offset with rounded or squared corners; named parameters driving dimensions |
 | Solids | extrude (one side / symmetric / two sides), revolve, sweep, loft, from a sketch region or a planar face; join / cut / intersect; fillet, chamfer, combine, move |
 | Construction | offset plane, plane at an angle, sketch on a planar face |
 | Timeline | insert at cursor, edit, suppress, reorder, delete, roll back / forward; edits replay forward with per-feature caching; per-feature failure reporting |
@@ -43,7 +43,12 @@ cargo clippy --workspace --all-targets -- -D warnings
   shows the kind used last, and holding it or right-clicking lists the others. Click
   points; clicks snap to existing points, which is how loops close. Right-click or Esc
   ends a line chain. Points that snap to nothing land on the grid, which is drawn on the
-  sketch plane; the palette turns snapping off or pins the increment. After a shape's
+  sketch plane; the palette turns snapping off or pins the increment, and **holding shift
+  lets go of the grid** for as long as it is down — for the one point that has to land
+  between the lines, which is far commoner than wanting no grid at all. Shift frees the
+  manipulators too, not just the drawing. Snapping to an existing *point* is never given
+  up: it is how geometry gets joined, and shift is for escaping the grid rather than for
+  drawing something that only looks attached. After a shape's
   first click, type its sizes (length, width and height, diameter…) in the entry boxes
   that appear, Tab between them and press Enter to place it; a typed size pins the
   preview while the pointer picks the direction, and becomes a driving dimension. With
@@ -91,11 +96,26 @@ cargo clippy --workspace --all-targets -- -D warnings
   origin then places a circular pattern's centre with a click, snapping to a point if one
   is under the pointer. Instance counts are not capped — a bolt circle of two hundred is
   an ordinary thing to ask for — only the total work is, and a pattern that would exceed
-  it says so. While either is up the sketch belongs to it: geometry underneath cannot be
-  dragged away, and Ctrl+Z puts the operation back the way Esc does. A move is rigid, so
-  if the constraints will not take it — asking
-  a rectangle held to the axes to turn — it is refused and said so, rather than the
-  solver quietly finding some other shape that satisfies them.
+  it says so. Offset (or `O`) draws a second chain of curves alongside the selection at a
+  fixed distance, and the two corner styles are the two different drawings people mean by
+  the word: rounded corners keep every *point* of the result the distance from what you
+  drew, so an outward offset of a rectangle comes out with radiused corners, while square
+  corners keep every *edge* that far from its own edge and run the edges out to meet, so
+  an offset rectangle is still a rectangle. The distance is dragged by a handle on the
+  result itself, so it is set by looking at the drawing rather than at a field in a
+  panel; dragging back across the geometry and out the far side puts the offset on that
+  side, which is the whole answer to "which way round is this" on an open path. It snaps
+  to the grid, shift frees it, and the number in the palette reads back whatever the drag
+  is showing. The result is new geometry rather than a linked copy, but it carries what is true
+  of it — each edge parallel to its own edge, each arc concentric with its own arc, each
+  rounded corner centred on the corner it rounds — so it comes out driven rather than a
+  loose pile of blue. An offset larger than the shape can carry, or a corner too sharp to
+  square off, is refused and said so instead of leaving a knot of crossed lines that looks
+  like geometry. While any of the three is up the sketch belongs to it: geometry
+  underneath cannot be dragged away, and Ctrl+Z puts the operation back the way Esc does.
+  A move is rigid, so if the constraints will not take it — asking a rectangle held to the
+  axes to turn — it is refused and said so, rather than the solver quietly finding some
+  other shape that satisfies them.
   `E` extrudes the region under the pointer (or the ones you clicked inside):
   it finishes the sketch and opens Extrude with those regions already chosen. Finish
   Sketch commits.

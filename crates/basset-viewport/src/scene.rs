@@ -22,9 +22,34 @@ pub enum MeshStyle {
     Shaded,
     /// Shaded faces plus feature edges (face boundaries, creases, open borders).
     ShadedWithEdges,
+    /// Feature edges alone, no faces: the skeleton view. Nothing writes depth, so every
+    /// edge of the body is visible, which is the point of the mode.
+    Wireframe,
+    /// Translucent faces with their edges and no depth write, so a body standing behind
+    /// another is still visible through it.
+    XRay,
     /// Translucent, no depth write: used for bodies hidden behind a tool preview or
     /// components being edited in context.
     Ghost,
+}
+
+impl MeshStyle {
+    /// Whether the shaded triangles are drawn at all.
+    pub fn draws_faces(self) -> bool {
+        !matches!(self, Self::Wireframe)
+    }
+
+    /// Whether the mesh's feature edges are drawn. A mesh uploaded without edges draws
+    /// none whatever the style says.
+    pub fn draws_edges(self) -> bool {
+        matches!(self, Self::ShadedWithEdges | Self::Wireframe | Self::XRay)
+    }
+
+    /// Styles that blend rather than replace and leave the depth buffer alone. They are
+    /// drawn after the opaque ones so there is something for them to blend over.
+    pub fn is_translucent(self) -> bool {
+        matches!(self, Self::Ghost | Self::XRay)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -36,12 +61,18 @@ pub struct MeshInstance {
     /// used for selection and hover feedback.
     pub highlight_faces: Vec<u32>,
     pub highlight_color: [f32; 4],
+    /// Colour of the feature edges the style draws. It is per instance because an edge
+    /// that reads well over a lit face is invisible over the background, and the
+    /// edges-only styles have nothing but the background behind them.
+    pub edge_color: [f32; 4],
     pub style: MeshStyle,
 }
 
 impl MeshInstance {
     pub const DEFAULT_COLOR: [f32; 4] = [0.62, 0.66, 0.70, 1.0];
     pub const DEFAULT_HIGHLIGHT: [f32; 4] = [0.20, 0.55, 1.00, 1.0];
+    /// Near-black, which is what a crease on a shaded face looks like.
+    pub const DEFAULT_EDGE: [f32; 4] = [0.08, 0.09, 0.10, 1.0];
 
     pub fn new(handle: MeshHandle) -> Self {
         Self {
@@ -50,6 +81,7 @@ impl MeshInstance {
             color: Self::DEFAULT_COLOR,
             highlight_faces: Vec::new(),
             highlight_color: Self::DEFAULT_HIGHLIGHT,
+            edge_color: Self::DEFAULT_EDGE,
             style: MeshStyle::Shaded,
         }
     }
@@ -149,5 +181,45 @@ impl<'a> Scene<'a> {
             show_grid: true,
             grid_frame: Frame::XY,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn styles_agree_on_what_they_draw() {
+        assert!(MeshStyle::Shaded.draws_faces() && !MeshStyle::Shaded.draws_edges());
+        assert!(
+            MeshStyle::ShadedWithEdges.draws_faces() && MeshStyle::ShadedWithEdges.draws_edges()
+        );
+        // The skeleton view is the only style with no faces, and the only reason the
+        // renderer may skip a mesh draw call entirely.
+        assert!(!MeshStyle::Wireframe.draws_faces() && MeshStyle::Wireframe.draws_edges());
+        assert!(MeshStyle::XRay.draws_faces() && MeshStyle::XRay.draws_edges());
+        assert!(MeshStyle::Ghost.draws_faces() && !MeshStyle::Ghost.draws_edges());
+    }
+
+    #[test]
+    fn only_the_see_through_styles_are_translucent() {
+        for style in [MeshStyle::Ghost, MeshStyle::XRay] {
+            assert!(style.is_translucent(), "{style:?}");
+        }
+        for style in [
+            MeshStyle::Shaded,
+            MeshStyle::ShadedWithEdges,
+            MeshStyle::Wireframe,
+        ] {
+            assert!(!style.is_translucent(), "{style:?}");
+        }
+    }
+
+    #[test]
+    fn a_new_instance_is_plain_shaded() {
+        let instance = MeshInstance::new(MeshHandle(1));
+        assert_eq!(instance.style, MeshStyle::Shaded);
+        assert_eq!(instance.edge_color, MeshInstance::DEFAULT_EDGE);
+        assert_eq!(instance.transform, Mat4::IDENTITY);
     }
 }

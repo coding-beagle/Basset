@@ -2638,3 +2638,646 @@ fn a_move_can_be_typed_straight_into_its_boxes() {
         .fold(f64::INFINITY, |acc, (min, _)| acc.min(min.x));
     assert!((left - 50.0).abs() < 1e-6, "moved exactly 50 mm: {left}");
 }
+
+/// Overall bounds of everything drawn, for judging which side an offset went and how far.
+fn drawn_bounds(s: &sketch_mode::SketchEditor) -> (Vec2, Vec2) {
+    s.sketch
+        .entities()
+        .filter_map(|(id, _)| s.sketch.entity_bounds(id))
+        .fold(
+            (Vec2::splat(f64::INFINITY), Vec2::splat(f64::NEG_INFINITY)),
+            |(lo, hi), (min, max)| (lo.min(min), hi.max(max)),
+        )
+}
+
+fn select_all_curves(s: &mut sketch_mode::SketchEditor) {
+    s.selected = s
+        .sketch
+        .entities()
+        .filter(|(_, d)| d.entity.is_curve())
+        .map(|(id, _)| id)
+        .collect();
+}
+
+/// The offset previews in the live sketch like a pattern does, re-makes itself when the
+/// distance changes rather than offsetting its own offset, and leaves nothing behind
+/// when it is cancelled.
+#[test]
+fn an_offset_previews_live_and_can_be_cancelled() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(40.0, 20.0));
+    let s = sketch(&mut editor);
+    let before = s.sketch.entities().count();
+    select_all_curves(s);
+    s.offset.distance = 5.0;
+    s.offset.corner = sketch_mode::Corner::Round;
+    assert!(s.begin_offset(), "a closed loop can be offset");
+
+    let (min, max) = drawn_bounds(s);
+    assert!(
+        (min.x + 5.0).abs() < 1e-6 && (max.x - 45.0).abs() < 1e-6,
+        "{min:?} {max:?}"
+    );
+    assert!(
+        (min.y + 5.0).abs() < 1e-6 && (max.y - 25.0).abs() < 1e-6,
+        "{min:?} {max:?}"
+    );
+
+    // Changing the distance replaces the result instead of offsetting it again.
+    s.offset.distance = 10.0;
+    s.update_offset();
+    let (min, max) = drawn_bounds(s);
+    assert!(
+        (min.x + 10.0).abs() < 1e-6 && (max.x - 50.0).abs() < 1e-6,
+        "{min:?} {max:?}"
+    );
+
+    assert_eq!(s.finish_offset(false), None, "cancelled");
+    assert_eq!(
+        s.sketch.entities().count(),
+        before,
+        "and the sketch is exactly as it was"
+    );
+}
+
+/// The two corner styles are the two different drawings the user is choosing between:
+/// rounded keeps every *point* the distance away, squared keeps every *edge* that far.
+#[test]
+fn the_corner_style_changes_what_comes_out() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(40.0, 20.0));
+    let s = sketch(&mut editor);
+    // Everything, corner points and all: a box drag selects the points too, and they are
+    // not something to make the user deselect before the tool will speak to them.
+    s.selected = s.sketch.entities().map(|(id, _)| id).collect();
+    s.offset.distance = 5.0;
+    s.offset.corner = sketch_mode::Corner::Round;
+    assert!(s.begin_offset());
+    let (made, error) = s.offset_status().expect("an offset is running");
+    assert_eq!(error, None);
+    assert_eq!(made, 8, "four edges and four corner arcs");
+
+    s.offset.corner = sketch_mode::Corner::Miter;
+    s.update_offset();
+    let (made, _) = s.offset_status().expect("still running");
+    assert_eq!(
+        made, 4,
+        "squared corners add nothing, the edges run out to meet"
+    );
+    // Both reach the same corner of the drawing; only rounded gets there on an arc.
+    let (_, max) = drawn_bounds(s);
+    assert!(
+        (max.x - 45.0).abs() < 1e-6 && (max.y - 25.0).abs() < 1e-6,
+        "{max:?}"
+    );
+}
+
+/// An offset larger than the shape has nowhere to go. It says so and leaves the drawing
+/// alone, rather than making a knot of crossed lines that looks like geometry.
+#[test]
+fn an_offset_that_will_not_fit_says_so_and_changes_nothing() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(40.0, 20.0));
+    let s = sketch(&mut editor);
+    let before = s.sketch.entities().count();
+    select_all_curves(s);
+    // The rectangle is 20 tall; 15 in from both sides leaves nothing between them.
+    s.offset.distance = -15.0;
+    assert!(s.begin_offset());
+    let (made, error) = s.offset_status().expect("an offset is running");
+    assert_eq!(made, 0);
+    assert!(
+        error.is_some_and(|e| e.contains("larger than the geometry can carry")),
+        "{error:?}"
+    );
+    assert_eq!(s.sketch.entities().count(), before);
+    // Keeping a failed offset keeps nothing, and leaves no checkpoint behind either.
+    assert_eq!(s.finish_offset(true), None);
+    assert_eq!(s.sketch.entities().count(), before);
+    assert!(s.undo());
+    assert!(
+        s.sketch.entities().count() < before,
+        "undo went back past the rectangle, so the failed offset left no step of its own"
+    );
+}
+
+/// The offset is dragged on the result itself, so the distance is set by looking at the
+/// drawing rather than at a field in a panel. The handle sits at `anchor + dir *
+/// distance`, which is on the result, and a drag of it *is* the distance.
+#[test]
+fn the_offset_is_dragged_by_a_handle_on_the_result() {
+    use super::gizmo;
+
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(40.0, 20.0));
+    let s = sketch(&mut editor);
+    select_all_curves(s);
+    s.offset.distance = 5.0;
+    assert!(gizmo::slider(&editor).is_none(), "nothing has a handle yet");
+
+    assert!(sketch(&mut editor).begin_offset());
+    let slider = gizmo::slider(&editor).expect("the offset has a handle");
+    // The handle sits on the bottom edge of the result, 5 mm below the drawing.
+    assert_eq!(slider.grip(), Vec3::new(20.0, -5.0, 0.0));
+
+    let s = sketch(&mut editor);
+    // Off the grid, so this measures the drag rather than the snap.
+    s.snap_to_grid = false;
+    assert!(s.nudge_offset(3.0));
+    s.update_offset();
+    assert_eq!(s.offset.distance, 8.0);
+    assert_eq!(
+        gizmo::slider(&editor).expect("still there").grip(),
+        Vec3::new(20.0, -8.0, 0.0)
+    );
+}
+
+/// Dragging the handle back across the drawing and out the far side takes the distance
+/// through zero and negative, which is how the side is chosen. There is no flip to press:
+/// the offset is on the side the pointer is.
+#[test]
+fn dragging_the_offset_across_the_drawing_puts_it_on_the_other_side() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(40.0, 20.0));
+    let s = sketch(&mut editor);
+    select_all_curves(s);
+    s.snap_to_grid = false;
+    s.offset.distance = 5.0;
+    assert!(s.begin_offset());
+    let (min, _) = drawn_bounds(s);
+    assert!((min.y + 5.0).abs() < 1e-6, "outside, 5 mm clear: {min:?}");
+
+    // All the way back through the rectangle and 5 mm out the other side.
+    assert!(s.nudge_offset(-10.0));
+    s.update_offset();
+    assert_eq!(s.offset.distance, -5.0);
+    let (min, max) = drawn_bounds(s);
+    assert!(
+        (min.y).abs() < 1e-6 && (max.y - 20.0).abs() < 1e-6,
+        "the offset is inside the rectangle now: {min:?} {max:?}"
+    );
+}
+
+/// Keeping an offset is one step of undo, not one per curve it drew.
+#[test]
+fn an_offset_is_one_step_of_undo() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(40.0, 20.0));
+    let s = sketch(&mut editor);
+    let before = s.sketch.entities().count();
+    select_all_curves(s);
+    s.offset.distance = 5.0;
+    assert!(s.begin_offset());
+    assert_eq!(s.finish_offset(true), Some(8));
+    assert!(s.sketch.entities().count() > before);
+    assert!(s.undo());
+    assert_eq!(
+        s.sketch.entities().count(),
+        before,
+        "one undo took all of it"
+    );
+}
+
+/// Only one modal operation runs at a time. A second begun on top of the first would
+/// take the first one's preview as the sketch to re-derive from, so cancelling it would
+/// keep what the first one had provisionally made.
+#[test]
+fn a_modal_operation_will_not_start_on_top_of_another() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(40.0, 20.0));
+    let s = sketch(&mut editor);
+    let before = s.sketch.entities().count();
+    select_all_curves(s);
+    s.offset.distance = 5.0;
+    assert!(s.begin_offset());
+    assert!(
+        !s.begin_pattern(),
+        "a pattern will not start over an offset"
+    );
+    assert!(!s.begin_move(), "nor will a move");
+    assert_eq!(s.modal_name(), Some("Offset"));
+    s.finish_modal(false);
+    assert_eq!(s.sketch.entities().count(), before);
+}
+
+/// A tool that refuses because something else is running says so. Telling someone to
+/// select geometry first, when they have selected it and are halfway through a move,
+/// says nothing about what to do next.
+#[test]
+fn a_tool_refused_by_a_running_operation_says_which_one() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(40.0, 20.0));
+    let s = sketch(&mut editor);
+    select_all_curves(s);
+    assert!(s.begin_move());
+    editor.on_key(&winit::keyboard::Key::Character("o".into()));
+    assert!(
+        editor.status.contains("Move is still up"),
+        "{}",
+        editor.status
+    );
+}
+
+/// Keeping an offset that could make nothing is a cancel, and the status line says so
+/// rather than leaving the button looking unresponsive.
+#[test]
+fn a_kept_offset_that_made_nothing_says_it_was_cancelled() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(40.0, 20.0));
+    let s = sketch(&mut editor);
+    select_all_curves(s);
+    s.offset.distance = -15.0;
+    assert!(s.begin_offset());
+    editor.confirm();
+    assert!(
+        editor.status.contains("nothing it could make"),
+        "{}",
+        editor.status
+    );
+}
+
+/// Shift lets go of the grid for as long as it is held. The toggle in the palette says
+/// whether the drawing is built on a grid at all; shift says "not this one placement",
+/// which is the far commoner thing to want and should not need a trip to the palette.
+#[test]
+fn shift_lets_go_of_the_grid_while_it_is_held() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    let s = sketch(&mut editor);
+    s.snap_to_grid = true;
+    assert!(s.snapping(), "the grid holds by default");
+    s.set_free_snap(true);
+    assert!(!s.snapping(), "and lets go while shift is down");
+    s.set_free_snap(false);
+    assert!(s.snapping(), "and takes hold again when it comes up");
+
+    // The toggle still wins: shift releases a grid that is on, it does not turn one on.
+    s.snap_to_grid = false;
+    s.set_free_snap(false);
+    assert!(!s.snapping());
+}
+
+/// Every handle that snaps has to answer to shift, or the escape is only half an escape.
+#[test]
+fn shift_frees_the_manipulators_as_well_as_the_drawing() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(40.0, 20.0));
+    let s = sketch(&mut editor);
+    select_all_curves(s);
+    s.snap_to_grid = true;
+    s.fixed_grid_step = Some(5.0);
+    s.grid_step = 5.0;
+
+    // The move's arrows and ring.
+    assert!(s.begin_move());
+    s.nudge_move(true, 4.0);
+    s.turn_move(2.0);
+    {
+        let op = s.move_op.as_ref().expect("moving");
+        assert_eq!(
+            (op.dx, op.angle_deg),
+            (5.0, 0.0),
+            "snapped to the grid and to 5°"
+        );
+    }
+    s.set_free_snap(true);
+    s.nudge_move(true, 1.3);
+    s.turn_move(2.0);
+    {
+        let op = s.move_op.as_ref().expect("moving");
+        assert!(
+            (op.dx - 6.3).abs() < 1e-9 && (op.angle_deg - 2.0).abs() < 1e-9,
+            "{op:?}"
+        );
+    }
+    s.finish_move(false);
+
+    // And the offset's handle.
+    s.set_free_snap(false);
+    s.offset.distance = 0.0;
+    assert!(s.begin_offset());
+    s.nudge_offset(4.0);
+    assert_eq!(s.offset.distance, 5.0, "snapped");
+    s.set_free_snap(true);
+    s.nudge_offset(1.3);
+    assert!(
+        (s.offset.distance - 6.3).abs() < 1e-9,
+        "{}",
+        s.offset.distance
+    );
+    s.finish_offset(false);
+}
+
+/// A rectangle whose four sides are all tied to one of them, which puts four badges on
+/// that one side and one on each of the others. Dense enough that a layout which only
+/// stacked outwards from the midpoint would overlap, and small enough to reason about.
+fn crowded_rectangle(editor: &mut Editor) -> Vec<EntityId> {
+    draw_rectangle(editor, Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+    let s = sketch(editor);
+    let sides: Vec<EntityId> = s
+        .sketch
+        .entities()
+        .filter(|(_, d)| matches!(d.entity, Entity::Line { .. }))
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(sides.len(), 4, "a rectangle has four sides");
+    // Equal all round is redundant but consistent, so the solver takes it and the sketch
+    // stays a shape rather than folding flat.
+    for other in &sides[1..] {
+        s.add_constraint(Constraint::Equal(sides[0], *other))
+            .expect("equal sides");
+    }
+    sides
+}
+
+/// Distance from a point to a segment, for asserting a badge is clear of a curve.
+fn distance_to_segment(p: Vec2, a: Vec2, b: Vec2) -> f64 {
+    let d = b - a;
+    let len2 = d.length_squared();
+    if len2 <= 0.0 {
+        return p.distance(a);
+    }
+    let t = ((p - a).dot(d) / len2).clamp(0.0, 1.0);
+    p.distance(a + d * t)
+}
+
+/// Badges declutter: they dodge the geometry they annotate and each other, and the ones
+/// decluttering pushed away say where they came from with a leader.
+///
+/// The old layout stacked every badge of one entity straight out from its midpoint. That
+/// is tidy for a rectangle drawn on its own and a pile of overlapping marks the moment
+/// several constraints land on one line, which is exactly when the user needs to read
+/// them.
+#[test]
+fn constraint_badges_dodge_the_geometry_and_each_other() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    let sides = crowded_rectangle(&mut editor);
+    let camera = editor.camera;
+    let window = editor.window_px;
+    let s = sketch(&mut editor);
+    let px = camera.pixel_size_at(s.frame.to_world(Vec2::ZERO), window);
+    let glyphs = s.constraint_glyphs();
+    assert_eq!(
+        glyphs.len(),
+        4 + 3 * 2,
+        "four axis marks and three equals on two sides"
+    );
+
+    let clear = sketch_mode::glyph_clearance_px();
+    for (i, a) in glyphs.iter().enumerate() {
+        let pa = s.frame.to_local(a.center) / px;
+        for b in &glyphs[i + 1..] {
+            let pb = s.frame.to_local(b.center) / px;
+            assert!(
+                (pa.x - pb.x).abs() >= clear - 1e-6 || (pa.y - pb.y).abs() >= clear - 1e-6,
+                "two badges sit on top of each other at {pa:?} and {pb:?}"
+            );
+        }
+        for side in &sides {
+            let (q0, q1) = s.sketch.curve_endpoints(*side).expect("a line");
+            let d = distance_to_segment(pa, q0 / px, q1 / px);
+            assert!(
+                d >= clear * 0.5 - 1e-6,
+                "a badge is sitting on the drawing, {d} px from a side"
+            );
+        }
+    }
+    assert!(
+        glyphs.iter().any(|g| g.leader.is_some()),
+        "the badge that had to leave its entity says which one it belongs to"
+    );
+    // And the ones that did not move away are not cluttered with leaders.
+    assert!(
+        glyphs.iter().any(|g| g.leader.is_none()),
+        "a badge in its natural slot needs no line"
+    );
+}
+
+/// The badge layout is cached. The overlay asks for it twice a frame — once to draw the
+/// marks, once to put a hit area over each — and a few hundred constraints make laying
+/// them out that often a cost the user feels while panning.
+#[test]
+fn the_badge_layout_is_cached_until_the_sketch_or_the_view_changes() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    crowded_rectangle(&mut editor);
+    let camera = editor.camera;
+    let window = editor.window_px;
+    let s = sketch(&mut editor);
+    s.pointer_moved(&click_at(50.0, 50.0), &camera, window, false);
+    let _ = s.constraint_glyphs();
+    let built = s.glyph_layouts();
+
+    // Redrawing, and moving the pointer over the sketch, costs nothing.
+    for i in 0..50 {
+        s.pointer_moved(&click_at(30.0 + f64::from(i), 40.0), &camera, window, false);
+        let _ = s.constraint_glyphs();
+        let _ = s.constraint_glyphs();
+    }
+    assert_eq!(s.glyph_layouts(), built, "nothing changed, nothing rebuilt");
+
+    // Moving the geometry does rebuild it: a badge whose entity moved is in the wrong
+    // place, and no hash of the sketch can miss that.
+    let corner = s
+        .sketch
+        .entities()
+        .find(|(_, d)| matches!(d.entity, Entity::Point { .. }))
+        .map(|(id, _)| id)
+        .expect("a corner");
+    let goal = s.sketch.point_pos(corner).expect("a corner") + Vec2::new(3.0, 3.0);
+    s.sketch.drag_points(&[(corner, goal)]).expect("drag");
+    let _ = s.constraint_glyphs();
+    assert_eq!(s.glyph_layouts(), built + 1, "the sketch changed");
+
+    // So does a real change of zoom, because what collides with what is read in pixels.
+    let mut zoomed = camera;
+    zoomed.zoom(0.5);
+    s.pointer_moved(&click_at(30.0, 40.0), &zoomed, window, false);
+    let _ = s.constraint_glyphs();
+    assert_eq!(s.glyph_layouts(), built + 2, "the view changed");
+}
+
+/// Placement is stable: a layout recomputed after the view moved offers every badge the
+/// slot it already had, so nothing shuffles under the user while they zoom. Optimal
+/// packing matters far less than a mark staying where the eye last found it.
+#[test]
+fn badge_placement_survives_a_change_of_zoom() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    crowded_rectangle(&mut editor);
+    let camera = editor.camera;
+    let window = editor.window_px;
+    let s = sketch(&mut editor);
+
+    // Every badge's offset from its entity's midpoint, in pixels: the layout's own units,
+    // and what the user sees.
+    let slots = |s: &super::SketchEditor, camera: &basset_viewport::Camera| {
+        let px = camera.pixel_size_at(s.frame.to_world(Vec2::ZERO), window);
+        s.constraint_glyphs()
+            .iter()
+            .map(|g| {
+                let id = s.glyph_entity(g).expect("a badge names its entity");
+                let (a, b) = s.sketch.curve_endpoints(id).expect("a line");
+                let d = (s.frame.to_local(g.center) - (a + b) * 0.5) / px;
+                (
+                    g.target,
+                    (d.x * 1e6).round() as i64,
+                    (d.y * 1e6).round() as i64,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    s.pointer_moved(&click_at(50.0, 50.0), &camera, window, false);
+    let before = slots(s, &camera);
+    let built = s.glyph_layouts();
+
+    let mut zoomed = camera;
+    zoomed.zoom(0.5);
+    s.pointer_moved(&click_at(50.0, 50.0), &zoomed, window, false);
+    let after = slots(s, &zoomed);
+    assert!(
+        s.glyph_layouts() > built,
+        "the zoom really did make the layout reconsider itself"
+    );
+    assert_eq!(before, after, "and it put every badge back where it was");
+}
+
+/// A few hundred constraints stay responsive: the layout is worked out once and every
+/// frame after that reads it back.
+///
+/// Not a precise benchmark — it runs on whatever the machine is doing at the time — but
+/// it fails loudly if the per-frame cost goes back to laying out from scratch, which is
+/// the regression that matters.
+#[test]
+fn several_hundred_constraints_are_laid_out_once_and_redrawn_from_the_cache() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    let camera = editor.camera;
+    let window = editor.window_px;
+    let s = sketch(&mut editor);
+    // The view scale first, so the timed call below is the one that lays the badges out.
+    s.pointer_moved(&click_at(50.0, 50.0), &camera, window, false);
+    let built = s.glyph_layouts();
+
+    // A field of short lines, each held horizontal and tied to the one before it. The
+    // sketch is not solved: the badges are placed from the geometry as it stands, which
+    // is what the editor draws between solves anyway.
+    let mut lines: Vec<EntityId> = Vec::new();
+    for i in 0..160 {
+        let x = f64::from(i % 16) * 12.0;
+        let y = f64::from(i / 16) * 12.0;
+        let a = s.sketch.add_point(Vec2::new(x, y));
+        let b = s.sketch.add_point(Vec2::new(x + 8.0, y));
+        let line = s.sketch.add_line(a, b).expect("a line");
+        s.sketch
+            .add_constraint(Constraint::Horizontal(line))
+            .expect("horizontal");
+        if let Some(prev) = lines.last() {
+            s.sketch
+                .add_constraint(Constraint::Equal(*prev, line))
+                .expect("equal");
+        }
+        lines.push(line);
+    }
+    assert_eq!(s.sketch.constraints().count(), 160 + 159);
+
+    let start = std::time::Instant::now();
+    let glyphs = s.constraint_glyphs();
+    let layout = start.elapsed();
+    assert_eq!(s.glyph_layouts(), built + 1, "that call did the layout");
+    assert_eq!(
+        glyphs.len(),
+        160 + 159 * 2,
+        "one badge per constraint per entity it holds"
+    );
+
+    let start = std::time::Instant::now();
+    for _ in 0..200 {
+        let _ = s.constraint_glyphs();
+    }
+    let redraw = start.elapsed();
+    assert_eq!(
+        s.glyph_layouts(),
+        built + 1,
+        "a hundred frames of overlay, and no second layout"
+    );
+    // Generous bounds: the point is that neither is seconds, which is where rebuilding
+    // the layout twice a frame was heading.
+    assert!(
+        layout < std::time::Duration::from_secs(2),
+        "one layout of {} constraints took {layout:?}",
+        160 + 159
+    );
+    assert!(
+        redraw < std::time::Duration::from_secs(4),
+        "200 cached redraws took {redraw:?}"
+    );
+}
+
+/// A dimension's value is placed in the drawing like everything else the user puts
+/// there, so dragging it lands on the grid and shift lets go. Dragged freehand, two
+/// dimensions of the same feature never line up with each other.
+#[test]
+fn dragging_a_dimension_value_snaps_it_to_the_grid() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_line(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(20.0, 0.0));
+    let camera = editor.camera;
+    let window = editor.window_px;
+    let s = sketch(&mut editor);
+    let (cid, _) = dimension(
+        s,
+        &camera,
+        window,
+        Vec2::new(10.0, 0.0),
+        Vec2::new(10.0, -6.0),
+    );
+
+    s.pointer_moved(&click_at(7.0, -9.0), &camera, window, false);
+    let step = s.grid_step;
+    assert!(step > 0.0, "the grid has a step");
+
+    s.move_label(cid, &click_at(7.3, -9.4));
+    let placed = s.sketch.dimension_label(cid).expect("placed");
+    assert!(
+        (placed.x / step).fract().abs() < 1e-9 && (placed.y / step).fract().abs() < 1e-9,
+        "the value landed on the grid: {placed:?} with step {step}"
+    );
+
+    // Shift is for the one label that has to sit between the lines.
+    s.set_free_snap(true);
+    s.move_label(cid, &click_at(7.3, -9.4));
+    let free = s.sketch.dimension_label(cid).expect("placed");
+    assert!(
+        (free.x - 7.3).abs() < 1e-9 && (free.y + 9.4).abs() < 1e-9,
+        "shift let go of the grid: {free:?}"
+    );
+}

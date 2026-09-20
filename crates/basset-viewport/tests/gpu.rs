@@ -514,3 +514,73 @@ fn a_dashed_run_of_short_segments_still_shows_gaps() {
         "and it alternates between ink and gap rather than running solid: {along:?}"
     );
 }
+
+#[test]
+fn wireframe_draws_the_edges_and_leaves_the_faces_out() {
+    let Some(gpu) = gpu() else { return };
+    let mut renderer = Renderer::new(&gpu.device, FORMAT, 1);
+    let handle = renderer
+        .upload_mesh(&gpu.device, &gpu.queue, &cube(20.0), &cube_edges(20.0))
+        .expect("valid cube");
+    let camera = looking_at_origin();
+    let mut scene = Scene::new(&camera);
+    scene.background = BACKGROUND;
+    scene.show_grid = false;
+    scene.meshes.push(MeshInstance {
+        style: MeshStyle::Wireframe,
+        edge_color: [1.0, 1.0, 0.0, 1.0],
+        ..MeshInstance::new(handle)
+    });
+
+    let pixels = render_with(&gpu, &mut renderer, &scene);
+    // The centre of a cube seen face-on is inside a face and crossed by no edge, so in
+    // wireframe it must show the background the shaded modes cover up.
+    let centre = pixel(&pixels, SIZE[0] / 2, SIZE[1] / 2);
+    assert!(
+        is_background(centre),
+        "wireframe must not fill the face: {centre:?}"
+    );
+    let edge_pixels = pixels
+        .iter()
+        .filter(|p| p[0] > 200 && p[1] > 200 && p[2] < 60)
+        .count();
+    assert!(edge_pixels > 0, "no edges drawn at all");
+}
+
+#[test]
+fn xray_blends_the_body_with_what_is_behind_it() {
+    let Some(gpu) = gpu() else { return };
+    let mut renderer = Renderer::new(&gpu.device, FORMAT, 1);
+    let handle = renderer
+        .upload_mesh(&gpu.device, &gpu.queue, &cube(20.0), &cube_edges(20.0))
+        .expect("valid cube");
+    let camera = looking_at_origin();
+    let mut scene = Scene::new(&camera);
+    scene.background = BACKGROUND;
+    scene.show_grid = false;
+    scene.meshes.push(MeshInstance::new(handle));
+    let opaque = pixel(
+        &render_with(&gpu, &mut renderer, &scene),
+        SIZE[0] / 2,
+        SIZE[1] / 2,
+    );
+
+    scene.meshes[0].style = MeshStyle::XRay;
+    let xray = pixel(
+        &render_with(&gpu, &mut renderer, &scene),
+        SIZE[0] / 2,
+        SIZE[1] / 2,
+    );
+    assert!(!is_background(xray), "the body still shades: {xray:?}");
+    // Letting what is behind through means every channel lands between the shaded body
+    // and the background, rather than at either end.
+    let background = BACKGROUND.map(srgb_encode);
+    for c in 0..3 {
+        let (lo, hi) = (background[c].min(opaque[c]), background[c].max(opaque[c]));
+        assert!(
+            xray[c] > lo && xray[c] < hi,
+            "channel {c} of x-ray {xray:?} is not between the background {background:?} \
+             and the shaded body {opaque:?}"
+        );
+    }
+}

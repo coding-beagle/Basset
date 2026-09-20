@@ -11,6 +11,12 @@
 //! two ways of saying one thing and the boxes always read what the viewport is showing.
 //! Only the grips are egui widgets; the shafts and rings are drawn by the scene so they
 //! sit in 3D with the geometry.
+//!
+//! A [`Slider`] is the other shape of handle: one grip sitting *at* the value rather
+//! than on an arm of fixed length, so dragging it is dragging the number itself. An
+//! offset's distance is one — the result is already drawn at that distance, so that is
+//! where the handle belongs, and dragging it back through the geometry and out the far
+//! side is how the side gets chosen.
 
 use basset_math::{Vec2, Vec3};
 use basset_viewport::Camera;
@@ -26,6 +32,8 @@ const RING_PX: f64 = 58.0;
 const GRIP: f32 = 20.0;
 
 const X_COLOR: [f32; 4] = [0.93, 0.35, 0.35, 1.0];
+/// The offset handle, in the same blue its preview is drawn in.
+const SLIDE_COLOR: [f32; 4] = [0.55, 0.85, 1.0, 1.0];
 const Y_COLOR: [f32; 4] = [0.45, 0.85, 0.42, 1.0];
 const Z_COLOR: [f32; 4] = [0.40, 0.60, 0.98, 1.0];
 
@@ -57,6 +65,39 @@ pub enum Axis {
     X,
     Y,
     Z,
+}
+
+/// A single grip that sits at the value it drives. `anchor` is where the value is zero
+/// and `dir` the direction it grows along, so the grip is at `anchor + dir * value` and
+/// a drag of the grip along `dir` *is* the value.
+pub struct Slider {
+    pub anchor: Vec3,
+    pub dir: Vec3,
+    pub value: f64,
+    pub color: [f32; 4],
+}
+
+impl Slider {
+    pub fn grip(&self) -> Vec3 {
+        self.anchor + self.dir * self.value
+    }
+}
+
+/// The slider the editor should be showing, or `None` when nothing has one.
+pub fn slider(editor: &Editor) -> Option<Slider> {
+    let Mode::Sketch(s) = &editor.mode else {
+        return None;
+    };
+    let (anchor, dir) = s.offset_handle()?;
+    let frame = &s.frame;
+    Some(Slider {
+        anchor: frame.to_world(anchor),
+        // A direction, not a point, so it is built from the frame's axes rather than
+        // being mapped through the origin.
+        dir: frame.x * dir.x + frame.y * dir.y,
+        value: s.offset.distance,
+        color: SLIDE_COLOR,
+    })
 }
 
 /// The manipulator for whatever is being moved right now.
@@ -174,14 +215,37 @@ impl Gizmo {
 
 /// Draws the grips and applies whatever was dragged. Returns whether anything moved.
 pub fn interact(editor: &mut Editor, ctx: &egui::Context) -> bool {
-    let Some(gizmo) = current(editor) else {
-        return false;
-    };
+    // egui owns the modifier state during a drag, and the sketch's snapping has to read
+    // the same shift the user is holding as they drag.
+    if let Mode::Sketch(s) = &mut editor.mode {
+        s.set_free_snap(ctx.input(|i| i.modifiers.shift));
+    }
     let camera = editor.camera;
     let window = editor.window_px;
+    let mut slid = false;
+    if let Some(slider) = slider(editor) {
+        let grip = slider.grip();
+        if let Some(delta) = grip_drag(
+            ctx,
+            &camera,
+            window,
+            ("gizmo-slider", Axis::X),
+            grip,
+            slider.color,
+        ) && let Some(world) = along_axis(&camera, window, grip, slider.dir, delta)
+        {
+            slid = slide(editor, world);
+        }
+    }
+    let Some(gizmo) = current(editor) else {
+        if slid {
+            apply(editor);
+        }
+        return slid;
+    };
     let arm = gizmo.arm(&camera, window);
     let radius = gizmo.radius(&camera, window);
-    let mut moved = false;
+    let mut moved = slid;
     for arrow in &gizmo.arrows {
         let tip = gizmo.origin + arrow.dir * arm;
         let Some(delta) = grip_drag(
@@ -316,6 +380,14 @@ fn translate(editor: &mut Editor, axis: Axis, world: f64) -> bool {
     }
 }
 
+/// Drags whatever the slider drives by `world` units.
+fn slide(editor: &mut Editor, world: f64) -> bool {
+    match &mut editor.mode {
+        Mode::Sketch(s) => s.nudge_offset(world),
+        Mode::Model => false,
+    }
+}
+
 fn rotate(editor: &mut Editor, axis: Axis, degrees: f64) -> bool {
     match &mut editor.mode {
         // A sketch turns in its own plane and nowhere else, so its one ring is the only
@@ -339,7 +411,9 @@ fn rotate(editor: &mut Editor, axis: Axis, degrees: f64) -> bool {
 fn apply(editor: &mut Editor) {
     match &mut editor.mode {
         Mode::Sketch(s) => {
+            // Whichever operation the handle belongs to; they are never both running.
             s.update_move();
+            s.update_offset();
             if s.take_dirty() {
                 editor.commit_sketch();
             }

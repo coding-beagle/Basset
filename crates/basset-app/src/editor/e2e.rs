@@ -606,3 +606,207 @@ fn the_variant_menu_icon_picks_the_variant() {
         "clicking the icon chose that variant"
     );
 }
+
+/// The offset tool, all the way through the real interface: the button is on screen with
+/// a selection, the result previews at once, the corner style is a choice you can see the
+/// effect of, and OK keeps exactly what is on screen.
+///
+/// The palette's lower reaches have been off screen before now, which made a tool that
+/// existed in the code unusable in the window; the assertions quote what was on screen
+/// so a failure says which part went missing.
+#[test]
+fn the_offset_tool_is_reachable_and_previews_what_it_will_keep() {
+    let mut h = Harness::new();
+    h.editor.set_window_size([800, 600]);
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    h.rectangle(Vec2::new(0.0, 0.0), Vec2::new(40.0, 20.0));
+    {
+        let s = h.sketch();
+        s.set_tool(SketchTool::Select);
+        s.selected = s
+            .sketch
+            .entities()
+            .filter(|(_, d)| d.entity.is_curve())
+            .map(|(id, _)| id)
+            .collect();
+        s.offset.distance = 5.0;
+    }
+    h.frame();
+    h.frame();
+    let before = h.sketch().sketch.entities().count();
+
+    assert!(
+        h.click_ui("Offset"),
+        "the palette offers Offset for a selection: {:?}",
+        h.frame().text()
+    );
+    assert!(h.sketch().offset_in_progress());
+    assert_eq!(
+        h.sketch().offset_status().map(|(n, _)| n),
+        Some(8),
+        "rounded corners by default, so four edges and four arcs are already on screen"
+    );
+    h.frame();
+    h.frame();
+
+    // The corner style is a control on the running operation, so it has to be on screen
+    // while the operation is running — the whole point is to try one and look at it.
+    assert!(
+        h.click_ui("Square corners"),
+        "and the running offset's own controls are reachable: {:?}",
+        h.frame().text()
+    );
+    assert_eq!(
+        h.sketch().offset_status().map(|(n, _)| n),
+        Some(4),
+        "squaring the corners re-made the offset with no arcs in it"
+    );
+    h.frame();
+    h.frame();
+
+    assert!(h.click_ui("OK"), "{:?}", h.frame().text());
+    assert!(!h.sketch().offset_in_progress());
+    assert_eq!(
+        h.sketch().sketch.entities().count(),
+        before + 8,
+        "four lines and the four corner points they share"
+    );
+}
+
+/// The offset's distance is set by dragging a handle on the result in the viewport, not
+/// only by a field in a panel — the rule for anything the user enters data into. The
+/// handle is a real widget at a real place on the geometry, so the test grabs it where
+/// the user would and drags it there.
+#[test]
+fn the_offset_distance_is_dragged_on_the_geometry() {
+    let mut h = Harness::new();
+    h.editor.set_window_size([800, 600]);
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    h.rectangle(Vec2::new(0.0, 0.0), Vec2::new(40.0, 20.0));
+    {
+        let s = h.sketch();
+        s.set_tool(SketchTool::Select);
+        s.selected = s
+            .sketch
+            .entities()
+            .filter(|(_, d)| d.entity.is_curve())
+            .map(|(id, _)| id)
+            .collect();
+        // A coarse grid, so a snapped drag lands on a multiple of it and a freed one
+        // almost certainly does not.
+        s.fixed_grid_step = Some(5.0);
+        s.offset.distance = 5.0;
+    }
+    h.frame();
+    h.frame();
+    assert!(h.click_ui("Offset"));
+    h.frame();
+    h.frame();
+
+    let slider = super::gizmo::slider(&h.editor).expect("the offset has a handle");
+    let ppp = h.points_per_pixel();
+    let from = h
+        .at_world(slider.grip(), ppp)
+        .expect("the handle is on screen");
+    // Ten millimetres further out, wherever that lands on screen from here.
+    let to = h
+        .at_world(slider.anchor + slider.dir * 15.0, ppp)
+        .expect("and so is where it is going");
+    h.drag_ui(from, to, egui::Modifiers::default());
+
+    let distance = h.sketch().offset.distance;
+    assert!(
+        (distance - 15.0).abs() < 2.5,
+        "the drag set the distance, landing near where it was dropped: {distance}"
+    );
+    assert!(
+        (distance / 5.0).fract().abs() < 1e-9,
+        "and it snapped to the grid: {distance}"
+    );
+    assert!(
+        h.sketch()
+            .offset_status()
+            .is_some_and(|(n, e)| n > 0 && e.is_none()),
+        "and the result was re-made at it"
+    );
+
+    // Shift lets go of the grid for as long as it is held, so the same gesture lands
+    // wherever it was dropped instead of on the nearest line.
+    let slider = super::gizmo::slider(&h.editor).expect("still running");
+    let from = h.at_world(slider.grip(), ppp).expect("on screen");
+    let to = h
+        .at_world(slider.anchor + slider.dir * (slider.value + 7.3), ppp)
+        .expect("on screen");
+    h.drag_ui(
+        from,
+        to,
+        egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        },
+    );
+    let freed = h.sketch().offset.distance;
+    assert!(
+        (freed / 5.0).fract().abs() > 1e-6,
+        "shift freed the drag from the grid: {freed}"
+    );
+}
+
+/// Hovering a badge lights up the geometry it holds, and hovering the geometry lights up
+/// its badges. The palette's constraint list already pointed from a row to the drawing;
+/// this is the same link read from the drawing, which is where the user is looking.
+#[test]
+fn hovering_a_constraint_badge_lights_up_the_geometry_it_holds() {
+    let mut h = Harness::new();
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    h.rectangle(Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+
+    // Away from every badge first, as the baseline for what is lit.
+    h.move_world(Vec3::new(60.0, 60.0, 0.0));
+    let quiet = amber_segments(&mut h);
+    assert_eq!(
+        h.sketch().hovered_constraint,
+        None,
+        "nothing is hovered out here"
+    );
+
+    let (center, id) = {
+        let s = h.sketch();
+        let g = s
+            .constraint_glyphs()
+            .into_iter()
+            .next()
+            .expect("a rectangle is held by badged constraints");
+        (g.center, g.id)
+    };
+    h.move_world(center);
+    {
+        let s = h.sketch();
+        assert_eq!(
+            s.hovered_constraint,
+            Some(id),
+            "the badge under the pointer"
+        );
+        assert!(
+            !s.constraint_hover_entities().is_empty(),
+            "and it names the geometry it holds"
+        );
+    }
+    assert!(
+        amber_segments(&mut h) > quiet,
+        "both the badge and its geometry are drawn lit"
+    );
+}
+
+/// Segments drawn in the hover amber: the geometry under the pointer and any badge lit
+/// with it.
+fn amber_segments(h: &mut Harness) -> usize {
+    let mut lines = Vec::new();
+    h.sketch()
+        .draw(&mut lines, &mut Vec::new(), &mut Vec::new());
+    lines
+        .iter()
+        .filter(|b| b.color == [1.0, 0.85, 0.3, 1.0])
+        .map(|b| b.segments.len())
+        .sum()
+}

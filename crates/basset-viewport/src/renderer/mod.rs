@@ -23,8 +23,6 @@ use gpu_mesh::{GpuMesh, SegmentInstance};
 use pipelines::{DEPTH_FORMAT, Layouts, Pipelines};
 use uniforms::{Globals, LineDraw, MeshDraw, PointDraw, StreamBuffer, TriDraw, UniformArena};
 
-/// Colour of feature edges drawn for [`MeshStyle::ShadedWithEdges`].
-const EDGE_COLOR: [f32; 4] = [0.08, 0.09, 0.10, 1.0];
 const EDGE_WIDTH_PX: f32 = 1.2;
 const DASH_PX: f32 = 8.0;
 /// How far apart two segment ends may be and still count as joined, squared. Curves are
@@ -82,7 +80,7 @@ struct MeshDrawCall {
     handle: MeshHandle,
     uniform_offset: u32,
     highlight: HighlightKey,
-    ghost: bool,
+    translucent: bool,
 }
 
 struct LineDrawCall {
@@ -184,8 +182,8 @@ impl Renderer {
         self.ensure_targets(device, size);
     }
 
-    /// Converts the mesh to `f32` GPU buffers. `edges` are the segments drawn for
-    /// [`MeshStyle::ShadedWithEdges`]; the caller supplies them because only the modeller
+    /// Converts the mesh to `f32` GPU buffers. `edges` are the segments drawn by every
+    /// style with [`MeshStyle::draws_edges`]; the caller supplies them because only the modeller
     /// that built the mesh knows which of its triangle edges are real geometry, and a
     /// guess made from the triangles alone shows the user the mesh.
     ///
@@ -312,35 +310,41 @@ impl Renderer {
             let key = (instance.handle, *ordinal);
             *ordinal += 1;
 
-            let mut color = instance.color;
-            if instance.style == MeshStyle::Ghost {
-                color[3] *= 0.35;
+            let translucent = instance.style.is_translucent();
+            if instance.style.draws_faces() {
+                let mut color = instance.color;
+                if translucent {
+                    color[3] *= 0.35;
+                }
+                let uniform_offset = self.uniforms.push(&MeshDraw {
+                    model: instance.transform.as_mat4().to_cols_array_2d(),
+                    normal_matrix: normal_matrix(&instance.transform)
+                        .as_mat4()
+                        .to_cols_array_2d(),
+                    color,
+                    highlight_color: instance.highlight_color,
+                });
+                draws.meshes.push(MeshDrawCall {
+                    handle: instance.handle,
+                    uniform_offset,
+                    highlight: key,
+                    translucent,
+                });
             }
-            let uniform_offset = self.uniforms.push(&MeshDraw {
-                model: instance.transform.as_mat4().to_cols_array_2d(),
-                normal_matrix: normal_matrix(&instance.transform)
-                    .as_mat4()
-                    .to_cols_array_2d(),
-                color,
-                highlight_color: instance.highlight_color,
-            });
-            draws.meshes.push(MeshDrawCall {
-                handle: instance.handle,
-                uniform_offset,
-                highlight: key,
-                ghost: instance.style == MeshStyle::Ghost,
-            });
-            if instance.style == MeshStyle::ShadedWithEdges && gpu.edges.is_some() {
+            if instance.style.draws_edges() && gpu.edges.is_some() {
                 let uniform_offset = self.uniforms.push(&LineDraw {
                     model: instance.transform.as_mat4().to_cols_array_2d(),
-                    color: EDGE_COLOR,
+                    color: instance.edge_color,
                     params: [EDGE_WIDTH_PX, 0.0, DASH_PX, GAP_PX],
                 });
                 draws.lines.push(LineDrawCall {
                     uniform_offset,
                     instances: 0..gpu.edge_count,
                     source: SegmentSource::MeshEdges(instance.handle),
-                    depth_test: true,
+                    // Only the shaded style hides the edges it occludes. Wireframe and
+                    // x-ray exist to show the far side of the body, and depth-testing
+                    // their edges would hide exactly what the user switched modes to see.
+                    depth_test: instance.style == MeshStyle::ShadedWithEdges,
                 });
             }
             let words = gpu.highlight_words;
@@ -558,15 +562,15 @@ impl Renderer {
         pass.set_bind_group(0, &self.globals_bind_group, &[]);
         let draw_uniforms = self.uniforms.bind_group();
 
-        // Opaque first so ghosts blend over them, then depth-tested annotations, then the
-        // overlays that must stay visible through geometry.
-        for ghost in [false, true] {
-            pass.set_pipeline(if ghost {
+        // Opaque first so the translucent styles blend over them, then depth-tested
+        // annotations, then the overlays that must stay visible through geometry.
+        for translucent in [false, true] {
+            pass.set_pipeline(if translucent {
                 &self.pipelines.mesh_ghost
             } else {
                 &self.pipelines.mesh_opaque
             });
-            for call in draws.meshes.iter().filter(|c| c.ghost == ghost) {
+            for call in draws.meshes.iter().filter(|c| c.translucent == translucent) {
                 let (Some(mesh), Some(highlight)) = (
                     self.meshes.get(&call.handle),
                     self.highlights.get(&call.highlight),

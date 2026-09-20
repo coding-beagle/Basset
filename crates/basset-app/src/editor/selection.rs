@@ -319,6 +319,13 @@ fn same_region(a: &ProfileRef, b: &ProfileRef) -> bool {
     a.sample.distance(b.sample) < 1e-9
 }
 
+/// How much wider the aim is for a tool that is really asking for edges. An edge is one
+/// pixel of drawn line on a body whose faces are thousands, and Fillet spends its whole
+/// life collecting them: eight pixels of slack means chasing a rim around a screen. The
+/// face behind is not lost by this — it is still there in the middle of the face, which
+/// is where a user who means the face is pointing anyway.
+const BLEND_EDGE_SLACK: f64 = 2.0;
+
 /// Everything under the ray that the filter allows, nearest first, then the one to use.
 /// Edges win over faces when both are within tolerance because edges are thin and a
 /// user aiming at one is never aiming at the face behind it.
@@ -328,6 +335,10 @@ pub fn pick(
     filter: &SelectionFilter,
     tolerance_px: f64,
 ) -> Option<Pick> {
+    let thin_px = match editor.tool.as_ref() {
+        Some(tool) if tool.prefers_edges() => tolerance_px * BLEND_EDGE_SLACK,
+        _ => tolerance_px,
+    };
     let mut best: Option<Pick> = None;
     let mut consider = |candidate: Pick| {
         if best.as_ref().is_none_or(|b| candidate.t() < b.t()) {
@@ -368,7 +379,7 @@ pub fn pick(
                     .as_ref()
                     .map(|p| ray.at(p.t()))
                     .unwrap_or(editor.camera.target);
-                let tol = editor.camera.pixel_size_at(anchor, editor.window_px) * tolerance_px;
+                let tol = editor.camera.pixel_size_at(anchor, editor.window_px) * thin_px;
                 if filter.edges
                     && let Some(e) = pick_edge(&mesh.edges, ray, tol)
                     && edge_hit.as_ref().is_none_or(|p| e.t < p.t())
@@ -399,9 +410,8 @@ pub fn pick(
         // smaller target is always the one the user was aiming at.
         match (vertex_hit.or(edge_hit), face_hit) {
             (Some(thin), Some(f)) => {
-                let tol = editor.camera.pixel_size_at(ray.at(f.t()), editor.window_px)
-                    * tolerance_px
-                    * 2.0;
+                let tol =
+                    editor.camera.pixel_size_at(ray.at(f.t()), editor.window_px) * thin_px * 2.0;
                 consider(if thin.t() <= f.t() + tol { thin } else { f });
             }
             (Some(thin), None) => consider(thin),
@@ -549,5 +559,67 @@ impl Editor {
                 basset_core::regen::face_frame(body.solid.face(face.key)?)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use basset_math::Aabb;
+
+    use crate::editor::harness::{Harness, block, click_at};
+    use crate::editor::tools::{self, ToolKind};
+
+    /// The edge under the pointer lights up before the click, so what a pick will take
+    /// is never a surprise. The hover runs the same pick a click does, which is what
+    /// makes the promise and the result agree.
+    #[test]
+    fn the_edge_under_the_pointer_hovers_while_a_fillet_runs() {
+        let mut h = Harness::new();
+        let body = h.block();
+        h.start_tool(ToolKind::Fillet);
+        h.move_world(Vec3::new(5.0, 0.0, 2.0));
+        assert!(
+            matches!(&h.editor.hover, Some(Pick::Edge(e, _)) if e.body == body),
+            "{:?}",
+            h.editor.hover
+        );
+        // And the scene draws it: the hovered-edge batch is one of the line batches.
+        assert!(h.frame().line_batches > 0);
+    }
+
+    /// Aiming at an edge is the whole of using Fillet, so while it runs the aim is wider
+    /// and the edge wins over the face it lies on. With no tool the same click is a
+    /// perfectly ordinary face pick.
+    #[test]
+    fn a_blend_tool_aims_wider_and_prefers_the_edge() {
+        let mut editor = Editor::new(None);
+        editor.window_px = [800, 600];
+        let body = block(&mut editor);
+        // The default camera sees the whole world, so ten pixels of slack covers the
+        // 10 mm block twice over and every edge of it is within tolerance of every
+        // click. Frame the body first, the way a user looking at it would.
+        editor.camera.zoom_to_fit(&Aabb {
+            min: Vec3::ZERO,
+            max: Vec3::new(10.0, 10.0, 2.0),
+        });
+        // Between the ordinary eight pixels of slack and the blend tools' sixteen.
+        let px = editor
+            .camera
+            .pixel_size_at(Vec3::new(5.0, 0.0, 2.0), editor.window_px);
+        let ray = click_at(5.0, px * 12.0);
+        let plain = pick(&editor, &ray, &editor.pick_filter(), 8.0);
+        assert!(matches!(plain, Some(Pick::Face(..))), "{plain:?}");
+
+        tools::start_tool(&mut editor, ToolKind::Fillet);
+        let blend = pick(&editor, &ray, &editor.pick_filter(), 8.0);
+        assert!(
+            matches!(&blend, Some(Pick::Edge(e, _)) if e.body == body),
+            "{blend:?}"
+        );
+
+        // Still only slack, not a free-for-all: the middle of the face is the face.
+        let middle = pick(&editor, &click_at(5.0, 5.0), &editor.pick_filter(), 8.0);
+        assert!(matches!(middle, Some(Pick::Face(..))), "{middle:?}");
     }
 }

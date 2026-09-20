@@ -17,9 +17,10 @@
 
 use basset_core::{FeatureId, FeatureKind, PlaneRef, ProfileRef};
 use basset_math::{Frame, Ray, Vec2, Vec3};
+pub use basset_sketch::offset::Corner;
 use basset_sketch::{
     Constraint, ConstraintId, Entity, EntityId, Hit, Profile, Sketch, SketchError, SolveError,
-    SolveReport, Tessellation, edit, pattern, shapes,
+    SolveReport, Tessellation, edit, offset, pattern, shapes,
 };
 use basset_viewport::{Camera, LineBatch, PointBatch, TriBatch, grid};
 
@@ -55,8 +56,44 @@ const REGION_SELECT_FILL: [f32; 4] = [0.25, 0.6, 1.0, 0.22];
 const ANGLE_SNAP_DEG: f64 = 5.0;
 /// Half-extent of a constraint badge.
 const GLYPH_PX: f64 = 5.0;
-/// Clearance between the geometry and the first badge on it.
-const GLYPH_GAP_PX: f64 = 13.0;
+/// Clearance between the geometry and the first badge on it. Measured from the anchor,
+/// so it is wide enough that the first slot's box clears the curve it is written on.
+const GLYPH_GAP_PX: f64 = 15.0;
+/// Half-extent of the box a badge claims on screen: the symbol plus enough air that two
+/// of them read as two marks rather than as one smudge.
+const GLYPH_BOX_PX: f64 = 9.0;
+/// How much further out each successive ring of candidate slots sits. Wider than a
+/// badge's box, so a badge pushed to the next ring is clear of the one that displaced it.
+const GLYPH_STEP_PX: f64 = 20.0;
+/// How many rings a badge may be pushed out through before the layout gives up and puts
+/// it in its first slot anyway. A badge that vanished would be worse than one that
+/// overlaps: it could never be hovered, named or deleted.
+const GLYPH_RINGS: usize = 5;
+/// Directions tried in each ring, as eighths of a turn about the entity's own normal.
+const GLYPH_DIRS: usize = 8;
+/// What turning away from the entity's natural side costs, in pixels per radian. Half a
+/// turn costs about a ring, so a badge crosses to the other side of its line before it
+/// walks a long way out along the near side.
+const GLYPH_TURN_PX: f64 = 6.0;
+/// Beyond this the badge has visibly left its anchor and gets a leader line back to it.
+const GLYPH_LEADER_PX: f64 = 22.0;
+/// How near the pointer must come to a badge's centre to be on it, in pixels.
+const GLYPH_HIT_PX: f64 = 11.0;
+/// Cell size of the grid the drawing's segments are bucketed into for the collision
+/// tests, in pixels. A little larger than a badge's box, so a badge reads a handful of
+/// cells.
+const GLYPH_CELL_PX: f64 = 24.0;
+/// Cells one segment may be written into. A line is thousands of cells long when the
+/// view is zoomed right into one corner of it, and the layout's cost should follow the
+/// drawing rather than the zoom; the price is a coarser bucket for a curve whose whole
+/// length nobody can see anyway.
+const GLYPH_MAX_CELLS: usize = 256;
+/// Zoom steps, as a divisor of one e-fold, at which the packing is reconsidered. The
+/// layout is decided in pixels and the badges are drawn at the true scale, so between
+/// two steps the whole overlay simply scales with the view: no badge moves relative to
+/// its geometry while the user zooms, which is the property that matters more than an
+/// optimal packing.
+const GLYPH_SCALE_STEPS: f64 = 4.0;
 
 /// What a click or a box drag may land on in a sketch.
 ///
@@ -396,6 +433,10 @@ pub enum Dim {
     /// "50 mm that way and nothing up" is an ordinary thing to ask for.
     Dx,
     Dy,
+    /// An offset's distance. Signed for the same reason a move's offset is, and for one
+    /// more: the sign is which side of the drawing the result went, so typing a minus is
+    /// the flip, exactly as dragging the handle out the far side is.
+    Distance,
     Width,
     Height,
     Diameter,
@@ -409,6 +450,7 @@ impl Dim {
             Dim::Angle => "Angle",
             Dim::Dx => "dX",
             Dim::Dy => "dY",
+            Dim::Distance => "Distance",
             Dim::Width => "Width",
             Dim::Height => "Height",
             Dim::Diameter => "Diameter",
@@ -449,7 +491,9 @@ impl Entry {
         match self.dim {
             Dim::Angle => Some(v.to_radians()),
             // A move's offset keeps its sign, and zero along one axis is a real answer.
-            Dim::Dx | Dim::Dy => Some(v),
+            // An offset's distance keeps its sign because the sign is the side; zero is
+            // no offset at all, and the tool says so rather than the box swallowing it.
+            Dim::Dx | Dim::Dy | Dim::Distance => Some(v),
             _ => (v != 0.0).then_some(v.abs()),
         }
     }
@@ -521,6 +565,45 @@ pub struct ConstraintGlyph {
     /// World centre of the badge, for placing an interactive area over it.
     pub center: Vec3,
     pub segments: Vec<[Vec3; 2]>,
+    /// A line back to the geometry, drawn when decluttering pushed the badge far enough
+    /// off its entity that which entity it belongs to stopped being obvious.
+    pub leader: Option<[Vec3; 2]>,
+}
+
+/// A badge's placement in the units the layout is decided in: an anchor on the geometry,
+/// the direction it was pushed in, and how far in *pixels*.
+///
+/// Keeping the distance in pixels is what makes the overlay stable. The world position
+/// is derived at the current zoom every time the badges are asked for, so a badge holds
+/// its size on screen exactly while the packing — which slot each badge took — is
+/// reconsidered only when the view has really changed.
+#[derive(Clone)]
+struct GlyphPlacement {
+    id: ConstraintId,
+    target: usize,
+    /// Index into the candidate slots, kept so the next layout can offer a badge the
+    /// place it already had.
+    slot: usize,
+    base: Vec2,
+    dir: Vec2,
+    dist_px: f64,
+    /// Local axes the symbol is drawn on: the entity's own, so a badge that dodges to
+    /// the far side of its line does not also turn over.
+    u: Vec2,
+    v: Vec2,
+}
+
+/// The badge layout, kept until something it depends on changes.
+///
+/// The overlay asks for the badges twice a frame — once to draw them, once to put a hit
+/// area over each — and a few hundred constraints make laying them out that often a real
+/// cost. `key` hashes everything the layout reads; `builds` counts the rebuilds so a
+/// test can assert that panning and redrawing cause none.
+#[derive(Default)]
+struct GlyphCache {
+    key: Option<u64>,
+    placements: Vec<GlyphPlacement>,
+    builds: u64,
 }
 
 /// A keyboard-driven move of the selection. The numbers are typed rather than dragged,
@@ -654,6 +737,39 @@ pub struct PatternOp {
     picking_center: bool,
 }
 
+/// Settings of the offset tool, kept between uses.
+#[derive(Clone, Debug)]
+pub struct OffsetParams {
+    /// Signed. Positive grows a closed shape; for an open chain the sides have no names
+    /// the drawing can tell apart, so the sign is the side and there is no flip to press:
+    /// drag the handle out the far side, or type the minus.
+    pub distance: f64,
+    pub corner: Corner,
+}
+
+impl Default for OffsetParams {
+    fn default() -> Self {
+        Self {
+            distance: 5.0,
+            corner: Corner::Round,
+        }
+    }
+}
+
+/// An offset being set up. Like a pattern, the result is made in the live sketch so the
+/// user is looking at the real thing, and every change re-makes it from `base` — the
+/// sketch as it was before the tool started — so a distance can be changed twice without
+/// the offsets piling up.
+pub struct OffsetOp {
+    seed: Vec<EntityId>,
+    base: Sketch,
+    /// Why the last attempt made nothing, for the palette to show. An offset refuses far
+    /// more often than a pattern does — a distance bigger than the shape, a corner too
+    /// sharp to square off — so saying why is most of the tool.
+    pub error: Option<String>,
+    pub created: usize,
+}
+
 /// Rubber-band selection in progress.
 #[derive(Clone, Copy)]
 struct Marquee {
@@ -699,6 +815,19 @@ pub struct SketchEditor {
     pub cursor_snapped: bool,
     /// World size of one pixel at the cursor, so the marker keeps its size on screen.
     cursor_px: f64,
+    /// World size of one pixel at the sketch plane's origin. The badges use this rather
+    /// than [`Self::cursor_px`] because it depends on the view alone: a scale measured
+    /// where the pointer happens to be changes as the pointer moves, which under a
+    /// perspective camera sized every badge by how far the pointer was from it and made
+    /// the whole overlay breathe.
+    view_px: f64,
+    /// The constraint badge under the pointer, so hovering a badge can light up the
+    /// geometry it holds — the palette's constraint list read the other way round.
+    pub hovered_constraint: Option<ConstraintId>,
+    /// Where each badge sits, rebuilt only when the sketch, the solve report or the view
+    /// scale changes. Interior mutability because the overlay and the renderer both ask
+    /// for the badges through `&self`.
+    glyph_cache: std::cell::RefCell<GlyphCache>,
     /// The snapped pointer position before typed sizes are applied, kept so the cursor
     /// can be recomputed when an entry box changes without the pointer moving.
     raw_cursor: Option<Vec2>,
@@ -735,6 +864,10 @@ pub struct SketchEditor {
     /// thing to say about it.
     pub report: Option<Result<SolveReport, SolveError>>,
     pub snap_to_grid: bool,
+    /// Shift is down, so the grid lets go for as long as it is. The toggle says whether
+    /// the drawing is built on a grid at all; this says "not this one placement", which
+    /// is the far commoner thing to want and is not worth a trip to the palette and back.
+    free_snap: bool,
     /// A step the user pinned, or `None` to follow the zoom.
     pub fixed_grid_step: Option<f64>,
     /// The step actually in use, for the palette to display. Updated as the pointer moves
@@ -761,6 +894,10 @@ pub struct SketchEditor {
     pub pattern: PatternParams,
     /// The pattern being set up, if any.
     pattern_op: Option<PatternOp>,
+    /// Settings of the offset tool, kept between uses.
+    pub offset: OffsetParams,
+    /// The offset being set up, if any.
+    offset_op: Option<OffsetOp>,
     /// Editable text of the parameter panel: what the user is typing, which is not the
     /// same as what the sketch has accepted.
     pub param_drafts: Vec<(String, String)>,
@@ -789,6 +926,9 @@ impl SketchEditor {
             cursor: None,
             cursor_snapped: false,
             cursor_px: 1.0,
+            view_px: 1.0,
+            hovered_constraint: None,
+            glyph_cache: std::cell::RefCell::new(GlyphCache::default()),
             raw_cursor: None,
             selected: Vec::new(),
             pick: SketchPick::default(),
@@ -803,6 +943,7 @@ impl SketchEditor {
             constraint_error: None,
             report: None,
             snap_to_grid: true,
+            free_snap: false,
             fixed_grid_step: None,
             grid_step: 1.0,
             clicks: Vec::new(),
@@ -816,6 +957,8 @@ impl SketchEditor {
             move_op: None,
             pattern: PatternParams::default(),
             pattern_op: None,
+            offset: OffsetParams::default(),
+            offset_op: None,
             param_drafts: Vec::new(),
             new_param: (String::new(), String::new()),
             param_error: None,
@@ -840,19 +983,44 @@ impl SketchEditor {
             || self.chain_end.is_some()
             || self.dim_first.is_some()
             || self.move_op.is_some()
+            || self.offset_op.is_some()
     }
 
     pub fn move_in_progress(&self) -> bool {
         self.move_op.is_some()
     }
 
-    /// True while a modal operation owns the sketch. Both of them re-derive the result
-    /// from a copy taken when they started, so anything else that edits the sketch
+    /// True while a modal operation owns the sketch. Each of them re-derives the result
+    /// from a copy taken when it started, so anything else that edits the sketch
     /// meanwhile is silently thrown away the next time a number changes — and undo,
-    /// which pops checkpoints neither of them took, corrupts the stack outright. The
-    /// editor therefore refuses those commands rather than losing the user's work.
+    /// which pops checkpoints none of them took, corrupts the stack outright. The editor
+    /// therefore refuses those commands rather than losing the user's work, and only one
+    /// modal operation runs at a time: a second begun on top of the first would take the
+    /// first one's preview for its base and keep it on cancelling.
     pub fn modal(&self) -> bool {
-        self.move_op.is_some() || self.pattern_op.is_some()
+        self.move_op.is_some() || self.pattern_op.is_some() || self.offset_op.is_some()
+    }
+
+    /// What the modal operation in progress is called, for the messages that have to
+    /// name it. `None` when nothing modal is running.
+    pub fn modal_name(&self) -> Option<&'static str> {
+        match (
+            self.move_op.is_some(),
+            self.pattern_op.is_some(),
+            self.offset_op.is_some(),
+        ) {
+            (true, ..) => Some("Move"),
+            (_, true, _) => Some("Pattern"),
+            (.., true) => Some("Offset"),
+            _ => None,
+        }
+    }
+
+    /// Ends whichever modal operation is running, keeping or discarding it.
+    pub fn finish_modal(&mut self, keep: bool) {
+        self.finish_move(keep);
+        self.finish_pattern(keep);
+        self.finish_offset(keep);
     }
 
     pub fn select_tool(&mut self) {
@@ -888,8 +1056,7 @@ impl SketchEditor {
     }
 
     pub fn cancel_current(&mut self) {
-        self.finish_move(false);
-        self.finish_pattern(false);
+        self.finish_modal(false);
         self.constraint_picks.clear();
         self.finish_current();
     }
@@ -930,6 +1097,19 @@ impl SketchEditor {
             self.mirror_move_entries();
             return;
         }
+        // An offset is one number, and it is typed in the same box for the same reason:
+        // a clearance is usually a stated figure, and dragging to it is the fine
+        // adjustment rather than the way it is said.
+        if self.offset_op.is_some() {
+            self.entries = vec![Entry {
+                dim: Dim::Distance,
+                text: String::new(),
+                locked: false,
+            }];
+            self.entry_focus = Some(0);
+            self.mirror_offset_entry();
+            return;
+        }
         self.entries = self
             .tool
             .dims()
@@ -945,7 +1125,15 @@ impl SketchEditor {
     }
 
     fn checkpoint(&mut self) {
-        self.undo.push(self.sketch.clone());
+        let before = self.sketch.clone();
+        self.push_undo(before);
+    }
+
+    /// Puts `before` on the undo stack as one step. The stack is bounded, because a
+    /// session's worth of edits held in full copies of the sketch is otherwise unbounded
+    /// memory.
+    fn push_undo(&mut self, before: Sketch) {
+        self.undo.push(before);
         if self.undo.len() > 100 {
             self.undo.remove(0);
         }
@@ -1120,11 +1308,25 @@ impl SketchEditor {
     }
 
     fn to_grid(&self, pos: Vec2) -> Vec2 {
-        if self.snap_to_grid {
+        if self.snapping() {
             grid::snap_to(pos, self.grid_step)
         } else {
             pos
         }
+    }
+
+    /// Whether the grid is holding right now. Snapping to an existing *point* is a
+    /// different thing and is never given up: it is how geometry gets joined, and shift
+    /// is for escaping the grid, not for drawing something that only looks attached.
+    pub fn snapping(&self) -> bool {
+        self.snap_to_grid && !self.free_snap
+    }
+
+    /// Tells the sketch whether shift is down. Called from wherever the modifier is
+    /// known rather than read at the point of use, because the drawing path comes from
+    /// winit and the manipulators come from egui and neither can see the other's.
+    pub fn set_free_snap(&mut self, on: bool) {
+        self.free_snap = on;
     }
 
     /// Snaps, then applies typed sizes. A typed value beats the snap: the user has said
@@ -1248,6 +1450,10 @@ impl SketchEditor {
             self.drive_move_from_entries();
             return;
         }
+        if self.offset_op.is_some() {
+            self.drive_offset_from_entry();
+            return;
+        }
         if let Some(raw) = self.raw_cursor {
             let constrained = self.constrained_cursor(raw);
             if constrained != raw {
@@ -1356,15 +1562,17 @@ impl SketchEditor {
         let Some(pos) = self.to_plane(ray) else {
             self.cursor = None;
             self.raw_cursor = None;
+            self.hovered_constraint = None;
             return;
         };
         self.grid_step = self.step_for(pos, camera, window);
         self.cursor_px = camera.pixel_size_at(self.frame.to_world(pos), window);
+        self.view_px = camera.pixel_size_at(self.frame.to_world(Vec2::ZERO), window);
+        // Badges are hit-tested here rather than by the egui area over them, because the
+        // highlight belongs to the drawing: the area's job is the tooltip and the
+        // context menu, and it is rebuilt from this layout anyway.
+        self.hovered_constraint = self.constraint_at(pos);
         let tol = self.tolerance(pos, camera, window);
-        if self.move_in_progress() {
-            self.cursor = None;
-            return;
-        }
         if self.pattern_op.is_some() {
             // The crosshair follows the pointer only while a centre is being picked;
             // nothing else in the sketch may be touched.
@@ -1378,6 +1586,12 @@ impl SketchEditor {
                         .is_some_and(|e| e.entity.is_point())
                 })
             });
+            return;
+        }
+        // Every other modal operation owns the sketch outright, so the crosshair goes
+        // away rather than promising a click that will not land.
+        if self.modal() {
+            self.cursor = None;
             return;
         }
         if self.tool == SketchTool::Select {
@@ -1514,9 +1728,6 @@ impl SketchEditor {
         // While a modal operation is up the viewport belongs to it: a click on a
         // circular pattern puts its centre where the user pointed, which is how one is
         // actually placed, and nothing else may edit the sketch underneath it.
-        if self.move_in_progress() {
-            return;
-        }
         if self.pattern_op.is_some() {
             if self.picking_pattern_center() {
                 // Snapping means the centre can be put on an existing point — the middle
@@ -1525,6 +1736,9 @@ impl SketchEditor {
                 self.pick_pattern_center(false);
                 self.update_pattern();
             }
+            return;
+        }
+        if self.modal() {
             return;
         }
         match self.tool {
@@ -1702,7 +1916,7 @@ impl SketchEditor {
     /// Starts a typed move of the selection. `false` when nothing is selected, so the
     /// key press can fall through to whatever else `M` might mean.
     pub fn begin_move(&mut self) -> bool {
-        if self.selected.is_empty() || self.move_op.is_some() {
+        if self.selected.is_empty() || self.modal() {
             return false;
         }
         let selected = self.selected.clone();
@@ -1753,7 +1967,7 @@ impl SketchEditor {
     /// a grid stays on it, and a dragged arrow that left geometry at 49.87 mm would
     /// quietly undo the point of drawing on a grid at all.
     pub fn nudge_move(&mut self, along_x: bool, distance: f64) -> bool {
-        let (snap, step) = (self.snap_to_grid, self.grid_step);
+        let (snap, step) = (self.snapping(), self.grid_step);
         let Some(op) = self.move_op.as_mut() else {
             return false;
         };
@@ -1766,7 +1980,7 @@ impl SketchEditor {
     /// whole steps for the same reason the offsets are; a ring dragged to 37.4° is
     /// almost never what was meant.
     pub fn turn_move(&mut self, degrees: f64) -> bool {
-        let snap = self.snap_to_grid;
+        let snap = self.snapping();
         let Some(op) = self.move_op.as_mut() else {
             return false;
         };
@@ -1865,11 +2079,7 @@ impl SketchEditor {
             // The base goes on the undo stack now rather than when the move started, so
             // a move that was cancelled leaves no step behind and one that was kept is
             // exactly one.
-            self.undo.push(op.base);
-            if self.undo.len() > 100 {
-                self.undo.remove(0);
-            }
-            self.redo.clear();
+            self.push_undo(op.base);
         } else {
             self.sketch = op.base;
         }
@@ -1884,7 +2094,7 @@ impl SketchEditor {
     /// The copies appear at once from the settings last used, because a pattern with no
     /// preview is a pattern the user has to undo to understand.
     pub fn begin_pattern(&mut self) -> bool {
-        if self.selected.is_empty() || self.pattern_op.is_some() {
+        if self.selected.is_empty() || self.modal() {
             return false;
         }
         self.pattern_center_from_selection();
@@ -1969,8 +2179,7 @@ impl SketchEditor {
     pub fn finish_pattern(&mut self, keep: bool) -> Option<usize> {
         let op = self.pattern_op.take()?;
         if keep {
-            self.undo.push(op.base);
-            self.redo.clear();
+            self.push_undo(op.base);
             self.after_change();
             Some(op.created)
         } else {
@@ -1994,14 +2203,16 @@ impl SketchEditor {
 
     /// The entities the pattern preview added, so they can be drawn as the provisional
     /// things they are rather than as geometry the user has already committed to.
-    fn pattern_copies(&self) -> std::collections::HashSet<EntityId> {
-        let Some(op) = self.pattern_op.as_ref() else {
-            return std::collections::HashSet::new();
+    fn previewed(&self) -> std::collections::HashSet<EntityId> {
+        let base = match (self.pattern_op.as_ref(), self.offset_op.as_ref()) {
+            (Some(op), _) => &op.base,
+            (_, Some(op)) => &op.base,
+            _ => return std::collections::HashSet::new(),
         };
         self.sketch
             .entities()
             .map(|(id, _)| id)
-            .filter(|id| op.base.entity(*id).is_none())
+            .filter(|id| base.entity(*id).is_none())
             .collect()
     }
 
@@ -2018,6 +2229,159 @@ impl SketchEditor {
             self.pattern.center =
                 points.iter().fold(Vec2::ZERO, |a, p| a + *p) / points.len() as f64;
         }
+    }
+
+    // --- Offset ----------------------------------------------------------------------
+
+    /// Starts an offset of the selection. `false` when nothing is selected, so the
+    /// command can say why instead of doing nothing.
+    ///
+    /// The result appears at once from the settings last used, for the same reason a
+    /// pattern's copies do: which side an offset went, and what its corners did, are
+    /// things to look at rather than to imagine.
+    pub fn begin_offset(&mut self) -> bool {
+        if self.selected.is_empty() || self.modal() {
+            return false;
+        }
+        self.offset_op = Some(OffsetOp {
+            seed: self.selected.clone(),
+            base: self.sketch.clone(),
+            error: None,
+            created: 0,
+        });
+        self.update_offset();
+        // The box appears with the offset and takes the keyboard straight away, so an
+        // offset begun with O can be finished by typing the clearance and pressing Enter.
+        self.reset_entries();
+        true
+    }
+
+    pub fn offset_in_progress(&self) -> bool {
+        self.offset_op.is_some()
+    }
+
+    /// Re-makes the offset from the sketch as it was before the tool started, so editing
+    /// the distance replaces it rather than offsetting the offset.
+    pub fn update_offset(&mut self) {
+        let Some(op) = self.offset_op.as_ref() else {
+            return;
+        };
+        let (seed, base) = (op.seed.clone(), op.base.clone());
+        let (distance, corner) = (self.offset.distance, self.offset.corner);
+        self.sketch = base;
+        let result = offset::offset(&mut self.sketch, &seed, distance, corner);
+        let Some(op) = self.offset_op.as_mut() else {
+            return;
+        };
+        match result {
+            Ok(created) => {
+                op.created = created.len();
+                op.error = None;
+            }
+            Err(e) => {
+                op.created = 0;
+                op.error = Some(e.to_string());
+                // A refused offset leaves the sketch the user had, never a half-made one.
+                self.sketch = op.base.clone();
+            }
+        }
+        self.solve();
+        self.mirror_offset_entry();
+        self.dirty = true;
+    }
+
+    /// Writes the distance into the box, so whatever moved the offset — the handle, the
+    /// palette's own spinner — reads back as a number at once.
+    ///
+    /// A box the user has typed into is left alone while it still says what the offset
+    /// is made at, half-typed minus and all. One that says some *other* number has been
+    /// overtaken by something else driving the same distance, and a box disagreeing with
+    /// the geometry beside it is worse than no box at all, so it goes back to mirroring.
+    fn mirror_offset_entry(&mut self) {
+        let distance = self.offset.distance;
+        for entry in self.entries.iter_mut().filter(|e| e.dim == Dim::Distance) {
+            if entry.locked
+                && entry
+                    .text
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .is_none_or(|typed| typed == distance)
+            {
+                continue;
+            }
+            entry.locked = false;
+            entry.text = format!("{distance:.2}");
+        }
+    }
+
+    /// Re-makes the offset at whatever has been typed into the box.
+    ///
+    /// A typed distance is taken exactly: the grid is there to steady a pointer, and a
+    /// user who has typed 3.2 has already said what they want. Nothing happens when the
+    /// number has not changed, so the idle refreshes that come with every keystroke
+    /// elsewhere do not rebuild the geometry.
+    fn drive_offset_from_entry(&mut self) {
+        let Some(v) = typed_value(&self.entries, Dim::Distance) else {
+            return;
+        };
+        if self.offset_op.is_none() || v == self.offset.distance {
+            return;
+        }
+        self.offset.distance = v;
+        self.update_offset();
+    }
+
+    /// Where the offset's drag handle belongs in the sketch plane, and which way its
+    /// distance grows from there. `None` when no offset is running.
+    pub fn offset_handle(&self) -> Option<(Vec2, Vec2)> {
+        let op = self.offset_op.as_ref()?;
+        offset::handle(&op.base, &op.seed)
+    }
+
+    /// Drags the offset's distance by `by` along the handle's direction.
+    ///
+    /// Dragging back across the geometry and out the other side takes the distance
+    /// through zero and negative, which is how the side is chosen: the offset is on the
+    /// side the pointer is, and there is no flip to go and press.
+    pub fn nudge_offset(&mut self, by: f64) -> bool {
+        if self.offset_op.is_none() {
+            return false;
+        }
+        let step = self.snapping().then_some(self.grid_step);
+        self.offset.distance = snapped(self.offset.distance + by, step);
+        // A drag is the user saying the distance again, so it takes the box back off
+        // whatever was typed into it rather than leaving a number that disagrees with
+        // the geometry under the pointer.
+        for entry in self.entries.iter_mut().filter(|e| e.dim == Dim::Distance) {
+            entry.locked = false;
+        }
+        self.mirror_offset_entry();
+        true
+    }
+
+    /// Ends the offset. Keeping it makes the whole thing one step of undo; cancelling
+    /// puts back the sketch the tool started from.
+    pub fn finish_offset(&mut self, keep: bool) -> Option<usize> {
+        let op = self.offset_op.take()?;
+        // The distance box belongs to the offset, not to the sketch it leaves behind.
+        self.reset_entries();
+        if keep && op.error.is_none() && op.created > 0 {
+            self.push_undo(op.base);
+            self.after_change();
+            Some(op.created)
+        } else {
+            self.sketch = op.base;
+            self.after_change();
+            None
+        }
+    }
+
+    /// What the palette needs to say: how many curves are on screen, and why there are
+    /// none if there are none.
+    pub fn offset_status(&self) -> Option<(usize, Option<&str>)> {
+        let op = self.offset_op.as_ref()?;
+        Some((op.created, op.error.as_deref()))
     }
 
     // --- Parameters ------------------------------------------------------------------
@@ -2118,6 +2482,12 @@ impl SketchEditor {
         // Enter in a move's box applies the move, as it places a shape from its sizes.
         if self.move_op.is_some() {
             self.finish_move(true);
+            return;
+        }
+        // And in an offset's box it keeps the offset, which is what OK in the palette
+        // does; an offset that made nothing is a cancel, and `finish_offset` says so.
+        if self.offset_op.is_some() {
+            self.finish_offset(true);
             return;
         }
         let Some(cursor) = self.cursor else { return };
@@ -2719,6 +3089,11 @@ impl SketchEditor {
         if let Some(pivot) = self.move_pivot() {
             return Some(self.frame.to_world(pivot));
         }
+        // Beside the drag handle, because the box and the handle are the same number
+        // said two ways and reading one while dragging the other is the whole point.
+        if let Some((anchor, dir)) = self.offset_handle() {
+            return Some(self.frame.to_world(anchor + dir * self.offset.distance));
+        }
         let pos = match self.tool {
             SketchTool::Line => self.chain_end.and_then(|id| self.sketch.point_pos(id)),
             _ => self.clicks.last().map(|c| c.pos),
@@ -2821,23 +3196,27 @@ impl SketchEditor {
         let mut sel_pts = PointBatch::new([0.25, 0.6, 1.0, 1.0]);
         sel_pts.size_px = 8.0;
         let free = self.under_constrained();
-        // A pattern's copies are provisional until OK, so they are drawn as a preview
-        // rather than as geometry the user has already committed to.
-        let copies = self.pattern_copies();
-        let mut pattern_preview = LineBatch::new([0.55, 0.85, 1.0, 0.85]);
-        pattern_preview.depth_test = false;
+        // What a pattern or an offset has made is provisional until OK, so it is drawn
+        // as a preview rather than as geometry the user has already committed to.
+        let copies = self.previewed();
+        let mut preview = LineBatch::new([0.55, 0.85, 1.0, 0.85]);
+        preview.depth_test = false;
 
         let region_curves = self
             .hover_region
             .map(|r| self.region_curves(r))
             .unwrap_or_default();
+        // Hovering a badge lights its geometry, exactly as hovering a row of the
+        // palette's constraint list does.
+        let held_by_badge = self.constraint_hover_entities();
         for (id, data) in self.sketch.entities() {
             let is_selected = self.selected.contains(&id);
             let is_hovered = self.hover == Some(id)
                 || self.dim_first == Some(id)
                 || region_curves.contains(&id)
                 || self.constraint_picks.contains(&id)
-                || self.highlighted.contains(&id);
+                || self.highlighted.contains(&id)
+                || held_by_badge.contains(&id);
             if let Entity::Point { pos } = data.entity {
                 if is_selected || is_hovered {
                     sel_pts.points.push(to3(pos));
@@ -2857,7 +3236,7 @@ impl SketchEditor {
                 data.construction,
                 free.contains(&id),
             ) {
-                _ if copies.contains(&id) => &mut pattern_preview,
+                _ if copies.contains(&id) => &mut preview,
                 (true, ..) => &mut selected,
                 (_, true, ..) => &mut hovered,
                 (.., true, true) => &mut loose_construction,
@@ -2967,24 +3346,39 @@ impl SketchEditor {
         // Amber, so a constraint mark is never mistaken for a dimension or for geometry.
         let mut glyphs = LineBatch::new([0.95, 0.72, 0.30, 0.95]);
         glyphs.depth_test = false;
+        // A badge the pointer is on, or one belonging to geometry that is lit up, is
+        // drawn in the hover colour and a little wider. That is the other half of the
+        // link the palette's constraint list gives: from the drawing to the mark, as
+        // well as from the list to the drawing.
+        let mut lit_glyphs = LineBatch::new([1.0, 0.85, 0.3, 1.0]);
+        lit_glyphs.width_px = 2.5;
+        lit_glyphs.depth_test = false;
         for g in self.constraint_glyphs() {
-            let batch = if in_conflict.contains(&g.id) {
-                &mut conflicting
-            } else {
-                &mut glyphs
+            let lit = self.hovered_constraint == Some(g.id)
+                || self.glyph_entity(&g).is_some_and(|id| {
+                    self.hover == Some(id)
+                        || self.selected.contains(&id)
+                        || self.highlighted.contains(&id)
+                });
+            let batch = match (in_conflict.contains(&g.id), lit) {
+                (true, _) => &mut conflicting,
+                (_, true) => &mut lit_glyphs,
+                _ => &mut glyphs,
             };
             batch.segments.extend(g.segments);
+            batch.segments.extend(g.leader);
         }
         lines.extend([
             normal,
             construction,
             loose,
             loose_construction,
-            pattern_preview,
+            preview,
             hovered,
             selected,
             dims,
             glyphs,
+            lit_glyphs,
             conflicting,
         ]);
         points.extend([pts, loose_pts, sel_pts]);
@@ -3062,7 +3456,11 @@ impl SketchEditor {
     /// user places the whole dimension.
     pub fn move_label(&mut self, id: ConstraintId, ray: &Ray) {
         if let Some(pos) = self.to_plane(ray) {
-            let _ = self.sketch.set_dimension_label(id, pos);
+            // A dimension's value is placed in the drawing like anything else the user
+            // puts there, so it lands on the grid and shift lets go of it. Dragged
+            // freehand, two dimensions of the same feature never line up with each other.
+            let snapped = self.to_grid(pos);
+            let _ = self.sketch.set_dimension_label(id, snapped);
             self.dirty = true;
         }
     }
@@ -3204,17 +3602,132 @@ impl SketchEditor {
 
     /// A badge for every geometric constraint, placed beside the geometry it holds.
     ///
-    /// Several constraints on one entity stack outwards from it so they stay legible,
-    /// which is what a real drawing does with its constraint marks.
+    /// The placement is a cached, decluttered layout: see [`Self::lay_out_glyphs`]. This
+    /// only turns it into world coordinates at the current zoom, which is why a badge
+    /// keeps its size on screen exactly while its slot changes only when the view does.
     pub fn constraint_glyphs(&self) -> Vec<ConstraintGlyph> {
-        let size = self.cursor_px * GLYPH_PX;
-        let gap = self.cursor_px * GLYPH_GAP_PX;
+        let key = self.glyph_key();
+        {
+            let mut cache = self.glyph_cache.borrow_mut();
+            if cache.key != Some(key) {
+                // The previous placements go back in so a badge that is still free to
+                // stay where it was does. Re-packing optimally on every change reads as
+                // jitter, and a badge the eye has already found moving is worse than a
+                // badge in a slightly worse slot.
+                let placements = self.lay_out_glyphs(&cache.placements);
+                cache.placements = placements;
+                cache.key = Some(key);
+                cache.builds += 1;
+            }
+        }
+        let cache = self.glyph_cache.borrow();
+        let px = self.glyph_scale();
+        let size = px * GLYPH_PX;
         let to3 = |p: Vec2| self.frame.to_world(p);
-        let mut stacked: Vec<(EntityId, f64)> = Vec::new();
+        cache
+            .placements
+            .iter()
+            .filter_map(|p| {
+                let strokes = glyph_strokes(self.sketch.constraint(p.id)?);
+                let center = p.base + p.dir * (p.dist_px * px);
+                let place = |q: Vec2| center + p.u * (q.x * size) + p.v * (q.y * size);
+                Some(ConstraintGlyph {
+                    id: p.id,
+                    target: p.target,
+                    center: to3(center),
+                    segments: strokes
+                        .iter()
+                        .map(|[a, b]| [to3(place(*a)), to3(place(*b))])
+                        .collect(),
+                    // A badge that had to move away says which entity it came from; one
+                    // sitting in its natural slot needs no line, and drawing one anyway
+                    // would double the ink on a tidy sketch.
+                    leader: (p.dist_px > GLYPH_LEADER_PX).then(|| {
+                        let start = p.base + p.dir * (GLYPH_GAP_PX * 0.3 * px);
+                        let end = center - p.dir * (GLYPH_BOX_PX * px);
+                        [to3(start), to3(end)]
+                    }),
+                })
+            })
+            .collect()
+    }
+
+    /// How many times the badge layout has been rebuilt. The overlay asks for the badges
+    /// twice a frame, so this is what a test asserts the caching on: the number a user
+    /// would feel is rebuilds per second, not calls. Test-only: nothing the application
+    /// does should depend on how often a cache happened to miss.
+    #[cfg(test)]
+    pub fn glyph_layouts(&self) -> u64 {
+        self.glyph_cache.borrow().builds
+    }
+
+    /// World size of one pixel for the badges. Falls back to millimetres when no pointer
+    /// has moved yet, so a sketch built by a test still lays its badges out sensibly.
+    fn glyph_scale(&self) -> f64 {
+        if self.view_px.is_finite() && self.view_px > 0.0 {
+            self.view_px
+        } else {
+            1.0
+        }
+    }
+
+    /// Everything the badge layout reads, hashed.
+    ///
+    /// A revision counter would be cheaper still but would go stale: `sketch` is a public
+    /// field and the panels, the tools and the tests all write to it directly. Hashing a
+    /// few hundred point positions is a rounding error next to the layout it saves, and
+    /// it cannot be wrong.
+    fn glyph_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        // The scale is quantised, so panning and zooming rescale the whole overlay
+        // rather than re-deciding it. See `GLYPH_SCALE_STEPS`.
+        ((self.glyph_scale().ln() * GLYPH_SCALE_STEPS).round() as i64).hash(&mut h);
+        for (id, data) in self.sketch.entities() {
+            id.hash(&mut h);
+            match data.entity {
+                Entity::Point { pos } => (pos.x.to_bits(), pos.y.to_bits()).hash(&mut h),
+                Entity::Circle { radius, .. } => radius.to_bits().hash(&mut h),
+                _ => {}
+            }
+        }
+        for (cid, c) in self.sketch.constraints() {
+            cid.hash(&mut h);
+            c.references().hash(&mut h);
+            glyph_kind(c)
+                .map(|k| std::mem::discriminant(&k))
+                .hash(&mut h);
+            // A dimension's value box is an obstacle, so dragging one re-lays the badges.
+            self.sketch
+                .dimension_label(cid)
+                .map(|p| (p.x.to_bits(), p.y.to_bits()))
+                .hash(&mut h);
+        }
+        // The solve report only changes the colours, but a conflicting badge is drawn
+        // wider and the palette may have just deleted what it blamed.
+        self.conflicting().hash(&mut h);
+        h.finish()
+    }
+
+    /// Decides where every badge goes.
+    ///
+    /// Each badge has a natural anchor on its entity — the midpoint of a line, the rim of
+    /// a circle — and a ranked list of slots around it: successive rings outwards, each
+    /// tried in eight directions, ordered by distance plus a penalty for turning away
+    /// from the entity's own normal. The first slot that collides with neither the
+    /// drawing, nor a dimension's value box, nor a badge already placed wins, and the
+    /// slot a badge held in `previous` is offered to it first so a layout recomputed
+    /// after an edit leaves everything it can where the user last saw it.
+    ///
+    /// Greedy and in the sketch's own constraint order rather than optimal: the packing
+    /// only has to be legible, and an optimal packing that re-shuffles when a ninth
+    /// constraint is added is worse to use than a greedy one that appends to it.
+    fn lay_out_glyphs(&self, previous: &[GlyphPlacement]) -> Vec<GlyphPlacement> {
+        let px = self.glyph_scale();
+        let mut space = GlyphSpace::new(self, px);
         let mut out = Vec::new();
         for (cid, c) in self.sketch.constraints() {
-            let strokes = glyph_strokes(c);
-            if strokes.is_empty() {
+            if glyph_strokes(c).is_empty() {
                 continue;
             }
             // Horizontal and Vertical are statements about the axes, so their marks keep
@@ -3224,33 +3737,76 @@ impl SketchEditor {
                 let Some((base, outward, along)) = self.glyph_anchor(id) else {
                     continue;
                 };
-                let slot = match stacked.iter_mut().find(|(e, _)| *e == id) {
-                    Some((_, used)) => used,
-                    None => {
-                        stacked.push((id, 0.0));
-                        &mut stacked.last_mut().expect("just pushed").1
-                    }
-                };
-                let center = base + outward * (gap + *slot);
-                *slot += size * 2.6;
                 let (u, v) = if axis_aligned {
                     (Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0))
                 } else {
                     (along, outward)
                 };
-                let place = |p: Vec2| center + u * (p.x * size) + v * (p.y * size);
-                out.push(ConstraintGlyph {
+                let candidates = glyph_candidates(outward);
+                let anchor = base / px;
+                let sticky = previous
+                    .iter()
+                    .find(|p| p.id == cid && p.target == target)
+                    .map(|p| p.slot);
+                let chosen = sticky
+                    .into_iter()
+                    .chain(0..candidates.len())
+                    .find(|index| match candidates.get(*index) {
+                        Some((dir, dist)) => space.free(anchor + *dir * *dist),
+                        None => false,
+                    })
+                    // Nothing was clear anywhere: the sketch is denser than the screen
+                    // can show. The badge still goes down, in its natural slot, because
+                    // one that is not drawn can never be hovered, named or deleted.
+                    .unwrap_or(0);
+                let (dir, dist) = candidates[chosen];
+                space.claim(anchor + dir * dist);
+                out.push(GlyphPlacement {
                     id: cid,
                     target,
-                    center: to3(center),
-                    segments: strokes
-                        .iter()
-                        .map(|[a, b]| [to3(place(*a)), to3(place(*b))])
-                        .collect(),
+                    slot: chosen,
+                    base,
+                    dir,
+                    dist_px: dist,
+                    u,
+                    v,
                 });
             }
         }
         out
+    }
+
+    /// The badge under a point on the sketch plane, if any. Badges are a constant size on
+    /// screen, so the reach is in pixels too: at a small zoom the geometry crowds but the
+    /// badges do not, and a reach in millimetres would swallow the whole drawing.
+    fn constraint_at(&self, pos: Vec2) -> Option<ConstraintId> {
+        let reach = self.glyph_scale() * GLYPH_HIT_PX;
+        self.constraint_glyphs()
+            .into_iter()
+            .filter_map(|g| {
+                let d = self.frame.to_local(g.center).distance(pos);
+                (d <= reach).then_some((d, g.id))
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, id)| id)
+    }
+
+    /// The geometry the badge under the pointer holds, lit up while it is. The palette's
+    /// constraint list already highlights from a row; this is the same link read from the
+    /// drawing instead, and it uses the same `references()` the palette does so the two
+    /// light up exactly the same entities.
+    pub fn constraint_hover_entities(&self) -> Vec<EntityId> {
+        self.hovered_constraint
+            .and_then(|id| self.sketch.constraint(id))
+            .map(|c| c.references())
+            .unwrap_or_default()
+    }
+
+    /// The entity a badge sits on, for lighting the badge when its geometry is — and for
+    /// a test to ask a badge which curve it was laid out against.
+    pub fn glyph_entity(&self, g: &ConstraintGlyph) -> Option<EntityId> {
+        let c = self.sketch.constraint(g.id)?;
+        glyph_targets(c).get(g.target).copied()
     }
 
     /// Where a badge for a constraint on `id` sits: a point on the entity, the direction
@@ -3291,6 +3847,185 @@ impl SketchEditor {
 }
 
 // --- Shape building -----------------------------------------------------------------------
+
+/// How far apart two badge centres must be to read as two marks, in pixels. Exposed to
+/// the tests so they assert on the property the layout exists to keep rather than on a
+/// number copied out of it.
+#[cfg(test)]
+pub fn glyph_clearance_px() -> f64 {
+    GLYPH_BOX_PX * 2.0
+}
+
+/// The slots a badge may take, best first: rings outwards from the anchor, each tried in
+/// eight directions, ordered by how far out they are plus what turning away from the
+/// entity's own normal costs. Half a turn is worth about one ring, so a badge crosses to
+/// the other side of its line before it walks a long way out along the near side.
+fn glyph_candidates(outward: Vec2) -> Vec<(Vec2, f64)> {
+    let mut out: Vec<(Vec2, f64, f64)> = Vec::with_capacity(GLYPH_RINGS * GLYPH_DIRS);
+    for ring in 0..GLYPH_RINGS {
+        let dist = GLYPH_GAP_PX + ring as f64 * GLYPH_STEP_PX;
+        for step in 0..GLYPH_DIRS {
+            // 0, -45, +45, -90, +90 … so the two sides of the entity are tried in step,
+            // and the order is the same every time the layout runs.
+            let eighths = step.div_ceil(2) as f64;
+            let sign = if step.is_multiple_of(2) { 1.0 } else { -1.0 };
+            let turn = sign * eighths * std::f64::consts::FRAC_PI_4;
+            let dir = Vec2::from_angle(turn).rotate(outward);
+            out.push((dir, dist, dist + turn.abs() * GLYPH_TURN_PX));
+        }
+    }
+    // A stable sort, so slots of equal cost keep the ring-then-direction order above and
+    // two runs of the layout on the same drawing agree exactly.
+    out.sort_by(|a, b| a.2.total_cmp(&b.2));
+    out.into_iter().map(|(dir, dist, _)| (dir, dist)).collect()
+}
+
+/// Which cell of the collision grid a point falls in. `as i32` saturates rather than
+/// wrapping, so a coordinate the user has sent to infinity buckets absurdly instead of
+/// aliasing onto somebody else's cell.
+fn glyph_cell(p: Vec2) -> (i32, i32) {
+    (
+        (p.x / GLYPH_CELL_PX).floor() as i32,
+        (p.y / GLYPH_CELL_PX).floor() as i32,
+    )
+}
+
+/// Whether a segment touches an axis-aligned square, by Liang–Barsky clipping. A
+/// degenerate segment is a point, and falls out of the same test.
+fn segment_hits_box(a: Vec2, b: Vec2, center: Vec2, half: f64) -> bool {
+    let d = b - a;
+    let (mut t0, mut t1) = (0.0f64, 1.0f64);
+    for (p, q) in [
+        (-d.x, a.x - (center.x - half)),
+        (d.x, (center.x + half) - a.x),
+        (-d.y, a.y - (center.y - half)),
+        (d.y, (center.y + half) - a.y),
+    ] {
+        if p == 0.0 {
+            // Parallel to this edge: either wholly inside its slab or wholly outside.
+            if q < 0.0 {
+                return false;
+            }
+            continue;
+        }
+        let r = q / p;
+        if p < 0.0 {
+            if r > t1 {
+                return false;
+            }
+            t0 = t0.max(r);
+        } else {
+            if r < t0 {
+                return false;
+            }
+            t1 = t1.min(r);
+        }
+    }
+    true
+}
+
+/// Where a badge may not go: the drawing it would cover, the dimension values already on
+/// it, and the badges placed before it.
+///
+/// Everything is in pixels on the sketch plane, because that is the space the user reads
+/// a collision in — two marks a millimetre apart are on top of each other zoomed out and
+/// comfortably apart zoomed in, and only the second of those is a collision.
+struct GlyphSpace {
+    segments: Vec<[Vec2; 2]>,
+    /// Segments of the drawing bucketed by cell. A few hundred badges against a few
+    /// hundred curves is 1e5 pairs tested without this, every time the layout runs.
+    cells: std::collections::HashMap<(i32, i32), Vec<usize>>,
+    /// Centres of the boxes already claimed, bucketed the same way.
+    taken: std::collections::HashMap<(i32, i32), Vec<Vec2>>,
+}
+
+impl GlyphSpace {
+    fn new(s: &SketchEditor, px: f64) -> Self {
+        let mut space = Self {
+            segments: Vec::new(),
+            cells: std::collections::HashMap::new(),
+            taken: std::collections::HashMap::new(),
+        };
+        for (id, data) in s.sketch.entities() {
+            // A point is drawn as a dot the badge should not sit on either, so it goes in
+            // as a segment of no length.
+            if let Entity::Point { pos } = data.entity {
+                space.add_segment([pos / px, pos / px]);
+                continue;
+            }
+            let Some(polyline) = outline(&s.sketch, id, &s.tess) else {
+                continue;
+            };
+            for w in polyline.windows(2) {
+                space.add_segment([w[0] / px, w[1] / px]);
+            }
+        }
+        // A dimension's value box is drawn over the sketch too, and a badge landing on
+        // one hides a number the user is trying to read.
+        for g in s.dimension_graphics() {
+            space.claim(s.frame.to_local(g.label) / px);
+        }
+        space
+    }
+
+    fn add_segment(&mut self, seg: [Vec2; 2]) {
+        let index = self.segments.len();
+        self.segments.push(seg);
+        let len = seg[0].distance(seg[1]);
+        if !len.is_finite() {
+            return;
+        }
+        let steps = ((len / (GLYPH_CELL_PX * 0.5)).ceil() as usize).clamp(1, GLYPH_MAX_CELLS);
+        for i in 0..=steps {
+            let p = seg[0] + (seg[1] - seg[0]) * (i as f64 / steps as f64);
+            let bucket = self.cells.entry(glyph_cell(p)).or_default();
+            if bucket.last() != Some(&index) {
+                bucket.push(index);
+            }
+        }
+    }
+
+    /// The cells a badge centred at `center` has to look in. One cell of margin, because
+    /// a segment is sampled into cells rather than rasterised exactly and may cross the
+    /// box while its nearest sample sits just outside.
+    fn range(center: Vec2) -> ((i32, i32), (i32, i32)) {
+        let margin = Vec2::splat(GLYPH_BOX_PX + GLYPH_CELL_PX);
+        (glyph_cell(center - margin), glyph_cell(center + margin))
+    }
+
+    fn free(&self, center: Vec2) -> bool {
+        let (lo, hi) = Self::range(center);
+        for cx in lo.0..=hi.0 {
+            for cy in lo.1..=hi.1 {
+                if let Some(others) = self.taken.get(&(cx, cy))
+                    && others.iter().any(|o| {
+                        (o.x - center.x).abs() < GLYPH_BOX_PX * 2.0
+                            && (o.y - center.y).abs() < GLYPH_BOX_PX * 2.0
+                    })
+                {
+                    return false;
+                }
+                let Some(ids) = self.cells.get(&(cx, cy)) else {
+                    continue;
+                };
+                if ids.iter().any(|i| {
+                    let [a, b] = self.segments[*i];
+                    segment_hits_box(a, b, center, GLYPH_BOX_PX)
+                }) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn claim(&mut self, center: Vec2) {
+        self.taken
+            .entry(glyph_cell(center))
+            .or_default()
+            .push(center);
+    }
+}
 
 /// The entities a constraint puts a badge on. A constraint between two curves marks
 /// both, as a drawing does, so it is clear which pair it ties together.
@@ -3881,4 +4616,177 @@ pub fn finish(editor: &mut Editor, keep: bool) {
         editor.set_status("Sketch cancelled");
     }
     editor.request_repaint();
+}
+
+/// The offset's distance box: the number and the handle are the same value said two
+/// ways, and these are the tests that they stay that way.
+///
+/// They live here rather than in `editor::tests` because they need nothing of the
+/// editor: the box, the drag and the geometry are all the sketch editor's own.
+#[cfg(test)]
+mod offset_entry_tests {
+    use super::*;
+
+    /// A sketch editor holding a 40 × 20 rectangle with every curve of it selected —
+    /// what an offset starts from.
+    fn with_rectangle() -> SketchEditor {
+        let mut sketch = Sketch::new();
+        shapes::rectangle_two_point(&mut sketch, Vec2::ZERO, Vec2::new(40.0, 20.0));
+        let mut s = SketchEditor::new(FeatureId(0), Frame::XY, sketch, Camera::default());
+        s.selected = s
+            .sketch
+            .entities()
+            .filter(|(_, d)| d.entity.is_curve())
+            .map(|(id, _)| id)
+            .collect();
+        s
+    }
+
+    /// Overall bounds of everything drawn, for judging which side the offset went.
+    fn drawn_bounds(s: &SketchEditor) -> (Vec2, Vec2) {
+        s.sketch
+            .entities()
+            .filter_map(|(id, _)| s.sketch.entity_bounds(id))
+            .fold(
+                (Vec2::splat(f64::INFINITY), Vec2::splat(f64::NEG_INFINITY)),
+                |(lo, hi), (min, max)| (lo.min(min), hi.max(max)),
+            )
+    }
+
+    fn box_text(s: &SketchEditor) -> Option<&str> {
+        s.entries
+            .iter()
+            .find(|e| e.dim == Dim::Distance)
+            .map(|e| e.text.as_str())
+    }
+
+    /// The box is there the moment the offset is, it holds the keyboard, and what is
+    /// typed into it re-makes the geometry — exactly, without the grid rounding it off.
+    #[test]
+    fn the_distance_can_be_typed_and_the_offset_is_re_made_at_it() {
+        let mut s = with_rectangle();
+        s.offset.distance = 5.0;
+        assert!(s.begin_offset());
+        assert_eq!(
+            s.entries.iter().map(|e| e.dim).collect::<Vec<_>>(),
+            vec![Dim::Distance],
+            "the box is there as soon as the offset is"
+        );
+        assert_eq!(s.entry_focus, Some(0), "and it has the keyboard");
+        assert_eq!(box_text(&s), Some("5.00"), "showing the distance in use");
+
+        assert!(s.snapping(), "the grid is on, so this measures the typing");
+        for c in ["3", ".", "2"] {
+            assert!(s.type_into_entry(c));
+        }
+        assert_eq!(s.offset.distance, 3.2, "a typed distance is taken exactly");
+        let (min, max) = drawn_bounds(&s);
+        assert!(
+            (min.y + 3.2).abs() < 1e-9 && (max.y - 23.2).abs() < 1e-9,
+            "and the drawing is at it: {min:?} {max:?}"
+        );
+    }
+
+    /// The other direction: a drag of the handle writes the number back into the box as
+    /// it happens, and takes the box off whatever was typed into it — a number that
+    /// disagreed with the geometry under the pointer would be worse than no number.
+    #[test]
+    fn dragging_the_handle_writes_the_number_into_the_box() {
+        let mut s = with_rectangle();
+        s.snap_to_grid = false;
+        s.offset.distance = 5.0;
+        assert!(s.begin_offset());
+        // The box hangs off the handle, which sits on the result: 5 mm below the bottom
+        // edge, halfway along it.
+        assert_eq!(s.entry_anchor(), Some(Vec3::new(20.0, -5.0, 0.0)));
+
+        assert!(s.nudge_offset(3.0));
+        s.update_offset();
+        assert_eq!(box_text(&s), Some("8.00"));
+        assert_eq!(s.entry_anchor(), Some(Vec3::new(20.0, -8.0, 0.0)));
+
+        assert!(s.type_into_entry("2"));
+        assert!(s.entries[0].locked, "typing locks the box");
+        assert!(s.nudge_offset(1.0));
+        assert!(!s.entries[0].locked, "and a drag releases it again");
+        assert_eq!(box_text(&s), Some("3.00"));
+        assert_eq!(s.offset.distance, 3.0);
+    }
+
+    /// A dragged distance lands on the grid; shift lets go of it for as long as it is
+    /// held, exactly as it does for a drawn point or a dragged move.
+    #[test]
+    fn a_dragged_distance_snaps_and_shift_lets_it_go() {
+        let mut s = with_rectangle();
+        s.grid_step = 1.0;
+        s.offset.distance = 0.0;
+        assert!(s.begin_offset());
+        assert!(s.nudge_offset(4.4));
+        assert_eq!(s.offset.distance, 4.0, "snapped to the grid");
+        s.set_free_snap(true);
+        assert!(s.nudge_offset(0.3));
+        assert!(
+            (s.offset.distance - 4.3).abs() < 1e-9,
+            "shift lets go of it: {}",
+            s.offset.distance
+        );
+    }
+
+    /// The sign is the side, so a typed minus is the flip. Half a minus is not a
+    /// distance at all, and the preview stays where it was rather than flickering off.
+    #[test]
+    fn a_typed_minus_puts_the_offset_on_the_other_side() {
+        let mut s = with_rectangle();
+        s.offset.distance = 5.0;
+        assert!(s.begin_offset());
+        assert!(s.type_into_entry("-"));
+        assert_eq!(s.offset.distance, 5.0, "a lone minus is not a number yet");
+        assert!(s.type_into_entry("5"));
+        assert_eq!(s.offset.distance, -5.0);
+        let (min, max) = drawn_bounds(&s);
+        assert!(
+            min.abs_diff_eq(Vec2::ZERO, 1e-9) && max.abs_diff_eq(Vec2::new(40.0, 20.0), 1e-9),
+            "the offset went inside the rectangle: {min:?} {max:?}"
+        );
+        assert_eq!(s.offset_status().map(|(n, _)| n), Some(4));
+    }
+
+    /// The palette's spinner drives the same distance, and the box follows it rather
+    /// than sitting there holding a number the drawing is no longer at.
+    #[test]
+    fn a_distance_changed_elsewhere_takes_the_box_back_from_what_was_typed() {
+        let mut s = with_rectangle();
+        s.offset.distance = 5.0;
+        assert!(s.begin_offset());
+        assert!(s.type_into_entry("7"));
+        assert_eq!(box_text(&s), Some("7"), "the user's own typing stands");
+
+        // What the palette's spinner does: the number, then the same update the box asks
+        // for.
+        s.offset.distance = 9.0;
+        s.update_offset();
+        assert_eq!(box_text(&s), Some("9.00"));
+        assert!(!s.entries[0].locked);
+    }
+
+    /// The box belongs to the offset, so it goes when the offset does — by Enter, which
+    /// keeps it, as much as by the palette.
+    #[test]
+    fn enter_in_the_box_keeps_the_offset_and_the_box_goes_with_it() {
+        let mut s = with_rectangle();
+        s.offset.distance = 5.0;
+        assert!(s.begin_offset());
+        assert!(s.type_into_entry("7"));
+        s.submit_entry();
+        assert!(!s.offset_in_progress(), "Enter keeps the offset");
+        assert!(
+            s.entries.iter().all(|e| e.dim != Dim::Distance),
+            "and takes its box away"
+        );
+        let (min, max) = drawn_bounds(&s);
+        assert!(
+            (min.y + 7.0).abs() < 1e-9 && (max.y - 27.0).abs() < 1e-9,
+            "what was typed is what was kept: {min:?} {max:?}"
+        );
+    }
 }

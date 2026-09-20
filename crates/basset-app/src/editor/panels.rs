@@ -9,7 +9,7 @@ use basset_viewport::ViewPreset;
 
 use super::sketch_mode::{self, SketchTool, ToolGroup, edit_text, parse_value};
 use super::tools::{self, ToolKind};
-use super::{Editor, Mode, SelectMode};
+use super::{DisplayMode, Editor, Mode, SelectMode};
 
 /// The blue the viewport draws under-constrained geometry in, so the words that explain it
 /// match what the user is looking at.
@@ -31,6 +31,9 @@ enum Command {
     Fit,
     View(ViewPreset),
     ToggleProjection,
+    Display(DisplayMode),
+    ToggleGrid,
+    ToggleOrigin,
     SetCursor(usize),
     Edit(FeatureId),
     Suppress(FeatureId, bool),
@@ -60,6 +63,11 @@ enum Command {
     SketchPatternUpdate,
     /// Keep (`true`) or undo (`false`) the pattern in progress.
     SketchPatternFinish(bool),
+    SketchOffset,
+    /// A setting in the offset palette changed: re-make the result.
+    SketchOffsetUpdate,
+    /// Keep (`true`) or undo (`false`) the offset in progress.
+    SketchOffsetFinish(bool),
     SketchSetParameter(String, String),
     SketchRemoveParameter(String),
     SketchBindDimension(basset_sketch::ConstraintId, String),
@@ -131,6 +139,9 @@ fn run(editor: &mut Editor, c: Command) {
         Command::Fit => editor.zoom_to_fit(),
         Command::View(p) => editor.look_from(p),
         Command::ToggleProjection => editor.toggle_projection(),
+        Command::Display(m) => editor.set_display_mode(m),
+        Command::ToggleGrid => editor.show_grid = !editor.show_grid,
+        Command::ToggleOrigin => editor.show_origin = !editor.show_origin,
         Command::SetCursor(c) => editor.set_cursor(c),
         Command::Edit(id) => editor.edit_feature(id),
         Command::Suppress(id, on) => {
@@ -251,6 +262,34 @@ fn run(editor: &mut Editor, c: Command) {
                 }
             }
         }
+        Command::SketchOffset => {
+            if let Mode::Sketch(s) = &mut editor.mode {
+                if s.begin_offset() {
+                    editor.commit_sketch();
+                } else {
+                    editor.set_status("Select the sketch geometry to offset, then Offset");
+                }
+            }
+        }
+        Command::SketchOffsetUpdate => {
+            if let Mode::Sketch(s) = &mut editor.mode {
+                s.update_offset();
+                editor.commit_sketch();
+            }
+        }
+        Command::SketchOffsetFinish(keep) => {
+            if let Mode::Sketch(s) = &mut editor.mode {
+                let made = s.finish_offset(keep);
+                editor.commit_sketch();
+                // Keeping an offset that made nothing is a cancel, and saying so is what
+                // tells the user the button was pressed at all.
+                editor.set_status(match (keep, made) {
+                    (_, Some(n)) => format!("Offset added {n} curves"),
+                    (true, None) => "Offset cancelled: there was nothing it could make".into(),
+                    (false, None) => "Offset cancelled".to_string(),
+                });
+            }
+        }
         Command::SketchSetParameter(name, expression) => {
             if let Mode::Sketch(s) = &mut editor.mode {
                 match s.set_parameter(&name, &expression) {
@@ -362,6 +401,29 @@ fn menu_bar(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
             ui.separator();
             if ui.button("Toggle orthographic").clicked() {
                 commands.push(Command::ToggleProjection);
+            }
+            ui.separator();
+            ui.label(egui::RichText::new("Display (D)").weak());
+            for mode in DisplayMode::ALL {
+                if ui
+                    .selectable_label(editor.display == mode, mode.title())
+                    .clicked()
+                {
+                    commands.push(Command::Display(mode));
+                }
+            }
+            ui.separator();
+            // Selectable labels rather than checkboxes: the menu only has `&Editor`, and
+            // a checkbox would need somewhere to write the new value before the command
+            // that actually applies it runs.
+            if ui.selectable_label(editor.show_grid, "Show grid").clicked() {
+                commands.push(Command::ToggleGrid);
+            }
+            if ui
+                .selectable_label(editor.show_origin, "Show origin planes and axes")
+                .clicked()
+            {
+                commands.push(Command::ToggleOrigin);
             }
         });
         ui.menu_button("Create", |ui| {
@@ -594,7 +656,7 @@ fn sketch_toolbar(s: &super::SketchEditor, ui: &mut egui::Ui, commands: &mut Vec
         // viewport exist only for whoever already knows to press M.
         if ui
             .add_enabled(
-                !s.selected.is_empty() && !s.move_in_progress(),
+                !s.selected.is_empty() && !s.modal(),
                 egui::Button::new("Move"),
             )
             .on_hover_text("Move the selection: drag the arrows and ring, or type offsets (M)")
@@ -608,7 +670,7 @@ fn sketch_toolbar(s: &super::SketchEditor, ui: &mut egui::Ui, commands: &mut Vec
         // and the OK, so what the numbers mean is visible while they are being changed.
         if ui
             .add_enabled(
-                !s.selected.is_empty() && !s.pattern_in_progress(),
+                !s.selected.is_empty() && !s.modal(),
                 egui::Button::new("Pattern"),
             )
             .on_hover_text("Repeat the selection; the copies preview as you set them up")
@@ -616,6 +678,19 @@ fn sketch_toolbar(s: &super::SketchEditor, ui: &mut egui::Ui, commands: &mut Vec
             .clicked()
         {
             commands.push(Command::SketchPattern);
+        }
+        // Offset, like pattern, is a tool with a preview: which side it went and what it
+        // did to the corners are things to look at, not to guess from a number.
+        if ui
+            .add_enabled(
+                !s.selected.is_empty() && !s.modal(),
+                egui::Button::new("Offset"),
+            )
+            .on_hover_text("Draw a chain of curves alongside the selection at a fixed distance (O)")
+            .on_disabled_hover_text("Select the path or loop to offset first")
+            .clicked()
+        {
+            commands.push(Command::SketchOffset);
         }
         ui.separator();
         if ui.button("✔ Finish Sketch").clicked() {
@@ -1349,10 +1424,8 @@ fn sketch_operation_dialog(
     let Mode::Sketch(s) = &mut editor.mode else {
         return;
     };
-    let title = match (s.move_in_progress(), s.pattern_in_progress()) {
-        (true, _) => "Move",
-        (_, true) => "Pattern",
-        _ => return,
+    let Some(title) = s.modal_name() else {
+        return;
     };
     let mut centre_on_selection = false;
     let mut pick_center: Option<bool> = None;
@@ -1584,6 +1657,70 @@ fn sketch_operation_dialog(
                 });
                 if changed {
                     commands.push(Command::SketchPatternUpdate);
+                }
+            }
+            if s.offset_in_progress() {
+                let mut changed = false;
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut s.offset.distance)
+                            .speed(0.5)
+                            .prefix("distance ")
+                            .suffix(" mm"),
+                    )
+                    .changed();
+                for corner in [sketch_mode::Corner::Round, sketch_mode::Corner::Miter] {
+                    changed |= ui
+                        .selectable_value(&mut s.offset.corner, corner, corner.name())
+                        .on_hover_text(corner.hint())
+                        .changed();
+                }
+                match s.offset_status() {
+                    Some((_, Some(error))) => {
+                        ui.colored_label(egui::Color32::from_rgb(230, 120, 100), error)
+                    }
+                    Some((made, None)) => ui.colored_label(
+                        LOOSE_LABEL,
+                        match made {
+                            1 => "1 curve".to_string(),
+                            n => format!("{n} curves"),
+                        },
+                    ),
+                    None => ui.label(""),
+                };
+                ui.label(
+                    egui::RichText::new(
+                        "Rounded corners keep every point of the result the distance from \
+                         the drawing; square corners keep every edge that far from its own \
+                         edge, and run the edges out to meet",
+                    )
+                    .weak(),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "Drag the handle on the result in the viewport — across the \
+                         geometry and out the far side puts it on that side. It snaps to \
+                         the grid; hold shift for anywhere in between",
+                    )
+                    .weak(),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "What is on screen is the offset: OK keeps exactly that, Esc puts \
+                         the sketch back",
+                    )
+                    .weak(),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        commands.push(Command::SketchOffsetFinish(true));
+                    }
+                    if ui.button("Cancel").clicked() {
+                        commands.push(Command::SketchOffsetFinish(false));
+                    }
+                });
+                if changed {
+                    commands.push(Command::SketchOffsetUpdate);
                 }
             }
         });

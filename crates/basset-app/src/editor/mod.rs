@@ -31,7 +31,7 @@ use basset_core::{
 use basset_kernel::{Edge, Solid, Tessellated};
 use basset_math::{Aabb, Frame, Vec3};
 use basset_sketch::Font;
-use basset_viewport::{Camera, MeshHandle, Projection, ViewPreset};
+use basset_viewport::{Camera, MeshHandle, MeshStyle, Projection, ViewPreset};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{Key, NamedKey};
 
@@ -76,6 +76,59 @@ pub enum Mode {
     Sketch(Box<SketchEditor>),
 }
 
+/// How bodies are drawn in the viewport. It is a property of the view, not of the
+/// document, so it is neither saved nor undoable: switching to wireframe to see through a
+/// part and back again should not put anything in the timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DisplayMode {
+    /// Shaded faces with their feature edges drawn on top.
+    #[default]
+    Shaded,
+    /// Shaded faces alone. Reads as a render rather than a drawing, and is the mode to
+    /// judge a fillet blend in.
+    NoEdges,
+    /// Edges alone over the background: the skeleton view.
+    Wireframe,
+    /// Translucent faces with their edges, so a body standing behind another is visible
+    /// through it.
+    XRay,
+}
+
+impl DisplayMode {
+    /// In the order the menu lists them and `D` cycles them.
+    pub const ALL: [DisplayMode; 4] = [
+        DisplayMode::Shaded,
+        DisplayMode::NoEdges,
+        DisplayMode::Wireframe,
+        DisplayMode::XRay,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            DisplayMode::Shaded => "Shaded with edges",
+            DisplayMode::NoEdges => "Shaded",
+            DisplayMode::Wireframe => "Wireframe",
+            DisplayMode::XRay => "X-ray",
+        }
+    }
+
+    pub fn mesh_style(self) -> MeshStyle {
+        match self {
+            DisplayMode::Shaded => MeshStyle::ShadedWithEdges,
+            DisplayMode::NoEdges => MeshStyle::Shaded,
+            DisplayMode::Wireframe => MeshStyle::Wireframe,
+            DisplayMode::XRay => MeshStyle::XRay,
+        }
+    }
+
+    /// The next mode in [`DisplayMode::ALL`], wrapping. One key that walks the list beats
+    /// four keys nobody remembers.
+    pub fn next(self) -> Self {
+        let i = Self::ALL.iter().position(|m| *m == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+}
+
 pub struct Editor {
     pub doc: Document,
     pub path: Option<PathBuf>,
@@ -86,6 +139,7 @@ pub struct Editor {
     pub hidden_sketches: HashSet<FeatureId>,
     pub show_origin: bool,
     pub show_grid: bool,
+    pub display: DisplayMode,
     pub selection: Selection,
     /// What a click may land on. Narrows a running tool's own filter.
     pub select_mode: SelectMode,
@@ -131,6 +185,7 @@ impl Editor {
             hidden_sketches: HashSet::new(),
             show_origin: false,
             show_grid: true,
+            display: DisplayMode::default(),
             selection: Selection::default(),
             select_mode: SelectMode::default(),
             hover: None,
@@ -205,6 +260,16 @@ impl Editor {
 
     pub fn is_sketching(&self) -> bool {
         matches!(self.mode, Mode::Sketch(_))
+    }
+
+    pub fn set_display_mode(&mut self, mode: DisplayMode) {
+        self.display = mode;
+        self.set_status(format!("Display: {}", mode.title()));
+        self.repaint = true;
+    }
+
+    pub fn cycle_display_mode(&mut self) {
+        self.set_display_mode(self.display.next());
     }
 
     // --- State cache ----------------------------------------------------------------
@@ -466,6 +531,12 @@ impl Editor {
             WindowEvent::ModifiersChanged(m) => {
                 self.pointer.shift = m.state().shift_key();
                 self.pointer.ctrl = m.state().control_key();
+                // Shift lets go of the grid for as long as it is held, and the drawing
+                // path reads the sketch's own copy of it rather than reaching back here.
+                if let Mode::Sketch(s) = &mut self.mode {
+                    s.set_free_snap(self.pointer.shift);
+                }
+                self.repaint = true;
             }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed && !egui_has_keyboard =>
@@ -500,6 +571,9 @@ impl Editor {
                 ("o", true, _) => self.open(),
                 ("n", true, _) => self.new_document(),
                 ("f", false, _) => self.zoom_to_fit(),
+                // D walks the display modes, as it does in the View menu. It is free in
+                // sketch mode too: a sketch is drawn over whatever the bodies show.
+                ("d", false, _) => self.cycle_display_mode(),
                 // 1-5 switch the selection filter, as in the toolbar. A sketch has its
                 // own filter over its own kinds of thing, on the same keys.
                 (d @ ("1" | "2" | "3" | "4"), false, _) if matches!(self.mode, Mode::Sketch(_)) => {
@@ -523,7 +597,25 @@ impl Editor {
                     if let Mode::Sketch(s) = &mut self.mode
                         && !s.begin_move()
                     {
-                        self.set_status("Select sketch geometry first, then press M to move it");
+                        let why = busy(s).unwrap_or(
+                            "Select sketch geometry first, then press M to move it".into(),
+                        );
+                        self.set_status(why);
+                    }
+                }
+                // O offsets it, after Fusion. Ctrl-O is Open and is matched above.
+                ("o", false, _) => {
+                    if let Mode::Sketch(s) = &mut self.mode {
+                        if s.begin_offset() {
+                            // The preview is real geometry in the feature by now, so it
+                            // has to reach the document for anything downstream to see.
+                            self.commit_sketch();
+                        } else {
+                            let why = busy(s).unwrap_or(
+                                "Select the path or loop first, then press O to offset it".into(),
+                            );
+                            self.set_status(why);
+                        }
                     }
                 }
                 ("e", false, _) => match &self.mode {
@@ -657,13 +749,10 @@ impl Editor {
                 // A modal operation is what Escape means while one is running, and the
                 // revert has to reach the document: the copies it takes back are in the
                 // feature by now, so anything downstream would keep showing them.
-                if s.pattern_in_progress() {
-                    s.finish_pattern(false);
+                if let Some(what) = s.modal_name() {
+                    s.finish_modal(false);
                     self.commit_sketch();
-                    self.set_status("Pattern cancelled");
-                } else if s.move_in_progress() {
-                    s.finish_move(false);
-                    self.commit_sketch();
+                    self.set_status(format!("{what} cancelled"));
                 } else if s.has_pending() || s.armed_constraint().is_some() {
                     s.cancel_current();
                     s.select_tool();
@@ -695,6 +784,15 @@ impl Editor {
             if s.move_in_progress() {
                 s.finish_move(true);
                 self.commit_sketch();
+                self.repaint = true;
+                return;
+            }
+            if let Some(made) = s.offset_in_progress().then(|| s.finish_offset(true)) {
+                self.commit_sketch();
+                self.set_status(match made {
+                    Some(n) => format!("Offset added {n} curves"),
+                    None => "Offset cancelled: there was nothing it could make".to_string(),
+                });
                 self.repaint = true;
                 return;
             }
@@ -744,16 +842,10 @@ impl Editor {
             // up: putting it back is exactly what the user is asking to undo, and it is
             // also the only safe answer, since neither operation has a checkpoint of its
             // own and undoing past them would pop an unrelated one.
-            if s.modal() {
-                let was_pattern = s.pattern_in_progress();
-                s.finish_pattern(false);
-                s.finish_move(false);
+            if let Some(what) = s.modal_name() {
+                s.finish_modal(false);
                 self.commit_sketch();
-                self.set_status(if was_pattern {
-                    "Pattern cancelled"
-                } else {
-                    "Move cancelled"
-                });
+                self.set_status(format!("{what} cancelled"));
                 self.repaint = true;
                 return;
             }
@@ -856,4 +948,14 @@ impl Editor {
     pub fn scene(&self) -> basset_viewport::Scene<'_> {
         scene::build(self)
     }
+}
+
+/// Why a tool refused to start, when the reason is that something else is already
+/// running. A message about selecting geometry first, said to someone who has selected
+/// it and is halfway through a move, tells them nothing about what to do next.
+fn busy(s: &sketch_mode::SketchEditor) -> Option<String> {
+    let what = s.modal_name()?;
+    Some(format!(
+        "{what} is still up — finish it or cancel it first (Enter or Esc)"
+    ))
 }

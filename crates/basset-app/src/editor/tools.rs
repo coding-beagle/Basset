@@ -98,6 +98,9 @@ pub struct Params {
     pub rotate_deg: Vec3,
     pub axis: Option<AxisRef>,
     pub name: String,
+    /// Fillet and Chamfer: one pick takes the whole tangentially continuous run of
+    /// edges, as Fusion's tangent chain does. Ctrl-clicking overrides it for one pick.
+    pub tangent_chain: bool,
 }
 
 impl Default for Params {
@@ -116,6 +119,7 @@ impl Default for Params {
             rotate_deg: Vec3::ZERO,
             axis: None,
             name: "Component".into(),
+            tangent_chain: true,
         }
     }
 }
@@ -153,6 +157,13 @@ impl Tool {
             ToolKind::Combine | ToolKind::Move => SelectionFilter::BODIES,
             ToolKind::Component => SelectionFilter::NONE,
         }
+    }
+
+    /// Whether this tool is really asking for edges, so a click near one means the edge
+    /// and not the face it lies on. Only the blend tools are: they take faces too, but
+    /// only as shorthand for every edge around one.
+    pub fn prefers_edges(&self) -> bool {
+        matches!(self.kind, ToolKind::Fillet | ToolKind::Chamfer)
     }
 
     pub fn selection_changed(&mut self, selection: &Selection) {
@@ -629,6 +640,7 @@ pub fn dialog(editor: &mut Editor, ctx: &egui::Context) {
         .and_then(|id| editor.cached_statuses.get(&id).cloned());
     let bodies: Vec<(BodyRef, String)> = editor.cached_bodies.clone();
     let selection_text = editor.selection.summary();
+    let edge_count = editor.selection.edges.len();
 
     let op_before = tool.params.op;
     egui::Window::new(kind.title())
@@ -667,8 +679,27 @@ pub fn dialog(editor: &mut Editor, ctx: &egui::Context) {
                 ToolKind::Sweep | ToolKind::Loft => {
                     changed |= operation_ui(ui, p, &bodies);
                 }
-                ToolKind::Fillet => changed |= drag(ui, "Radius", &mut p.radius, 0.1, "mm"),
-                ToolKind::Chamfer => changed |= drag(ui, "Distance", &mut p.radius, 0.1, "mm"),
+                ToolKind::Fillet | ToolKind::Chamfer => {
+                    // The count is the one thing a blend's dialog cannot show as
+                    // geometry: the highlighted edges may be behind the body or off the
+                    // side of it, and "6 edges" is how the user knows the rim closed.
+                    ui.label(format!(
+                        "{edge_count} edge{} selected",
+                        if edge_count == 1 { "" } else { "s" }
+                    ));
+                    changed |= ui
+                        .checkbox(&mut p.tangent_chain, "Tangent chain")
+                        .on_hover_text(
+                            "Take the whole smooth run of edges with each pick \
+                             (hold Ctrl while clicking for a single edge)",
+                        )
+                        .changed();
+                    let (label, speed) = match kind {
+                        ToolKind::Fillet => ("Radius", 0.1),
+                        _ => ("Distance", 0.1),
+                    };
+                    changed |= drag(ui, label, &mut p.radius, speed, "mm");
+                }
                 ToolKind::Combine => {
                     ui.horizontal(|ui| {
                         ui.label("Operation");
@@ -782,14 +813,14 @@ pub fn handle(editor: &Editor) -> Option<Handle> {
             let edge = editor.selection.edges.first()?;
             let body = editor.pick_body(edge.body)?;
             let edge = body.edges.iter().find(|e| e.key == edge.key)?;
-            // The middle segment of the edge, and the outward bisector of its two
-            // faces: that is where the blend eats into the corner.
+            // The middle segment of the edge, and the direction the blend grows in.
             let seg = edge.segments.get(edge.segments.len() / 2)?;
             let origin = (seg.start + seg.end) * 0.5;
-            let dir = (seg.normal_a + seg.normal_b).normalize_or_zero();
-            if dir == Vec3::ZERO {
-                return None;
-            }
+            // Into the corner, not out of it: a fillet's radius is measured towards the
+            // centre of the blend, which is inside the material on a convex edge and out
+            // in the notch on a concave one. The arrow used to point the opposite way and
+            // so pointed at the material the tool leaves alone.
+            let dir = basset_kernel::blend::blend_direction(seg)?;
             Some(Handle {
                 origin,
                 tip: origin + dir * p.radius,
@@ -962,29 +993,52 @@ pub fn edges_of_face(editor: &Editor, face: &basset_core::FaceRef) -> Vec<basset
         .collect()
 }
 
-/// Fillet and Chamfer take a face as shorthand for its edges: the whole ring goes in
-/// together, and picking the face again takes the whole ring out. Returns whether the
-/// pick was consumed this way.
+/// The tangentially continuous run of edges a picked edge belongs to: what Fusion calls
+/// the tangent chain, and what the user means by "round that rim". An edge that nothing
+/// runs on from stands for itself alone.
+pub fn tangent_chain(editor: &Editor, edge: &basset_core::EdgeRef) -> Vec<basset_core::EdgeRef> {
+    let Some(body) = editor.pick_body(edge.body) else {
+        return vec![*edge];
+    };
+    basset_kernel::pick::tangent_chain(&body.edges, edge.key)
+        .into_iter()
+        .map(|key| basset_core::EdgeRef {
+            body: edge.body,
+            key,
+        })
+        .collect()
+}
+
+/// Fillet and Chamfer read a pick as shorthand for a group of edges: a face stands for
+/// the ring around it, an edge for its tangent chain. Picking the same thing again takes
+/// the group back out, so a misaimed click is undone by repeating it rather than by
+/// restarting the tool. Returns whether the pick was consumed this way.
+///
+/// Ctrl is the escape hatch from the chain, for the one edge of a rim that wants a
+/// different radius; the dialog's checkbox is the same choice made for every pick.
 pub fn expand_face_pick(editor: &mut Editor, pick: &Pick) -> bool {
-    let Pick::Face(face, _) = pick else {
+    let Some(tool) = editor.tool.as_ref() else {
         return false;
     };
-    if !editor
-        .tool
-        .as_ref()
-        .is_some_and(|t| matches!(t.kind, ToolKind::Fillet | ToolKind::Chamfer))
-    {
+    if !tool.prefers_edges() {
         return false;
     }
-    let ring = edges_of_face(editor, face);
-    if ring.is_empty() {
+    let chaining = tool.params.tangent_chain && !editor.pointer.ctrl;
+    let group = match pick {
+        Pick::Face(face, _) => edges_of_face(editor, face),
+        Pick::Edge(edge, _) if chaining => tangent_chain(editor, edge),
+        // Anything else is an ordinary pick for the selection to toggle.
+        _ => return false,
+    };
+    if group.is_empty() {
         return true;
     }
-    let all_in = ring.iter().all(|e| editor.selection.edges.contains(e));
+    // All of it already in means the user is pointing at their own selection: let it go.
+    let all_in = group.iter().all(|e| editor.selection.edges.contains(e));
     if all_in {
-        editor.selection.edges.retain(|e| !ring.contains(e));
+        editor.selection.edges.retain(|e| !group.contains(e));
     } else {
-        for e in ring {
+        for e in group {
             if !editor.selection.edges.contains(&e) {
                 editor.selection.edges.push(e);
             }
@@ -1112,4 +1166,106 @@ fn axis_ui(ui: &mut egui::Ui, p: &mut Params) -> bool {
         }
     });
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::editor::Mode;
+    use crate::editor::harness::{Harness, block, click_at, top_face};
+    use crate::editor::selection::Pick;
+    use crate::editor::sketch_mode::SketchTool;
+    use basset_core::OriginPlane;
+    use basset_math::Vec2;
+
+    /// A 20×4 slot 3 mm thick: the rim of its top face is two straight edges and two
+    /// half-round ones, which is the geometry a tangent chain exists for.
+    fn slot(h: &mut Harness) -> BodyRef {
+        h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+        let camera = h.editor.camera;
+        let window = h.editor.window_px;
+        let s = h.sketch();
+        s.snap_to_grid = false;
+        s.set_tool(SketchTool::SlotOverall);
+        for p in [Vec2::ZERO, Vec2::new(20.0, 0.0), Vec2::new(10.0, 2.0)] {
+            s.pointer_up(&click_at(p.x, p.y), &camera, window, true, false);
+        }
+        h.editor.commit_sketch();
+        h.finish_sketch(true);
+        h.extrude(Vec2::new(10.0, 0.0), 3.0)
+    }
+
+    /// One pick of a slot's top rim takes the whole rim, because the user drew one
+    /// outline; picking any of it again lets all of it go. Ctrl is how they get at the
+    /// single edge instead.
+    #[test]
+    fn a_fillet_pick_takes_the_tangent_chain_and_gives_it_back() {
+        let mut h = Harness::new();
+        let body = slot(&mut h);
+        h.start_tool(ToolKind::Fillet);
+        let rim = edges_of_face(&h.editor, &top_face(body));
+        assert_eq!(rim.len(), 4, "two flats and two round ends");
+
+        h.editor.apply_pick(Some(Pick::Edge(rim[0], 0.0)), false);
+        assert_eq!(
+            h.editor.selection.edges.len(),
+            4,
+            "the rim went in together"
+        );
+        // A window egui has not laid out before spends its first frame sizing itself,
+        // so the frame that shows its contents is the second one.
+        h.frame();
+        assert!(
+            h.frame().has_text("4 edges selected"),
+            "{:?}",
+            h.frame().text()
+        );
+
+        // Any edge of the chain lets the whole chain go, not only the one picked first.
+        h.editor.apply_pick(Some(Pick::Edge(rim[2], 0.0)), false);
+        assert!(h.editor.selection.edges.is_empty());
+
+        h.set_modifiers(false, true);
+        h.editor.apply_pick(Some(Pick::Edge(rim[0], 0.0)), false);
+        assert_eq!(
+            h.editor.selection.edges,
+            vec![rim[0]],
+            "Ctrl takes one edge"
+        );
+        h.editor.apply_pick(Some(Pick::Edge(rim[0], 0.0)), false);
+        assert!(h.editor.selection.edges.is_empty(), "and gives it back");
+
+        // The same switch lives in the dialog for the user who wants it every time.
+        h.set_modifiers(false, false);
+        h.editor.tool.as_mut().unwrap().params.tangent_chain = false;
+        h.editor.apply_pick(Some(Pick::Edge(rim[0], 0.0)), false);
+        assert_eq!(h.editor.selection.edges, vec![rim[0]]);
+        assert!(
+            h.frame().has_text("1 edge selected"),
+            "{:?}",
+            h.frame().text()
+        );
+    }
+
+    /// The radius arrow points at the material the fillet works on: into the body at a
+    /// convex edge. It used to point straight out of it.
+    #[test]
+    fn the_fillet_arrow_points_into_the_corner() {
+        let mut editor = Editor::new(None);
+        editor.window_px = [800, 600];
+        let body = block(&mut editor);
+        start_tool(&mut editor, ToolKind::Fillet);
+        let ring = edges_of_face(&editor, &top_face(body));
+        editor.selection.edges.push(ring[0]);
+        let h = handle(&editor).expect("a fillet handle");
+        assert!(
+            (h.tip.distance(h.origin) - editor.tool.as_ref().unwrap().params.radius).abs() < 1e-9
+        );
+        // The block spans z 0..2 and x, y 0..10; a step along the arrow from an edge of
+        // the top face lands inside it.
+        assert!(h.tip.z < h.origin.z, "{:?}", h.tip);
+        let inside = |v: f64| (0.0..=10.0).contains(&v);
+        assert!(inside(h.tip.x) && inside(h.tip.y), "{:?}", h.tip);
+        assert!(matches!(editor.mode, Mode::Model));
+    }
 }

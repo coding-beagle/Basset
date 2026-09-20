@@ -136,6 +136,30 @@ constraints written *between* them, so every copy holds its shape; copies are no
 back to the seed, because a sketch-level pattern entity to regenerate from does not exist
 yet and a silently broken copy would be worse than honest plain geometry.
 
+Offsetting (`offset`) orders the picked curves into one chain end to end — refusing a
+branch, where three curves meet and there is no single answer — normalises a closed chain
+counter-clockwise so that "outward" means something, moves every curve sideways, and then
+resolves each corner. A corner that opens away from the side being offset to leaves a
+gap, closed either by an arc of the offset radius about the source corner or by running
+both edges out to their crossing; a corner that closes has the two edges overlapping, and
+they are trimmed to that same crossing. The trap is that an offset bigger than the shape
+is thick stays locally valid at every corner while the shape turns inside out, so each
+piece is checked against its own untrimmed self (`Piece::agrees_with`): a piece trimmed
+past its far end has reversed, and that is the offset running out of room rather than a
+smaller copy of the drawing. That is still only local, though, and a slit narrower than
+twice the distance closes over without any single corner noticing — so the finished
+curves are also checked against each other for crossings (`crossing_free`) before any of
+them is written down. A convex curve tighter than the offset is *not* an error: it
+shrinks past a point and out of existence, its neighbours are joined to each other
+instead, and that is what makes an offset of a filleted rectangle come out as a
+square-cornered one rather than a refusal. Mitres are capped (`MITER_LIMIT`) because the
+meeting point of a sharp enough corner runs away to infinity, and a cusp — where the
+chain doubles back and the turn direction cannot be read off a cross product that is zero
+— is named as a gap outright rather than left to the rounding. The result carries the constraints that
+are true of it by construction — parallel, concentric, coincident corner centres, tangent
+where the source was smooth — but is not linked back to its source, for the same reason a
+pattern's copies are not.
+
 A sketch also carries a table of named parameters — expressions over each other in a tiny
 `+ - * / ()` language — and a binding from dimensions to expressions. Solving evaluates
 the bindings first, so changing one parameter re-drives everything written over it.
@@ -177,7 +201,7 @@ view of the same surface (egui blends in gamma space, the viewport in linear). T
   on every parameter change, so the viewport is a live preview; the document's transaction
   API makes the whole interaction one undo step and Cancel a rollback.
 * **Sketch mode** draws on one plane with the same shape builders the sketch crate tests
-  use, trims and breaks existing curves, patterns and moves a selection, names closed
+  use, trims and breaks existing curves, patterns, offsets and moves a selection, names closed
   regions by a point inside them so `E` can hand them straight to Extrude, writes the
   working copy back into the feature after each change (so downstream
   features update live), and keeps its own undo stack for the session. The grid is drawn
@@ -188,13 +212,13 @@ view of the same surface (egui blends in gamma space, the viewport in linear). T
   constraint is picked first and its geometry after, and `constraints_for` decides what a
   set of picks means without caring about their order — which is also the question the
   toolbar asks to decide whether a button would do anything. The modal operations (move,
-  pattern) keep the sketch they started from and re-derive the result from it on every
+  pattern, offset) keep the sketch they started from and re-derive the result from it on every
   change, so editing a number twice replaces the result rather than compounding it;
   cancelling is putting that copy back, and keeping is pushing it onto the undo stack,
   which is why a modal operation is exactly one step of undo and never pops a checkpoint
   it did not take.
 
-  Both of them have to watch out for the same trap. The solver does not fail when a
+  They all have to watch out for the same trap. The solver does not fail when a
   constraint cannot be satisfied the way the user meant; it finds some *other*
   arrangement that satisfies it, and the cheapest one is usually the geometry folded flat.
   A move therefore checks that its result is still rigid (`rigid_error`) rather than
@@ -203,7 +227,7 @@ view of the same surface (egui blends in gamma space, the viewport in linear). T
   copy that contradicts it. Both failures used to look like a converged solve and a
   destroyed drawing.
 
-  Both also get a window of their own (`panels::sketch_operation_dialog`) rather than a
+  They all also get a window of their own (`panels::sketch_operation_dialog`) rather than a
   section at the bottom of the sketch palette. The controls an operation is driven by
   have to be on screen for as long as it is running, and the palette is a scrolling panel
   whose lower reaches are past the fold on an ordinary window — which made a pattern's
@@ -231,6 +255,24 @@ on screen* and scaled by the world size of a pixel, which is what makes the hand
 the pointer at any camera angle; a ring converts the same projection into an angle through
 its radius. The manipulator only ever writes the numbers the dialog or palette shows, so
 dragging and typing are two ways of saying one thing.
+
+A `gizmo::Slider` is the other shape of handle: one grip sitting *at* the value rather
+than on an arm of fixed length, so dragging it is dragging the number. An offset's
+distance is one — `anchor + dir * distance` is a point of the result, and the anchor is a
+point of the *source*, so the grip slides along one fixed line instead of wandering out
+from under the pointer as it is dragged. It is still there at a distance the offset
+refuses, which is how the user drags back out of one that does not fit, and taking it
+through zero is how the side gets chosen, so there is no flip button to go and press.
+
+Every handle that snaps answers to shift. `SketchEditor::snapping()` is the single
+question — the palette's toggle *and* shift not being held — and the drawing path, the
+move's arrows and ring, and the offset's slider all ask it rather than reading the toggle
+directly. The modifier reaches the sketch from two places, because the drawing path comes
+from winit and the manipulators come from egui and neither sees the other's events; both
+write it through `set_free_snap`. egui carries modifiers as a standing state set by
+`ModifiersChanged`, not as a field on each pointer event, which is what lets a widget know
+shift is down *while* it is being dragged — and is what a test driving a drag has to
+reproduce.
 
 The navigation cube is drawn from the camera's own basis and hit-tested by casting the
 pointer into a unit cube, so its 26 click targets are exactly the shapes drawn and need no
