@@ -11,7 +11,7 @@ use winit::keyboard::NamedKey;
 
 use super::harness::{Harness, TempDir};
 use super::selection::SelectMode;
-use super::sketch_mode::{SketchEditor, SketchTool};
+use super::sketch_mode::{ConstraintKind, SketchTool};
 use super::tools::ToolKind;
 
 #[test]
@@ -314,16 +314,23 @@ fn the_toolbar_shows_every_constraint_and_enables_the_ones_that_apply() {
     h.sketch().selected.clear();
     h.frame();
     let frame = h.frame();
-    for name in SketchEditor::CONSTRAINT_NAMES {
+    for kind in ConstraintKind::ALL {
         assert!(
-            frame.has_text(name),
-            "{name} is listed even with nothing selected"
+            frame.has_text(kind.name()),
+            "{} is listed even with nothing selected",
+            kind.name()
         );
     }
-    // Nothing applies to an empty selection, so nothing can be applied.
+    // Nothing is selected, so the click arms the tool and waits rather than guessing
+    // what it was meant to act on.
     let before = h.sketch().sketch.constraints().count();
     h.click_ui("Perpendicular");
     assert_eq!(h.sketch().sketch.constraints().count(), before);
+    assert_eq!(
+        h.sketch().armed_constraint(),
+        Some(ConstraintKind::Perpendicular),
+        "the button arms the tool"
+    );
 }
 
 /// Whatever does not fit in the palette can still be scrolled to.

@@ -168,6 +168,16 @@ fn parse_transform(s: &str) -> Result<Affine3, IoError> {
     ))
 }
 
+/// Vertices this close together are the same vertex. It matches the modelling kernel's
+/// own merge tolerance: a boolean leaves the two polygons meeting along an edge agreeing
+/// on its endpoints only to within that, so anything tighter here splits a shared vertex
+/// in two and the slicer reports the edges between them as non-manifold.
+///
+/// It is also far below any printable feature, so no real detail can be welded away.
+/// The value mirrors `basset_kernel::solid::MERGE_TOL`; this crate deliberately does not
+/// depend on the kernel, so it is repeated rather than imported.
+const WELD_TOL: f64 = 1e-5;
+
 /// A mesh with coincident vertices merged. The kernel emits flat-shaded meshes with
 /// three private vertices per triangle; slicers want shared vertices so they can walk
 /// edges and detect holes, and the file shrinks by roughly 4x.
@@ -178,22 +188,20 @@ struct IndexedMesh {
 
 impl IndexedMesh {
     fn dedup(mesh: &TriMesh, name: &str) -> Self {
-        let mut positions = Vec::new();
+        let mut index = VertexWeld::default();
         let mut triangles = Vec::with_capacity(mesh.indices.len());
-        let mut lookup: HashMap<[u64; 3], u32> = HashMap::new();
         let mut dropped = 0usize;
 
         for i in 0..mesh.triangle_count() {
             let tri = mesh.triangle(i);
             let mut ids = [0u32; 3];
             for (id, p) in ids.iter_mut().zip(tri) {
-                *id = *lookup.entry(position_key(p)).or_insert_with(|| {
-                    positions.push(p);
-                    (positions.len() - 1) as u32
-                });
+                *id = index.id(p);
             }
             // A triangle with a repeated index has zero area; the spec forbids it and it
             // carries no information, so it is dropped rather than failing the export.
+            // Its two remaining edges are the same edge traversed both ways, so dropping
+            // it cannot open the shell.
             if ids[0] == ids[1] || ids[1] == ids[2] || ids[0] == ids[2] {
                 dropped += 1;
                 continue;
@@ -204,21 +212,48 @@ impl IndexedMesh {
             log::warn!("3MF export of '{name}': dropped {dropped} degenerate triangle(s)");
         }
         Self {
-            positions,
+            positions: index.points,
             triangles,
         }
     }
 }
 
-/// Exact-match key. `-0.0` is folded into `0.0` so a vertex on a mirror plane does not
-/// split in two depending on which operation produced it.
-fn position_key(p: Vec3) -> [u64; 3] {
-    let norm = |v: f64| if v == 0.0 { 0.0f64 } else { v };
-    [
-        norm(p.x).to_bits(),
-        norm(p.y).to_bits(),
-        norm(p.z).to_bits(),
-    ]
+/// Snaps points within [`WELD_TOL`] of each other onto one id.
+///
+/// A hash of the rounded coordinates will not do: two vertices a nanometre apart can
+/// still round to different cells, and every triangle edge that misses its twin because
+/// of it becomes a hole in the printed shell. So the grid has cells of `2·WELD_TOL` and
+/// every lookup probes the 26 neighbours as well, which makes the tolerance a real
+/// distance rather than an artefact of where the cell boundaries happen to fall.
+#[derive(Default)]
+struct VertexWeld {
+    cells: HashMap<(i64, i64, i64), Vec<u32>>,
+    points: Vec<Vec3>,
+}
+
+impl VertexWeld {
+    fn id(&mut self, p: Vec3) -> u32 {
+        let cell = |x: f64| (x / (2.0 * WELD_TOL)).floor() as i64;
+        let c = (cell(p.x), cell(p.y), cell(p.z));
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    let Some(ids) = self.cells.get(&(c.0 + dx, c.1 + dy, c.2 + dz)) else {
+                        continue;
+                    };
+                    for &id in ids {
+                        if self.points[id as usize].distance_squared(p) <= WELD_TOL * WELD_TOL {
+                            return id;
+                        }
+                    }
+                }
+            }
+        }
+        let id = self.points.len() as u32;
+        self.points.push(p);
+        self.cells.entry(c).or_default().push(id);
+        id
+    }
 }
 
 /// Reads the objects and build items of a 3MF package back into export items.
@@ -429,6 +464,45 @@ mod tests {
         mesh.positions[0] = Vec3::new(-0.0, 0.0, -0.0);
         let indexed = IndexedMesh::dedup(&mesh, "cube");
         assert_eq!(indexed.positions.len(), 8);
+    }
+
+    /// A boolean leaves the two polygons either side of a shared edge agreeing on its
+    /// endpoints only to within the kernel's merge tolerance. Deduplicating on the exact
+    /// bits split every such vertex in two, and the slicer read the triangle edges
+    /// between the halves as non-manifold: "Error 330" on a body that models fine.
+    #[test]
+    fn vertices_that_agree_only_to_the_weld_tolerance_become_one() {
+        let mut mesh = unit_cube();
+        let mut n = 0.0_f64;
+        for p in &mut mesh.positions {
+            n += 1.0;
+            let dir = Vec3::new(n.sin(), n.cos(), (n * 0.7).sin()).normalize();
+            *p += dir * (0.45 * WELD_TOL);
+        }
+        let indexed = IndexedMesh::dedup(&mesh, "cube");
+        assert_eq!(indexed.positions.len(), 8);
+        assert_eq!(indexed.triangles.len() / 3, 12);
+        assert_eq!(unmatched_edges(&indexed), 0);
+    }
+
+    #[test]
+    fn vertices_further_apart_than_the_tolerance_stay_apart() {
+        let mut mesh = unit_cube();
+        mesh.positions[0] += Vec3::new(3.0 * WELD_TOL, 0.0, 0.0);
+        assert_eq!(IndexedMesh::dedup(&mesh, "cube").positions.len(), 9);
+    }
+
+    /// Directed edges that are not walked once each way. Zero is what a slicer demands.
+    fn unmatched_edges(indexed: &IndexedMesh) -> usize {
+        let mut directed: HashMap<(u32, u32), i32> = HashMap::new();
+        for t in indexed.triangles.as_chunks::<3>().0 {
+            for i in 0..3 {
+                let (a, b) = (t[i], t[(i + 1) % 3]);
+                let (k, s) = if a < b { ((a, b), 1) } else { ((b, a), -1) };
+                *directed.entry(k).or_default() += s;
+            }
+        }
+        directed.values().filter(|c| **c != 0).count()
     }
 
     #[test]

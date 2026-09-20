@@ -30,6 +30,7 @@ pub use refs::{
     AxisRef, BodyRef, EdgeRef, FaceRef, OriginAxis, OriginPlane, PathRef, PlaneRef, ProfileRef,
     RegionRef,
 };
+pub use regen::convert_profile;
 pub use timeline::Timeline;
 
 // Re-exported so application code only needs one dependency for the object model.

@@ -433,7 +433,7 @@ fn cursor_marker_tracks_the_snapped_position() {
     let marker = |s: &sketch_mode::SketchEditor| {
         let mut lines = Vec::new();
         let mut points = Vec::new();
-        s.draw(&mut lines, &mut points);
+        s.draw(&mut lines, &mut points, &mut Vec::new());
         points.last().and_then(|b| b.points.last().copied())
     };
 
@@ -455,7 +455,7 @@ fn cursor_marker_tracks_the_snapped_position() {
     s.pointer_moved(&click_at(2.4, 3.7), &camera, window, false);
     let mut lines = Vec::new();
     let mut points = Vec::new();
-    s.draw(&mut lines, &mut points);
+    s.draw(&mut lines, &mut points, &mut Vec::new());
     assert!(points.iter().all(|b| b.size_px != 5.0 && b.size_px != 9.0));
 }
 
@@ -1240,7 +1240,7 @@ fn dimensions_are_drawn_and_placed_by_their_label() {
     // The lines of the overlay are part of what the sketch draws.
     let mut lines = Vec::new();
     let mut points = Vec::new();
-    s.draw(&mut lines, &mut points);
+    s.draw(&mut lines, &mut points, &mut Vec::new());
     assert!(lines.iter().any(|l| l.segments.len() == 7));
 }
 
@@ -1265,7 +1265,7 @@ fn the_trim_tool_removes_the_piece_under_the_pointer() {
     let s = sketch(&mut editor);
     s.set_tool(SketchTool::Trim);
     s.pointer_moved(&click_at(10.0, 13.0), &camera, window, false);
-    s.draw(&mut Vec::new(), &mut Vec::new());
+    s.draw(&mut Vec::new(), &mut Vec::new(), &mut Vec::new());
 
     click_with(&mut editor, SketchTool::Trim, Vec2::new(10.0, 13.0));
     click_with(&mut editor, SketchTool::Trim, Vec2::new(10.0, -3.0));
@@ -1431,17 +1431,76 @@ fn a_pattern_repeats_the_selected_geometry() {
         .map(|(id, _)| id)
         .collect();
     s.pattern.circular = false;
-    s.pattern.cols = 3;
-    s.pattern.rows = 2;
-    s.pattern.dx = 10.0;
-    s.pattern.dy = 10.0;
-    let created = s.apply_pattern().expect("pattern applied");
+    s.pattern.spacing = sketch_mode::Spacing::Between;
+    s.pattern.count_x = 3;
+    s.pattern.count_y = 2;
+    s.pattern.distance_x = 10.0;
+    s.pattern.distance_y = 10.0;
+    assert!(s.begin_pattern(), "the selection can be repeated");
+    // The copies are there before anything is confirmed: the tool previews in the live
+    // sketch, which is how the numbers can be judged while they are being set.
+    let previewed = s.sketch.profiles(&Default::default());
+    assert_eq!(previewed.len(), 6, "3 x 2 including the seed");
+    let created = s.finish_pattern(true).expect("the pattern was kept");
     assert!(created > 0);
     let profiles = s.sketch.profiles(&Default::default());
     assert_eq!(profiles.len(), 6);
     for p in &profiles {
         assert!((p.area() - seed_area).abs() < 1e-6, "{}", p.area());
     }
+}
+
+/// Changing a number replaces the copies instead of adding a second pattern on top of
+/// the first, and cancelling leaves the sketch exactly as it was.
+#[test]
+fn a_pattern_previews_live_and_can_be_cancelled() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(5.0, 5.0));
+    let s = sketch(&mut editor);
+    let before = s.sketch.entities().count();
+    s.selected = s
+        .sketch
+        .entities()
+        .filter(|(_, d)| d.entity.is_curve())
+        .map(|(id, _)| id)
+        .collect();
+    s.pattern.circular = false;
+    s.pattern.count_x = 2;
+    s.pattern.count_y = 1;
+    s.pattern.distance_x = 10.0;
+    assert!(s.begin_pattern());
+    assert_eq!(s.sketch.profiles(&Default::default()).len(), 2);
+
+    s.pattern.count_x = 4;
+    s.update_pattern();
+    assert_eq!(
+        s.sketch.profiles(&Default::default()).len(),
+        4,
+        "the copies were re-made, not added to"
+    );
+
+    // Stated as a total, the same distance spans the four copies instead of separating
+    // each pair, so the last one lands on 10 rather than at 30.
+    s.pattern.spacing = sketch_mode::Spacing::Total;
+    s.update_pattern();
+    let right = s
+        .sketch
+        .entities()
+        .filter_map(|(id, _)| s.sketch.entity_bounds(id))
+        .fold(f64::NEG_INFINITY, |acc, (_, max)| acc.max(max.x));
+    assert!(
+        (right - 15.0).abs() < 1e-6,
+        "seed 0..5 plus a 10 mm span: {right}"
+    );
+
+    assert_eq!(s.finish_pattern(false), None, "cancelled");
+    assert_eq!(
+        s.sketch.entities().count(),
+        before,
+        "cancelling puts the sketch back"
+    );
 }
 
 #[test]
@@ -1628,7 +1687,7 @@ fn a_conflicting_sketch_names_and_marks_the_constraints_at_fault() {
     // The badges of the offenders are drawn in their own batch, so they read as red.
     let mut lines = Vec::new();
     let mut points = Vec::new();
-    s.draw(&mut lines, &mut points);
+    s.draw(&mut lines, &mut points, &mut Vec::new());
     let red = lines
         .iter()
         .find(|b| b.color == sketch_mode::CONFLICT_COLOR)
@@ -1705,4 +1764,645 @@ fn under_constrained_geometry_includes_the_curves_its_points_hold() {
         s.add_constraint(Constraint::Fix(id)).unwrap();
     }
     assert!(s.under_constrained().is_empty());
+}
+
+// ----- sketch mode: regions, construction and constraints --------------------------------
+
+/// Pointing at a closed region fills it. An outline alone says "these curves"; the thing
+/// the user is about to extrude is the area, so the area is what lights up.
+#[test]
+fn the_enclosed_area_under_the_pointer_is_filled() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(20.0, 20.0));
+    let camera = editor.camera;
+    let window = editor.window_px;
+    let s = sketch(&mut editor);
+    s.set_tool(SketchTool::Select);
+
+    let filled = |s: &sketch_mode::SketchEditor| {
+        let mut tris = Vec::new();
+        s.draw(&mut Vec::new(), &mut Vec::new(), &mut tris);
+        tris.iter().map(|t| t.triangles.len()).sum::<usize>()
+    };
+
+    // Outside the rectangle nothing is filled.
+    s.pointer_moved(&click_at(40.0, 40.0), &camera, window, false);
+    assert_eq!(filled(s), 0);
+
+    s.pointer_moved(&click_at(10.0, 10.0), &camera, window, false);
+    assert!(filled(s) > 0, "the region under the pointer is filled");
+
+    // Clicking it keeps the fill, because the region stays selected once picked.
+    s.pointer_up(&click_at(10.0, 10.0), &camera, window, true, false);
+    s.pointer_moved(&click_at(40.0, 40.0), &camera, window, false);
+    assert!(filled(s) > 0, "a picked region stays filled");
+}
+
+/// Construction is decided before the shape is drawn, not converted afterwards: the mode
+/// is what a centre line or a bolt circle actually needs.
+#[test]
+fn construction_mode_draws_reference_geometry() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    {
+        let s = sketch(&mut editor);
+        assert!(!s.construction);
+        // With nothing selected the command arms the mode rather than converting.
+        s.toggle_construction();
+        assert!(s.construction);
+    }
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(10.0, 10.0));
+    let s = sketch(&mut editor);
+    let curves: Vec<_> = s
+        .sketch
+        .entities()
+        .filter(|(_, d)| d.entity.is_curve())
+        .collect();
+    assert!(!curves.is_empty());
+    assert!(
+        curves.iter().all(|(_, d)| d.construction),
+        "every curve of the rectangle is reference geometry"
+    );
+    assert!(
+        s.sketch.profiles(&Default::default()).is_empty(),
+        "construction geometry encloses nothing"
+    );
+
+    // Turning it off again leaves the next shape as real geometry.
+    s.toggle_construction();
+    assert!(!s.construction);
+    draw_rectangle(&mut editor, Vec2::new(20.0, 0.0), Vec2::new(30.0, 10.0));
+    assert_eq!(
+        sketch(&mut editor)
+            .sketch
+            .profiles(&Default::default())
+            .len(),
+        1
+    );
+}
+
+/// A constraint is a tool: pick it first and the geometry after, the way Fusion works.
+#[test]
+fn a_constraint_tool_applies_to_the_picks_that_follow_it() {
+    use sketch_mode::ConstraintKind;
+
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_line(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(20.0, 3.0));
+    let camera = editor.camera;
+    let window = editor.window_px;
+    let s = sketch(&mut editor);
+    s.select_tool();
+    s.select_only(Vec::new());
+
+    // Armed with nothing picked, it waits rather than guessing.
+    let before = s.sketch.constraints().count();
+    s.begin_constraint(ConstraintKind::Horizontal).unwrap();
+    assert_eq!(s.armed_constraint(), Some(ConstraintKind::Horizontal));
+    assert_eq!(s.sketch.constraints().count(), before);
+
+    // One pick on the line is all Horizontal needs, so it goes on at once.
+    s.pointer_up(&click_at(10.0, 1.5), &camera, window, true, false);
+    assert_eq!(s.sketch.constraints().count(), before + 1);
+    assert!(
+        s.selected.is_empty(),
+        "the picks are cleared, ready for the next line"
+    );
+    assert_eq!(
+        s.armed_constraint(),
+        Some(ConstraintKind::Horizontal),
+        "the tool stays armed"
+    );
+    let (_, line) = s
+        .sketch
+        .entities()
+        .find(|(_, d)| d.entity.is_line())
+        .unwrap();
+    let Entity::Line { start, end } = line.entity else {
+        unreachable!()
+    };
+    let (a, b) = (
+        s.sketch.point_pos(start).unwrap(),
+        s.sketch.point_pos(end).unwrap(),
+    );
+    assert!((a.y - b.y).abs() < 1e-6, "the line was levelled: {a} {b}");
+}
+
+/// Order never matters, and what a constraint means for a set of picks is the same
+/// question the toolbar asks to decide whether it can be applied at all.
+#[test]
+fn a_constraint_reads_its_picks_in_either_order() {
+    use sketch_mode::ConstraintKind;
+
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+    let s = sketch(&mut editor);
+    let line = s
+        .sketch
+        .entities()
+        .find(|(_, d)| d.entity.is_line())
+        .map(|(id, _)| id)
+        .unwrap();
+    let loose = s.sketch.add_point(Vec2::new(5.0, 7.0));
+
+    for picks in [vec![loose, line], vec![line, loose]] {
+        let made = s.constraints_for(ConstraintKind::Midpoint, &picks);
+        assert!(
+            matches!(made[..], [Constraint::Midpoint { point, line: l }] if point == loose && l == line),
+            "midpoint reads the point and the line whichever was picked first: {made:?}"
+        );
+    }
+    // A line has no midpoint constraint with another line, so the toolbar says so.
+    assert!(
+        s.constraints_for(ConstraintKind::Midpoint, &[line, line])
+            .is_empty()
+    );
+}
+
+/// Equal across a run of curves is one command, which is what "these five holes are the
+/// same size" should cost.
+#[test]
+fn a_transitive_constraint_chains_through_every_pick() {
+    use sketch_mode::ConstraintKind;
+
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+    let s = sketch(&mut editor);
+    let lines: Vec<EntityId> = s
+        .sketch
+        .entities()
+        .filter(|(_, d)| d.entity.is_line())
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(lines.len(), 4);
+    let made = s.constraints_for(ConstraintKind::Equal, &lines);
+    assert_eq!(made.len(), 3, "four lines tie together with three equals");
+    assert!(made.iter().all(|c| matches!(c, Constraint::Equal(..))));
+}
+
+/// The manipulator drives the same numbers the palette shows, so a drag and a typed
+/// offset are two ways of saying one thing.
+#[test]
+fn the_move_manipulator_drives_the_move_numbers() {
+    use super::gizmo;
+
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(10.0, 10.0));
+    let s = sketch(&mut editor);
+    s.selected = s
+        .sketch
+        .entities()
+        .filter(|(_, d)| d.entity.is_curve())
+        .map(|(id, _)| id)
+        .collect();
+    assert!(gizmo::current(&editor).is_none(), "nothing is being moved");
+
+    sketch(&mut editor).begin_move();
+    let g = gizmo::current(&editor).expect("the move has a manipulator");
+    assert_eq!(g.arrows.len(), 2, "a sketch moves on its plane, not off it");
+    assert_eq!(g.rings.len(), 1, "and turns about its normal alone");
+    assert_eq!(g.origin, Vec3::new(5.0, 5.0, 0.0), "on what is being moved");
+
+    let s = sketch(&mut editor);
+    // A drag on an arrow and a drag on the ring land in the boxes the palette shows.
+    assert!(s.nudge_move(true, 4.0));
+    assert!(s.turn_move(15.0));
+    {
+        let op = s.move_op.as_ref().expect("still moving");
+        assert_eq!((op.dx, op.dy, op.angle_deg), (4.0, 0.0, 15.0));
+    }
+    // The rectangle's own horizontal and vertical constraints refuse the turn, which is
+    // the point of offering the move as a goal rather than applying it outright. The
+    // slide along the arrow is free, so that is what survives.
+    s.turn_move(-15.0);
+    s.update_move();
+    s.finish_move(true);
+    let (min, max) = s
+        .sketch
+        .entities()
+        .filter_map(|(id, _)| s.sketch.entity_bounds(id))
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), (a, b)| {
+            (lo.min(a.x), hi.max(b.x))
+        });
+    assert!(
+        (min - 4.0).abs() < 1e-6 && (max - 14.0).abs() < 1e-6,
+        "the square slid 4 mm across: {min}..{max}"
+    );
+}
+
+/// The manipulator has to sit on the thing it moves. Getting this wrong is invisible in
+/// a unit that only checks the numbers and glaring the moment anyone drags an arrow, so
+/// it is asserted against the body's real position rather than reasoned about.
+#[test]
+fn the_body_manipulator_sits_on_the_body_it_moves() {
+    use super::gizmo;
+
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    // A 10x10x2 block from the origin, so its centre is a number we can write down.
+    block(&mut editor);
+    let body = *editor.doc.state().bodies.keys().next().unwrap();
+    tools::start_tool(&mut editor, ToolKind::Move);
+    editor.selection.bodies.push(body);
+    tools::sync_tool(&mut editor);
+    editor.refresh_cache();
+
+    let centre = |editor: &mut Editor| {
+        let aabb = editor.doc.state().body(body).unwrap().solid.aabb();
+        (aabb.min + aabb.max) * 0.5
+    };
+    let before = centre(&mut editor);
+    let g = gizmo::current(&editor).expect("the Move tool has a manipulator");
+    assert_eq!(g.origin, before, "it starts on the body");
+    assert_eq!(g.arrows.len(), 3);
+    assert_eq!(g.rings.len(), 3);
+
+    editor.tool.as_mut().unwrap().params.translate = Vec3::new(7.0, 0.0, 0.0);
+    tools::sync_tool(&mut editor);
+    editor.refresh_cache();
+    let after = centre(&mut editor);
+    assert_eq!(after, before + Vec3::new(7.0, 0.0, 0.0), "the body moved");
+    let g = gizmo::current(&editor).expect("still moving");
+    assert_eq!(
+        g.origin, after,
+        "and the manipulator moved with it, exactly once"
+    );
+}
+
+/// Right-drag is the orbit gesture. Orbiting to look at a pattern must not be the
+/// gesture that throws it away, which is what sharing `cancel_current` with the
+/// end-a-line-chain path used to mean.
+#[test]
+fn orbiting_does_not_destroy_a_pattern_in_progress() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(5.0, 5.0));
+    let s = sketch(&mut editor);
+    s.selected = s
+        .sketch
+        .entities()
+        .filter(|(_, d)| d.entity.is_curve())
+        .map(|(id, _)| id)
+        .collect();
+    s.pattern.circular = false;
+    s.pattern.count_x = 3;
+    s.pattern.count_y = 1;
+    assert!(s.begin_pattern());
+    let copies = s.sketch.profiles(&Default::default()).len();
+    assert_eq!(copies, 3);
+
+    // The right-button release that ends an orbit, and the one that ends a line chain.
+    s.finish_current();
+    assert!(s.pattern_in_progress(), "the pattern survived the gesture");
+    assert_eq!(s.sketch.profiles(&Default::default()).len(), copies);
+}
+
+/// Undo, while a move is being set up, means the move: putting it back is exactly what
+/// the user is asking to undo, and neither modal operation has a checkpoint of its own
+/// to undo past safely.
+#[test]
+fn undo_during_a_move_puts_the_move_back() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(5.0, 5.0));
+    draw_rectangle(&mut editor, Vec2::new(10.0, 0.0), Vec2::new(15.0, 5.0));
+    let s = sketch(&mut editor);
+    let entities = s.sketch.entities().count();
+    s.selected = s
+        .sketch
+        .entities()
+        .filter(|(_, d)| d.entity.is_curve())
+        .map(|(id, _)| id)
+        .collect();
+    assert!(s.begin_move());
+    s.nudge_move(true, 4.0);
+    s.update_move();
+
+    editor.undo();
+    assert_eq!(editor.status, "Move cancelled");
+    let s = sketch(&mut editor);
+    assert!(!s.move_in_progress());
+    assert_eq!(
+        s.sketch.entities().count(),
+        entities,
+        "and it undid the move, not the shape drawn before it"
+    );
+    let left = s
+        .sketch
+        .entities()
+        .filter_map(|(id, _)| s.sketch.entity_bounds(id))
+        .fold(f64::INFINITY, |acc, (min, _)| acc.min(min.x));
+    assert!(
+        left.abs() < 1e-9,
+        "the geometry went back to where it was: {left}"
+    );
+}
+
+/// A move that was applied is one step of undo, which is what was missing: the move took
+/// its checkpoint on the way in and popped it again on the way out, so afterwards there
+/// was nothing on the stack to go back to.
+#[test]
+fn an_applied_sketch_move_can_be_undone() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(5.0, 5.0));
+    let s = sketch(&mut editor);
+    s.selected = s
+        .sketch
+        .entities()
+        .filter(|(_, d)| d.entity.is_curve())
+        .map(|(id, _)| id)
+        .collect();
+    assert!(s.begin_move());
+    s.nudge_move(true, 7.0);
+    s.update_move();
+    s.finish_move(true);
+
+    let left = |editor: &mut Editor| {
+        let s = sketch(editor);
+        s.sketch
+            .entities()
+            .filter_map(|(id, _)| s.sketch.entity_bounds(id))
+            .fold(f64::INFINITY, |acc, (min, _)| acc.min(min.x))
+    };
+    assert!((left(&mut editor) - 7.0).abs() < 1e-6, "the move applied");
+    editor.undo();
+    assert!(left(&mut editor).abs() < 1e-9, "and one undo puts it back");
+}
+
+/// Escape cancels the pattern itself and the revert reaches the document, so nothing
+/// downstream keeps showing copies the user took back.
+#[test]
+fn escape_cancels_a_pattern_and_the_document_follows() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(5.0, 5.0));
+    let feature = sketch(&mut editor).feature;
+    let s = sketch(&mut editor);
+    s.selected = s
+        .sketch
+        .entities()
+        .filter(|(_, d)| d.entity.is_curve())
+        .map(|(id, _)| id)
+        .collect();
+    s.pattern.circular = false;
+    s.pattern.count_x = 3;
+    s.pattern.count_y = 1;
+    assert!(s.begin_pattern());
+    editor.commit_sketch();
+    editor.refresh_cache();
+    assert_eq!(
+        editor.doc.state().sketches[&feature].profiles.len(),
+        3,
+        "the preview is in the document, which is why cancelling has to reach it"
+    );
+
+    editor.cancel();
+    editor.refresh_cache();
+    assert!(!sketch(&mut editor).pattern_in_progress());
+    assert_eq!(
+        editor.doc.state().sketches[&feature].profiles.len(),
+        1,
+        "the document went back to the seed alone"
+    );
+}
+
+/// A pick that could never become the armed constraint is refused and named, rather than
+/// joining a pile the tool has already given up on.
+#[test]
+fn a_constraint_tool_refuses_a_pick_it_could_never_use() {
+    use sketch_mode::ConstraintKind;
+
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+    let camera = editor.camera;
+    let window = editor.window_px;
+    let s = sketch(&mut editor);
+    s.select_only(Vec::new());
+    s.begin_constraint(ConstraintKind::Perpendicular).unwrap();
+
+    // The corner is a point, and no set of picks containing one is ever perpendicular.
+    s.pointer_up(&click_at(0.0, 0.0), &camera, window, true, false);
+    assert!(s.constraint_picks().is_empty(), "the pick was refused");
+    assert!(
+        s.take_constraint_error()
+            .is_some_and(|e| e.contains("Perpendicular")),
+        "and the user is told what it wants"
+    );
+
+    // A line is a pick it can use, and it waits for the second.
+    s.pointer_up(&click_at(10.0, 0.0), &camera, window, true, false);
+    assert_eq!(s.constraint_picks().len(), 1);
+}
+
+/// A transitive constraint chains on past the pair: the pick it just used stays as the
+/// start of the next one, so five equal holes are five clicks.
+#[test]
+fn a_transitive_constraint_tool_chains_click_by_click() {
+    use sketch_mode::ConstraintKind;
+
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+    let camera = editor.camera;
+    let window = editor.window_px;
+    let s = sketch(&mut editor);
+    s.select_only(Vec::new());
+    let before = s.sketch.constraints().count();
+    s.begin_constraint(ConstraintKind::Equal).unwrap();
+
+    // Bottom, right, top: each click after the first ties onto the one before it.
+    s.pointer_up(&click_at(10.0, 0.0), &camera, window, true, false);
+    assert_eq!(s.sketch.constraints().count(), before);
+    s.pointer_up(&click_at(20.0, 5.0), &camera, window, true, false);
+    assert_eq!(s.sketch.constraints().count(), before + 1);
+    assert_eq!(s.constraint_picks().len(), 1, "the last pick carries over");
+    s.pointer_up(&click_at(10.0, 10.0), &camera, window, true, false);
+    assert_eq!(
+        s.sketch.constraints().count(),
+        before + 2,
+        "the third click chains rather than starting a fresh pair"
+    );
+}
+
+/// One construction command that reads its context: with geometry selected it converts
+/// that geometry and leaves the mode alone, and with nothing selected it arms the mode.
+#[test]
+fn the_construction_command_reads_what_is_selected() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(10.0, 10.0));
+    let s = sketch(&mut editor);
+    s.construction = true;
+    s.selected = vec![
+        s.sketch
+            .entities()
+            .find(|(_, d)| d.entity.is_curve())
+            .map(|(id, _)| id)
+            .unwrap(),
+    ];
+    // With a selection it converts, and leaves the mode where it was.
+    s.toggle_construction();
+    assert!(s.selection_is_construction());
+    assert!(s.construction, "the mode is untouched by a conversion");
+    s.toggle_construction();
+    assert!(!s.selection_is_construction(), "and it converts back");
+
+    // With nothing selected the same command is the mode.
+    s.selected.clear();
+    s.toggle_construction();
+    assert!(!s.construction);
+    s.toggle_construction();
+    assert!(s.construction);
+}
+
+/// Rotating geometry the constraints hold to the axes used to fold it flat: the solver
+/// does not fail, it finds some *other* arrangement satisfying horizontal and vertical,
+/// and the cheapest one is the rectangle collapsed to a line. That is a converged solve
+/// and a destroyed drawing, so the move is judged by the shape rather than the residual.
+#[test]
+fn a_rotation_the_constraints_refuse_leaves_the_geometry_alone() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    // The rectangle builder constrains its edges horizontal and vertical, so no rotation
+    // of it is possible at all.
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(10.0, 6.0));
+    let s = sketch(&mut editor);
+    let area = |s: &sketch_mode::SketchEditor| {
+        s.sketch
+            .profiles(&Default::default())
+            .first()
+            .map(|p| p.area())
+            .unwrap_or(0.0)
+    };
+    let before = area(s);
+    assert!(before > 0.0);
+    s.selected = s
+        .sketch
+        .entities()
+        .filter(|(_, d)| d.entity.is_curve())
+        .map(|(id, _)| id)
+        .collect();
+    assert!(s.begin_move());
+
+    s.turn_move(30.0);
+    s.update_move();
+    assert!(
+        s.move_refused().is_some(),
+        "the move says it could not be done"
+    );
+    assert!(
+        (area(s) - before).abs() < 1e-9,
+        "and the rectangle is untouched: {} was {before}",
+        area(s)
+    );
+
+    // Taking the rotation back off leaves an ordinary slide, which the constraints allow.
+    s.turn_move(-30.0);
+    s.nudge_move(true, 5.0);
+    s.update_move();
+    assert!(s.move_refused().is_none(), "a slide is fine");
+    assert!((area(s) - before).abs() < 1e-9, "and keeps its shape");
+}
+
+/// A sketch with nothing holding it to the axes turns as asked, so the refusal above is
+/// about the constraints and not about rotation being unsupported.
+#[test]
+fn a_free_shape_rotates_in_the_sketch_plane() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    let s = sketch(&mut editor);
+    s.snap_to_grid = false;
+    // A bare triangle of points: no constraints at all, so it is free to turn.
+    let a = s.sketch.add_point(Vec2::new(0.0, 0.0));
+    let b = s.sketch.add_point(Vec2::new(10.0, 0.0));
+    let c = s.sketch.add_point(Vec2::new(0.0, 4.0));
+    s.selected = vec![a, b, c];
+    assert!(s.begin_move());
+    s.turn_move(90.0);
+    s.update_move();
+    assert!(s.move_refused().is_none(), "nothing objects");
+
+    // A quarter turn about the centroid takes (10, 0) to where the rotation says, and
+    // every distance is kept, which is what makes it a rotation rather than a reshape.
+    let pos = |id| s.sketch.point_pos(id).unwrap();
+    assert!(
+        (pos(a).distance(pos(b)) - 10.0).abs() < 1e-6
+            && (pos(a).distance(pos(c)) - 4.0).abs() < 1e-6,
+        "distances kept"
+    );
+    // The turn is about the centroid of what is being moved, so (10, 0) lands where a
+    // quarter turn about that point puts it.
+    let pivot = Vec2::new(10.0 / 3.0, 4.0 / 3.0);
+    let was = Vec2::new(10.0, 0.0);
+    let expected = pivot + Vec2::from_angle(std::f64::consts::FRAC_PI_2).rotate(was - pivot);
+    assert!(pos(b).distance(expected) < 1e-6, "{} vs {expected}", pos(b));
+}
+
+/// Placing a circular pattern's centre is a mode you ask for, not something every click
+/// does: while a pattern is up the pointer is otherwise idle, and a stray click that
+/// silently moved the centre of a pattern already placed would be worse than no picking.
+#[test]
+fn a_circular_pattern_centre_is_picked_in_a_mode() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(20.0, 0.0), Vec2::new(25.0, 5.0));
+    let camera = editor.camera;
+    let window = editor.window_px;
+    let s = sketch(&mut editor);
+    s.selected = s
+        .sketch
+        .entities()
+        .filter(|(_, d)| d.entity.is_curve())
+        .map(|(id, _)| id)
+        .collect();
+    s.pattern.circular = true;
+    s.pattern.count = 4;
+    s.pattern.angle_deg = 360.0;
+    assert!(s.begin_pattern());
+    let centred = s.pattern.center;
+
+    // A click while the mode is off leaves the centre exactly where it was.
+    s.pointer_up(&click_at(0.0, 0.0), &camera, window, true, false);
+    assert_eq!(s.pattern.center, centred, "an idle click changes nothing");
+
+    s.pick_pattern_center(true);
+    assert!(s.picking_pattern_center());
+    s.pointer_up(&click_at(0.0, 0.0), &camera, window, true, false);
+    assert_eq!(s.pattern.center, Vec2::ZERO, "the click placed the centre");
+    assert!(
+        !s.picking_pattern_center(),
+        "and the mode ends with the pick, so the next click is idle again"
+    );
+
+    // The copies are laid out about the new centre, each a quarter turn on, and each
+    // still a square: a copy that inherited the seed's horizontal would have collapsed.
+    assert_eq!(s.sketch.profiles(&Default::default()).len(), 4);
+    let left = s
+        .sketch
+        .entities()
+        .filter_map(|(id, _)| s.sketch.entity_bounds(id))
+        .fold(f64::INFINITY, |acc, (min, _)| acc.min(min.x));
+    assert!(left < -20.0, "the pattern went round the origin: {left}");
 }

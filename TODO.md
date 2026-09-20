@@ -74,3 +74,7 @@ Fillet tool:
 - Slow for some geometries, needs optimisation
 - Where several blended edges meet, the result is the intersection of their tools rather
   than a corner patch, and a radius larger than the neighbouring face is not detected
+
+Export:
+
+"Error 330 non manifold edges" - fix?

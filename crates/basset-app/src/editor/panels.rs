@@ -42,17 +42,23 @@ enum Command {
     Activate(ComponentId),
     FinishSketch(bool),
     SketchTool(SketchTool),
-    SketchConstraint(basset_sketch::Constraint),
     SketchSelect(Vec<basset_sketch::EntityId>),
     SketchDimension(basset_sketch::ConstraintId, f64),
     SketchRemoveConstraint(basset_sketch::ConstraintId),
     SketchDelete,
     SketchConstruction,
+    /// Start a move of the selection, as `M` does.
+    SketchMoveBegin,
     /// A number in the move palette changed: re-apply the move from where it started.
     SketchMoveUpdate,
     /// Keep (`true`) or undo (`false`) the move in progress.
     SketchMoveFinish(bool),
+    /// Start a pattern of the selection.
     SketchPattern,
+    /// A number in the pattern palette changed: re-make the copies.
+    SketchPatternUpdate,
+    /// Keep (`true`) or undo (`false`) the pattern in progress.
+    SketchPatternFinish(bool),
     SketchSetParameter(String, String),
     SketchRemoveParameter(String),
     SketchBindDimension(basset_sketch::ConstraintId, String),
@@ -97,6 +103,7 @@ pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
     let ctx = ui.ctx().clone();
     super::viewcube::show(editor, &ctx, free);
     tools::dialog(editor, &ctx);
+    super::gizmo::interact(editor, &ctx);
     entry_overlay(editor, &ctx, &mut commands);
     dimension_overlay(editor, &ctx, &mut commands);
     constraint_overlay(editor, &ctx, &mut commands);
@@ -153,16 +160,23 @@ fn run(editor: &mut Editor, c: Command) {
         }
         Command::Activate(c) => editor.active_component = c,
         Command::FinishSketch(keep) => sketch_mode::finish(editor, keep),
-        Command::SketchTool(t) => {
+        // Arming a constraint tool applies it straight away to a selection that already
+        // suits it, so selecting first and selecting after are the same command.
+        Command::SketchTool(SketchTool::Constrain(kind)) => {
             if let Mode::Sketch(s) = &mut editor.mode {
-                s.set_tool(t);
-            }
-        }
-        Command::SketchConstraint(c) => {
-            if let Mode::Sketch(s) = &mut editor.mode {
-                match s.add_constraint(c) {
+                match s.begin_constraint(kind) {
                     Ok(()) => editor.commit_sketch(),
                     Err(e) => editor.report_error(e),
+                }
+            }
+        }
+        Command::SketchTool(t) => {
+            if let Mode::Sketch(s) = &mut editor.mode {
+                // Picking another tool cancels a move or a pattern, and that revert has
+                // to reach the document or the feature keeps the copies it just took back.
+                s.set_tool(t);
+                if s.take_dirty() {
+                    editor.commit_sketch();
                 }
             }
         }
@@ -205,12 +219,26 @@ fn run(editor: &mut Editor, c: Command) {
         }
         Command::SketchPattern => {
             if let Mode::Sketch(s) = &mut editor.mode {
-                match s.apply_pattern() {
-                    Ok(n) => {
-                        editor.commit_sketch();
-                        editor.set_status(format!("Pattern created {n} entities"));
-                    }
-                    Err(e) => editor.report_error(e),
+                if s.begin_pattern() {
+                    editor.commit_sketch();
+                } else {
+                    editor.set_status("Select the sketch geometry to repeat, then Pattern");
+                }
+            }
+        }
+        Command::SketchPatternUpdate => {
+            if let Mode::Sketch(s) = &mut editor.mode {
+                s.update_pattern();
+                editor.commit_sketch();
+            }
+        }
+        Command::SketchPatternFinish(keep) => {
+            if let Mode::Sketch(s) = &mut editor.mode {
+                let created = s.finish_pattern(keep);
+                editor.commit_sketch();
+                match created {
+                    Some(n) => editor.set_status(format!("Pattern added {n} entities")),
+                    None => editor.set_status("Pattern cancelled"),
                 }
             }
         }
@@ -244,6 +272,13 @@ fn run(editor: &mut Editor, c: Command) {
             if let Mode::Sketch(s) = &mut editor.mode {
                 s.toggle_construction();
                 editor.commit_sketch();
+            }
+        }
+        Command::SketchMoveBegin => {
+            if let Mode::Sketch(s) = &mut editor.mode
+                && !s.begin_move()
+            {
+                editor.set_status("Select the sketch geometry to move first");
             }
         }
         Command::SketchCommit => {
@@ -478,28 +513,45 @@ fn sketch_toolbar(s: &super::SketchEditor, ui: &mut egui::Ui, commands: &mut Vec
             }
         }
         ui.separator();
-        // Constraints live in the toolbar, as they do in Fusion: this is where the user
-        // looks after selecting something, and it is always in view, which the palette's
-        // lower reaches are not. The whole set is shown so the user can see what exists;
-        // only what the selection supports is enabled.
-        let applicable = s.applicable_constraints();
-        for name in super::SketchEditor::CONSTRAINT_NAMES {
-            let offered = applicable.iter().find(|(n, _)| *n == name);
-            let response = ui
-                .add_enabled(offered.is_some(), egui::Button::new(name))
-                .on_disabled_hover_text("Select the geometry this applies to");
-            if response.clicked()
-                && let Some((_, c)) = offered
-            {
-                commands.push(Command::SketchConstraint(c.clone()));
+        // Constraints are tools, like the shapes to their left: clicking one arms it and
+        // the picks that follow are what it acts on. They are always available, because
+        // a button that greys out until you have guessed what it wants teaches nobody
+        // what it does. Picking the geometry first still works — an armed tool applies
+        // at once to a selection that already suits it.
+        let armed = s.armed_constraint();
+        for kind in sketch_mode::ConstraintKind::ALL {
+            let ready = !s.constraints_for(kind, &s.selected).is_empty();
+            let response =
+                constraint_button(ui, kind, armed == Some(kind), ready).on_hover_ui(|ui| {
+                    ui.strong(kind.name());
+                    ui.label(kind.hint());
+                    if ready {
+                        ui.colored_label(LOOSE_LABEL, "The selection is ready for this");
+                    }
+                });
+            if response.clicked() {
+                commands.push(Command::SketchTool(SketchTool::Constrain(kind)));
             }
         }
         ui.separator();
-        let construction =
-            egui::Button::new("Construction (X)").selected(s.selection_is_construction());
+        // One button that reads its context, the way `X` does: with geometry selected it
+        // converts that geometry, and with nothing selected it arms the mode so the next
+        // shape is drawn as construction. Its lit state says which of those is true of
+        // what is in front of the user right now, and the palette carries the standing
+        // "the next shape is construction" note so an armed mode is never only implied.
+        let selection = !s.selected.is_empty();
+        let lit = if selection {
+            s.selection_is_construction()
+        } else {
+            s.construction
+        };
         if ui
-            .add_enabled(!s.selected.is_empty(), construction)
-            .on_hover_text("Toggle construction geometry on the selection")
+            .add(egui::Button::new("Construction (X)").selected(lit))
+            .on_hover_text(if selection {
+                "Make the selection construction geometry, or ordinary geometry again"
+            } else {
+                "Draw the next shape as construction (reference) geometry"
+            })
             .clicked()
         {
             commands.push(Command::SketchConstruction);
@@ -509,6 +561,33 @@ fn sketch_toolbar(s: &super::SketchEditor, ui: &mut egui::Ui, commands: &mut Vec
             .clicked()
         {
             commands.push(Command::SketchDelete);
+        }
+        // Move is the manipulator's only entry point: without a button the arrows in the
+        // viewport exist only for whoever already knows to press M.
+        if ui
+            .add_enabled(
+                !s.selected.is_empty() && !s.move_in_progress(),
+                egui::Button::new("Move"),
+            )
+            .on_hover_text("Move the selection: drag the arrows and ring, or type offsets (M)")
+            .on_disabled_hover_text("Select the geometry to move first")
+            .clicked()
+        {
+            commands.push(Command::SketchMoveBegin);
+        }
+        // A pattern is a tool with a preview, not a button that silently drops copies
+        // into the sketch: the copies appear at once and the palette holds the numbers
+        // and the OK, so what the numbers mean is visible while they are being changed.
+        if ui
+            .add_enabled(
+                !s.selected.is_empty() && !s.pattern_in_progress(),
+                egui::Button::new("Pattern"),
+            )
+            .on_hover_text("Repeat the selection; the copies preview as you set them up")
+            .on_disabled_hover_text("Select the geometry to repeat first")
+            .clicked()
+        {
+            commands.push(Command::SketchPattern);
         }
         ui.separator();
         if ui.button("✔ Finish Sketch").clicked() {
@@ -566,6 +645,61 @@ fn warning_summary(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Comman
     if response.clicked() {
         commands.push(Command::SelectFeature(*first));
     }
+}
+
+/// A constraint button: the symbol the viewport draws for this constraint, and its name.
+///
+/// The symbol is there so the toolbar and the badges on the drawing teach each other —
+/// they come from one definition, [`sketch_mode::kind_strokes`] — and the name is there
+/// because a row of bare symbols is only discoverable to someone who already knows them.
+/// A selection that would satisfy the constraint outlines the button, so the user can
+/// see which one is about to do something without hovering all eleven.
+fn constraint_button(
+    ui: &mut egui::Ui,
+    kind: sketch_mode::ConstraintKind,
+    armed: bool,
+    ready: bool,
+) -> egui::Response {
+    const GLYPH: f32 = 15.0;
+    let font = egui::FontId::proportional(13.0);
+    let galley = ui.painter().layout_no_wrap(
+        kind.name().to_owned(),
+        font,
+        ui.style().visuals.text_color(),
+    );
+    let size = egui::vec2(GLYPH + 6.0 + galley.size().x + 10.0, 24.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let visuals = ui.style().interact_selectable(&response, armed);
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        visuals.corner_radius,
+        visuals.weak_bg_fill,
+        if ready {
+            egui::Stroke::new(1.0, LOOSE_LABEL)
+        } else {
+            visuals.bg_stroke
+        },
+        egui::StrokeKind::Inside,
+    );
+    let stroke = egui::Stroke::new(1.5, visuals.fg_stroke.color);
+    let centre = egui::pos2(rect.left() + 5.0 + GLYPH * 0.5, rect.center().y);
+    let scale = GLYPH * 0.5;
+    for [a, b] in sketch_mode::kind_strokes(kind) {
+        // The glyph is defined in a frame spanning -1..1 with y upwards, as the viewport
+        // draws it; the painter's y runs the other way.
+        let to = |p: basset_math::Vec2| centre + egui::vec2(p.x as f32, -p.y as f32) * scale;
+        painter.line_segment([to(a), to(b)], stroke);
+    }
+    painter.galley(
+        egui::pos2(
+            rect.left() + 5.0 + GLYPH + 6.0,
+            rect.center().y - galley.size().y * 0.5,
+        ),
+        galley,
+        visuals.fg_stroke.color,
+    );
+    response
 }
 
 /// A tool button with its icon painted rather than typed: the default fonts have no
@@ -719,6 +853,15 @@ fn tool_icon(ui: &mut egui::Ui, tool: SketchTool, selected: bool) -> egui::Respo
             } else {
                 line(egui::pos2(l, y - 2.0), egui::pos2(l + 4.0, y - 2.0));
                 line(egui::pos2(l + 8.0, y + 2.0), egui::pos2(r, y + 2.0));
+            }
+        }
+        // Constraints have their own button, which carries the name as well; this arm
+        // exists so the icon of any tool can be drawn, and draws the same symbol.
+        SketchTool::Constrain(kind) => {
+            let scale = inner.width() * 0.5;
+            for [a, b] in sketch_mode::kind_strokes(kind) {
+                let to = |p: basset_math::Vec2| c + egui::vec2(p.x as f32, -p.y as f32) * scale;
+                line(to(a), to(b));
             }
         }
         SketchTool::Dimension => {
@@ -991,6 +1134,7 @@ fn sketch_palette(editor: &mut Editor, ui: &mut egui::Ui, commands: &mut Vec<Com
         return;
     };
     let mut centre_on_selection = false;
+    let mut pick_center: Option<bool> = None;
     // The palette is taller than the panel on an ordinary window, and without a scroll
     // area whatever overflowed was simply unreachable — which is how a sketch could end
     // up with no way to apply a constraint at all.
@@ -1028,7 +1172,23 @@ fn sketch_palette(editor: &mut Editor, ui: &mut egui::Ui, commands: &mut Vec<Com
         }
         ui.separator();
         ui.label(s.tool.name());
-        if s.tool == SketchTool::Select {
+        if let Some(kind) = s.armed_constraint() {
+            ui.label(egui::RichText::new(kind.hint()).weak());
+            let picked = s.constraint_picks().len();
+            if picked > 0 {
+                ui.colored_label(
+                    LOOSE_LABEL,
+                    format!("{picked} picked — it applies as soon as the picks are enough"),
+                );
+            }
+            ui.label(
+                egui::RichText::new(
+                    "Click a pick again to drop it, empty space to start over, Esc (or the \
+                     lit button) to put the tool down",
+                )
+                .weak(),
+            );
+        } else if s.tool == SketchTool::Select {
             ui.label(
                 egui::RichText::new(
                     "Click inside a closed region to select its curves. Drag geometry to move \
@@ -1057,6 +1217,12 @@ fn sketch_palette(editor: &mut Editor, ui: &mut egui::Ui, commands: &mut Vec<Com
                      moves to the next, Enter places the shape",
                 )
                 .weak(),
+            );
+        }
+        if s.construction {
+            ui.colored_label(
+                egui::Color32::from_rgb(200, 200, 150),
+                "Construction: the next shape is drawn as reference geometry",
             );
         }
         ui.separator();
@@ -1137,9 +1303,22 @@ fn sketch_palette(editor: &mut Editor, ui: &mut egui::Ui, commands: &mut Vec<Com
                     )
                     .changed();
             }
-            ui.label(
-                egui::RichText::new("Enter applies, Esc puts it back. Constraints still hold")
+            if let Some(why) = s.move_refused() {
+                ui.colored_label(egui::Color32::from_rgb(235, 190, 90), why);
+                ui.label(
+                    egui::RichText::new(
+                        "The geometry is left where it was. Delete or relax what is \
+                         holding it, or move it a way the constraints allow",
+                    )
                     .weak(),
+                );
+            }
+            ui.label(
+                egui::RichText::new(
+                    "Drag the arrows and the ring in the viewport, or type here. Enter \
+                     applies, Esc puts it back. Constraints still hold",
+                )
+                .weak(),
             );
             ui.horizontal(|ui| {
                 if ui.button("Apply").clicked() {
@@ -1153,72 +1332,188 @@ fn sketch_palette(editor: &mut Editor, ui: &mut egui::Ui, commands: &mut Vec<Com
                 commands.push(Command::SketchMoveUpdate);
             }
         }
-        ui.separator();
-        egui::CollapsingHeader::new("Pattern")
-            .default_open(false)
-            .show(ui, |ui| {
-                let p = &mut s.pattern;
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut p.circular, false, "Rectangular");
-                    ui.selectable_value(&mut p.circular, true, "Circular");
-                });
-                if p.circular {
-                    ui.add(egui::Slider::new(&mut p.count, 2..=64).text("instances"));
-                    ui.add(
+        if s.pattern_in_progress() {
+            ui.separator();
+            ui.label("Pattern");
+            let mut changed = false;
+            let p = &mut s.pattern;
+            ui.horizontal(|ui| {
+                changed |= ui
+                    .selectable_value(&mut p.circular, false, "Rectangular")
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut p.circular, true, "Circular")
+                    .changed();
+            });
+            if p.circular {
+                changed |= ui
+                    .add(egui::Slider::new(&mut p.count, 2..=64).text("instances"))
+                    .changed();
+                changed |= ui
+                    .add(
                         egui::DragValue::new(&mut p.angle_deg)
                             .speed(1.0)
                             .range(-360.0..=360.0)
-                            .suffix("° total"),
-                    );
-                    ui.horizontal(|ui| {
-                        ui.add(
+                            .prefix("through ")
+                            .suffix("\u{b0}"),
+                    )
+                    .changed();
+                ui.label(egui::RichText::new("Centre").weak());
+                ui.horizontal(|ui| {
+                    changed |= ui
+                        .add(
                             egui::DragValue::new(&mut p.center.x)
                                 .speed(0.5)
-                                .prefix("x "),
-                        );
-                        ui.add(
+                                .prefix("x ")
+                                .suffix(" mm"),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
                             egui::DragValue::new(&mut p.center.y)
                                 .speed(0.5)
-                                .prefix("y "),
-                        );
-                    });
-                    if ui.button("Centre on selection").clicked() {
+                                .prefix("y ")
+                                .suffix(" mm"),
+                        )
+                        .changed();
+                });
+                ui.horizontal(|ui| {
+                    let picking = s.picking_pattern_center();
+                    if ui
+                        .add(egui::Button::new("Select origin").selected(picking))
+                        .on_hover_text(
+                            "Then click in the viewport: the centre snaps to an existing \
+                             point if there is one under the pointer",
+                        )
+                        .clicked()
+                    {
+                        pick_center = Some(!picking);
+                    }
+                    if ui
+                        .button("Centre on selection")
+                        .on_hover_text("Put the centre at the middle of what is being repeated")
+                        .clicked()
+                    {
                         centre_on_selection = true;
                     }
-                } else {
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::DragValue::new(&mut p.cols)
-                                .range(1..=64)
-                                .prefix("cols "),
-                        );
-                        ui.add(egui::DragValue::new(&mut p.dx).speed(0.5).prefix("dX "));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::DragValue::new(&mut p.rows)
-                                .range(1..=64)
-                                .prefix("rows "),
-                        );
-                        ui.add(egui::DragValue::new(&mut p.dy).speed(0.5).prefix("dY "));
-                    });
+                });
+                if s.picking_pattern_center() {
+                    ui.colored_label(LOOSE_LABEL, "Click the origin in the viewport");
                 }
-                let enabled = !s.selected.is_empty();
-                if ui
-                    .add_enabled(enabled, egui::Button::new("Repeat selection"))
-                    .on_disabled_hover_text("Select the geometry to repeat first")
-                    .clicked()
-                {
-                    commands.push(Command::SketchPattern);
+                ui.label(
+                    egui::RichText::new(
+                        "Counts include the original. A full turn spreads the instances \
+                         evenly all the way round; less than one puts the last one \
+                         exactly on the angle",
+                    )
+                    .weak(),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "The copies on screen are the pattern: OK keeps exactly what you \
+                         are looking at, Esc puts the sketch back",
+                    )
+                    .weak(),
+                );
+            } else {
+                // The count includes the seed, as Fusion's does, so "3" is what the user
+                // ends up looking at rather than what was added to what they drew.
+                ui.horizontal(|ui| {
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut p.count_x)
+                                .range(1..=64)
+                                .prefix("across "),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut p.distance_x)
+                                .speed(0.5)
+                                .prefix("dX ")
+                                .suffix(" mm"),
+                        )
+                        .changed();
+                });
+                ui.horizontal(|ui| {
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut p.count_y)
+                                .range(1..=64)
+                                .prefix("up "),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut p.distance_y)
+                                .speed(0.5)
+                                .prefix("dY ")
+                                .suffix(" mm"),
+                        )
+                        .changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Distance is");
+                    changed |= ui
+                        .selectable_value(
+                            &mut p.spacing,
+                            sketch_mode::Spacing::Between,
+                            "between copies",
+                        )
+                        .changed();
+                    changed |= ui
+                        .selectable_value(&mut p.spacing, sketch_mode::Spacing::Total, "in total")
+                        .changed();
+                });
+                ui.label(
+                    egui::RichText::new("Counts include the original; 1 means no copies that way")
+                        .weak(),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "The copies on screen are the pattern: OK keeps exactly what you \
+                         are looking at, Esc puts the sketch back",
+                    )
+                    .weak(),
+                );
+            }
+            match s.pattern_status() {
+                Some((_, Some(error))) => {
+                    ui.colored_label(egui::Color32::from_rgb(230, 120, 100), error)
+                }
+                Some((copies, None)) => ui.colored_label(
+                    LOOSE_LABEL,
+                    match copies {
+                        1 => "1 copy".to_string(),
+                        n => format!("{n} copies"),
+                    },
+                ),
+                None => ui.label(""),
+            };
+            ui.horizontal(|ui| {
+                if ui.button("OK").clicked() {
+                    commands.push(Command::SketchPatternFinish(true));
+                }
+                if ui.button("Cancel").clicked() {
+                    commands.push(Command::SketchPatternFinish(false));
                 }
             });
+            if changed {
+                commands.push(Command::SketchPatternUpdate);
+            }
+        }
         ui.separator();
         egui::CollapsingHeader::new("Parameters")
             .default_open(false)
             .show(ui, |ui| parameters_panel(s, ui, commands));
     });
+    if let Some(on) = pick_center {
+        s.pick_pattern_center(on);
+    }
     if centre_on_selection {
         s.pattern_center_from_selection();
+        s.pick_pattern_center(false);
+        commands.push(Command::SketchPatternUpdate);
     }
 }
 

@@ -6,6 +6,7 @@
 //! state every frame, so there is never a second copy of geometry to keep in sync.
 
 mod files;
+mod gizmo;
 mod panels;
 mod scene;
 mod selection;
@@ -577,8 +578,14 @@ impl Editor {
         match &mut self.mode {
             Mode::Sketch(s) => {
                 s.pointer_up(&ray, &self.camera, self.window_px, clicked, shift);
+                let refused = s.take_constraint_error();
                 if s.take_dirty() {
                     self.commit_sketch();
+                }
+                // A constraint the sketch would not take is the user's next move, not a
+                // log line: the tool stays armed and the reason is on screen.
+                if let Some(e) = refused {
+                    self.report_error(e);
                 }
             }
             Mode::Model if clicked => {
@@ -640,11 +647,19 @@ impl Editor {
     pub fn cancel(&mut self) {
         match &mut self.mode {
             Mode::Sketch(s) => {
-                if s.move_in_progress() {
+                // A modal operation is what Escape means while one is running, and the
+                // revert has to reach the document: the copies it takes back are in the
+                // feature by now, so anything downstream would keep showing them.
+                if s.pattern_in_progress() {
+                    s.finish_pattern(false);
+                    self.commit_sketch();
+                    self.set_status("Pattern cancelled");
+                } else if s.move_in_progress() {
                     s.finish_move(false);
                     self.commit_sketch();
-                } else if s.has_pending() {
+                } else if s.has_pending() || s.armed_constraint().is_some() {
                     s.cancel_current();
+                    s.select_tool();
                 } else {
                     s.select_tool();
                 }
@@ -663,6 +678,13 @@ impl Editor {
 
     pub fn confirm(&mut self) {
         if let Mode::Sketch(s) = &mut self.mode {
+            if let Some(copies) = s.pattern_in_progress().then(|| s.finish_pattern(true)) {
+                self.commit_sketch();
+                let n = copies.unwrap_or(0);
+                self.set_status(format!("Pattern added {n} entities"));
+                self.repaint = true;
+                return;
+            }
             if s.move_in_progress() {
                 s.finish_move(true);
                 self.commit_sketch();
@@ -711,6 +733,23 @@ impl Editor {
 
     pub fn undo(&mut self) {
         if let Mode::Sketch(s) = &mut self.mode {
+            // Undo, while a move or a pattern is being set up, means the thing being set
+            // up: putting it back is exactly what the user is asking to undo, and it is
+            // also the only safe answer, since neither operation has a checkpoint of its
+            // own and undoing past them would pop an unrelated one.
+            if s.modal() {
+                let was_pattern = s.pattern_in_progress();
+                s.finish_pattern(false);
+                s.finish_move(false);
+                self.commit_sketch();
+                self.set_status(if was_pattern {
+                    "Pattern cancelled"
+                } else {
+                    "Move cancelled"
+                });
+                self.repaint = true;
+                return;
+            }
             if s.undo() {
                 self.commit_sketch();
             }
@@ -728,6 +767,13 @@ impl Editor {
 
     pub fn redo(&mut self) {
         if let Mode::Sketch(s) = &mut self.mode {
+            // Redo has nothing to say about an operation still being set up; the move
+            // or pattern is what the numbers say, and changing them is how to change it.
+            if s.modal() {
+                self.set_status("Finish or cancel what you are doing first (Enter or Esc)");
+                self.repaint = true;
+                return;
+            }
             if s.redo() {
                 self.commit_sketch();
             }

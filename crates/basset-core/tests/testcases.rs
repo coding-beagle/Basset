@@ -115,3 +115,120 @@ fn a_bar_whose_dividers_nearly_touch_still_traces_every_compartment() {
         assert!(solved.report.degrees_of_freedom > 0, "and it is loose");
     }
 }
+
+/// A battery holder: a 1 mm base plate, walls joined onto it, a boss, and a pocket cut
+/// into the boss's top face. Exported to 3MF it made the slicer report "Error 330
+/// non-manifold edges", and the file was faithful — the body really was full of cracks.
+///
+/// Three things made them, and this file walks through all three, so it checks the body
+/// after every feature rather than only at the end:
+///
+/// * the BSP splitter counted a vertex as lying on a plane only within 1e-7, so a vertex
+///   between that and the merge tolerance made its edge "spanning" and the split point
+///   invented on that edge landed a hair from the vertex itself;
+/// * healing then split neighbouring edges at that near-duplicate, adding a zero-area
+///   spur out to a point the merge tolerance calls the edge's own start, and each later
+///   boolean interpolated from the mess and drifted further;
+/// * tessellation fanned each polygon from its first vertex and dropped the zero-area
+///   triangles that fan produces at healed T-junctions, which put holes in the mesh even
+///   where the solid underneath was sound.
+#[test]
+fn a_joined_and_pocketed_body_exports_as_a_closed_manifold_mesh() {
+    let mut doc = open("ExportAs3MFCreatesBadGeometry.bass");
+    for cursor in 1..=5 {
+        doc.set_cursor(cursor);
+        for body in doc.state().bodies.values() {
+            body.solid
+                .validate()
+                .unwrap_or_else(|e| panic!("after feature {cursor}, body '{}': {e}", body.name));
+
+            // What the exporter and the slicer see. Every triangle edge must be walked
+            // once each way; anything else is the non-manifold edge the user hit.
+            let mesh = body.solid.tessellate().mesh;
+            let polygon_triangles: usize = body
+                .solid
+                .faces
+                .iter()
+                .flat_map(|f| f.polygons.iter())
+                .map(|p| p.vertices.len() - 2)
+                .sum();
+            assert_eq!(
+                mesh.triangle_count(),
+                polygon_triangles,
+                "after feature {cursor}: tessellation dropped a triangle"
+            );
+            let (unpaired, non_manifold) = bad_mesh_edges(&mesh);
+            assert_eq!(
+                unpaired, 0,
+                "after feature {cursor}, body '{}': the shell leaks",
+                body.name
+            );
+            // An edge shared by four triangles is where two parts of the shell pinch
+            // together along a line. It is watertight and still unprintable, and it is
+            // the half of "Error 330" that a volume or a closedness check will not see.
+            assert_eq!(
+                non_manifold, 0,
+                "after feature {cursor}, body '{}': edges shared by other than two triangles",
+                body.name
+            );
+            assert!(mesh.signed_volume() > 0.0, "and it is wound outward");
+        }
+    }
+}
+
+/// Counts (edges not paired with an opposite-direction twin, edges not used by exactly
+/// two triangles), by welded vertex — which is how a 3MF exporter and a slicer decide
+/// that two triangles share an edge.
+fn bad_mesh_edges(mesh: &basset_math::TriMesh) -> (usize, usize) {
+    use std::collections::HashMap;
+    const WELD: f64 = basset_kernel::solid::MERGE_TOL;
+
+    let mut points: Vec<basset_math::Vec3> = Vec::new();
+    let mut cells: HashMap<(i64, i64, i64), Vec<u32>> = HashMap::new();
+    let mut id = |p: basset_math::Vec3, points: &mut Vec<basset_math::Vec3>| -> u32 {
+        let cell = |x: f64| (x / (2.0 * WELD)).floor() as i64;
+        let c = (cell(p.x), cell(p.y), cell(p.z));
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    for &i in cells
+                        .get(&(c.0 + dx, c.1 + dy, c.2 + dz))
+                        .into_iter()
+                        .flatten()
+                    {
+                        if points[i as usize].distance(p) <= WELD {
+                            return i;
+                        }
+                    }
+                }
+            }
+        }
+        points.push(p);
+        let i = (points.len() - 1) as u32;
+        cells.entry(c).or_default().push(i);
+        i
+    };
+
+    let mut directed: HashMap<(u32, u32), i32> = HashMap::new();
+    let mut users: HashMap<(u32, u32), usize> = HashMap::new();
+    for t in 0..mesh.triangle_count() {
+        let ids: Vec<u32> = mesh
+            .triangle(t)
+            .iter()
+            .map(|v| id(*v, &mut points))
+            .collect();
+        for i in 0..3 {
+            let (a, b) = (ids[i], ids[(i + 1) % 3]);
+            if a == b {
+                continue;
+            }
+            let (k, s) = if a < b { ((a, b), 1) } else { ((b, a), -1) };
+            *directed.entry(k).or_default() += s;
+            *users.entry(k).or_default() += 1;
+        }
+    }
+    (
+        directed.values().filter(|c| **c != 0).count(),
+        users.values().filter(|n| **n != 2).count(),
+    )
+}

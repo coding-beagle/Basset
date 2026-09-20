@@ -14,7 +14,7 @@
 use basset_math::Vec3;
 
 use crate::error::KernelError;
-use crate::solid::{Face, Polygon, Solid, SurfaceKind};
+use crate::solid::{Face, MERGE_TOL, Polygon, Solid, SurfaceKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoolOp {
@@ -24,7 +24,13 @@ pub enum BoolOp {
 }
 
 /// Distance from a plane below which a vertex counts as lying on it.
-const EPSILON: f64 = 1e-7;
+///
+/// This is the merge tolerance, and it has to be: a vertex further from the plane than
+/// this but closer than [`MERGE_TOL`] would make its edge "spanning", and the split point
+/// manufactured on that edge would land within the merge tolerance of the vertex itself.
+/// That near-duplicate is what a later split drags further out of place, and it is what
+/// leaves the shell with slivers and holes no amount of healing can pair up.
+const EPSILON: f64 = MERGE_TOL;
 
 pub fn boolean(a: &Solid, b: &Solid, op: BoolOp) -> Result<Solid, KernelError> {
     let sources = [a, b];
@@ -422,6 +428,36 @@ mod tests {
     use approx::assert_relative_eq;
     use basset_math::Vec3;
 
+    /// The splitter's "on the plane" tolerance is the merge tolerance, and has to be.
+    /// A vertex further off than this but closer than `MERGE_TOL` used to make its edge
+    /// spanning, and the crossing point invented on that edge landed within the merge
+    /// tolerance of the vertex: a near-duplicate that every later split drags further out
+    /// of place, until the shell has a crack the healer cannot close.
+    #[test]
+    fn a_vertex_inside_the_merge_tolerance_of_a_plane_does_not_split_its_edge() {
+        let v = |x: f64, y: f64| Vec3::new(x, y, 0.0);
+        // A triangle with one corner half a merge tolerance past the plane x = 0.
+        let poly = CsgPolygon {
+            vertices: vec![v(-0.5 * MERGE_TOL, 0.0), v(1.0, 0.0), v(1.0, 1.0)],
+            normal: Vec3::Z,
+            w: 0.0,
+            source: (0, 0),
+            flipped: false,
+        };
+        let plane = SplitPlane {
+            normal: Vec3::X,
+            w: 0.0,
+        };
+        let (mut cf, mut cb, mut front, mut back) = (vec![], vec![], vec![], vec![]);
+        plane.split(&poly, &mut cf, &mut cb, &mut front, &mut back);
+        assert_eq!(back.len(), 0, "no sliver behind the plane");
+        assert_eq!(front.len(), 1);
+        assert_eq!(
+            front[0].vertices, poly.vertices,
+            "the triangle came through untouched"
+        );
+    }
+
     fn cube(op: u64, min: Vec3, size: f64) -> Solid {
         cuboid(OpId::new(op), min, min + Vec3::splat(size))
     }
@@ -507,15 +543,19 @@ mod tests {
     fn union_survives_a_face_polygon_that_misses_its_own_plane() {
         let mut a = cube(1, Vec3::ZERO, 2.0);
         let b = cube(2, Vec3::splat(1.0), 2.0);
-        // Nudge one vertex of every polygon off its face by less than MERGE_TOL, which is
-        // what healing is entitled to leave behind.
+        // Nudge one vertex of every polygon off its face, far enough that the splitter
+        // does not write it off as coplanar: the case where a polygon is not flat and the
+        // tree has to cope anyway.
+        let nudge = 2.0 * EPSILON;
         for f in &mut a.faces {
             for p in &mut f.polygons {
-                p.vertices[0] += p.plane.normal * (2.0 * EPSILON);
+                p.vertices[0] += p.plane.normal * nudge;
             }
         }
         let u = boolean(&a, &b, BoolOp::Union).unwrap();
-        assert_relative_eq!(u.volume(), 8.0 + 8.0 - 1.0, epsilon = 1e-5);
+        // Moving corners outward adds a little real volume; the tolerance tracks the
+        // nudge rather than being a fixed number that quietly stops meaning anything.
+        assert_relative_eq!(u.volume(), 8.0 + 8.0 - 1.0, epsilon = 8.0 * nudge);
     }
 
     #[test]

@@ -6,6 +6,12 @@
 //! constrained as the original, so dragging one corner of a copy deforms it exactly as
 //! it would deform the seed.
 //!
+//! A turned copy keeps every constraint that still describes it. Horizontal and Vertical
+//! are the exception, because they are statements about the sketch's axes rather than
+//! about the shape: a quarter turn swaps them, a half turn keeps them, and any other
+//! angle leaves them unsayable, so they are dropped and the copy is honestly loose
+//! rather than dishonestly crushed. See [`turned`].
+//!
 //! Copies are not linked back to the seed. Fusion's sketch patterns are; ours would need
 //! a pattern entity in the sketch to re-generate from, and until that exists a pattern
 //! that silently broke its copies when the seed moved would be worse than one that is
@@ -138,6 +144,67 @@ fn closure(sketch: &Sketch, seed: &[EntityId]) -> Result<Vec<EntityId>, SketchEr
     Ok(points)
 }
 
+/// A constraint as it applies to a copy turned through `rotate`, or `None` when it
+/// cannot be expressed there at all.
+///
+/// Horizontal and Vertical are statements about the sketch's axes, not about the shape,
+/// and a copy turned through a quarter of a turn has them the other way round. Copying
+/// them unchanged does not merely mis-describe the copy — it contradicts it, and the
+/// solver resolves the contradiction by folding the copy flat, which is what made a
+/// circular pattern of anything drawn square destroy its own copies. A turn that is not
+/// a multiple of a right angle has no axis-aligned answer at all, so those constraints
+/// are dropped: the copy is then free where the seed was pinned, which is visible in the
+/// blue and is a great deal better than a copy crushed to a point.
+fn turned(c: crate::Constraint, rotate: f64) -> Option<crate::Constraint> {
+    use crate::Constraint as C;
+    // Quarter turns from the rotation, as a whole number: 0 keeps the axes, 2 keeps them
+    // reversed, 1 and 3 swap them, and anything in between keeps neither.
+    let quarters = rotate / std::f64::consts::FRAC_PI_2;
+    let whole = quarters.round();
+    let axes_survive = (quarters - whole).abs() * std::f64::consts::FRAC_PI_2 <= ANGULAR_TOL;
+    if !axes_survive {
+        return match c {
+            C::Horizontal(_)
+            | C::Vertical(_)
+            | C::HorizontalDistance { .. }
+            | C::VerticalDistance { .. } => None,
+            other => Some(other),
+        };
+    }
+    let quarter = (whole as i64).rem_euclid(4);
+    // The turn maps (dx, dy) to (-dy, dx) each quarter, so a half turn negates both and
+    // the odd quarters swap the axes with one sign flipped.
+    Some(match (quarter, c) {
+        (0, other) => other,
+        (2, C::HorizontalDistance { a, b, value }) => C::HorizontalDistance {
+            a,
+            b,
+            value: -value,
+        },
+        (2, C::VerticalDistance { a, b, value }) => C::VerticalDistance {
+            a,
+            b,
+            value: -value,
+        },
+        (2, other) => other,
+        (_, C::Horizontal(l)) => C::Vertical(l),
+        (_, C::Vertical(l)) => C::Horizontal(l),
+        (1, C::HorizontalDistance { a, b, value }) => C::VerticalDistance { a, b, value },
+        (1, C::VerticalDistance { a, b, value }) => C::HorizontalDistance {
+            a,
+            b,
+            value: -value,
+        },
+        (_, C::HorizontalDistance { a, b, value }) => C::VerticalDistance {
+            a,
+            b,
+            value: -value,
+        },
+        (_, C::VerticalDistance { a, b, value }) => C::HorizontalDistance { a, b, value },
+        (_, other) => other,
+    })
+}
+
 fn copy_once(
     sketch: &mut Sketch,
     set: &[EntityId],
@@ -177,7 +244,10 @@ fn copy_once(
         .filter(|(_, c)| c.references().iter().all(|r| map.contains_key(r)))
         .map(|(_, c)| c.clone())
         .collect();
-    for mut c in inherited {
+    for c in inherited {
+        let Some(mut c) = turned(c, placement.rotate) else {
+            continue;
+        };
         for (from, to) in &map {
             c.retarget(*from, *to);
         }

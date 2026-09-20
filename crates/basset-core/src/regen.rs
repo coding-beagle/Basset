@@ -597,7 +597,7 @@ fn convert_contour(c: &basset_sketch::Contour) -> kernel::Contour {
     }
 }
 
-pub(crate) fn convert_profile(frame: &Frame, p: &basset_sketch::Profile) -> Profile {
+pub fn convert_profile(frame: &Frame, p: &basset_sketch::Profile) -> Profile {
     Profile {
         frame: *frame,
         outer: convert_contour(&p.outer),

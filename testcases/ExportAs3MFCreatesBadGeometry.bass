@@ -1,0 +1,974 @@
+{
+  "format_version": 2,
+  "generator": "basset 0.1.0",
+  "document": {
+    "name": "BatteryHolder",
+    "timeline": {
+      "cursor": 5,
+      "features": [
+        {
+          "id": 1,
+          "kind": {
+            "Sketch": {
+              "component": 0,
+              "plane": {
+                "Origin": "XY"
+              },
+              "sketch": {
+                "constraints": [
+                  {
+                    "value": null,
+                    "version": 0
+                  },
+                  {
+                    "value": {
+                      "Horizontal": {
+                        "idx": 5,
+                        "version": 1
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "Vertical": {
+                        "idx": 6,
+                        "version": 1
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "Horizontal": {
+                        "idx": 7,
+                        "version": 1
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "Vertical": {
+                        "idx": 8,
+                        "version": 1
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "Midpoint": {
+                        "line": {
+                          "idx": 10,
+                          "version": 1
+                        },
+                        "point": {
+                          "idx": 9,
+                          "version": 1
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "Midpoint": {
+                        "line": {
+                          "idx": 11,
+                          "version": 1
+                        },
+                        "point": {
+                          "idx": 9,
+                          "version": 1
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "Distance": {
+                        "a": {
+                          "idx": 1,
+                          "version": 1
+                        },
+                        "b": {
+                          "idx": 2,
+                          "version": 1
+                        },
+                        "value": 82.0
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "Distance": {
+                        "a": {
+                          "idx": 2,
+                          "version": 1
+                        },
+                        "b": {
+                          "idx": 3,
+                          "version": 1
+                        },
+                        "value": 16.0
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "Horizontal": {
+                        "idx": 32,
+                        "version": 1
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "Vertical": {
+                        "idx": 33,
+                        "version": 1
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "Horizontal": {
+                        "idx": 34,
+                        "version": 1
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "Vertical": {
+                        "idx": 35,
+                        "version": 1
+                      }
+                    },
+                    "version": 1
+                  }
+                ],
+                "dimension_exprs": [
+                  {
+                    "value": null,
+                    "version": 0
+                  }
+                ],
+                "entities": [
+                  {
+                    "value": null,
+                    "version": 0
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Point": {
+                          "pos": [
+                            -40.99999999999965,
+                            -8.00000000000013
+                          ]
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Point": {
+                          "pos": [
+                            41.000000000000355,
+                            -8.00000000000013
+                          ]
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Point": {
+                          "pos": [
+                            41.000000000000355,
+                            7.99999999999987
+                          ]
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Point": {
+                          "pos": [
+                            -40.99999999999965,
+                            7.99999999999987
+                          ]
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Line": {
+                          "end": {
+                            "idx": 2,
+                            "version": 1
+                          },
+                          "start": {
+                            "idx": 1,
+                            "version": 1
+                          }
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Line": {
+                          "end": {
+                            "idx": 3,
+                            "version": 1
+                          },
+                          "start": {
+                            "idx": 2,
+                            "version": 1
+                          }
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Line": {
+                          "end": {
+                            "idx": 4,
+                            "version": 1
+                          },
+                          "start": {
+                            "idx": 3,
+                            "version": 1
+                          }
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Line": {
+                          "end": {
+                            "idx": 1,
+                            "version": 1
+                          },
+                          "start": {
+                            "idx": 4,
+                            "version": 1
+                          }
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": true,
+                      "entity": {
+                        "Point": {
+                          "pos": [
+                            3.517186542012496e-13,
+                            -1.2967404927621828e-13
+                          ]
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": true,
+                      "entity": {
+                        "Line": {
+                          "end": {
+                            "idx": 3,
+                            "version": 1
+                          },
+                          "start": {
+                            "idx": 1,
+                            "version": 1
+                          }
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": true,
+                      "entity": {
+                        "Line": {
+                          "end": {
+                            "idx": 4,
+                            "version": 1
+                          },
+                          "start": {
+                            "idx": 2,
+                            "version": 1
+                          }
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Point": {
+                          "pos": [
+                            -34.999999999999886,
+                            8.000000105050946
+                          ]
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Line": {
+                          "end": {
+                            "idx": 12,
+                            "version": 1
+                          },
+                          "start": {
+                            "idx": 4,
+                            "version": 1
+                          }
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Point": {
+                          "pos": [
+                            -35.000000105050944,
+                            -7.99999999999989
+                          ]
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Line": {
+                          "end": {
+                            "idx": 14,
+                            "version": 1
+                          },
+                          "start": {
+                            "idx": 12,
+                            "version": 1
+                          }
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Point": {
+                          "pos": [
+                            35.00000000000022,
+                            7.9999997898905395
+                          ]
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Line": {
+                          "end": {
+                            "idx": 16,
+                            "version": 1
+                          },
+                          "start": {
+                            "idx": 3,
+                            "version": 1
+                          }
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Point": {
+                          "pos": [
+                            35.00000000000011,
+                            -8.000000315160406
+                          ]
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Line": {
+                          "end": {
+                            "idx": 18,
+                            "version": 1
+                          },
+                          "start": {
+                            "idx": 16,
+                            "version": 1
+                          }
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Point": {
+                          "pos": [
+                            36.999999579796224,
+                            5.999999789897668
+                          ]
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Circle": {
+                          "center": {
+                            "idx": 20,
+                            "version": 1
+                          },
+                          "radius": 1.0
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Point": {
+                          "pos": [
+                            37.0,
+                            -5.999999789897888
+                          ]
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Circle": {
+                          "center": {
+                            "idx": 22,
+                            "version": 1
+                          },
+                          "radius": 1.0
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Point": {
+                          "pos": [
+                            -37.000000000000114,
+                            6.000000105050946
+                          ]
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Circle": {
+                          "center": {
+                            "idx": 24,
+                            "version": 1
+                          },
+                          "radius": 1.0
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Point": {
+                          "pos": [
+                            -37.00000000000022,
+                            -6.00000000000022
+                          ]
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Circle": {
+                          "center": {
+                            "idx": 26,
+                            "version": 1
+                          },
+                          "radius": 1.0
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Point": {
+                          "pos": [
+                            -33.0,
+                            -7.999999789890318
+                          ]
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Point": {
+                          "pos": [
+                            33.0,
+                            -7.999999789890318
+                          ]
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Point": {
+                          "pos": [
+                            33.0,
+                            7.999999789890318
+                          ]
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Point": {
+                          "pos": [
+                            -33.0,
+                            7.999999789890318
+                          ]
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Line": {
+                          "end": {
+                            "idx": 29,
+                            "version": 1
+                          },
+                          "start": {
+                            "idx": 28,
+                            "version": 1
+                          }
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Line": {
+                          "end": {
+                            "idx": 30,
+                            "version": 1
+                          },
+                          "start": {
+                            "idx": 29,
+                            "version": 1
+                          }
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Line": {
+                          "end": {
+                            "idx": 31,
+                            "version": 1
+                          },
+                          "start": {
+                            "idx": 30,
+                            "version": 1
+                          }
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Line": {
+                          "end": {
+                            "idx": 28,
+                            "version": 1
+                          },
+                          "start": {
+                            "idx": 31,
+                            "version": 1
+                          }
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Line": {
+                          "end": {
+                            "idx": 1,
+                            "version": 1
+                          },
+                          "start": {
+                            "idx": 4,
+                            "version": 1
+                          }
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Line": {
+                          "end": {
+                            "idx": 2,
+                            "version": 1
+                          },
+                          "start": {
+                            "idx": 3,
+                            "version": 1
+                          }
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Line": {
+                          "end": {
+                            "idx": 2,
+                            "version": 1
+                          },
+                          "start": {
+                            "idx": 18,
+                            "version": 1
+                          }
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Line": {
+                          "end": {
+                            "idx": 1,
+                            "version": 1
+                          },
+                          "start": {
+                            "idx": 14,
+                            "version": 1
+                          }
+                        }
+                      }
+                    },
+                    "version": 1
+                  }
+                ],
+                "labels": [
+                  {
+                    "value": null,
+                    "version": 0
+                  },
+                  {
+                    "value": null,
+                    "version": 0
+                  },
+                  {
+                    "value": null,
+                    "version": 0
+                  },
+                  {
+                    "value": null,
+                    "version": 0
+                  },
+                  {
+                    "value": null,
+                    "version": 0
+                  },
+                  {
+                    "value": null,
+                    "version": 0
+                  },
+                  {
+                    "value": null,
+                    "version": 0
+                  },
+                  {
+                    "value": [
+                      -1.2423480779033405,
+                      -13.20430649971825
+                    ],
+                    "version": 1
+                  }
+                ],
+                "parameters": []
+              }
+            }
+          },
+          "name": "Sketch1",
+          "suppressed": false
+        },
+        {
+          "id": 2,
+          "kind": {
+            "Extrude": {
+              "component": 0,
+              "extent": {
+                "TwoSides": {
+                  "negative": -1.0,
+                  "positive": 1.0
+                }
+              },
+              "operation": "NewBody",
+              "regions": [
+                {
+                  "Profile": {
+                    "sample": [
+                      36.234397,
+                      0.282401
+                    ],
+                    "sketch": 1
+                  }
+                },
+                {
+                  "Profile": {
+                    "sample": [
+                      -35.442124,
+                      -0.84869
+                    ],
+                    "sketch": 1
+                  }
+                }
+              ]
+            }
+          },
+          "name": "Extrude2",
+          "suppressed": false
+        },
+        {
+          "id": 3,
+          "kind": {
+            "Extrude": {
+              "component": 0,
+              "extent": {
+                "TwoSides": {
+                  "negative": 1.0,
+                  "positive": 10.0
+                }
+              },
+              "operation": {
+                "Join": 2
+              },
+              "regions": [
+                {
+                  "Profile": {
+                    "sample": [
+                      -34.426696,
+                      0.828129
+                    ],
+                    "sketch": 1
+                  }
+                },
+                {
+                  "Profile": {
+                    "sample": [
+                      33.243525,
+                      -2.798243
+                    ],
+                    "sketch": 1
+                  }
+                }
+              ]
+            }
+          },
+          "name": "Extrude3",
+          "suppressed": false
+        },
+        {
+          "id": 4,
+          "kind": {
+            "Extrude": {
+              "component": 0,
+              "extent": {
+                "OneSide": 10.0
+              },
+              "operation": {
+                "Join": 2
+              },
+              "regions": [
+                {
+                  "Profile": {
+                    "sample": [
+                      -20.410779,
+                      1.008409
+                    ],
+                    "sketch": 1
+                  }
+                }
+              ]
+            }
+          },
+          "name": "Extrude4",
+          "suppressed": false
+        },
+        {
+          "id": 5,
+          "kind": {
+            "Extrude": {
+              "component": 0,
+              "extent": {
+                "OneSide": -8.0
+              },
+              "operation": {
+                "Cut": 2
+              },
+              "regions": [
+                {
+                  "Face": {
+                    "body": 2,
+                    "key": {
+                      "op": {
+                        "feature": 4,
+                        "sub": 0
+                      },
+                      "role": "StartCap"
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          "name": "Extrude5",
+          "suppressed": false
+        }
+      ],
+      "next_id": 6
+    },
+    "units": "Millimeters"
+  }
+}

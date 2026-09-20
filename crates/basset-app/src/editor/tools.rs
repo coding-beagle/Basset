@@ -258,9 +258,19 @@ impl Tool {
                     p.rotate_deg.y.to_radians(),
                     p.rotate_deg.z.to_radians(),
                 );
+                // The rotation turns the body about itself, not about the world origin.
+                // A body 200 mm out would otherwise swing across the screen for a few
+                // degrees typed, and the manipulator's rings — drawn on the body —
+                // would be promising something quite different from what they do. The
+                // pivot comes from the body as it was before this feature, so it stays
+                // put while the parameters are being changed.
+                let aabb = editor.pick_body(body)?.solid.aabb();
+                let pivot = (aabb.min + aabb.max) * 0.5;
                 FeatureKind::Move {
                     body,
-                    transform: Affine3::from_rotation_translation(rot, p.translate),
+                    transform: Affine3::from_translation(pivot + p.translate)
+                        * Affine3::from_quat(rot)
+                        * Affine3::from_translation(-pivot),
                 }
             }
             ToolKind::OffsetPlane => FeatureKind::OffsetPlane {

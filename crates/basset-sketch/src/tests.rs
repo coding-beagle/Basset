@@ -1324,6 +1324,30 @@ fn hit_test_orders_nearest_first_and_prefers_points() {
     );
 }
 
+/// A point sitting on a curve is the target the user is aiming at, and it is the one a
+/// plain nearest-first test never gives them: the cursor is exactly on the line and only
+/// nearly on the point. The bias is what makes an endpoint clickable at all.
+#[test]
+fn a_point_beats_the_curve_running_through_it() {
+    let mut s = Sketch::new();
+    let r = shapes::rectangle_two_point(&mut s, v(0.0, 0.0), v(10.0, 5.0));
+    // Exactly on the bottom edge and a little short of the corner: the edge is zero away
+    // and the corner is not, yet the corner is what was meant.
+    let hits = s.hit_test(v(0.4, 0.0), 1.0);
+    assert_eq!(
+        hits[0].entity, r.corners[0],
+        "a corner just off the pointer wins over the line under it"
+    );
+    assert_relative_eq!(hits[0].distance, 0.4);
+    // Far enough along the line and the honest distance takes over again, so clicking
+    // the middle of an edge still means the edge.
+    assert_eq!(
+        s.hit_test(v(5.0, 0.0), 1.0)[0].entity,
+        r.lines[0],
+        "out along the line the line wins"
+    );
+}
+
 #[test]
 fn hit_test_rect_window_vs_crossing() {
     let mut s = Sketch::new();
@@ -1792,4 +1816,92 @@ fn the_trim_preview_of_a_circle_wraps_around_its_start() {
         crate::edit::trim_preview(&s, circle, v(0.0, -5.0), &Tessellation::default()).unwrap();
     assert!(wrapping.iter().any(|p| p.x > 4.9), "passes the start angle");
     assert!(wrapping.iter().any(|p| p.y < -4.9));
+}
+
+/// A turned copy must not inherit the seed's idea of which way is up.
+///
+/// Horizontal and Vertical describe the sketch's axes, not the shape, so a copy turned a
+/// quarter of a turn has them the other way round. Copying them unchanged contradicts
+/// the copy outright, and the solver settles the contradiction by folding it flat — the
+/// reason a circular pattern of anything drawn square used to destroy its own copies.
+#[test]
+fn a_rotated_copy_does_not_inherit_the_seed_s_axes() {
+    let mut s = Sketch::new();
+    let r = shapes::rectangle_two_point(&mut s, v(20.0, 0.0), v(25.0, 5.0));
+    let seed: Vec<EntityId> = r.lines.to_vec();
+    let area = |s: &Sketch| {
+        s.profiles(&tess())
+            .iter()
+            .map(|p| p.area())
+            .collect::<Vec<_>>()
+    };
+    let seed_area = area(&s)[0];
+    assert!(seed_area > 0.0);
+
+    crate::pattern::circular(&mut s, &seed, Vec2::ZERO, 4, std::f64::consts::TAU).unwrap();
+    s.solve().expect("a pattern of a square is solvable");
+    let areas = area(&s);
+    assert_eq!(areas.len(), 4, "four squares, none folded away");
+    for a in &areas {
+        assert_relative_eq!(*a, seed_area, epsilon = 1e-9);
+    }
+}
+
+/// A quarter turn swaps the axes rather than dropping them, so a copy turned that far is
+/// as constrained as the seed — just about the other axis.
+#[test]
+fn a_quarter_turn_swaps_horizontal_for_vertical() {
+    let mut s = Sketch::new();
+    let a = s.add_point(v(10.0, 0.0));
+    let b = s.add_point(v(20.0, 0.0));
+    let line = s.add_line(a, b).unwrap();
+    s.add_constraint(Constraint::Horizontal(line)).unwrap();
+
+    crate::pattern::circular(&mut s, &[line], Vec2::ZERO, 4, std::f64::consts::TAU).unwrap();
+    s.solve().unwrap();
+    let verticals = s
+        .constraints()
+        .filter(|(_, c)| matches!(c, Constraint::Vertical(_)))
+        .count();
+    let horizontals = s
+        .constraints()
+        .filter(|(_, c)| matches!(c, Constraint::Horizontal(_)))
+        .count();
+    assert_eq!(verticals, 2, "the quarter and three-quarter turns");
+    assert_eq!(horizontals, 2, "the seed and the half turn");
+}
+
+/// A turn that is not a multiple of a right angle has no axis-aligned answer, so the
+/// axis constraints are dropped and the copy is honestly loose rather than crushed.
+#[test]
+fn an_odd_turn_drops_the_axis_constraints() {
+    let mut s = Sketch::new();
+    let a = s.add_point(v(10.0, 0.0));
+    let b = s.add_point(v(20.0, 0.0));
+    let line = s.add_line(a, b).unwrap();
+    s.add_constraint(Constraint::Horizontal(line)).unwrap();
+    s.add_constraint(Constraint::Distance { a, b, value: 10.0 })
+        .unwrap();
+
+    crate::pattern::circular(&mut s, &[line], Vec2::ZERO, 3, std::f64::consts::TAU).unwrap();
+    s.solve().unwrap();
+    assert_eq!(
+        s.constraints()
+            .filter(|(_, c)| matches!(c, Constraint::Horizontal(_)))
+            .count(),
+        1,
+        "only the seed keeps it"
+    );
+    // The length is about the shape, not about the axes, so every copy keeps it and is
+    // still the right size.
+    assert_eq!(
+        s.constraints()
+            .filter(|(_, c)| matches!(c, Constraint::Distance { .. }))
+            .count(),
+        3
+    );
+    for (id, _) in s.entities().filter(|(_, d)| d.entity.is_line()) {
+        let (p, q) = s.curve_endpoints(id).unwrap();
+        assert_relative_eq!(p.distance(q), 10.0, epsilon = 1e-9);
+    }
 }

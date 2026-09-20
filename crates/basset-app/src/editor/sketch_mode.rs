@@ -21,7 +21,7 @@ use basset_sketch::{
     Constraint, ConstraintId, Entity, EntityId, Hit, Profile, Sketch, SketchError, SolveError,
     SolveReport, Tessellation, edit, pattern, shapes,
 };
-use basset_viewport::{Camera, LineBatch, PointBatch, grid};
+use basset_viewport::{Camera, LineBatch, PointBatch, TriBatch, grid};
 
 use super::Editor;
 
@@ -44,10 +44,104 @@ const LOOSE_COLOR: [f32; 4] = [0.55, 0.72, 1.0, 1.0];
 /// drawn at all: the palette names them, but the answer to "which one is fighting?"
 /// belongs on the drawing.
 pub const CONFLICT_COLOR: [f32; 4] = [0.95, 0.35, 0.3, 1.0];
+/// A closed region the pointer is inside, filled so the user can see the area itself
+/// rather than infer it from the curves around it. Matches the model-mode profile
+/// highlight, because it is the same thing being pointed at.
+const REGION_HOVER_FILL: [f32; 4] = [1.0, 0.85, 0.3, 0.16];
+/// A region the user has picked, in the selection blue.
+const REGION_SELECT_FILL: [f32; 4] = [0.25, 0.6, 1.0, 0.22];
 /// Half-extent of a constraint badge.
 const GLYPH_PX: f64 = 5.0;
 /// Clearance between the geometry and the first badge on it.
 const GLYPH_GAP_PX: f64 = 13.0;
+
+/// A geometric constraint the toolbar offers. Dimensions are a tool of their own; these
+/// are the ones that carry no number.
+///
+/// Each of these is a *tool*, not a command on the current selection: the user picks the
+/// constraint first and the geometry after, which is how Fusion works and is what makes
+/// a constraint discoverable — the prompt tells you what to pick, instead of the button
+/// staying grey until you have guessed. Picking geometry first still works: clicking the
+/// button then applies it at once and leaves the tool armed for the next pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConstraintKind {
+    Coincident,
+    Horizontal,
+    Vertical,
+    Parallel,
+    Perpendicular,
+    Tangent,
+    Equal,
+    Concentric,
+    Midpoint,
+    Symmetric,
+    Fix,
+}
+
+impl ConstraintKind {
+    pub const ALL: [ConstraintKind; 11] = [
+        ConstraintKind::Coincident,
+        ConstraintKind::Horizontal,
+        ConstraintKind::Vertical,
+        ConstraintKind::Parallel,
+        ConstraintKind::Perpendicular,
+        ConstraintKind::Tangent,
+        ConstraintKind::Equal,
+        ConstraintKind::Concentric,
+        ConstraintKind::Midpoint,
+        ConstraintKind::Symmetric,
+        ConstraintKind::Fix,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ConstraintKind::Coincident => "Coincident",
+            ConstraintKind::Horizontal => "Horizontal",
+            ConstraintKind::Vertical => "Vertical",
+            ConstraintKind::Parallel => "Parallel",
+            ConstraintKind::Perpendicular => "Perpendicular",
+            ConstraintKind::Tangent => "Tangent",
+            ConstraintKind::Equal => "Equal",
+            ConstraintKind::Concentric => "Concentric",
+            ConstraintKind::Midpoint => "Midpoint",
+            ConstraintKind::Symmetric => "Symmetric",
+            ConstraintKind::Fix => "Fix",
+        }
+    }
+
+    /// What the tool is waiting for, shown while it is armed. Order is never required —
+    /// the tool works out which pick is the point and which the line — so the wording
+    /// says what to pick rather than what to pick first.
+    pub fn hint(self) -> &'static str {
+        match self {
+            ConstraintKind::Coincident => {
+                "Pick a point, then the point, line, circle or arc to put it on"
+            }
+            ConstraintKind::Horizontal => "Pick a line, or two points to level with each other",
+            ConstraintKind::Vertical => "Pick a line, or two points to stack above each other",
+            ConstraintKind::Parallel => "Pick two or more lines",
+            ConstraintKind::Perpendicular => "Pick two lines",
+            ConstraintKind::Tangent => {
+                "Pick a circle or arc, and the line, circle or arc it touches"
+            }
+            ConstraintKind::Equal => "Pick two or more lines, or two or more circles and arcs",
+            ConstraintKind::Concentric => "Pick two or more circles and arcs",
+            ConstraintKind::Midpoint => "Pick a point and the line to centre it on",
+            ConstraintKind::Symmetric => "Pick two points and the line to mirror them about",
+            ConstraintKind::Fix => "Pick a point or a line to pin in place",
+        }
+    }
+
+    /// Whether the constraint is transitive, so picking on past a pair keeps tying each
+    /// new entity to the one before. Equal across five holes is then five clicks rather
+    /// than five commands, which is how Fusion's equal behaves.
+    pub fn chains(self) -> bool {
+        matches!(
+            self,
+            ConstraintKind::Parallel | ConstraintKind::Equal | ConstraintKind::Concentric
+        )
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SketchTool {
@@ -73,6 +167,8 @@ pub enum SketchTool {
     Trim,
     /// Cuts a curve at its crossings without removing anything.
     Break,
+    /// Applies one geometric constraint to the entities picked next.
+    Constrain(ConstraintKind),
 }
 
 /// A toolbar button. Variants of one shape (the three ways to draw a circle…) share a
@@ -90,6 +186,9 @@ pub enum ToolGroup {
     Text,
     Dimension,
     Trim,
+    /// The constraint tools. Deliberately outside [`ToolGroup::ALL`]: they have their own
+    /// row in the toolbar, one button per constraint, rather than one folded button.
+    Constrain,
 }
 
 impl ToolGroup {
@@ -118,6 +217,7 @@ impl ToolGroup {
             ToolGroup::Text => "Text",
             ToolGroup::Dimension => "Dimension",
             ToolGroup::Trim => "Trim",
+            ToolGroup::Constrain => "Constrain",
         }
     }
 
@@ -142,6 +242,7 @@ impl ToolGroup {
             ToolGroup::Text => &[SketchTool::Text],
             ToolGroup::Dimension => &[SketchTool::Dimension],
             ToolGroup::Trim => &[SketchTool::Trim, SketchTool::Break],
+            ToolGroup::Constrain => &[],
         }
     }
 }
@@ -166,6 +267,7 @@ impl SketchTool {
             SketchTool::Dimension => "Dimension",
             SketchTool::Trim => "Trim",
             SketchTool::Break => "Break",
+            SketchTool::Constrain(kind) => kind.name(),
         }
     }
 
@@ -185,6 +287,7 @@ impl SketchTool {
             SketchTool::Text => ToolGroup::Text,
             SketchTool::Dimension => ToolGroup::Dimension,
             SketchTool::Trim | SketchTool::Break => ToolGroup::Trim,
+            SketchTool::Constrain(_) => ToolGroup::Constrain,
         }
     }
 
@@ -195,7 +298,8 @@ impl SketchTool {
             | SketchTool::Line
             | SketchTool::Dimension
             | SketchTool::Trim
-            | SketchTool::Break => 0,
+            | SketchTool::Break
+            | SketchTool::Constrain(_) => 0,
             SketchTool::Text => 1,
             SketchTool::Circle3Point
             | SketchTool::Arc3Point
@@ -363,6 +467,14 @@ pub struct MoveOp {
     start: Vec<(EntityId, Vec2)>,
     /// What the rotation turns about: the centre of what is being moved.
     pivot: Vec2,
+    /// The sketch as it was before the move. Every change re-derives from this rather
+    /// than nudging what the last change left, so the result depends on the numbers
+    /// alone and not on the order they were typed in — and so cancelling, and undoing
+    /// afterwards, are both just putting this back.
+    base: Sketch,
+    /// Set when the constraints would not take the move, naming what refused. The
+    /// geometry is left where it was; see [`SketchEditor::update_move`].
+    pub refused: Option<String>,
 }
 
 impl MoveOp {
@@ -372,17 +484,43 @@ impl MoveOp {
             self.pivot + Vec2::from_angle(self.angle_deg.to_radians()).rotate(from - self.pivot);
         turned + Vec2::new(self.dx, self.dy)
     }
+
+    /// Where the rotation centre ends up, which is where the manipulator belongs.
+    fn moved_pivot(&self) -> Vec2 {
+        self.target(self.pivot)
+    }
 }
 
-/// Settings of the pattern palette, kept between uses so repeating a pattern is one
-/// click rather than four numbers again.
+/// How far a moved shape may stray from rigid before the move is judged refused, as a
+/// fraction of its own size. The solver converges to ~1e-9, so a genuinely rigid result
+/// is far below this and anything above it is the constraints having found some other
+/// answer entirely.
+const RIGID_TOL: f64 = 1e-4;
+
+/// What a rectangular pattern's distance means. Fusion offers both and the difference
+/// is the single thing users get wrong about patterns: "20 mm apart" and "20 mm from
+/// end to end" are the same number and a different drawing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Spacing {
+    /// The gap between one copy and the next.
+    Between,
+    /// The total span from the seed to the last copy.
+    Total,
+}
+
+/// Settings of the pattern tool, kept between uses so repeating a pattern is one click
+/// rather than four numbers again.
 #[derive(Clone, Debug)]
 pub struct PatternParams {
     pub circular: bool,
-    pub cols: usize,
-    pub rows: usize,
-    pub dx: f64,
-    pub dy: f64,
+    pub spacing: Spacing,
+    /// Copies across, the seed included, and how far they reach.
+    pub count_x: usize,
+    pub distance_x: f64,
+    /// Copies up, the seed included, and how far they reach.
+    pub count_y: usize,
+    pub distance_y: f64,
+    /// Copies around, the seed included, and through how much of a turn.
     pub count: usize,
     pub angle_deg: f64,
     pub center: Vec2,
@@ -392,15 +530,59 @@ impl Default for PatternParams {
     fn default() -> Self {
         Self {
             circular: false,
-            cols: 3,
-            rows: 1,
-            dx: 10.0,
-            dy: 10.0,
+            spacing: Spacing::Between,
+            count_x: 3,
+            distance_x: 20.0,
+            count_y: 1,
+            distance_y: 20.0,
             count: 6,
             angle_deg: 360.0,
             center: Vec2::ZERO,
         }
     }
+}
+
+impl PatternParams {
+    /// How many copies the settings make, not counting the original. This is the number
+    /// the user is thinking in; the entity count the pattern module returns includes
+    /// every point of every copy and means nothing to anyone.
+    pub fn copies(&self) -> usize {
+        let instances = if self.circular {
+            self.count
+        } else {
+            self.count_x * self.count_y
+        };
+        instances.saturating_sub(1)
+    }
+
+    /// The step from one copy to the next along a direction, which is what the pattern
+    /// module wants however the user chose to state it.
+    fn step(&self, distance: f64, count: usize) -> f64 {
+        match self.spacing {
+            Spacing::Between => distance,
+            // One copy is no span at all; dividing by the gaps rather than the copies is
+            // what puts the last copy exactly on the stated total.
+            Spacing::Total => distance / (count.max(2) - 1) as f64,
+        }
+    }
+}
+
+/// A pattern being set up. The copies are made in the live sketch so the user is looking
+/// at the real thing rather than at a sketch of it, and every change re-makes them from
+/// `base`, which is the sketch as it was before the tool started. That is what lets a
+/// number be changed twice without the copies piling up.
+pub struct PatternOp {
+    seed: Vec<EntityId>,
+    base: Sketch,
+    /// Why the last attempt made nothing, for the palette to show.
+    pub error: Option<String>,
+    pub created: usize,
+    /// The next click in the viewport places the circular pattern's centre.
+    ///
+    /// A mode rather than a standing behaviour: while a pattern is up the pointer is
+    /// otherwise doing nothing, and a stray click that silently moved the centre of a
+    /// pattern the user had already placed would be worse than no picking at all.
+    picking_center: bool,
 }
 
 /// Rubber-band selection in progress.
@@ -452,6 +634,11 @@ pub struct SketchEditor {
     /// can be recomputed when an entry box changes without the pointer moving.
     raw_cursor: Option<Vec2>,
     pub selected: Vec<EntityId>,
+    /// Whether the next shape drawn is construction geometry. Deciding before drawing is
+    /// how Fusion works and is what a centre line or a bolt circle actually needs: the
+    /// alternative is drawing a real curve, watching it open or close a profile, and
+    /// converting it afterwards.
+    pub construction: bool,
     pub polygon_sides: usize,
     pub text: String,
     pub text_height: f64,
@@ -461,6 +648,15 @@ pub struct SketchEditor {
     /// starts typing a number with the pointer in the viewport.
     pub entry_focus: Option<usize>,
     pub dim_edit: Option<(ConstraintId, String)>,
+    /// What the armed constraint tool has been pointed at so far.
+    ///
+    /// Kept apart from [`Self::selected`] deliberately: a pick made as an argument to a
+    /// constraint is not a selection, and if it were, Delete and the construction toggle
+    /// would act on geometry the user only pointed at. The picks are drawn lit up all
+    /// the same, which is the part the user actually wanted from a selection.
+    constraint_picks: Vec<EntityId>,
+    /// Why the constraint tool refused the last pick, for the editor to report once.
+    constraint_error: Option<String>,
     /// The last solve. The error is kept whole rather than as a message because a failed
     /// solve names the constraints that disagree, and pointing at them is the only useful
     /// thing to say about it.
@@ -488,8 +684,10 @@ pub struct SketchEditor {
     trim_preview: Option<Vec<Vec2>>,
     /// A keyboard-driven move of the selection, started with `M`.
     pub move_op: Option<MoveOp>,
-    /// Settings of the pattern dialog, kept between uses.
+    /// Settings of the pattern tool, kept between uses.
     pub pattern: PatternParams,
+    /// The pattern being set up, if any.
+    pattern_op: Option<PatternOp>,
     /// Editable text of the parameter panel: what the user is typing, which is not the
     /// same as what the sketch has accepted.
     pub param_drafts: Vec<(String, String)>,
@@ -520,12 +718,15 @@ impl SketchEditor {
             cursor_px: 1.0,
             raw_cursor: None,
             selected: Vec::new(),
+            construction: false,
             polygon_sides: 6,
             text: "Text".into(),
             text_height: 10.0,
             entries: Vec::new(),
             entry_focus: None,
             dim_edit: None,
+            constraint_picks: Vec::new(),
+            constraint_error: None,
             report: None,
             snap_to_grid: true,
             fixed_grid_step: None,
@@ -540,6 +741,7 @@ impl SketchEditor {
             trim_preview: None,
             move_op: None,
             pattern: PatternParams::default(),
+            pattern_op: None,
             param_drafts: Vec::new(),
             new_param: (String::new(), String::new()),
             param_error: None,
@@ -567,6 +769,15 @@ impl SketchEditor {
         self.move_op.is_some()
     }
 
+    /// True while a modal operation owns the sketch. Both of them re-derive the result
+    /// from a copy taken when they started, so anything else that edits the sketch
+    /// meanwhile is silently thrown away the next time a number changes — and undo,
+    /// which pops checkpoints neither of them took, corrupts the stack outright. The
+    /// editor therefore refuses those commands rather than losing the user's work.
+    pub fn modal(&self) -> bool {
+        self.move_op.is_some() || self.pattern_op.is_some()
+    }
+
     pub fn select_tool(&mut self) {
         self.set_tool(SketchTool::Select);
     }
@@ -574,11 +785,11 @@ impl SketchEditor {
     pub fn set_tool(&mut self, tool: SketchTool) {
         self.cancel_current();
         self.tool = tool;
-        let slot = ToolGroup::ALL
-            .iter()
-            .position(|g| *g == tool.group())
-            .unwrap_or(0);
-        self.last_variant[slot] = tool;
+        // Only the folded shape buttons remember a variant; a constraint tool has no
+        // button of its own to remember it on.
+        if let Some(slot) = ToolGroup::ALL.iter().position(|g| *g == tool.group()) {
+            self.last_variant[slot] = tool;
+        }
         self.reset_entries();
     }
 
@@ -588,11 +799,30 @@ impl SketchEditor {
             .iter()
             .position(|g| *g == group)
             .map(|i| self.last_variant[i])
-            .unwrap_or(group.variants()[0])
+            // `Constrain` is outside `ALL` and folds no variants, so indexing its empty
+            // list eagerly would panic the moment anyone asked about it.
+            .unwrap_or_else(|| {
+                group
+                    .variants()
+                    .first()
+                    .copied()
+                    .unwrap_or(SketchTool::Select)
+            })
     }
 
     pub fn cancel_current(&mut self) {
         self.finish_move(false);
+        self.finish_pattern(false);
+        self.constraint_picks.clear();
+        self.finish_current();
+    }
+
+    /// Ends a line chain (right click / Enter) without leaving the tool.
+    ///
+    /// Deliberately narrower than [`Self::cancel_current`]: right-drag is also the orbit
+    /// gesture, and orbiting to look at a pattern must not be the gesture that throws it
+    /// away. Only what is half-drawn goes.
+    pub fn finish_current(&mut self) {
         self.trim_preview = None;
         self.clicks.clear();
         self.chain_end = None;
@@ -600,11 +830,6 @@ impl SketchEditor {
         self.drag = None;
         self.marquee = None;
         self.reset_entries();
-    }
-
-    /// Ends a line chain (right click / Enter) without leaving the tool.
-    pub fn finish_current(&mut self) {
-        self.cancel_current();
     }
 
     /// Empties the entry boxes. Typed sizes belong to one shape; the next one starts
@@ -996,6 +1221,21 @@ impl SketchEditor {
         self.grid_step = self.step_for(pos, camera, window);
         self.cursor_px = camera.pixel_size_at(self.frame.to_world(pos), window);
         let tol = self.tolerance(pos, camera, window);
+        if self.pattern_op.is_some() {
+            // The crosshair follows the pointer only while a centre is being picked;
+            // nothing else in the sketch may be touched.
+            self.cursor = self
+                .picking_pattern_center()
+                .then(|| self.snap(pos, tol).pos);
+            self.cursor_snapped = self.cursor.is_some_and(|p| {
+                self.sketch.hit_test(p, tol).iter().any(|h| {
+                    self.sketch
+                        .entity(h.entity)
+                        .is_some_and(|e| e.entity.is_point())
+                })
+            });
+            return;
+        }
         if self.tool == SketchTool::Select {
             self.cursor = Some(pos);
             self.raw_cursor = Some(pos);
@@ -1054,7 +1294,11 @@ impl SketchEditor {
     }
 
     pub fn pointer_down(&mut self, ray: &Ray, camera: &Camera, window: [u32; 2], _shift: bool) {
-        if self.tool != SketchTool::Select {
+        // A pattern re-makes the whole sketch from the copy it started with, so a drag
+        // made underneath it would be thrown away by the next change of a number — and
+        // would leave its checkpoint on the undo stack pointing at a state that no
+        // longer follows from anything.
+        if self.tool != SketchTool::Select || self.pattern_op.is_some() {
             return;
         }
         let Some(pos) = self.to_plane(ray) else {
@@ -1118,6 +1362,19 @@ impl SketchEditor {
         };
         self.grid_step = self.step_for(pos, camera, window);
         let tol = self.tolerance(pos, camera, window);
+        // While a pattern is up the viewport belongs to it: a click on a circular
+        // pattern puts its centre where the user pointed, which is how one is actually
+        // placed, and nothing else may edit the sketch underneath it.
+        if self.pattern_op.is_some() {
+            if self.picking_pattern_center() {
+                // Snapping means the centre can be put on an existing point — the middle
+                // of a bolt circle is nearly always a point that is already drawn.
+                self.pattern.center = self.snap(pos, tol).pos;
+                self.pick_pattern_center(false);
+                self.update_pattern();
+            }
+            return;
+        }
         match self.tool {
             SketchTool::Select => {
                 let hit = self
@@ -1172,6 +1429,7 @@ impl SketchEditor {
                 }
             }
             SketchTool::Dimension => self.dimension_click(pos, tol),
+            SketchTool::Constrain(kind) => self.constraint_click(kind, pos, tol),
             SketchTool::Trim | SketchTool::Break => self.trim_click(pos, tol),
             SketchTool::Line => self.line_click(self.aim(pos, tol)),
             _ => self.shape_click(self.aim(pos, tol)),
@@ -1301,59 +1559,161 @@ impl SketchEditor {
         }
         let pivot =
             start.iter().map(|(_, p)| *p).fold(Vec2::ZERO, |a, p| a + p) / start.len() as f64;
-        // The checkpoint makes the whole move one undo step, and cancelling is an undo.
-        self.checkpoint();
         self.move_op = Some(MoveOp {
             dx: 0.0,
             dy: 0.0,
             angle_deg: 0.0,
             start,
             pivot,
+            base: self.sketch.clone(),
+            refused: None,
         });
         true
     }
 
-    /// Re-applies the move from its starting positions, so editing a number never
-    /// accumulates with what was already applied.
+    /// Where the manipulator sits: the rotation centre where the current numbers put it,
+    /// so the arrows travel with the geometry instead of staying behind at the start.
+    pub fn move_pivot(&self) -> Option<Vec2> {
+        self.move_op.as_ref().map(MoveOp::moved_pivot)
+    }
+
+    /// Why the constraints would not take the move, for the palette to say.
+    pub fn move_refused(&self) -> Option<&str> {
+        self.move_op.as_ref()?.refused.as_deref()
+    }
+
+    /// Adds to the move's offset along one of the sketch plane's axes, for the viewport
+    /// manipulator. The numbers it changes are the ones the palette shows, so dragging
+    /// and typing are two ways of saying the same thing.
+    pub fn nudge_move(&mut self, along_x: bool, distance: f64) -> bool {
+        let Some(op) = self.move_op.as_mut() else {
+            return false;
+        };
+        if along_x {
+            op.dx += distance;
+        } else {
+            op.dy += distance;
+        }
+        true
+    }
+
+    /// Adds to the move's rotation, for the viewport manipulator's ring.
+    pub fn turn_move(&mut self, degrees: f64) -> bool {
+        let Some(op) = self.move_op.as_mut() else {
+            return false;
+        };
+        op.angle_deg += degrees;
+        true
+    }
+
+    /// Re-applies the move to the sketch as it was when the move began.
+    ///
+    /// A move is a rigid transform, and the result has to be one. When the constraints
+    /// cannot take it — asking an axis-constrained rectangle to turn thirty degrees, say
+    /// — the solver does not fail; it finds some *other* arrangement that does satisfy
+    /// them, and the cheapest such arrangement is usually the shape folded flat onto
+    /// itself. That is a converged solve and a destroyed drawing, so the residual cannot
+    /// tell them apart. Measuring the shape can: if the moved points no longer hold
+    /// their distances to each other, the move was refused, and the geometry stays where
+    /// it was with the palette saying why.
     pub fn update_move(&mut self) {
-        let Some(op) = self.move_op.clone() else {
+        let Some(op) = self.move_op.as_ref() else {
             return;
         };
-        let goals: Vec<(EntityId, Vec2)> = op
-            .start
+        let (base, start) = (op.base.clone(), op.start.clone());
+        let goals: Vec<(EntityId, Vec2)> = start
             .iter()
             .map(|(id, from)| (*id, op.target(*from)))
             .collect();
-        if self.sketch.drag_points(&goals).is_ok() {
-            self.dirty = true;
+        self.sketch = base.clone();
+        let outcome = self.sketch.drag_points(&goals);
+        let refused = match outcome {
+            Err(e) => Some(e.to_string()),
+            Ok(_) => rigid_error(&self.sketch, &start).map(|_| {
+                "the constraints will not allow this move: something is holding this \
+                 geometry to the axes or to a dimension"
+                    .to_string()
+            }),
+        };
+        if refused.is_some() {
+            self.sketch = base;
         }
+        if let Some(op) = self.move_op.as_mut() {
+            op.refused = refused;
+        }
+        self.solve();
+        self.dirty = true;
     }
 
-    /// Ends the move. Cancelling puts the geometry back through the checkpoint the move
-    /// took when it started.
+    /// Ends the move. Keeping it makes the whole thing one step of undo; cancelling puts
+    /// back the sketch the move started from.
     pub fn finish_move(&mut self, keep: bool) {
-        if self.move_op.take().is_none() {
+        let Some(op) = self.move_op.take() else {
             return;
-        }
+        };
         if keep {
-            self.after_change();
-        } else if let Some(prev) = self.undo.pop() {
-            self.sketch = prev;
-            self.after_change();
+            // The base goes on the undo stack now rather than when the move started, so
+            // a move that was cancelled leaves no step behind and one that was kept is
+            // exactly one.
+            self.undo.push(op.base);
+            if self.undo.len() > 100 {
+                self.undo.remove(0);
+            }
+            self.redo.clear();
+        } else {
+            self.sketch = op.base;
         }
+        self.after_change();
     }
 
     // --- Pattern ---------------------------------------------------------------------
 
-    /// Repeats the selection. Returns how many entities were created, or the reason
-    /// nothing was.
-    pub fn apply_pattern(&mut self) -> Result<usize, String> {
-        if self.selected.is_empty() {
-            return Err("select the geometry to repeat first".into());
+    /// Starts a pattern of the selection. `false` when nothing is selected, so the
+    /// command can say why instead of doing nothing.
+    ///
+    /// The copies appear at once from the settings last used, because a pattern with no
+    /// preview is a pattern the user has to undo to understand.
+    pub fn begin_pattern(&mut self) -> bool {
+        if self.selected.is_empty() || self.pattern_op.is_some() {
+            return false;
         }
-        let seed = self.selected.clone();
+        self.pattern_center_from_selection();
+        self.pattern_op = Some(PatternOp {
+            seed: self.selected.clone(),
+            base: self.sketch.clone(),
+            error: None,
+            created: 0,
+            picking_center: false,
+        });
+        self.update_pattern();
+        true
+    }
+
+    pub fn pattern_in_progress(&self) -> bool {
+        self.pattern_op.is_some()
+    }
+
+    /// Whether the next click places the circular pattern's centre.
+    pub fn picking_pattern_center(&self) -> bool {
+        self.pattern_op.as_ref().is_some_and(|op| op.picking_center)
+    }
+
+    /// Arms or disarms picking the circular pattern's centre in the viewport.
+    pub fn pick_pattern_center(&mut self, on: bool) {
+        if let Some(op) = self.pattern_op.as_mut() {
+            op.picking_center = on;
+        }
+    }
+
+    /// Re-makes every copy from the sketch as it was before the tool started, so editing
+    /// a number replaces the pattern rather than adding a second one on top of it.
+    pub fn update_pattern(&mut self) {
+        let Some(op) = self.pattern_op.as_ref() else {
+            return;
+        };
+        let (seed, base) = (op.seed.clone(), op.base.clone());
         let p = self.pattern.clone();
-        self.checkpoint();
+        self.sketch = base;
         let result = if p.circular {
             pattern::circular(
                 &mut self.sketch,
@@ -1366,24 +1726,73 @@ impl SketchEditor {
             pattern::rectangular(
                 &mut self.sketch,
                 &seed,
-                Vec2::new(p.dx, 0.0),
-                p.cols,
-                Vec2::new(0.0, p.dy),
-                p.rows,
+                Vec2::new(p.step(p.distance_x, p.count_x), 0.0),
+                p.count_x,
+                Vec2::new(0.0, p.step(p.distance_y, p.count_y)),
+                p.count_y,
             )
+        };
+        let Some(op) = self.pattern_op.as_mut() else {
+            return;
         };
         match result {
             Ok(created) => {
-                self.after_change();
-                Ok(created.len())
+                op.created = created.len();
+                op.error = None;
             }
             Err(e) => {
-                if let Some(prev) = self.undo.pop() {
-                    self.sketch = prev;
-                }
-                Err(e.to_string())
+                op.created = 0;
+                op.error = Some(e.to_string());
             }
         }
+        // A failed pattern leaves the base sketch, which is what the user had before —
+        // never a half-made one.
+        if self.pattern_op.as_ref().is_some_and(|o| o.error.is_some()) {
+            self.sketch = self.pattern_op.as_ref().expect("just checked").base.clone();
+        }
+        self.solve();
+        self.dirty = true;
+    }
+
+    /// Ends the pattern. Keeping it makes the whole thing one step of undo; cancelling
+    /// puts back the sketch the tool started from.
+    pub fn finish_pattern(&mut self, keep: bool) -> Option<usize> {
+        let op = self.pattern_op.take()?;
+        if keep {
+            self.undo.push(op.base);
+            self.redo.clear();
+            self.after_change();
+            Some(op.created)
+        } else {
+            self.sketch = op.base;
+            self.after_change();
+            None
+        }
+    }
+
+    /// What the palette needs to say about the pattern being set up: how many copies are
+    /// on screen right now, and why there are none if there are none.
+    pub fn pattern_status(&self) -> Option<(usize, Option<&str>)> {
+        let op = self.pattern_op.as_ref()?;
+        let copies = if op.error.is_some() {
+            0
+        } else {
+            self.pattern.copies()
+        };
+        Some((copies, op.error.as_deref()))
+    }
+
+    /// The entities the pattern preview added, so they can be drawn as the provisional
+    /// things they are rather than as geometry the user has already committed to.
+    fn pattern_copies(&self) -> std::collections::HashSet<EntityId> {
+        let Some(op) = self.pattern_op.as_ref() else {
+            return std::collections::HashSet::new();
+        };
+        self.sketch
+            .entities()
+            .map(|(id, _)| id)
+            .filter(|id| op.base.entity(*id).is_none())
+            .collect()
     }
 
     /// Centres a circular pattern on what is selected, which is almost always what the
@@ -1550,6 +1959,9 @@ impl SketchEditor {
                 }
                 match self.sketch.add_line(start, end) {
                     Ok(line) => {
+                        if self.construction {
+                            let _ = self.sketch.set_construction(line, true);
+                        }
                         for c in line_dims(line, start, end, &self.params()) {
                             if let Err(e) = self.sketch.add_constraint(c) {
                                 log::warn!("line dimension: {e}");
@@ -1580,8 +1992,12 @@ impl SketchEditor {
         let clicks = std::mem::take(&mut self.clicks);
         let params = self.params();
         self.checkpoint();
+        let before = self.entity_ids();
         match build_shape(&mut self.sketch, self.tool, &clicks, &params) {
-            Ok(()) => self.after_change(),
+            Ok(()) => {
+                self.mark_new_as_construction(&before);
+                self.after_change()
+            }
             Err(e) => {
                 // A degenerate shape (collinear circle points…) leaves nothing behind,
                 // not even the partial entities the builder had already added.
@@ -1754,35 +2170,52 @@ impl SketchEditor {
         self.after_change();
     }
 
+    /// What `X` means: convert the selection, or, with nothing selected, arm the mode so
+    /// the next shape is drawn as construction. The toolbar splits these into two
+    /// buttons; a keystroke can read its context, a lit button cannot.
     pub fn toggle_construction(&mut self) {
+        if self.selected.is_empty() {
+            self.construction = !self.construction;
+            return;
+        }
+        self.convert_construction();
+    }
+
+    /// Makes the selection construction geometry, or ordinary geometry if it already is.
+    pub fn convert_construction(&mut self) {
         if self.selected.is_empty() {
             return;
         }
         self.checkpoint();
+        // Mixed selections go all-construction first, which is the answer that leaves
+        // the user looking at what they asked for rather than at an inverted half.
+        let target = !self.selection_is_construction();
         for id in self.selected.clone() {
-            let is = self
-                .sketch
-                .entity(id)
-                .map(|e| e.construction)
-                .unwrap_or(false);
-            let _ = self.sketch.set_construction(id, !is);
+            let _ = self.sketch.set_construction(id, target);
         }
         self.after_change();
     }
 
-    pub fn add_constraint(&mut self, c: Constraint) -> Result<(), String> {
-        self.checkpoint();
-        let r = self
-            .sketch
-            .add_constraint(c)
-            .map(|_| ())
-            .map_err(|e| e.to_string());
-        if r.is_err() {
-            self.undo.pop();
-        } else {
-            self.after_change();
+    /// Marks everything added since `before` as construction, so a shape drawn with the
+    /// mode on is construction from the moment it exists. Points are left alone: they
+    /// are shared with whatever else joins them and carry no profile meaning.
+    fn mark_new_as_construction(&mut self, before: &std::collections::HashSet<EntityId>) {
+        if !self.construction {
+            return;
         }
-        r
+        let fresh: Vec<EntityId> = self
+            .sketch
+            .entities()
+            .filter(|(id, data)| !before.contains(id) && !data.entity.is_point())
+            .map(|(id, _)| id)
+            .collect();
+        for id in fresh {
+            let _ = self.sketch.set_construction(id, true);
+        }
+    }
+
+    fn entity_ids(&self) -> std::collections::HashSet<EntityId> {
+        self.sketch.entities().map(|(id, _)| id).collect()
     }
 
     pub fn set_dimension(&mut self, id: ConstraintId, value: f64) {
@@ -1798,127 +2231,269 @@ impl SketchEditor {
         self.after_change();
     }
 
-    /// Every constraint the toolbar can offer, in a fixed order. The toolbar shows the
-    /// whole set so the user can see what exists, greying out the ones the current
-    /// selection does not support, rather than having buttons appear and vanish.
-    pub const CONSTRAINT_NAMES: [&'static str; 11] = [
-        "Coincident",
-        "Horizontal",
-        "Vertical",
-        "Parallel",
-        "Perpendicular",
-        "Tangent",
-        "Equal",
-        "Concentric",
-        "Midpoint",
-        "Symmetric",
-        "Fix",
-    ];
+    /// The constraint tool is armed: what it is waiting for, for the palette to say.
+    pub fn armed_constraint(&self) -> Option<ConstraintKind> {
+        match self.tool {
+            SketchTool::Constrain(kind) => Some(kind),
+            _ => None,
+        }
+    }
 
-    /// Constraints that can be applied to the current selection, by kind of selection.
-    pub fn applicable_constraints(&self) -> Vec<(&'static str, Constraint)> {
-        let sel = &self.selected;
-        let kind = |i: usize| self.sketch.entity(sel[i]).map(|e| &e.entity);
-        let mut out = Vec::new();
-        match sel.len() {
-            1 => match kind(0) {
-                Some(Entity::Line { .. }) => {
-                    out.push(("Horizontal", Constraint::Horizontal(sel[0])));
-                    out.push(("Vertical", Constraint::Vertical(sel[0])));
+    /// What the armed constraint tool has been pointed at, for the palette and the
+    /// viewport to light up.
+    pub fn constraint_picks(&self) -> &[EntityId] {
+        &self.constraint_picks
+    }
+
+    /// Arms a constraint tool, or disarms it when it is already the armed one and has
+    /// nothing half-picked — a button that only ever turns on is a trap.
+    ///
+    /// Geometry already selected is not thrown away: if it already supports the
+    /// constraint it is applied at once, and otherwise it becomes the tool's opening
+    /// picks, so selecting first and selecting after both work.
+    pub fn begin_constraint(&mut self, kind: ConstraintKind) -> Result<(), String> {
+        if self.armed_constraint() == Some(kind) && self.constraint_picks.is_empty() {
+            self.select_tool();
+            return Ok(());
+        }
+        let selected = std::mem::take(&mut self.selected);
+        self.set_tool(SketchTool::Constrain(kind));
+        self.constraint_picks = selected;
+        let result = self.apply_constraint_picks(kind);
+        // Picks that cannot ever become this constraint are not kept: the user would be
+        // left adding to a set the tool has already given up on.
+        if !self.viable_picks(kind, &self.constraint_picks) {
+            self.constraint_picks.clear();
+        }
+        result
+    }
+
+    /// Applies `kind` if the picks support it. A transitive constraint keeps its last
+    /// pick, so a third click ties onto the second rather than starting again; every
+    /// other kind starts clean.
+    fn apply_constraint_picks(&mut self, kind: ConstraintKind) -> Result<(), String> {
+        let constraints = self.constraints_for(kind, &self.constraint_picks);
+        if constraints.is_empty() {
+            return Ok(());
+        }
+        let result = self.add_constraints(constraints);
+        if result.is_ok() {
+            self.constraint_picks = match (kind.chains(), self.constraint_picks.last()) {
+                (true, Some(last)) => vec![*last],
+                _ => Vec::new(),
+            };
+        }
+        result
+    }
+
+    /// Whether these picks could still become `kind` once there are more of them.
+    ///
+    /// A constraint tool that quietly swallows a pick it can never use leaves the user
+    /// clicking at a sketch that says nothing back, which is the way a tool-shaped
+    /// constraint goes wrong. Refusing the pick and naming what is wanted is the whole
+    /// difference between a tool and a guessing game.
+    fn viable_picks(&self, kind: ConstraintKind, sel: &[EntityId]) -> bool {
+        let entity = |id: &EntityId| self.sketch.entity(*id).map(|e| &e.entity);
+        let count =
+            |f: fn(&Entity) -> bool| sel.iter().filter(|id| entity(id).is_some_and(f)).count();
+        let points = count(|e| matches!(e, Entity::Point { .. }));
+        let lines = count(|e| matches!(e, Entity::Line { .. }));
+        let rounds = count(|e| matches!(e, Entity::Circle { .. } | Entity::Arc { .. }));
+        let n = sel.len();
+        // Anything the tools cannot name at all (text) is never a viable pick.
+        if points + lines + rounds != n {
+            return false;
+        }
+        let curves = lines + rounds;
+        match kind {
+            ConstraintKind::Coincident => n <= 2 && points >= 1 && points + curves == n,
+            ConstraintKind::Horizontal | ConstraintKind::Vertical => {
+                lines == n || (points == n && n <= 2)
+            }
+            ConstraintKind::Parallel => lines == n,
+            ConstraintKind::Perpendicular => lines == n && n <= 2,
+            // Two lines cross or run parallel; tangency needs something curved.
+            ConstraintKind::Tangent => curves == n && n <= 2 && (n < 2 || rounds >= 1),
+            ConstraintKind::Equal => lines == n || rounds == n,
+            ConstraintKind::Concentric => rounds == n,
+            ConstraintKind::Midpoint => points <= 1 && lines <= 1 && points + lines == n,
+            ConstraintKind::Symmetric => points <= 2 && lines <= 1 && points + lines == n,
+            ConstraintKind::Fix => n <= 1 && points + lines == n,
+        }
+    }
+
+    // --- Constraint tool ---------------------------------------------------------------
+
+    /// A pick while a constraint tool is armed. Picks gather until they mean something,
+    /// then the constraint goes on and the tool stays armed for the next one. Clicking a
+    /// pick again drops it; clicking empty space starts over.
+    fn constraint_click(&mut self, kind: ConstraintKind, pos: Vec2, tol: f64) {
+        let Some(hit) = self.sketch.hit_test(pos, tol).into_iter().next() else {
+            self.constraint_picks.clear();
+            return;
+        };
+        if let Some(i) = self
+            .constraint_picks
+            .iter()
+            .position(|id| *id == hit.entity)
+        {
+            self.constraint_picks.remove(i);
+            return;
+        }
+        let mut picks = self.constraint_picks.clone();
+        picks.push(hit.entity);
+        if !self.viable_picks(kind, &picks) {
+            // The earlier picks stand: one wrong click should cost one click, not all of
+            // them.
+            self.constraint_error = Some(format!("{} needs: {}", kind.name(), kind.hint()));
+            return;
+        }
+        self.constraint_picks = picks;
+        if let Err(e) = self.apply_constraint_picks(kind) {
+            self.constraint_error = Some(e);
+            self.constraint_picks.clear();
+        }
+    }
+
+    /// The reason the constraint tool refused the last pick, for the editor to report.
+    pub fn take_constraint_error(&mut self) -> Option<String> {
+        self.constraint_error.take()
+    }
+
+    #[cfg(test)]
+    pub fn add_constraint(&mut self, c: Constraint) -> Result<(), String> {
+        self.add_constraints(vec![c])
+    }
+
+    /// Adds several constraints as one undoable change, so a command that means two
+    /// constraints (equal across three lines, a line pinned by both its ends) is one
+    /// step of undo rather than two.
+    pub fn add_constraints(&mut self, constraints: Vec<Constraint>) -> Result<(), String> {
+        self.checkpoint();
+        for c in constraints {
+            if let Err(e) = self.sketch.add_constraint(c) {
+                // Nothing partial is left behind: the sketch goes back to the checkpoint.
+                if let Some(prev) = self.undo.pop() {
+                    self.sketch = prev;
                 }
-                Some(Entity::Point { .. }) => out.push(("Fix", Constraint::Fix(sel[0]))),
-                _ => {}
+                return Err(e.to_string());
+            }
+        }
+        self.after_change();
+        Ok(())
+    }
+
+    /// What `kind` means for `sel`, or nothing when the picks do not support it yet.
+    ///
+    /// Order never matters: a point and a line are the same command whichever was picked
+    /// first, because the constraint itself knows which is which. Where a constraint is
+    /// transitive — equal, parallel, concentric — more than two picks chain, so
+    /// "these five holes are all the same size" is one command.
+    pub fn constraints_for(&self, kind: ConstraintKind, sel: &[EntityId]) -> Vec<Constraint> {
+        let entity = |id: &EntityId| self.sketch.entity(*id).map(|e| &e.entity);
+        let is = |f: fn(&Entity) -> bool| move |id: &EntityId| entity(id).is_some_and(&f);
+        let point = is(|e| matches!(e, Entity::Point { .. }));
+        let line = is(|e| matches!(e, Entity::Line { .. }));
+        let round = is(|e| matches!(e, Entity::Circle { .. } | Entity::Arc { .. }));
+        let curve = is(|e| e.is_curve());
+        let points: Vec<EntityId> = sel.iter().copied().filter(point).collect();
+        let lines: Vec<EntityId> = sel.iter().copied().filter(line).collect();
+        let rounds: Vec<EntityId> = sel.iter().copied().filter(round).collect();
+        // A transitive constraint over a run of entities: each one tied to the one before.
+        let chain = |ids: &[EntityId], make: fn(EntityId, EntityId) -> Constraint| {
+            ids.windows(2).map(|w| make(w[0], w[1])).collect::<Vec<_>>()
+        };
+        match kind {
+            ConstraintKind::Coincident => match (points.len(), sel.len()) {
+                // A point and anything it can sit on. Two points merge; a point and a
+                // curve means "on the curve", which is what the solver reads it as.
+                (1 | 2, 2) => {
+                    let p = points[0];
+                    let target = *sel.iter().find(|id| **id != p).expect("two picks");
+                    if point(&target) || curve(&target) {
+                        vec![Constraint::Coincident { point: p, target }]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                _ => Vec::new(),
             },
-            2 => match (kind(0), kind(1)) {
-                (Some(Entity::Line { .. }), Some(Entity::Line { .. })) => {
-                    out.push(("Parallel", Constraint::Parallel(sel[0], sel[1])));
-                    out.push(("Perpendicular", Constraint::Perpendicular(sel[0], sel[1])));
-                    out.push(("Equal", Constraint::Equal(sel[0], sel[1])));
+            ConstraintKind::Horizontal | ConstraintKind::Vertical => {
+                let horizontal = kind == ConstraintKind::Horizontal;
+                if !lines.is_empty() && lines.len() == sel.len() {
+                    return lines
+                        .iter()
+                        .map(|l| {
+                            if horizontal {
+                                Constraint::Horizontal(*l)
+                            } else {
+                                Constraint::Vertical(*l)
+                            }
+                        })
+                        .collect();
                 }
-                (Some(Entity::Point { .. }), Some(Entity::Point { .. })) => {
-                    out.push((
-                        "Coincident",
-                        Constraint::Coincident {
-                            point: sel[0],
-                            target: sel[1],
-                        },
-                    ));
-                    out.push((
-                        "Horizontal",
-                        Constraint::HorizontalDistance {
-                            a: sel[0],
-                            b: sel[1],
-                            value: 0.0,
-                        },
-                    ));
-                    out.push((
-                        "Vertical",
-                        Constraint::VerticalDistance {
-                            a: sel[0],
-                            b: sel[1],
-                            value: 0.0,
-                        },
-                    ));
-                }
-                (Some(Entity::Point { .. }), Some(Entity::Line { .. })) => {
-                    out.push((
-                        "Coincident",
-                        Constraint::Coincident {
-                            point: sel[0],
-                            target: sel[1],
-                        },
-                    ));
-                    out.push((
-                        "Midpoint",
-                        Constraint::Midpoint {
-                            point: sel[0],
-                            line: sel[1],
-                        },
-                    ));
-                }
-                (Some(Entity::Point { .. }), Some(Entity::Circle { .. } | Entity::Arc { .. })) => {
-                    out.push((
-                        "Coincident",
-                        Constraint::Coincident {
-                            point: sel[0],
-                            target: sel[1],
-                        },
-                    ));
-                }
-                (Some(Entity::Line { .. }), Some(Entity::Circle { .. } | Entity::Arc { .. }))
-                | (Some(Entity::Circle { .. } | Entity::Arc { .. }), Some(Entity::Line { .. })) => {
-                    out.push(("Tangent", Constraint::Tangent(sel[0], sel[1])));
-                }
-                (
-                    Some(Entity::Circle { .. } | Entity::Arc { .. }),
-                    Some(Entity::Circle { .. } | Entity::Arc { .. }),
-                ) => {
-                    out.push(("Tangent", Constraint::Tangent(sel[0], sel[1])));
-                    out.push(("Equal", Constraint::Equal(sel[0], sel[1])));
-                    out.push(("Concentric", Constraint::Concentric(sel[0], sel[1])));
-                }
-                _ => {}
-            },
-            3 => {
-                if let (
-                    Some(Entity::Point { .. }),
-                    Some(Entity::Point { .. }),
-                    Some(Entity::Line { .. }),
-                ) = (kind(0), kind(1), kind(2))
-                {
-                    out.push((
-                        "Symmetric",
-                        Constraint::Symmetric {
-                            a: sel[0],
-                            b: sel[1],
-                            axis: sel[2],
-                        },
-                    ));
+                // Two loose points are levelled or stacked by a zero offset along the
+                // axis, which is the only way to say it without a line between them.
+                match points[..] {
+                    [a, b] if sel.len() == 2 && horizontal => {
+                        vec![Constraint::HorizontalDistance { a, b, value: 0.0 }]
+                    }
+                    [a, b] if sel.len() == 2 => {
+                        vec![Constraint::VerticalDistance { a, b, value: 0.0 }]
+                    }
+                    _ => Vec::new(),
                 }
             }
-            _ => {}
+            ConstraintKind::Parallel if lines.len() >= 2 && lines.len() == sel.len() => {
+                chain(&lines, Constraint::Parallel)
+            }
+            ConstraintKind::Perpendicular if lines.len() == 2 && sel.len() == 2 => {
+                vec![Constraint::Perpendicular(lines[0], lines[1])]
+            }
+            // Tangency needs something curved to be tangent to; two lines are parallel
+            // or crossing, never tangent.
+            ConstraintKind::Tangent if sel.len() == 2 && !rounds.is_empty() => {
+                if sel.iter().all(curve) {
+                    vec![Constraint::Tangent(sel[0], sel[1])]
+                } else {
+                    Vec::new()
+                }
+            }
+            ConstraintKind::Equal if lines.len() >= 2 && lines.len() == sel.len() => {
+                chain(&lines, Constraint::Equal)
+            }
+            ConstraintKind::Equal if rounds.len() >= 2 && rounds.len() == sel.len() => {
+                chain(&rounds, Constraint::Equal)
+            }
+            ConstraintKind::Concentric if rounds.len() >= 2 && rounds.len() == sel.len() => {
+                chain(&rounds, Constraint::Concentric)
+            }
+            ConstraintKind::Midpoint if points.len() == 1 && lines.len() == 1 && sel.len() == 2 => {
+                vec![Constraint::Midpoint {
+                    point: points[0],
+                    line: lines[0],
+                }]
+            }
+            ConstraintKind::Symmetric
+                if points.len() == 2 && lines.len() == 1 && sel.len() == 3 =>
+            {
+                vec![Constraint::Symmetric {
+                    a: points[0],
+                    b: points[1],
+                    axis: lines[0],
+                }]
+            }
+            // A line is pinned by pinning both its ends: the solver only knows how to
+            // fix a point, and a line with both ends fixed is a fixed line.
+            ConstraintKind::Fix if sel.len() == 1 => match entity(&sel[0]) {
+                Some(Entity::Point { .. }) => vec![Constraint::Fix(sel[0])],
+                Some(Entity::Line { start, end }) => {
+                    vec![Constraint::Fix(*start), Constraint::Fix(*end)]
+                }
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
         }
-        out
     }
 
     // --- Drawing ----------------------------------------------------------------------
@@ -1972,9 +2547,39 @@ impl SketchEditor {
         out
     }
 
-    /// Line and point batches for the sketch overlay.
-    pub fn draw(&self, lines: &mut Vec<LineBatch>, points: &mut Vec<PointBatch>) {
+    /// Triangles of one closed region, for filling it. Reuses the kernel's
+    /// triangulation so a sketch region lights up exactly as the same region does in
+    /// model mode; a region the triangulator cannot handle simply yields nothing.
+    fn region_fill(&self, index: usize) -> Vec<[Vec3; 3]> {
+        match self.profiles.get(index) {
+            Some(profile) => basset_core::convert_profile(&self.frame, profile).triangles(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Line, point and triangle batches for the sketch overlay.
+    pub fn draw(
+        &self,
+        lines: &mut Vec<LineBatch>,
+        points: &mut Vec<PointBatch>,
+        tris: &mut Vec<TriBatch>,
+    ) {
         let to3 = |p: Vec2| self.frame.to_world(p);
+        // Filled regions go down first so the geometry and the badges stay readable on
+        // top of them.
+        let mut selected_fill = TriBatch::new(REGION_SELECT_FILL);
+        for (index, _) in self.profiles.iter().enumerate().filter(|(_, p)| {
+            self.selected_regions
+                .iter()
+                .any(|sample| p.contains(*sample))
+        }) {
+            selected_fill.triangles.extend(self.region_fill(index));
+        }
+        let mut hover_fill = TriBatch::new(REGION_HOVER_FILL);
+        if let Some(index) = self.hover_region {
+            hover_fill.triangles.extend(self.region_fill(index));
+        }
+        tris.extend([selected_fill, hover_fill]);
         let mut normal = LineBatch::new([0.92, 0.92, 0.95, 1.0]);
         normal.depth_test = false;
         let mut construction = LineBatch::new([0.75, 0.75, 0.55, 1.0]);
@@ -1998,6 +2603,11 @@ impl SketchEditor {
         let mut sel_pts = PointBatch::new([0.25, 0.6, 1.0, 1.0]);
         sel_pts.size_px = 8.0;
         let free = self.under_constrained();
+        // A pattern's copies are provisional until OK, so they are drawn as a preview
+        // rather than as geometry the user has already committed to.
+        let copies = self.pattern_copies();
+        let mut pattern_preview = LineBatch::new([0.55, 0.85, 1.0, 0.85]);
+        pattern_preview.depth_test = false;
 
         let region_curves = self
             .hover_region
@@ -2008,6 +2618,7 @@ impl SketchEditor {
             let is_hovered = self.hover == Some(id)
                 || self.dim_first == Some(id)
                 || region_curves.contains(&id)
+                || self.constraint_picks.contains(&id)
                 || self.highlighted.contains(&id);
             if let Entity::Point { pos } = data.entity {
                 if is_selected || is_hovered {
@@ -2028,6 +2639,7 @@ impl SketchEditor {
                 data.construction,
                 free.contains(&id),
             ) {
+                _ if copies.contains(&id) => &mut pattern_preview,
                 (true, ..) => &mut selected,
                 (_, true, ..) => &mut hovered,
                 (.., true, true) => &mut loose_construction,
@@ -2068,6 +2680,29 @@ impl SketchEditor {
             }
             lines.push(doomed);
         }
+        // A circular pattern turns about a point the user cannot otherwise see, and two
+        // numbers in a palette are not a position. It is drawn as the pivot mark a
+        // drawing uses.
+        if self.pattern_op.is_some() && self.pattern.circular {
+            let c = self.pattern.center;
+            let r = self.cursor_px * 7.0;
+            let mut pivot = LineBatch::new([1.0, 0.75, 0.35, 0.95]);
+            pivot.width_px = 2.0;
+            pivot.depth_test = false;
+            for axis in [Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0)] {
+                pivot
+                    .segments
+                    .push([to3(c - axis * r * 1.8), to3(c + axis * r * 1.8)]);
+            }
+            const STEPS: usize = 16;
+            let ring = |i: usize| {
+                c + Vec2::from_angle(std::f64::consts::TAU * i as f64 / STEPS as f64) * r
+            };
+            for i in 0..STEPS {
+                pivot.segments.push([to3(ring(i)), to3(ring(i + 1))]);
+            }
+            lines.push(pivot);
+        }
         if let Some(m) = self.marquee {
             let mut band = LineBatch::new([0.55, 0.8, 1.0, 0.9]);
             band.depth_test = false;
@@ -2084,6 +2719,9 @@ impl SketchEditor {
         if let Some(cursor) = self.cursor {
             let mut preview = LineBatch::new([0.6, 0.9, 1.0, 0.9]);
             preview.depth_test = false;
+            // The preview is dashed when the mode is on, so the decision is visible
+            // while the shape is still being aimed rather than only after it lands.
+            preview.dashed = self.construction;
             if let Some(start) = self.chain_end.and_then(|id| self.sketch.point_pos(id)) {
                 preview.segments.push([to3(start), to3(cursor)]);
             }
@@ -2124,6 +2762,7 @@ impl SketchEditor {
             construction,
             loose,
             loose_construction,
+            pattern_preview,
             hovered,
             selected,
             dims,
@@ -2135,7 +2774,7 @@ impl SketchEditor {
         // actually land rather than at the pointer, which the grid snap can pull away
         // from by half a step. Amber when it will reuse an existing point.
         if let Some(cursor) = self.cursor
-            && self.tool != SketchTool::Select
+            && (self.tool != SketchTool::Select || self.picking_pattern_center())
         {
             let color = if self.cursor_snapped {
                 [1.0, 0.85, 0.3, 1.0]
@@ -2466,26 +3105,51 @@ fn glyph_ring(r: f64) -> Vec<[Vec2; 2]> {
         .collect()
 }
 
+/// Which constraint tool made `c`, or `None` for a dimension, which is the dimension
+/// tool's work and draws its own value rather than a badge.
+fn glyph_kind(c: &Constraint) -> Option<ConstraintKind> {
+    Some(match c {
+        Constraint::Horizontal(_) => ConstraintKind::Horizontal,
+        Constraint::Vertical(_) => ConstraintKind::Vertical,
+        Constraint::Parallel(..) => ConstraintKind::Parallel,
+        Constraint::Perpendicular(..) => ConstraintKind::Perpendicular,
+        Constraint::Equal(..) => ConstraintKind::Equal,
+        Constraint::Tangent(..) => ConstraintKind::Tangent,
+        Constraint::Concentric(..) => ConstraintKind::Concentric,
+        Constraint::Coincident { .. } => ConstraintKind::Coincident,
+        Constraint::Midpoint { .. } => ConstraintKind::Midpoint,
+        Constraint::Symmetric { .. } => ConstraintKind::Symmetric,
+        Constraint::Fix(_) => ConstraintKind::Fix,
+        _ => return None,
+    })
+}
+
 /// The badge for a constraint, in a local frame spanning roughly -1..1 on each axis.
 /// Returns nothing for the dimensions, which draw themselves.
 fn glyph_strokes(c: &Constraint) -> Vec<[Vec2; 2]> {
+    glyph_kind(c).map(kind_strokes).unwrap_or_default()
+}
+
+/// The symbol for a constraint, drawn both as the badge beside the geometry and as the
+/// toolbar button that applies it. One definition, so the button teaches the badge.
+pub fn kind_strokes(kind: ConstraintKind) -> Vec<[Vec2; 2]> {
     let v = Vec2::new;
-    match c {
-        Constraint::Horizontal(_) => vec![[v(-1.0, 0.0), v(1.0, 0.0)]],
-        Constraint::Vertical(_) => vec![[v(0.0, -1.0), v(0.0, 1.0)]],
+    match kind {
+        ConstraintKind::Horizontal => vec![[v(-1.0, 0.0), v(1.0, 0.0)]],
+        ConstraintKind::Vertical => vec![[v(0.0, -1.0), v(0.0, 1.0)]],
         // Two slanted strokes, the drawing convention for parallel.
-        Constraint::Parallel(..) => {
+        ConstraintKind::Parallel => {
             vec![[v(-0.8, -1.0), v(-0.2, 1.0)], [v(0.2, -1.0), v(0.8, 1.0)]]
         }
-        Constraint::Perpendicular(..) => {
+        ConstraintKind::Perpendicular => {
             vec![[v(-1.0, 1.0), v(-1.0, -1.0)], [v(-1.0, -1.0), v(1.0, -1.0)]]
         }
-        Constraint::Equal(..) => vec![
+        ConstraintKind::Equal => vec![
             [v(-1.0, 0.45), v(1.0, 0.45)],
             [v(-1.0, -0.45), v(1.0, -0.45)],
         ],
         // A curve resting on its tangent line.
-        Constraint::Tangent(..) => {
+        ConstraintKind::Tangent => {
             let mut out = vec![[v(-1.0, -0.75), v(1.0, -0.75)]];
             out.extend(
                 glyph_ring(0.75)
@@ -2494,18 +3158,18 @@ fn glyph_strokes(c: &Constraint) -> Vec<[Vec2; 2]> {
             );
             out
         }
-        Constraint::Concentric(..) => {
+        ConstraintKind::Concentric => {
             let mut out = glyph_ring(1.0);
             out.extend(glyph_ring(0.45));
             out
         }
-        Constraint::Coincident { .. } => glyph_ring(0.8),
-        Constraint::Midpoint { .. } => vec![
+        ConstraintKind::Coincident => glyph_ring(0.8),
+        ConstraintKind::Midpoint => vec![
             [v(0.0, 1.0), v(-0.9, -0.7)],
             [v(-0.9, -0.7), v(0.9, -0.7)],
             [v(0.9, -0.7), v(0.0, 1.0)],
         ],
-        Constraint::Symmetric { .. } => vec![
+        ConstraintKind::Symmetric => vec![
             [v(0.0, -1.0), v(0.0, 1.0)],
             [v(-1.0, 0.7), v(-0.35, 0.0)],
             [v(-1.0, -0.7), v(-0.35, 0.0)],
@@ -2513,13 +3177,12 @@ fn glyph_strokes(c: &Constraint) -> Vec<[Vec2; 2]> {
             [v(1.0, -0.7), v(0.35, 0.0)],
         ],
         // A pinned point: a box around it.
-        Constraint::Fix(_) => vec![
+        ConstraintKind::Fix => vec![
             [v(-0.8, -0.8), v(0.8, -0.8)],
             [v(0.8, -0.8), v(0.8, 0.8)],
             [v(0.8, 0.8), v(-0.8, 0.8)],
             [v(-0.8, 0.8), v(-0.8, -0.8)],
         ],
-        _ => Vec::new(),
     }
 }
 
@@ -2687,7 +3350,8 @@ fn build_shape(
         | SketchTool::Line
         | SketchTool::Dimension
         | SketchTool::Trim
-        | SketchTool::Break => {}
+        | SketchTool::Break
+        | SketchTool::Constrain(_) => {}
     }
     for (created, click) in tie {
         // A click on a curve ties the same way a click on a point does; the solver takes
@@ -2748,6 +3412,33 @@ fn outline(sketch: &Sketch, id: EntityId, tess: &Tessellation) -> Option<Vec<Vec
         }),
         _ => sketch.curve_polyline(id, tess),
     }
+}
+
+/// How far the moved points have strayed from rigid, relative to their own size, or
+/// `None` when they are still rigid.
+///
+/// Distances to the first point are enough: a transform that preserves every distance
+/// from one point, for points that are not all collinear, is a rotation and a
+/// translation. Collinear sets can still be reflected, which a move cannot produce, so
+/// nothing is lost by not testing for it.
+fn rigid_error(sketch: &Sketch, start: &[(EntityId, Vec2)]) -> Option<f64> {
+    let (anchor, from) = *start.first()?;
+    let now_anchor = sketch.point_pos(anchor)?;
+    let scale = start
+        .iter()
+        .map(|(_, p)| p.distance(from))
+        .fold(0.0, f64::max);
+    if scale <= 0.0 {
+        return None;
+    }
+    let worst = start
+        .iter()
+        .filter_map(|(id, was)| {
+            let now = sketch.point_pos(*id)?;
+            Some((now.distance(now_anchor) - was.distance(from)).abs())
+        })
+        .fold(0.0, f64::max);
+    (worst > scale * RIGID_TOL).then_some(worst / scale)
 }
 
 /// `toward` moved to exactly `distance` from `from` along the same direction, or left

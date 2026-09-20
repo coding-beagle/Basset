@@ -26,6 +26,14 @@ use crate::{
 /// anything a user can draw deliberately.
 pub const JOIN_TOL: f64 = LINEAR_TOL * 1e3;
 
+/// The head start a point gets over a curve in [`Sketch::hit_test`], as a fraction of
+/// the tolerance. A cursor over a curve is exactly zero from it while it is never
+/// exactly on a point, so nearest-first alone would make an endpoint nearly unpickable
+/// wherever a curve runs through it — which is every endpoint there is. Inside this much
+/// of the tolerance the point wins; beyond it the honest distance decides, so a click
+/// plainly out along a line still takes the line.
+pub const POINT_PICK_BIAS: f64 = 0.6;
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Sketch {
     pub(crate) entities: SlotMap<EntityId, EntityData>,
@@ -457,26 +465,37 @@ impl Sketch {
         }
     }
 
-    /// Entities within `tolerance` of `pos`, nearest first. Points win ties against
-    /// curves so a shared endpoint is picked over the curves that meet there.
+    /// Entities within `tolerance` of `pos`, nearest first, with points favoured.
+    ///
+    /// A point is a target a few pixels across sitting on top of a curve that is as long
+    /// as the drawing, so an honest nearest-first test hands the user the curve nearly
+    /// every time: the pointer is almost never exactly on the point, while the curve
+    /// running through it is exactly zero away. Points therefore get a head start
+    /// ([`POINT_PICK_BIAS`]), which is enough to make an endpoint the easy thing to hit
+    /// without making a click halfway along a line mean its far end.
     pub fn hit_test(&self, pos: Vec2, tolerance: f64) -> Vec<Hit> {
-        let mut hits: Vec<(Hit, u8)> = self
+        let mut hits: Vec<(Hit, f64)> = self
             .entities
             .iter()
             .filter_map(|(id, d)| {
                 let distance = self.entity_distance(id, pos)?;
+                let bias = if d.entity.is_point() {
+                    tolerance * POINT_PICK_BIAS
+                } else {
+                    0.0
+                };
                 (distance <= tolerance).then_some((
                     Hit {
                         entity: id,
                         distance,
                     },
-                    if d.entity.is_point() { 0 } else { 1 },
+                    distance - bias,
                 ))
             })
             .collect();
-        // Quantising the distance to the linear tolerance turns "equal within tolerance"
-        // into a total order so the tie-break rule is well defined for sorting.
-        hits.sort_by_key(|(h, rank)| (((h.distance / LINEAR_TOL).round()) as i64, *rank));
+        // Quantising to the linear tolerance turns "equal within tolerance" into a total
+        // order, so the ordering is well defined for sorting.
+        hits.sort_by_key(|(_, rank)| (rank / LINEAR_TOL).round() as i64);
         hits.into_iter().map(|(h, _)| h).collect()
     }
 

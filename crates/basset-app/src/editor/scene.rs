@@ -239,7 +239,7 @@ pub fn build(editor: &Editor) -> Scene<'_> {
     if let Mode::Sketch(s) = &editor.mode {
         // Put the grid on the sketch plane: the user snaps to it, so they must see it.
         scene.grid_frame = s.frame;
-        s.draw(&mut scene.lines, &mut points);
+        s.draw(&mut scene.lines, &mut points, &mut scene.tris);
         // A faint square shows the sketch plane's extent.
         let half = editor.plane_half_size();
         let corners = [
@@ -257,6 +257,37 @@ pub fn build(editor: &Editor) -> Scene<'_> {
             ]);
         }
         scene.lines.push(plane);
+    }
+
+    // The transform manipulator: an arrow per direction the move can travel and a ring
+    // per axis it can turn about. The grips on them are egui widgets drawn over this.
+    if let Some(g) = super::gizmo::current(editor) {
+        let arm = g.arm(&editor.camera, editor.window_px);
+        let radius = g.radius(&editor.camera, editor.window_px);
+        let px = editor.camera.pixel_size_at(g.origin, editor.window_px);
+        for a in &g.arrows {
+            let mut arrow = LineBatch::new(a.color);
+            arrow.width_px = 2.5;
+            arrow.depth_test = false;
+            let tip = g.origin + a.dir * arm;
+            arrow.segments.push([g.origin, tip]);
+            let side = a.dir.cross(editor.camera.forward()).normalize_or_zero();
+            let head = a.dir * (12.0 * px);
+            let wing = side * (5.0 * px);
+            arrow.segments.push([tip, tip - head + wing]);
+            arrow.segments.push([tip, tip - head - wing]);
+            scene.lines.push(arrow);
+        }
+        for r in &g.rings {
+            let mut ring = LineBatch::new(r.color);
+            ring.width_px = 2.0;
+            ring.depth_test = false;
+            let points = g.ring_points(r, radius);
+            for w in points.windows(2) {
+                ring.segments.push([w[0], w[1]]);
+            }
+            scene.lines.push(ring);
+        }
     }
 
     // The running tool's size, as an arrow from where it grows to where it reaches. The
@@ -286,7 +317,7 @@ pub fn build(editor: &Editor) -> Scene<'_> {
         hovered_edges,
     ]);
     scene.points = points;
-    scene.tris = vec![selected_fill, hover_fill];
+    scene.tris.extend([selected_fill, hover_fill]);
     scene.tris.retain(|t| !t.triangles.is_empty());
     scene.lines.retain(|l| !l.segments.is_empty());
     scene.points.retain(|p: &PointBatch| !p.points.is_empty());

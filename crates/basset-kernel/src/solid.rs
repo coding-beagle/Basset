@@ -5,7 +5,11 @@
 //! approximate. Booleans only ever split polygons, so a face's key and surface survive
 //! every downstream operation: that is what keeps references from later features valid.
 //!
-//! Polygons are kept convex because the BSP splitter in [`crate::csg`] relies on it.
+//! Polygons start convex, which is what the BSP splitter in [`crate::csg`] wants, but
+//! they do not stay that way: a boolean leaves reflex fragments, and healing T-junctions
+//! inserts vertices in the middle of an edge. Nothing downstream may assume a polygon
+//! fans from its first vertex.
+//!
 //! Curved surfaces are faceted at creation time; the surface kind is what lets the
 //! tessellator shade them smoothly and lets selection report "cylinder, radius 5".
 
@@ -18,8 +22,16 @@ use crate::geometry::{Contour, Profile, Segment};
 use crate::ids::{EdgeKey, FaceKey};
 
 /// Distance below which two vertices are the same vertex. Looser than the maths crate's
-/// `LINEAR_TOL` because BSP splitting accumulates a little error per split.
-pub const MERGE_TOL: f64 = 1e-6;
+/// `LINEAR_TOL` because BSP splitting accumulates error per split: each split interpolates
+/// a crossing point on an edge whose ends a previous split already moved, so a vertex that
+/// four booleans have passed through is several microns from where the first one put it.
+/// Measured on `testcases/ExportAs3MFCreatesBadGeometry.bass`, which drifts 7.4e-6 across
+/// its four features; at 1e-6 the two copies of a corner stayed separate vertices and the
+/// exported shell pinched together along the line between them.
+///
+/// Ten nanometres is four orders of magnitude below anything a printer or a user can
+/// resolve, so nothing real is welded away by being generous here.
+pub const MERGE_TOL: f64 = 1e-5;
 
 /// Surfaces meeting at a sharper angle than this are separated by a visible crease.
 /// [`smooth_normals`] shades to the same cut-off, so an edge that reads as sharp is also
@@ -583,16 +595,26 @@ impl Solid {
         open
     }
 
-    /// Splits polygon edges at vertices of neighbouring polygons that lie on them.
+    /// Snaps near-coincident vertices together and splits polygon edges at vertices of
+    /// neighbouring polygons that lie on them.
     ///
     /// BSP splitting cuts a polygon by a plane without touching its neighbours, so the
     /// result is riddled with T-junctions. Edge extraction and closedness checks need every
     /// shared edge to be shared vertex-for-vertex, so booleans call this before returning.
+    ///
+    /// The snap has to come first, and it has to be written back into the polygons rather
+    /// than only used for the analysis. Splitting an edge computes the crossing point by
+    /// interpolation, so the two polygons either side of a shared edge come out of a
+    /// boolean agreeing on its endpoints to within [`MERGE_TOL`] but not exactly. Leaving
+    /// that difference in place lets the *next* boolean interpolate from two slightly
+    /// different edges and drift further, until a pair is far enough apart that nothing
+    /// pairs them up and the shell has a crack in it.
     pub(crate) fn heal(&mut self) {
         let mut index = VertexIndex::default();
-        for p in self.faces.iter().flat_map(|f| f.polygons.iter()) {
-            for v in &p.vertices {
-                index.id(*v);
+        for p in self.faces.iter_mut().flat_map(|f| f.polygons.iter_mut()) {
+            for v in &mut p.vertices {
+                let id = index.id(*v) as usize;
+                *v = index.points[id];
             }
         }
         let mut by_x: Vec<(f64, Vec3)> = index.points.iter().map(|p| (p.x, *p)).collect();
@@ -613,10 +635,15 @@ impl Solid {
                 if len2 < MERGE_TOL * MERGE_TOL {
                     continue;
                 }
+                // Only points strictly *inside* the edge split it. The guard is a
+                // distance, not a parameter: a vertex a few microns off `a` sits at
+                // t ~ 1e-7 on a 14 mm edge, and splitting there would add a spur out to a
+                // point the merge tolerance already treats as `a` and straight back.
+                let end_t = MERGE_TOL / len2.sqrt();
                 let mut inserts: Vec<(f64, Vec3)> = Vec::new();
                 for &(_, q) in by_x[start..].iter().take_while(|(x, _)| *x <= hi) {
                     let t = (q - a).dot(ab) / len2;
-                    if t <= 1e-9 || t >= 1.0 - 1e-9 {
+                    if t <= end_t || t >= 1.0 - end_t {
                         continue;
                     }
                     let foot = a + ab * t;
@@ -782,15 +809,12 @@ impl Solid {
             };
             for (pi, p) in f.polygons.iter().enumerate() {
                 let n = p.plane.normal;
-                for i in 1..p.vertices.len() - 1 {
-                    let tri = [p.vertices[0], p.vertices[i], p.vertices[i + 1]];
-                    if (tri[1] - tri[0]).cross(tri[2] - tri[0]).length_squared() < 1e-24 {
-                        continue;
-                    }
+                for [a, b, c] in triangulate_polygon(p) {
+                    let tri = [p.vertices[a], p.vertices[b], p.vertices[c]];
                     let base = mesh.positions.len() as u32;
                     mesh.positions.extend_from_slice(&tri);
                     match &smooth {
-                        Some(s) => mesh.normals.extend([s[pi][0], s[pi][i], s[pi][i + 1]]),
+                        Some(s) => mesh.normals.extend([s[pi][a], s[pi][b], s[pi][c]]),
                         None => mesh.normals.extend([n, n, n]),
                     }
                     mesh.indices.extend([base, base + 1, base + 2]);
@@ -800,6 +824,56 @@ impl Solid {
         }
         Tessellated { mesh, face_keys }
     }
+}
+
+/// Index triples covering `polygon`, wound about its own normal.
+///
+/// A fan from vertex 0 is not good enough. `heal` leaves T-junction vertices sitting mid-edge,
+/// so a fan makes zero-area triangles whenever the apex is collinear with a pair, and booleans
+/// leave genuinely non-convex fragments, which a fan covers with triangles that spill outside
+/// the polygon. Ear clipping handles both, and — this is the part the exporter depends on — it
+/// uses *every* vertex and emits triangles whose union is exactly the polygon, so each polygon
+/// edge is covered once and the shell stays closed. A dropped sliver would be a hole, and a
+/// hole is a non-manifold edge in the file.
+fn triangulate_polygon(polygon: &Polygon) -> Vec<[usize; 3]> {
+    let n = polygon.vertices.len();
+    if n < 3 {
+        return Vec::new();
+    }
+    let frame = Frame::from_normal(polygon.plane.origin, polygon.plane.normal);
+    let local: Vec<Vec2> = polygon
+        .vertices
+        .iter()
+        .map(|v| frame.to_local(*v))
+        .collect();
+    let flat: Vec<f64> = local.iter().flat_map(|p| [p.x, p.y]).collect();
+    let Ok(indices) = earcutr::earcut(&flat, &[], 2) else {
+        return fan(n);
+    };
+    if indices.len() < 3 * (n - 2) {
+        // Earcut gave up part-way through (it does that on self-touching input). A partial
+        // cover would leave the shell open, so fall back to something that at least uses
+        // every vertex.
+        return fan(n);
+    }
+    indices
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|&[a, b, c]| {
+            // The frame is right-handed about the polygon normal, so a counter-clockwise
+            // triangle in local coordinates already faces outward.
+            if (local[b] - local[a]).perp_dot(local[c] - local[a]) < 0.0 {
+                [a, c, b]
+            } else {
+                [a, b, c]
+            }
+        })
+        .collect()
+}
+
+fn fan(n: usize) -> Vec<[usize; 3]> {
+    (1..n - 1).map(|i| [0, i, i + 1]).collect()
 }
 
 /// Per-polygon, per-vertex normals averaged over the face's polygons that meet at the
@@ -1345,6 +1419,131 @@ mod tests {
             neighbour_tag(FaceKey::new(op, FaceRole::Side(1))),
             neighbour_tag(FaceKey::new(op, FaceRole::Fillet(1)))
         );
+    }
+
+    /// The fan triangulation this replaced covered a non-convex polygon with triangles
+    /// that spilled outside it, so the mesh a slicer saw did not match the solid.
+    #[test]
+    fn triangulation_covers_a_non_convex_polygon_exactly() {
+        // An L in the z = 0 plane, wound counter-clockwise about +z.
+        let v = |x: f64, y: f64| Vec3::new(x, y, 0.0);
+        let p = Polygon::new(vec![
+            v(0., 0.),
+            v(2., 0.),
+            v(2., 1.),
+            v(1., 1.),
+            v(1., 2.),
+            v(0., 2.),
+        ])
+        .unwrap();
+        let tris = triangulate_polygon(&p);
+        assert_eq!(tris.len(), 4, "six vertices, so four triangles");
+        let area: f64 = tris
+            .iter()
+            .map(|&[a, b, c]| {
+                let (a, b, c) = (p.vertices[a], p.vertices[b], p.vertices[c]);
+                (b - a).cross(c - a).dot(p.plane.normal) / 2.0
+            })
+            .sum();
+        // Signed, so a triangle laid down the wrong way or outside the L shows up.
+        assert_relative_eq!(area, 3.0, epsilon = 1e-12);
+    }
+
+    /// Healing leaves T-junction vertices sitting mid-edge. A fan from vertex 0 made a
+    /// zero-area triangle out of each one and `tessellate` used to drop those, which took
+    /// a bite out of the shell: a hole in the STL and a non-manifold edge in the 3MF.
+    #[test]
+    fn tessellation_of_a_healed_solid_keeps_every_triangle_and_stays_closed() {
+        let c = split_and_healed_cube();
+        let mesh = c.tessellate().mesh;
+        let expected: usize = c
+            .faces
+            .iter()
+            .flat_map(|f| f.polygons.iter())
+            .map(|p| p.vertices.len() - 2)
+            .sum();
+        assert_eq!(mesh.triangle_count(), expected, "a triangle went missing");
+        assert_eq!(unmatched_mesh_edges(&mesh), 0);
+    }
+
+    /// Every triangle edge should be walked once in each direction. Counts by welded
+    /// vertex id, the way an exporter and a slicer do.
+    fn unmatched_mesh_edges(mesh: &TriMesh) -> usize {
+        let mut index = VertexIndex::default();
+        let mut directed: HashMap<(u32, u32), i32> = HashMap::new();
+        for i in 0..mesh.triangle_count() {
+            let ids: Vec<u32> = mesh.triangle(i).iter().map(|v| index.id(*v)).collect();
+            for (j, &a) in ids.iter().enumerate() {
+                let b = ids[(j + 1) % 3];
+                if a == b {
+                    continue;
+                }
+                let (k, s) = if a < b { ((a, b), 1) } else { ((b, a), -1) };
+                *directed.entry(k).or_default() += s;
+            }
+        }
+        directed.values().filter(|c| **c != 0).count()
+    }
+
+    /// Healing used to split an edge at a vertex a few microns off its own start: the
+    /// parametric guard let `t ≈ 1e-7` through on a 14 mm edge. The polygon came back
+    /// with a zero-area spur out to a point the merge tolerance calls its own start, and
+    /// the spur's edges matched nothing.
+    #[test]
+    fn healing_does_not_split_an_edge_at_its_own_endpoint() {
+        let mut c = unit_cube();
+        // A stray vertex a tenth of the tolerance off one corner, on another face, so
+        // heal sees it as a candidate split point for every edge meeting that corner.
+        let i = c
+            .faces
+            .iter()
+            .position(|f| f.key.role == FaceRole::StartCap)
+            .unwrap();
+        c.faces[i].polygons[0].vertices[0] += Vec3::new(0.0, 0.1 * MERGE_TOL, 0.0);
+        c.heal();
+        for p in c.faces.iter().flat_map(|f| f.polygons.iter()) {
+            let n = p.vertices.len();
+            for (j, a) in p.vertices.iter().enumerate() {
+                for b in &p.vertices[j + 1..] {
+                    assert!(
+                        a.distance(*b) > MERGE_TOL,
+                        "polygon visits the same point twice: {:?}",
+                        p.vertices
+                    );
+                }
+            }
+            assert_eq!(n, p.vertices.len());
+        }
+        assert!(c.is_closed());
+    }
+
+    /// The snap is what stops error compounding across booleans: after healing, two
+    /// polygons' copies of a shared vertex are the same `f64`s, not merely close ones.
+    #[test]
+    fn healing_snaps_near_coincident_vertices_onto_one_point() {
+        let mut c = unit_cube();
+        let mut n = 0.0_f64;
+        for p in c.faces.iter_mut().flat_map(|f| f.polygons.iter_mut()) {
+            for v in &mut p.vertices {
+                n += 1.0;
+                let dir = Vec3::new(n.sin(), n.cos(), (n * 0.7).sin()).normalize();
+                *v += dir * (0.45 * MERGE_TOL);
+            }
+        }
+        c.heal();
+        let mut seen: Vec<Vec3> = Vec::new();
+        for v in c
+            .faces
+            .iter()
+            .flat_map(|f| f.polygons.iter())
+            .flat_map(|p| &p.vertices)
+        {
+            match seen.iter().find(|s| s.distance(*v) <= MERGE_TOL) {
+                Some(s) => assert_eq!(s, v, "two copies of one vertex still differ"),
+                None => seen.push(*v),
+            }
+        }
+        assert_eq!(seen.len(), 8, "a unit cube has eight corners");
     }
 
     #[test]

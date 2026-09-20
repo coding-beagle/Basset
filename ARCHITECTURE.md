@@ -170,11 +170,41 @@ view of the same surface (egui blends in gamma space, the viewport in linear). T
   on every parameter change, so the viewport is a live preview; the document's transaction
   API makes the whole interaction one undo step and Cancel a rollback.
 * **Sketch mode** draws on one plane with the same shape builders the sketch crate tests
-  use, trims and breaks existing curves, patterns and moves a selection by typed offsets,
-  names closed regions by a point inside them so `E` can hand them straight to Extrude, writes the working copy back into the feature after each change (so downstream
+  use, trims and breaks existing curves, patterns and moves a selection, names closed
+  regions by a point inside them so `E` can hand them straight to Extrude, writes the
+  working copy back into the feature after each change (so downstream
   features update live), and keeps its own undo stack for the session. The grid is drawn
   on the sketch plane and points that snap to no existing point snap to it; dragging on
   empty space is a rubber band, enclosing or crossing by its direction.
+
+  Everything the user *does* there is a tool, including the geometric constraints: a
+  constraint is picked first and its geometry after, and `constraints_for` decides what a
+  set of picks means without caring about their order — which is also the question the
+  toolbar asks to decide whether a button would do anything. The modal operations (move,
+  pattern) keep the sketch they started from and re-derive the result from it on every
+  change, so editing a number twice replaces the result rather than compounding it;
+  cancelling is putting that copy back, and keeping is pushing it onto the undo stack,
+  which is why a modal operation is exactly one step of undo and never pops a checkpoint
+  it did not take.
+
+  Both of them have to watch out for the same trap. The solver does not fail when a
+  constraint cannot be satisfied the way the user meant; it finds some *other*
+  arrangement that satisfies it, and the cheapest one is usually the geometry folded flat.
+  A move therefore checks that its result is still rigid (`rigid_error`) rather than
+  trusting the residual, and a pattern rewrites each copy's constraints for the angle it
+  was turned through (`pattern::turned`) rather than copying an axis constraint into a
+  copy that contradicts it. Both failures used to look like a converged solve and a
+  destroyed drawing.
+
+The manipulator both kinds of move are dragged by lives in `editor::gizmo`: arrows for the
+directions a transform can travel along and rings for the axes it can turn about, chosen
+from whatever is being moved (a sketch gets its plane's two arrows and one ring, a body
+gets three of each). Only the grips are egui widgets; the shafts and rings are scene
+geometry so they sit in 3D. A grip's drag is projected onto its axis *as that axis appears
+on screen* and scaled by the world size of a pixel, which is what makes the handle follow
+the pointer at any camera angle; a ring converts the same projection into an angle through
+its radius. The manipulator only ever writes the numbers the dialog or palette shows, so
+dragging and typing are two ways of saying one thing.
 
 The navigation cube is drawn from the camera's own basis and hit-tested by casting the
 pointer into a unit cube, so its 26 click targets are exactly the shapes drawn and need no
