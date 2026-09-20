@@ -36,6 +36,10 @@ pub enum KernelError {
     NotPlanarFace(FaceKey),
     #[error("edge {0:?} lies between tangent faces and cannot be blended")]
     TangentEdge(EdgeKey),
+    #[error(
+        "blend would need {needed} facets, over the budget of {budget}: coarsen the body's tessellation, or blend fewer edges at once"
+    )]
+    BlendTooDense { needed: usize, budget: usize },
     #[error("operation produced no solid")]
     EmptyResult,
     #[error("profile could not be triangulated near {0:?}")]

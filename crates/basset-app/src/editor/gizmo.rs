@@ -21,6 +21,7 @@
 use basset_math::{Vec2, Vec3};
 use basset_viewport::Camera;
 
+use super::snap::{Hint, Snap};
 use super::tools::ToolKind;
 use super::{Editor, Mode};
 
@@ -84,18 +85,27 @@ impl Slider {
 }
 
 /// The slider the editor should be showing, or `None` when nothing has one.
+///
+/// Two operations have one, and never at the same time: only one modal operation runs
+/// in a sketch at once.
 pub fn slider(editor: &Editor) -> Option<Slider> {
     let Mode::Sketch(s) = &editor.mode else {
         return None;
     };
-    let (anchor, dir) = s.offset_handle()?;
+    // A fillet's radius is dragged on the corner it rounds: the handle sits the radius
+    // out along the bisector, so the distance from the corner to the grip is the number.
+    let (anchor, dir, value) = match (s.offset_handle(), s.fillet_handle()) {
+        (Some((anchor, dir)), _) => (anchor, dir, s.offset.distance),
+        (_, Some((anchor, dir))) => (anchor, dir, s.fillet.radius),
+        _ => return None,
+    };
     let frame = &s.frame;
     Some(Slider {
         anchor: frame.to_world(anchor),
         // A direction, not a point, so it is built from the frame's axes rather than
         // being mapped through the origin.
         dir: frame.x * dir.x + frame.y * dir.y,
-        value: s.offset.distance,
+        value,
         color: SLIDE_COLOR,
     })
 }
@@ -215,10 +225,23 @@ impl Gizmo {
 
 /// Draws the grips and applies whatever was dragged. Returns whether anything moved.
 pub fn interact(editor: &mut Editor, ctx: &egui::Context) -> bool {
-    // egui owns the modifier state during a drag, and the sketch's snapping has to read
-    // the same shift the user is holding as they drag.
+    // egui owns the modifier state during a drag, and the snapping has to read the same
+    // shift the user is holding as they drag. The sketch keeps its own copy because the
+    // drawing path comes from winit and cannot see egui's.
+    let shift = ctx.input(|i| i.modifiers.shift);
+    editor.snapping.free = shift;
     if let Mode::Sketch(s) = &mut editor.mode {
-        s.set_free_snap(ctx.input(|i| i.modifiers.shift));
+        s.set_free_snap(shift);
+    }
+    // A gesture that has ended must not bank its travel into the next one: a running
+    // total is only meaningful while the button is down. Done here rather than after the
+    // handles because the slider returns early, and a total left behind there would be
+    // added to the next drag of the same grip.
+    if ctx.input(|i| !i.pointer.any_down()) {
+        editor.drags.release();
+        if let Mode::Sketch(s) = &mut editor.mode {
+            s.release_drags();
+        }
     }
     let camera = editor.camera;
     let window = editor.window_px;
@@ -233,8 +256,13 @@ pub fn interact(editor: &mut Editor, ctx: &egui::Context) -> bool {
             grip,
             slider.color,
         ) && let Some(world) = along_axis(&camera, window, grip, slider.dir, delta)
+            && let Some(value) = slide(editor, world)
         {
-            slid = slide(editor, world);
+            slid = true;
+            // The grip sits *at* the value, so the hint belongs where it has landed, not
+            // where it was grabbed.
+            let at = slider.anchor + slider.dir * value;
+            editor.snap_hint = Some(Hint::value(at, value, " mm", editor.snap_at(at)));
         }
     }
     let Some(gizmo) = current(editor) else {
@@ -262,7 +290,11 @@ pub fn interact(editor: &mut Editor, ctx: &egui::Context) -> bool {
         let Some(world) = along_axis(&camera, window, tip, arrow.dir, delta) else {
             continue;
         };
-        moved |= translate(editor, arrow.axis, world);
+        let snap = editor.snap_at(gizmo.origin);
+        if let Some(value) = translate(editor, arrow.axis, world, snap) {
+            moved = true;
+            editor.snap_hint = Some(Hint::value(tip, value, " mm", snap));
+        }
     }
     for ring in &gizmo.rings {
         let grip = gizmo.origin + ring.grip * radius;
@@ -282,7 +314,16 @@ pub fn interact(editor: &mut Editor, ctx: &egui::Context) -> bool {
         let Some(arc) = along_axis(&camera, window, grip, tangent, delta) else {
             continue;
         };
-        moved |= rotate(editor, ring.axis, (arc / radius).to_degrees());
+        let snap = editor.snap_at(gizmo.origin);
+        if let Some(value) = rotate(editor, ring.axis, (arc / radius).to_degrees(), snap) {
+            moved = true;
+            // An angle has no grid increment to name, so the hint says the angle alone.
+            editor.snap_hint = Some(Hint {
+                at: grip,
+                text: format!("{value:.1}\u{b0}"),
+                on_grid: snap.is_on(),
+            });
+        }
     }
     if moved {
         apply(editor);
@@ -361,48 +402,69 @@ fn along_axis(camera: &Camera, window: [u32; 2], at: Vec3, dir: Vec3, delta: Vec
     (length > 1.0).then(|| delta.dot(drawn / length) / length)
 }
 
-/// Adds `world` to the move's offset along `axis`. The sketch's axes are the sketch
+/// Adds `world` to the move's offset along `axis`, snapped, and hands back the offset it
+/// now reads. `None` when there is nothing to move. The sketch's axes are the sketch
 /// plane's, so its X and Y are the frame's, not the model's.
-fn translate(editor: &mut Editor, axis: Axis, world: f64) -> bool {
+///
+/// A sketch applies the rule itself rather than being handed it, because the same rule
+/// has to hold for the numbers typed into the palette; [`Editor::snap_at`] reports the
+/// sketch's own, so the two cannot disagree.
+fn translate(editor: &mut Editor, axis: Axis, world: f64, snap: Snap) -> Option<f64> {
     match &mut editor.mode {
-        Mode::Sketch(s) => s.nudge_move(axis == Axis::X, world),
+        Mode::Sketch(s) => s.nudge_move(axis == Axis::X, world).then(|| {
+            let op = s.move_op.as_ref()?;
+            Some(if axis == Axis::X { op.dx } else { op.dy })
+        })?,
         Mode::Model => {
-            let Some(tool) = editor.tool.as_mut() else {
-                return false;
+            let tool = editor.tool.as_mut()?;
+            let offset = match axis {
+                Axis::X => &mut tool.params.translate.x,
+                Axis::Y => &mut tool.params.translate.y,
+                Axis::Z => &mut tool.params.translate.z,
             };
-            match axis {
-                Axis::X => tool.params.translate.x += world,
-                Axis::Y => tool.params.translate.y += world,
-                Axis::Z => tool.params.translate.z += world,
-            }
-            true
+            let drag = &mut editor.drags.translate[axis as usize];
+            *offset = drag.advance(*offset, world, snap);
+            Some(*offset)
         }
     }
 }
 
-/// Drags whatever the slider drives by `world` units.
-fn slide(editor: &mut Editor, world: f64) -> bool {
+/// Drags whatever the slider drives by `world` units, and hands back the distance it now
+/// reads.
+fn slide(editor: &mut Editor, world: f64) -> Option<f64> {
     match &mut editor.mode {
-        Mode::Sketch(s) => s.nudge_offset(world),
-        Mode::Model => false,
+        // Two modal operations own a slider, and only one of them is ever live, so the
+        // first that takes the drag is the one being dragged.
+        Mode::Sketch(s) => {
+            if s.nudge_offset(world) {
+                Some(s.offset.distance)
+            } else if s.nudge_fillet(world) {
+                Some(s.fillet.radius)
+            } else {
+                None
+            }
+        }
+        Mode::Model => None,
     }
 }
 
-fn rotate(editor: &mut Editor, axis: Axis, degrees: f64) -> bool {
+/// Turns the move by `degrees`, snapped, and hands back the angle it now reads.
+fn rotate(editor: &mut Editor, axis: Axis, degrees: f64, snap: Snap) -> Option<f64> {
     match &mut editor.mode {
         // A sketch turns in its own plane and nowhere else, so its one ring is the only
         // rotation there is to drive.
-        Mode::Sketch(s) => axis == Axis::Z && s.turn_move(degrees),
+        Mode::Sketch(s) => (axis == Axis::Z && s.turn_move(degrees))
+            .then(|| s.move_op.as_ref().map(|op| op.angle_deg))?,
         Mode::Model => {
-            let Some(tool) = editor.tool.as_mut() else {
-                return false;
+            let tool = editor.tool.as_mut()?;
+            let angle = match axis {
+                Axis::X => &mut tool.params.rotate_deg.x,
+                Axis::Y => &mut tool.params.rotate_deg.y,
+                Axis::Z => &mut tool.params.rotate_deg.z,
             };
-            match axis {
-                Axis::X => tool.params.rotate_deg.x += degrees,
-                Axis::Y => tool.params.rotate_deg.y += degrees,
-                Axis::Z => tool.params.rotate_deg.z += degrees,
-            }
-            true
+            let drag = &mut editor.drags.rotate[axis as usize];
+            *angle = drag.advance_angle(*angle, degrees, snap);
+            Some(*angle)
         }
     }
 }
@@ -414,6 +476,7 @@ fn apply(editor: &mut Editor) {
             // Whichever operation the handle belongs to; they are never both running.
             s.update_move();
             s.update_offset();
+            s.update_fillet();
             if s.take_dirty() {
                 editor.commit_sketch();
             }

@@ -282,7 +282,10 @@ fn remove_with_orphans(sketch: &mut Sketch, curve: EntityId, candidates: &[Entit
 /// Deletes points that the edit left attached to nothing. A point the user drew
 /// deliberately is never a candidate here: only the endpoints of the curve being cut are
 /// offered, and one still holding a constraint (a dimension, a coincidence) stays.
-fn prune_orphans(sketch: &mut Sketch, candidates: &[EntityId]) {
+///
+/// Shared with [`crate::fillet`], which leaves the same kind of orphan behind when it
+/// trims a corner point away.
+pub(crate) fn prune_orphans(sketch: &mut Sketch, candidates: &[EntityId]) {
     for &p in candidates {
         let used_by_curve = sketch
             .entities()

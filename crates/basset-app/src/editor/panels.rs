@@ -20,6 +20,8 @@ const WARNING_LABEL: egui::Color32 = egui::Color32::from_rgb(235, 190, 90);
 /// Deferred commands, so panel code never needs `&mut Editor` while it borrows state.
 enum Command {
     Tool(ToolKind),
+    /// Start or leave the Measure tool, which owns no feature; see [`super::measure`].
+    Measure(bool),
     New,
     Open,
     Save(bool),
@@ -33,6 +35,7 @@ enum Command {
     ToggleProjection,
     Display(DisplayMode),
     ToggleGrid,
+    ToggleSnap,
     ToggleOrigin,
     SetCursor(usize),
     Edit(FeatureId),
@@ -68,6 +71,10 @@ enum Command {
     SketchOffsetUpdate,
     /// Keep (`true`) or undo (`false`) the offset in progress.
     SketchOffsetFinish(bool),
+    /// The radius in the fillet palette changed: re-make the arc.
+    SketchFilletUpdate,
+    /// Keep (`true`) or undo (`false`) the corner fillet in progress.
+    SketchFilletFinish(bool),
     SketchSetParameter(String, String),
     SketchRemoveParameter(String),
     SketchBindDimension(basset_sketch::ConstraintId, String),
@@ -82,6 +89,9 @@ enum Command {
 pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
     let mut commands: Vec<Command> = Vec::new();
     editor.refresh_cache();
+    // The hint belongs to the drag happening now; a stale one would leave a number
+    // hanging over geometry nobody is touching.
+    editor.snap_hint = None;
 
     egui::Panel::top("menu").show(ui, |ui| {
         menu_bar(editor, ui, &mut commands);
@@ -114,8 +124,12 @@ pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
     sketch_operation_dialog(editor, &ctx, free, &mut commands);
     tools::dialog(editor, &ctx);
     super::gizmo::interact(editor, &ctx);
+    if let Some(hint) = &editor.snap_hint {
+        super::snap::paint(&ctx, &editor.camera, editor.window_px, hint);
+    }
     entry_overlay(editor, &ctx, &mut commands);
     dimension_overlay(editor, &ctx, &mut commands);
+    measure_overlay(editor, &ctx);
     constraint_overlay(editor, &ctx, &mut commands);
     error_popup(editor, &ctx);
     rename_popup(editor, &ctx);
@@ -128,6 +142,13 @@ pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
 fn run(editor: &mut Editor, c: Command) {
     match c {
         Command::Tool(kind) => tools::start_tool(editor, kind),
+        Command::Measure(on) => {
+            if on {
+                super::measure::start(editor)
+            } else {
+                super::measure::stop(editor)
+            }
+        }
         Command::New => editor.new_document(),
         Command::Open => editor.open(),
         Command::Save(as_new) => editor.save(as_new),
@@ -141,6 +162,7 @@ fn run(editor: &mut Editor, c: Command) {
         Command::ToggleProjection => editor.toggle_projection(),
         Command::Display(m) => editor.set_display_mode(m),
         Command::ToggleGrid => editor.show_grid = !editor.show_grid,
+        Command::ToggleSnap => editor.set_snapping(!editor.snapping.to_grid),
         Command::ToggleOrigin => editor.show_origin = !editor.show_origin,
         Command::SetCursor(c) => editor.set_cursor(c),
         Command::Edit(id) => editor.edit_feature(id),
@@ -290,6 +312,23 @@ fn run(editor: &mut Editor, c: Command) {
                 });
             }
         }
+        Command::SketchFilletUpdate => {
+            if let Mode::Sketch(s) = &mut editor.mode {
+                s.update_fillet();
+                editor.commit_sketch();
+            }
+        }
+        Command::SketchFilletFinish(keep) => {
+            if let Mode::Sketch(s) = &mut editor.mode {
+                let kept = s.finish_fillet(keep);
+                editor.commit_sketch();
+                editor.set_status(match (keep, kept) {
+                    (_, true) => "Corner rounded".to_string(),
+                    (true, false) => "Fillet cancelled: that radius does not fit".into(),
+                    (false, false) => "Fillet cancelled".into(),
+                });
+            }
+        }
         Command::SketchSetParameter(name, expression) => {
             if let Mode::Sketch(s) = &mut editor.mode {
                 match s.set_parameter(&name, &expression) {
@@ -419,6 +458,15 @@ fn menu_bar(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
             if ui.selectable_label(editor.show_grid, "Show grid").clicked() {
                 commands.push(Command::ToggleGrid);
             }
+            // The master switch, reachable without opening a sketch: the modelling
+            // handles snap too, and a user who wants them free needs somewhere to say so
+            // that is not the sketch palette. Shift remains the way to free one drag.
+            if ui
+                .selectable_label(editor.snapping.to_grid, "Snap to grid (shift to override)")
+                .clicked()
+            {
+                commands.push(Command::ToggleSnap);
+            }
             if ui
                 .selectable_label(editor.show_origin, "Show origin planes and axes")
                 .clicked()
@@ -427,32 +475,34 @@ fn menu_bar(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
             }
         });
         ui.menu_button("Create", |ui| {
-            for kind in [
-                ToolKind::Sketch,
-                ToolKind::Extrude,
-                ToolKind::Revolve,
-                ToolKind::Sweep,
-                ToolKind::Loft,
-                ToolKind::OffsetPlane,
-                ToolKind::AngledPlane,
-                ToolKind::Component,
-            ] {
-                if ui.button(kind.title()).clicked() {
-                    commands.push(Command::Tool(kind));
-                }
-            }
+            tool_menu(
+                ui,
+                "create-menu",
+                &[
+                    ToolKind::Sketch,
+                    ToolKind::Extrude,
+                    ToolKind::Revolve,
+                    ToolKind::Sweep,
+                    ToolKind::Loft,
+                    ToolKind::OffsetPlane,
+                    ToolKind::AngledPlane,
+                    ToolKind::Component,
+                ],
+                commands,
+            );
         });
         ui.menu_button("Modify", |ui| {
-            for kind in [
-                ToolKind::Fillet,
-                ToolKind::Chamfer,
-                ToolKind::Combine,
-                ToolKind::Move,
-            ] {
-                if ui.button(kind.title()).clicked() {
-                    commands.push(Command::Tool(kind));
-                }
-            }
+            tool_menu(
+                ui,
+                "modify-menu",
+                &[
+                    ToolKind::Fillet,
+                    ToolKind::Chamfer,
+                    ToolKind::Combine,
+                    ToolKind::Move,
+                ],
+                commands,
+            );
         });
     });
 }
@@ -483,12 +533,22 @@ fn toolbar(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
         ];
         for group in groups {
             for (kind, label) in group {
-                if ui.add_enabled(!busy, egui::Button::new(*label)).clicked() {
+                // Icon and label are one button, so the symbol is as clickable as the
+                // word beside it.
+                if tool_button(ui, "toolbar", *kind, Some(label), false, !busy)
+                    .on_hover_text(kind.title())
+                    .clicked()
+                {
                     commands.push(Command::Tool(*kind));
                 }
             }
             ui.separator();
         }
+        let measuring = editor.measure.is_some();
+        if measure_button(ui, !busy, measuring) {
+            commands.push(Command::Measure(!measuring));
+        }
+        ui.separator();
         if ui.button("Fit").clicked() {
             commands.push(Command::Fit);
         }
@@ -507,6 +567,20 @@ fn toolbar(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
         ui.separator();
         ui.label(egui::RichText::new("Right-drag orbit · middle-drag pan · wheel zoom").weak());
     });
+}
+
+/// One menu's worth of modelling tools, each an icon and its name in one button.
+///
+/// The icon is part of the button rather than a picture beside it: a symbol that reacts
+/// to the pointer and then ignores the click is the menu saying one thing and meaning
+/// another, which is exactly the bug the sketch variant menus had.
+fn tool_menu(ui: &mut egui::Ui, salt: &str, kinds: &[ToolKind], commands: &mut Vec<Command>) {
+    for kind in kinds {
+        if tool_button(ui, salt, *kind, Some(kind.title()), false, true).clicked() {
+            commands.push(Command::Tool(*kind));
+            ui.close();
+        }
+    }
 }
 
 /// Holding a folded tool button this long opens its variants, as in Fusion.
@@ -805,25 +879,101 @@ fn constraint_button(
     response
 }
 
+/// Either kind of tool, so one icon set serves the sketch toolbar and the modelling one.
+///
+/// The two enums live in different modules and mean different things, but a button is a
+/// button: without this every modelling tool would have needed a second, parallel way of
+/// drawing a symbol, and the two would have drifted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AnyTool {
+    Sketch(SketchTool),
+    Model(ToolKind),
+}
+
+impl AnyTool {
+    /// The name the icon is filed under; the sketch titles and the modelling ones do not
+    /// collide.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            AnyTool::Sketch(t) => t.name(),
+            AnyTool::Model(k) => k.title(),
+        }
+    }
+}
+
+impl From<SketchTool> for AnyTool {
+    fn from(t: SketchTool) -> Self {
+        AnyTool::Sketch(t)
+    }
+}
+
+impl From<ToolKind> for AnyTool {
+    fn from(k: ToolKind) -> Self {
+        AnyTool::Model(k)
+    }
+}
+
+/// Side of the square a tool symbol is painted in.
+const ICON: f32 = 28.0;
+
 /// The id of a painted tool icon, so it can be found without text to search for.
 ///
 /// Absolute rather than derived from the surrounding `Ui`: `salt` already separates the
 /// toolbar's copy of an icon from the same icon in a variant menu, and an id that does
 /// not depend on where the button happens to sit is one anything can ask for.
-fn tool_icon_id(salt: &str, tool: SketchTool) -> egui::Id {
+pub(crate) fn tool_icon_id(salt: &str, tool: AnyTool) -> egui::Id {
     egui::Id::new(("tool-icon", salt, tool.name()))
+}
+
+/// A tool button showing its icon alone.
+fn tool_icon(
+    ui: &mut egui::Ui,
+    salt: &str,
+    tool: impl Into<AnyTool>,
+    selected: bool,
+) -> egui::Response {
+    tool_button(ui, salt, tool, None, selected, true)
 }
 
 /// A tool button with its icon painted rather than typed: the default fonts have no
 /// reliable glyphs for these shapes, and a drawn icon reads the same on every machine.
-fn tool_icon(ui: &mut egui::Ui, salt: &str, tool: SketchTool, selected: bool) -> egui::Response {
-    const SIZE: f32 = 28.0;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(SIZE, SIZE), egui::Sense::hover());
-    // A stable id rather than an automatic one: these buttons paint no text, so an id is
-    // the only handle anything — a test, or egui's own focus — has on them. `salt` keeps
-    // the toolbar's copy of an icon apart from the same icon in a variant menu.
-    let response = ui.interact(rect, tool_icon_id(salt, tool), egui::Sense::click());
-    let visuals = ui.style().interact_selectable(&response, selected);
+///
+/// `label` puts the name beside the symbol, which is what the modelling toolbar and the
+/// menus want: a row of bare symbols is discoverable only to someone who already knows
+/// them. Icon and label are one widget, so a click anywhere on it starts the tool —
+/// the symbol used to be a decorative thing beside a button, and clicking it did nothing.
+fn tool_button(
+    ui: &mut egui::Ui,
+    salt: &str,
+    tool: impl Into<AnyTool>,
+    label: Option<&str>,
+    selected: bool,
+    enabled: bool,
+) -> egui::Response {
+    let tool = tool.into();
+    let galley = label.map(|text| {
+        ui.painter().layout_no_wrap(
+            text.to_owned(),
+            egui::FontId::proportional(13.0),
+            ui.style().visuals.text_color(),
+        )
+    });
+    let width = ICON + galley.as_ref().map_or(0.0, |g| g.size().x + 8.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, ICON), egui::Sense::hover());
+    // A stable id rather than an automatic one: these buttons may paint no text, so an
+    // id is the only handle anything — a test, or egui's own focus — has on them. `salt`
+    // keeps the toolbar's copy of an icon apart from the same icon in a variant menu.
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let response = ui.interact(rect, tool_icon_id(salt, tool), sense);
+    let visuals = if enabled {
+        ui.style().interact_selectable(&response, selected)
+    } else {
+        ui.style().visuals.widgets.noninteractive
+    };
     let painter = ui.painter();
     painter.rect(
         rect,
@@ -832,12 +982,26 @@ fn tool_icon(ui: &mut egui::Ui, salt: &str, tool: SketchTool, selected: bool) ->
         visuals.bg_stroke,
         egui::StrokeKind::Inside,
     );
+    if let Some(galley) = galley {
+        let at = egui::pos2(
+            rect.left() + ICON + 4.0,
+            rect.center().y - galley.size().y * 0.5,
+        );
+        painter.galley(at, galley, visuals.fg_stroke.color);
+    }
+    // Everything below draws inside the icon's own square, whatever the label did to the
+    // width of the button.
+    let rect = egui::Rect::from_min_size(rect.min, egui::vec2(ICON, ICON));
     let stroke = egui::Stroke::new(1.6, visuals.fg_stroke.color);
-    let dot = |p: egui::Pos2| painter.circle_filled(p, 1.8, stroke.color);
+    let dot = |p: egui::Pos2| {
+        painter.circle_filled(p, 1.8, stroke.color);
+    };
     let inner = rect.shrink(6.0);
     let (l, r, t, b) = (inner.left(), inner.right(), inner.top(), inner.bottom());
     let c = inner.center();
-    let line = |a: egui::Pos2, b: egui::Pos2| painter.line_segment([a, b], stroke);
+    let line = |a: egui::Pos2, b: egui::Pos2| {
+        painter.line_segment([a, b], stroke);
+    };
     let arc = |center: egui::Pos2, radius: f32, from: f32, to: f32| {
         let n = 12;
         let pts: Vec<egui::Pos2> = (0..=n)
@@ -849,7 +1013,23 @@ fn tool_icon(ui: &mut egui::Ui, salt: &str, tool: SketchTool, selected: bool) ->
         painter.add(egui::Shape::line(pts, stroke));
     };
     let pi = std::f32::consts::PI;
-    match tool {
+    // An arrowhead on a shaft, for the symbols that have to say "this way".
+    let arrow = |from: egui::Pos2, to: egui::Pos2| {
+        line(from, to);
+        let dir = (to - from).normalized();
+        let back = -dir * 5.0;
+        let side = egui::vec2(-dir.y, dir.x) * 3.0;
+        line(to, to + back + side);
+        line(to, to + back - side);
+    };
+    let sketch_tool = match tool {
+        AnyTool::Sketch(t) => t,
+        AnyTool::Model(kind) => {
+            model_symbol(kind, inner, pi, &line, &arc, &arrow, &dot);
+            return response;
+        }
+    };
+    match sketch_tool {
         SketchTool::Select => {
             // A pointer arrow.
             let tip = egui::pos2(l + 2.0, t + 1.0);
@@ -934,7 +1114,7 @@ fn tool_icon(ui: &mut egui::Ui, salt: &str, tool: SketchTool, selected: bool) ->
             );
             arc(ca, radius, pi * 0.5, pi * 1.5);
             arc(cb, radius, -pi * 0.5, pi * 0.5);
-            match tool {
+            match sketch_tool {
                 SketchTool::Slot => {
                     dot(ca);
                     dot(cb);
@@ -958,12 +1138,25 @@ fn tool_icon(ui: &mut egui::Ui, salt: &str, tool: SketchTool, selected: bool) ->
                 stroke.color,
             );
         }
+        SketchTool::Fillet => {
+            // Two edges meeting at a corner that has been replaced by an arc: each
+            // edge stops where the round begins, which is what the tool does to them.
+            let rad = inner.width() * 0.5;
+            let hub = egui::pos2(l + rad, t + rad);
+            line(egui::pos2(l, b), egui::pos2(l, t + rad));
+            arc(hub, rad, pi * 0.5, pi);
+            line(egui::pos2(l + rad, t), egui::pos2(r, t));
+            // The centre and the radius it is measured by, so the symbol says which
+            // number the tool is about.
+            dot(hub);
+            line(hub, egui::pos2(l, t + rad));
+        }
         SketchTool::Trim | SketchTool::Break => {
             // A line crossed by a second one; for Trim the crossed-off piece is gone,
             // for Break the two halves are drawn apart.
             let y = c.y;
             line(egui::pos2(l, t + 2.0), egui::pos2(l + 7.0, b - 2.0));
-            if tool == SketchTool::Trim {
+            if sketch_tool == SketchTool::Trim {
                 line(egui::pos2(l + 6.0, y), egui::pos2(r, y));
                 dot(egui::pos2(l + 3.0, y));
             } else {
@@ -993,6 +1186,275 @@ fn tool_icon(ui: &mut egui::Ui, salt: &str, tool: SketchTool, selected: bool) ->
         }
     }
     response
+}
+
+/// The id of the painted caliper, so tests and egui's focus have a handle on a button
+/// that carries no text of its own. Shaped like [`tool_icon_id`] for the same reason.
+fn measure_icon_id() -> egui::Id {
+    egui::Id::new(("tool-icon", "toolbar", "Measure"))
+}
+
+/// The Measure tool's button: a painted caliper with its name beside it.
+///
+/// Painted rather than typed for the reason the sketch tools are — the default fonts have
+/// no caliper — and the icon takes the click as readily as the name does, because
+/// something that looks like a button and lights up on hover has to do something when it
+/// is pressed. Returns whether it was clicked.
+fn measure_button(ui: &mut egui::Ui, enabled: bool, active: bool) -> bool {
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.horizontal(|ui| {
+            let icon = measure_icon(ui, active);
+            let label = ui.selectable_label(active, "Measure");
+            icon.on_hover_text("Measure (no change to the model)")
+                .clicked()
+                || label.clicked()
+        })
+        .inner
+    })
+    .inner
+}
+
+/// A vernier caliper seen side on: the beam, the fixed jaw, the sliding jaw and its body.
+fn measure_icon(ui: &mut egui::Ui, selected: bool) -> egui::Response {
+    const SIZE: f32 = 28.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(SIZE, SIZE), egui::Sense::hover());
+    let response = ui.interact(rect, measure_icon_id(), egui::Sense::click());
+    let visuals = ui.style().interact_selectable(&response, selected);
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        visuals.corner_radius,
+        visuals.weak_bg_fill,
+        visuals.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+    let stroke = egui::Stroke::new(1.6, visuals.fg_stroke.color);
+    let inner = rect.shrink(5.0);
+    let (l, r, t, b) = (inner.left(), inner.right(), inner.top(), inner.bottom());
+    let beam = inner.center().y;
+    let line = |a: egui::Pos2, b: egui::Pos2| painter.line_segment([a, b], stroke);
+    line(egui::pos2(l, beam), egui::pos2(r, beam));
+    line(egui::pos2(l, beam), egui::pos2(l, t));
+    let slide = l + (r - l) * 0.6;
+    line(egui::pos2(slide, beam), egui::pos2(slide, t));
+    painter.rect_stroke(
+        egui::Rect::from_min_max(egui::pos2(slide, beam), egui::pos2(slide + 5.0, b)),
+        0.0,
+        stroke,
+        egui::StrokeKind::Middle,
+    );
+    // The gap between the jaws: the thing the tool actually reports.
+    let gap = (beam + t) * 0.5;
+    line(egui::pos2(l + 2.0, gap), egui::pos2(slide - 2.0, gap));
+    response
+}
+
+/// The measurement, drawn on the geometry it describes.
+///
+/// In the viewport rather than a side panel because that is where the user is looking,
+/// and selectable so a number can be copied straight into a dimension box. It is derived
+/// fresh every frame from the picks, so it cannot outlive or contradict the model.
+fn measure_overlay(editor: &Editor, ctx: &egui::Context) {
+    let Some(readout) = super::measure::readout(editor) else {
+        return;
+    };
+    let Some(px) = editor
+        .camera
+        .world_to_screen(readout.anchor, editor.window_px)
+    else {
+        return;
+    };
+    let ppp = ctx.pixels_per_point();
+    let pos = egui::pos2(px[0] as f32 / ppp + 16.0, px[1] as f32 / ppp + 16.0);
+    egui::Area::new(egui::Id::new("measure-readout"))
+        .fixed_pos(pos)
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.vertical(|ui| {
+                    for (i, text) in readout.lines.iter().enumerate() {
+                        // The first line names what was measured; the rest are the values.
+                        let rich = match i {
+                            0 => egui::RichText::new(text).strong(),
+                            _ => egui::RichText::new(text),
+                        };
+                        ui.add(egui::Label::new(rich).selectable(true));
+                    }
+                });
+            });
+        });
+}
+
+/// The symbol of a modelling tool, painted into `inner`.
+///
+/// Split out of [`tool_button`] rather than folded into its match because the two sets
+/// are drawn in different vocabularies: a sketch symbol is the shape the tool draws, a
+/// modelling symbol is a little picture of what the operation does to a solid. The
+/// drawing primitives are shared so both read as one family at the same size.
+#[allow(clippy::too_many_arguments)]
+fn model_symbol(
+    kind: ToolKind,
+    inner: egui::Rect,
+    pi: f32,
+    line: &dyn Fn(egui::Pos2, egui::Pos2),
+    arc: &dyn Fn(egui::Pos2, f32, f32, f32),
+    arrow: &dyn Fn(egui::Pos2, egui::Pos2),
+    dot: &dyn Fn(egui::Pos2),
+) {
+    let (l, r, t, b) = (inner.left(), inner.right(), inner.top(), inner.bottom());
+    let c = inner.center();
+    // A plane seen at an angle: the shape every datum and every sketch sits on.
+    let plane = |top: f32, height: f32| {
+        let (a, b2) = (egui::pos2(l + 4.0, top), egui::pos2(r, top));
+        let (c2, d) = (
+            egui::pos2(r - 4.0, top + height),
+            egui::pos2(l, top + height),
+        );
+        line(a, b2);
+        line(b2, c2);
+        line(c2, d);
+        line(d, a);
+    };
+    // A box seen square on, with one corner left open for the tools that change it.
+    let box_but_corner = |corner: &dyn Fn()| {
+        line(egui::pos2(l, b), egui::pos2(r, b));
+        line(egui::pos2(r, b), egui::pos2(r, t));
+        corner();
+    };
+    match kind {
+        ToolKind::Sketch => {
+            plane(t + 2.0, b - t - 4.0);
+            // A line drawn on the plane, with the points it was drawn between.
+            let (from, to) = (egui::pos2(l + 4.0, b - 5.0), egui::pos2(r - 4.0, t + 6.0));
+            line(from, to);
+            dot(from);
+            dot(to);
+        }
+        ToolKind::Extrude => {
+            plane(b - 5.0, 5.0);
+            arrow(egui::pos2(c.x, b - 6.0), egui::pos2(c.x, t));
+        }
+        ToolKind::Revolve => {
+            // The axis, the profile beside it, and the turn it makes about it.
+            line(egui::pos2(l, t), egui::pos2(l, b));
+            let (x0, x1) = (l + 4.0, l + 8.0);
+            line(egui::pos2(x0, t + 4.0), egui::pos2(x1, t + 4.0));
+            line(egui::pos2(x1, t + 4.0), egui::pos2(x1, b - 4.0));
+            line(egui::pos2(x1, b - 4.0), egui::pos2(x0, b - 4.0));
+            line(egui::pos2(x0, b - 4.0), egui::pos2(x0, t + 4.0));
+            let radius = r - l - 2.0;
+            arc(egui::pos2(l, c.y), radius, -0.9, 0.9);
+            let head = egui::pos2(l + radius * 0.9f32.cos(), c.y - radius * 0.9f32.sin());
+            arrow(egui::pos2(head.x + 1.0, head.y + 4.0), head);
+        }
+        ToolKind::Sweep => {
+            // A profile carried along a path: the path is the curve, the square is what
+            // travels down it.
+            let radius = r - l;
+            arc(egui::pos2(r, b), radius, pi * 0.5, pi);
+            let start = egui::pos2(r, b - radius);
+            for (a, b2) in [
+                (
+                    egui::pos2(start.x - 3.0, start.y - 3.0),
+                    egui::pos2(start.x + 3.0, start.y - 3.0),
+                ),
+                (
+                    egui::pos2(start.x + 3.0, start.y - 3.0),
+                    egui::pos2(start.x + 3.0, start.y + 3.0),
+                ),
+                (
+                    egui::pos2(start.x + 3.0, start.y + 3.0),
+                    egui::pos2(start.x - 3.0, start.y + 3.0),
+                ),
+                (
+                    egui::pos2(start.x - 3.0, start.y + 3.0),
+                    egui::pos2(start.x - 3.0, start.y - 3.0),
+                ),
+            ] {
+                line(a, b2);
+            }
+        }
+        ToolKind::Loft => {
+            // Two sections and the skin stretched between them.
+            line(egui::pos2(l + 4.0, t), egui::pos2(r - 4.0, t));
+            line(egui::pos2(l, b), egui::pos2(r, b));
+            line(egui::pos2(l + 4.0, t), egui::pos2(l, b));
+            line(egui::pos2(r - 4.0, t), egui::pos2(r, b));
+        }
+        ToolKind::Fillet => {
+            // A solid whose corner has been rounded away.
+            let radius = (r - l) * 0.45;
+            box_but_corner(&|| {
+                line(egui::pos2(r, t), egui::pos2(l + radius, t));
+                arc(egui::pos2(l + radius, t + radius), radius, pi * 0.5, pi);
+                line(egui::pos2(l, t + radius), egui::pos2(l, b));
+            });
+        }
+        ToolKind::Chamfer => {
+            // The same corner taken off flat, which is the whole difference.
+            let cut = (r - l) * 0.45;
+            box_but_corner(&|| {
+                line(egui::pos2(r, t), egui::pos2(l + cut, t));
+                line(egui::pos2(l + cut, t), egui::pos2(l, t + cut));
+                line(egui::pos2(l, t + cut), egui::pos2(l, b));
+            });
+        }
+        ToolKind::Combine => {
+            // Two bodies overlapping: what the tool joins, cuts or intersects.
+            let radius = (b - t) * 0.36;
+            arc(egui::pos2(c.x - radius * 0.7, c.y), radius, 0.0, pi * 2.0);
+            arc(egui::pos2(c.x + radius * 0.7, c.y), radius, 0.0, pi * 2.0);
+        }
+        ToolKind::Move => {
+            for to in [
+                egui::pos2(c.x, t),
+                egui::pos2(c.x, b),
+                egui::pos2(l, c.y),
+                egui::pos2(r, c.y),
+            ] {
+                arrow(c, to);
+            }
+        }
+        ToolKind::OffsetPlane => {
+            plane(t + 1.0, 4.0);
+            plane(b - 5.0, 4.0);
+            // The gap between them is the parameter, marked end to end. An arrowhead
+            // would not fit in the few pixels left between two planes.
+            line(egui::pos2(c.x, t + 5.0), egui::pos2(c.x, b - 5.0));
+            dot(egui::pos2(c.x, t + 5.0));
+            dot(egui::pos2(c.x, b - 5.0));
+        }
+        ToolKind::AngledPlane => {
+            plane(b - 5.0, 5.0);
+            // The new plane hinged off the base's near corner, drawn edge-on as the
+            // thin wedge it looks like from here, and the angle it turned through.
+            let hinge = egui::pos2(l, b);
+            let (tip, back) = (egui::pos2(r - 2.0, t + 1.0), egui::pos2(r - 7.0, t + 5.0));
+            line(hinge, tip);
+            line(tip, back);
+            line(back, hinge);
+            arc(hinge, (r - l) * 0.45, 0.0, pi * 0.32);
+        }
+        ToolKind::Component => {
+            // A cube: a part in its own right, which is what a component is.
+            let (top, bottom) = (egui::pos2(c.x, t), egui::pos2(c.x, b));
+            let (ul, ur) = (egui::pos2(l, t + 4.0), egui::pos2(r, t + 4.0));
+            let (ll, lr) = (egui::pos2(l, b - 4.0), egui::pos2(r, b - 4.0));
+            for (a, b2) in [
+                (top, ur),
+                (ur, lr),
+                (lr, bottom),
+                (bottom, ll),
+                (ll, ul),
+                (ul, top),
+            ] {
+                line(a, b2);
+            }
+            for to in [top, ll, lr] {
+                line(c, to);
+            }
+        }
+    }
 }
 
 fn browser(editor: &mut Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
@@ -1246,6 +1708,19 @@ fn abbreviation(kind: &FeatureKind) -> &'static str {
 }
 
 fn sketch_palette(editor: &mut Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
+    sketch_palette_body(editor, ui, commands);
+    // The palette's checkbox and the View menu's are the same switch, so whatever this
+    // one was left at is written back through the editor: the modelling handles have no
+    // palette of their own and read it from there.
+    if let Mode::Sketch(s) = &editor.mode {
+        let to_grid = s.snap_to_grid;
+        if to_grid != editor.snapping.to_grid {
+            editor.set_snapping(to_grid);
+        }
+    }
+}
+
+fn sketch_palette_body(editor: &mut Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
     let Mode::Sketch(s) = &mut editor.mode else {
         return;
     };
@@ -1316,6 +1791,16 @@ fn sketch_palette(editor: &mut Editor, ui: &mut egui::Ui, commands: &mut Vec<Com
                     "Press E to extrude this region",
                 );
             }
+        } else if let Some(prompt) = s.fillet_prompt() {
+            ui.label(egui::RichText::new(prompt).strong());
+            ui.label(
+                egui::RichText::new(
+                    "Click the corner where two curves meet, or the two curves either side \
+                     of it. The arc appears at once and its radius is dragged on the \
+                     drawing",
+                )
+                .weak(),
+            );
         } else if matches!(s.tool, SketchTool::Trim | SketchTool::Break) {
             let hint = if s.tool == SketchTool::Trim {
                 "Click the piece to remove: it is cut at the curves that cross it, and the \
@@ -1721,6 +2206,50 @@ fn sketch_operation_dialog(
                 });
                 if changed {
                     commands.push(Command::SketchOffsetUpdate);
+                }
+            }
+            if s.fillet_in_progress() {
+                let changed = ui
+                    .add(
+                        egui::DragValue::new(&mut s.fillet.radius)
+                            .speed(0.25)
+                            .range(0.01..=f64::MAX)
+                            .prefix("radius ")
+                            .suffix(" mm"),
+                    )
+                    .changed();
+                match s.fillet_status() {
+                    Some((_, Some(error))) => {
+                        ui.colored_label(egui::Color32::from_rgb(230, 120, 100), error)
+                    }
+                    Some((true, None)) => ui.colored_label(LOOSE_LABEL, "Corner rounded"),
+                    _ => ui.label(""),
+                };
+                ui.label(
+                    egui::RichText::new(
+                        "Drag the handle on the corner in the viewport: it sits the radius \
+                         out along the bisector, so where you drop it is the radius. It \
+                         snaps to the grid; hold shift for anywhere in between",
+                    )
+                    .weak(),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "The arc on screen is the fillet, tangent to both curves and holding \
+                         them that way: OK keeps it, Esc puts the corner back",
+                    )
+                    .weak(),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        commands.push(Command::SketchFilletFinish(true));
+                    }
+                    if ui.button("Cancel").clicked() {
+                        commands.push(Command::SketchFilletFinish(false));
+                    }
+                });
+                if changed {
+                    commands.push(Command::SketchFilletUpdate);
                 }
             }
         });

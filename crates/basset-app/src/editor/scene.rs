@@ -25,6 +25,12 @@ const HOVER_FILL: [f32; 4] = [1.0, 0.85, 0.3, 0.22];
 /// default edge colour is near-black, which is right on a shaded face and invisible against
 /// the background a wireframe body stands on.
 const BARE_EDGE: [f32; 4] = [0.80, 0.84, 0.90, 1.0];
+/// The pair of grid lines a drag has snapped onto. Faint: it is a confirmation, not a
+/// thing to look at.
+const SNAP_MARK: [f32; 4] = [0.75, 0.88, 1.0, 0.55];
+/// Half-length of each of those lines, in pixels, so the mark is the same size to read
+/// at any zoom.
+const SNAP_MARK_PX: f64 = 26.0;
 
 pub fn build(editor: &Editor) -> Scene<'_> {
     let mut scene = Scene::new(&editor.camera);
@@ -330,6 +336,17 @@ pub fn build(editor: &Editor) -> Scene<'_> {
         scene.lines.push(leader);
     }
 
+    // The span a measurement was taken across, so the number floating beside it is
+    // visibly attached to the two things it came from.
+    if let Some([a, b]) = super::measure::readout(editor).and_then(|r| r.leader) {
+        let mut span = LineBatch::new(HOVER);
+        span.width_px = 2.0;
+        span.dashed = true;
+        span.depth_test = false;
+        span.segments.push([a, b]);
+        scene.lines.push(span);
+    }
+
     // The running tool's size, as an arrow from where it grows to where it reaches. The
     // grip at the tip is an egui widget drawn over this.
     if let Some(h) = super::tools::handle(editor) {
@@ -344,6 +361,25 @@ pub fn build(editor: &Editor) -> Scene<'_> {
         arrow.segments.push([h.tip, h.tip - head + wing]);
         arrow.segments.push([h.tip, h.tip - head - wing]);
         scene.lines.push(arrow);
+    }
+
+    // What a drag in progress has landed on. The handle sits on the intersection of two
+    // grid lines, and a short length of each drawn through it is what says so — the
+    // number beside the grip says how far, this says where. Nothing is drawn while the
+    // grid is not holding, so shift reads as the marker disappearing.
+    if let Some(hint) = &editor.snap_hint
+        && hint.on_grid
+    {
+        let px = editor.camera.pixel_size_at(hint.at, editor.window_px);
+        let arm = px * SNAP_MARK_PX;
+        let mut mark = LineBatch::new(SNAP_MARK);
+        mark.width_px = 1.0;
+        mark.depth_test = false;
+        for dir in [scene.grid_frame.x, scene.grid_frame.y] {
+            mark.segments
+                .push([hint.at - dir * arm, hint.at + dir * arm]);
+        }
+        scene.lines.push(mark);
     }
 
     scene.lines.extend([
@@ -488,6 +524,38 @@ mod tests {
             "status: {}",
             editor.status
         );
+    }
+
+    /// A drag that snapped has to show what it snapped to, or the number jumping is
+    /// indistinguishable from the handle sticking. The mark is the two grid lines the
+    /// handle landed on, and it is drawn only while the grid is holding: shift reads as
+    /// the mark going away.
+    #[test]
+    fn a_snapped_drag_marks_the_grid_lines_it_landed_on() {
+        let mut editor = Editor::new(None);
+        editor.window_px = [800, 600];
+        editor.refresh_cache();
+        let marks = |editor: &Editor| {
+            build(editor)
+                .lines
+                .iter()
+                .filter(|l| l.color == SNAP_MARK)
+                .map(|l| l.segments.len())
+                .sum::<usize>()
+        };
+        assert_eq!(marks(&editor), 0, "nothing is being dragged");
+
+        editor.snap_hint = Some(super::super::snap::Hint {
+            at: Vec3::new(10.0, 5.0, 0.0),
+            text: "10.00 mm".into(),
+            on_grid: true,
+        });
+        assert_eq!(marks(&editor), 2, "one line of the grid along each axis");
+
+        if let Some(hint) = editor.snap_hint.as_mut() {
+            hint.on_grid = false;
+        }
+        assert_eq!(marks(&editor), 0, "a freed drag has nothing to point at");
     }
 
     #[test]

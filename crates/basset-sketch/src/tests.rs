@@ -2081,3 +2081,138 @@ fn a_pattern_may_be_large_but_not_unbounded() {
         "and it says what the limit is: {err}"
     );
 }
+
+// ----- fillets --------------------------------------------------------------------
+
+/// A right-angled corner of two lines that share their endpoint: the classic fillet.
+/// The arc is the radius from the corner's bisector, both lines are trimmed back to it,
+/// and the tangency is written down so the corner stays a corner later on.
+#[test]
+fn fillet_rounds_a_right_angle_and_trims_both_lines_to_it() {
+    let mut s = Sketch::new();
+    let corner = s.add_point(v(0.0, 0.0));
+    let right = s.add_point(v(10.0, 0.0));
+    let up = s.add_point(v(0.0, 10.0));
+    let a = s.add_line(corner, right).unwrap();
+    let b = s.add_line(corner, up).unwrap();
+
+    let made = crate::fillet::fillet(&mut s, a, v(6.0, 0.0), b, v(0.0, 6.0), 2.0)
+        .expect("a 2 mm fillet fits a 10 mm corner");
+
+    near(made.plan.center, v(2.0, 2.0));
+    assert_relative_eq!(radius_of(&s, made.arc), 2.0, epsilon = 1e-9);
+    let (sa, ea) = s.curve_endpoints(a).unwrap();
+    let (sb, eb) = s.curve_endpoints(b).unwrap();
+    near(sa, v(2.0, 0.0));
+    near(ea, v(10.0, 0.0));
+    near(sb, v(0.0, 2.0));
+    near(eb, v(0.0, 10.0));
+    // The corner point held nothing else, so it went with the corner it named.
+    assert!(s.entity(corner).is_none());
+    // The arc shares the trimmed ends outright, which is how the sketch joins geometry.
+    let arc_ends = s.curve_endpoints(made.arc).unwrap();
+    assert!(
+        [arc_ends.0, arc_ends.1]
+            .iter()
+            .any(|p| p.distance(sa) < 1e-9),
+        "the arc starts or ends where the first line now does"
+    );
+    let tangents = s
+        .constraints()
+        .filter(|(_, c)| matches!(c, Constraint::Tangent(..)))
+        .count();
+    assert_eq!(tangents, 2, "one tangency per curve");
+}
+
+/// The picks say which of the four possible arcs is meant: two lines crossing in the
+/// middle make four corners, and the fillet goes in the one that was pointed at.
+#[test]
+fn fillet_goes_in_the_quadrant_that_was_picked() {
+    let mut s = Sketch::new();
+    let (a, ..) = line(&mut s, v(-10.0, 0.0), v(10.0, 0.0));
+    let (b, ..) = line(&mut s, v(0.0, -10.0), v(0.0, 10.0));
+
+    let up_right = crate::fillet::plan(&s, a, v(5.0, 0.0), b, v(0.0, 5.0), 3.0).unwrap();
+    near(up_right.center, v(3.0, 3.0));
+    let down_left = crate::fillet::plan(&s, a, v(-5.0, 0.0), b, v(0.0, -5.0), 3.0).unwrap();
+    near(down_left.center, v(-3.0, -3.0));
+}
+
+/// A fillet between two curves that only meet when extended: the corner is where the
+/// carriers cross, and the lines grow out to their tangent points rather than the
+/// fillet being refused.
+#[test]
+fn fillet_reaches_a_corner_the_curves_only_make_when_extended() {
+    let mut s = Sketch::new();
+    let (a, ..) = line(&mut s, v(4.0, 0.0), v(20.0, 0.0));
+    let (b, ..) = line(&mut s, v(0.0, 4.0), v(0.0, 20.0));
+    let made = crate::fillet::fillet(&mut s, a, v(10.0, 0.0), b, v(0.0, 10.0), 6.0)
+        .expect("the corner at the origin is where they would meet");
+    near(made.plan.corner, v(0.0, 0.0));
+    near(made.plan.center, v(6.0, 6.0));
+    let (sa, _) = s.curve_endpoints(a).unwrap();
+    near(sa, v(6.0, 0.0));
+}
+
+/// A radius bigger than the corner can take is refused with the sketch untouched, and
+/// says so: a fillet that silently ate a whole edge would be worse than no fillet.
+#[test]
+fn a_fillet_too_big_for_the_corner_is_refused() {
+    let mut s = Sketch::new();
+    let corner = s.add_point(v(0.0, 0.0));
+    let right = s.add_point(v(5.0, 0.0));
+    let up = s.add_point(v(0.0, 5.0));
+    let a = s.add_line(corner, right).unwrap();
+    let b = s.add_line(corner, up).unwrap();
+    let before = s.entities().count();
+
+    let err = crate::fillet::fillet(&mut s, a, v(3.0, 0.0), b, v(0.0, 3.0), 9.0)
+        .expect_err("9 mm does not fit a 5 mm corner");
+    assert!(
+        matches!(err, SketchError::InvalidArgument(_)),
+        "a typed refusal: {err}"
+    );
+    assert_eq!(s.entities().count(), before, "and nothing was changed");
+
+    // Neither does a circle, which has no corner until something cuts it open.
+    let c = shapes::circle_center(&mut s, v(20.0, 0.0), 3.0);
+    let err = crate::fillet::plan(&s, a, v(3.0, 0.0), c.circle, v(23.0, 0.0), 1.0)
+        .expect_err("a circle is not a corner");
+    assert!(matches!(err, SketchError::WrongEntityKind { .. }), "{err}");
+}
+
+/// The tangency survives a re-solve, which is the whole reason for writing it down: the
+/// corner is dragged out of shape and the arc still meets both edges smoothly.
+#[test]
+fn a_filleted_corner_stays_tangent_after_a_re_solve() {
+    let mut s = Sketch::new();
+    let corner = s.add_point(v(0.0, 0.0));
+    let right = s.add_point(v(20.0, 0.0));
+    let up = s.add_point(v(0.0, 20.0));
+    let a = s.add_line(corner, right).unwrap();
+    let b = s.add_line(corner, up).unwrap();
+    s.add_constraint(Constraint::Horizontal(a)).unwrap();
+    s.add_constraint(Constraint::Vertical(b)).unwrap();
+    s.add_constraint(Constraint::Fix(right)).unwrap();
+    let made = crate::fillet::fillet(&mut s, a, v(10.0, 0.0), b, v(0.0, 10.0), 4.0).unwrap();
+    s.solve().expect("the filleted corner solves");
+
+    // Drag the free end of the vertical line sideways: the solver has to move the arc
+    // with it, and tangency is what says where the arc goes.
+    s.drag(up, v(6.0, 25.0)).expect("the drag solves");
+    let (center, radius) = {
+        let arc_center = match s.entity(made.arc).unwrap().entity {
+            Entity::Arc { center, .. } => center,
+            _ => panic!("the fillet is an arc"),
+        };
+        (pos(&s, arc_center), radius_of(&s, made.arc))
+    };
+    for curve in [a, b] {
+        let (p, q) = s.curve_endpoints(curve).unwrap();
+        let gap = crate::geometry::point_segment_distance(center, p, q);
+        assert!(
+            (gap - radius).abs() < 1e-6,
+            "the arc is still tangent to the line: {gap} against {radius}"
+        );
+    }
+}

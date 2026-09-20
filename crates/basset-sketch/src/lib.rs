@@ -26,7 +26,9 @@
 //! tolerance. Fonts are attached at runtime and never serialised.
 //!
 //! **Editing** ([`edit`]) trims and breaks existing curves at the points where other
-//! curves cross them, found analytically by [`intersect`]. [`pattern`] repeats geometry
+//! curves cross them, found analytically by [`intersect`]. [`fillet`] rounds the corner
+//! where two of them meet, trimming both back to a tangent arc and writing the tangency
+//! down as constraints so the corner stays rounded under later edits. [`pattern`] repeats geometry
 //! in a grid or around a centre, copying the constraints written between the copied
 //! entities so each copy holds its shape. [`offset`] draws a chain of curves alongside
 //! an existing one, either rounding the corners so every point is the same distance
@@ -45,6 +47,7 @@ pub mod edit;
 pub mod entity;
 pub mod error;
 pub mod expr;
+pub mod fillet;
 pub mod geometry;
 pub mod intersect;
 pub mod linalg;

@@ -169,12 +169,40 @@ impl Harness {
         true
     }
 
-    /// Where a painted tool icon sits, which is the only handle there is on a button
-    /// that shows no text.
-    pub fn icon_rect(&mut self, salt: &str, tool: SketchTool) -> Option<egui::Rect> {
+    /// Where a painted tool button sits. It takes either kind of tool, because both
+    /// toolbars are built from the same painted-icon button.
+    ///
+    /// For a button that carries a label the rectangle covers icon and text together;
+    /// [`Self::symbol_of`] narrows it to the symbol, which is the half that has to be as
+    /// clickable as the word.
+    pub fn icon_rect(
+        &mut self,
+        salt: &str,
+        tool: impl Into<super::panels::AnyTool>,
+    ) -> Option<egui::Rect> {
         self.frame();
-        let id = egui::Id::new(("tool-icon", salt, tool.name()));
+        let id = super::panels::tool_icon_id(salt, tool.into());
         self.egui.read_response(id).map(|r| r.rect)
+    }
+
+    /// Where the Measure tool's painted caliper sits. The button shows an icon and a
+    /// name, and this is the handle on the icon half of it.
+    pub fn measure_icon_rect(&mut self) -> Option<egui::Rect> {
+        self.frame();
+        self.egui
+            .read_response(egui::Id::new(("tool-icon", "toolbar", "Measure")))
+            .map(|r| r.rect)
+    }
+
+    /// A point inside the painted symbol of a tool button, for clicking the icon rather
+    /// than the name beside it.
+    pub fn symbol_of(
+        &mut self,
+        salt: &str,
+        tool: impl Into<super::panels::AnyTool>,
+    ) -> Option<egui::Pos2> {
+        let rect = self.icon_rect(salt, tool)?;
+        Some(egui::pos2(rect.left() + 8.0, rect.center().y))
     }
 
     /// Clicks at a point in egui's coordinates, for a widget that carries no text of its
@@ -197,7 +225,15 @@ impl Harness {
     /// shift is down *while* it is being dragged. The per-event `modifiers` field does
     /// not update it, so a drag that only tagged its button events would be reported as
     /// unmodified. `egui_winit` forwards winit's own `ModifiersChanged` the same way.
-    pub fn drag_ui(&mut self, from: egui::Pos2, to: egui::Pos2, modifiers: egui::Modifiers) {
+    /// Hands back the text on screen during the frame the pointer was travelling, which
+    /// is the only frame a drag's own feedback exists in: it is drawn while the handle
+    /// is held and gone by the time the button comes up.
+    pub fn drag_ui(
+        &mut self,
+        from: egui::Pos2,
+        to: egui::Pos2,
+        modifiers: egui::Modifiers,
+    ) -> Vec<String> {
         let button = |pos, pressed| egui::Event::PointerButton {
             pos,
             button: egui::PointerButton::Primary,
@@ -209,11 +245,17 @@ impl Harness {
             egui::Event::PointerMoved(from),
         ]);
         self.frame_with(vec![button(from, true)]);
-        self.frame_with(vec![egui::Event::PointerMoved(to)]);
+        let during = self
+            .frame_with(vec![egui::Event::PointerMoved(to)])
+            .text()
+            .iter()
+            .map(|t| (*t).to_owned())
+            .collect();
         self.frame_with(vec![button(to, false)]);
         self.frame_with(vec![egui::Event::ModifiersChanged(
             egui::Modifiers::default(),
         )]);
+        during
     }
 
     /// Where a point of the model sits in egui's coordinates, for grabbing a handle that

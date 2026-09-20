@@ -335,9 +335,17 @@ pub fn pick(
     filter: &SelectionFilter,
     tolerance_px: f64,
 ) -> Option<Pick> {
-    let thin_px = match editor.tool.as_ref() {
-        Some(tool) if tool.prefers_edges() => tolerance_px * BLEND_EDGE_SLACK,
-        _ => tolerance_px,
+    // Measuring aims at edges and corners as constantly as a blend tool does, so it gets
+    // the same slack: an edge is a pixel of line on a body whose faces are thousands.
+    let wide = editor.measure.is_some()
+        || editor
+            .tool
+            .as_ref()
+            .is_some_and(|tool| tool.prefers_edges());
+    let thin_px = if wide {
+        tolerance_px * BLEND_EDGE_SLACK
+    } else {
+        tolerance_px
     };
     let mut best: Option<Pick> = None;
     let mut consider = |candidate: Pick| {

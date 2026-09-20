@@ -7,9 +7,14 @@
 //! which is why face keys survive booleans.
 //!
 //! Known limits, inherited from the algorithm: overlapping *coplanar* faces with the same
-//! orientation are both kept, and performance is roughly `O(n log n)` polygons per
-//! clip with a poor worst case for very deep trees. Splitting planes are chosen from a
-//! handful of candidates to keep trees shallow.
+//! orientation are both kept, and the tree is only as shallow as the shape allows. A
+//! splitting plane is taken from one of the polygons, so on a convex body — a cylinder,
+//! or a fillet tool swept round a rim — every candidate leaves the whole remainder in
+//! front of it, the tree degenerates into a list of depth `n`, and both the build and the
+//! clip cost `O(n²)`. Measured on one rim of a cylinder: 450 tool facets take 10 ms,
+//! 1700 take 175 ms, 8.8k take 5.3 s, 14k take 7.9 s, and 30k overflows the stack.
+//! [`blend`](crate::blend) budgets its tools against those numbers; a general fix means
+//! splitting on planes that are not face planes, which this scheme cannot express.
 //!
 //! Keeping every fragment under its own key is right for naming and wrong for what the
 //! user sees, because two bodies joined flush leave the one flat face they now share as
@@ -379,6 +384,15 @@ impl Node {
             self.polygons.extend(polygons);
             return;
         }
+        // `front` and `back` already hold a copy of everything that is still wanted, so
+        // the input set is dead here — but it is a local, and a local lives until the end
+        // of the function, i.e. across both recursive calls. A tree that degenerates into
+        // a list (which is what a tool swept round a curved edge produces: every facet
+        // plane leaves the rest of the tool in front of it) then keeps one nearly-full
+        // set alive per level, and the peak is quadratic in the polygon count rather than
+        // linear. Measured on one rim of a cylinder: 1700 tool facets peaked at 252 MB
+        // before this line and 19 MB after it.
+        drop(polygons);
         self.polygons.extend(coplanar_front);
         self.polygons.extend(coplanar_back);
         if !front.is_empty() {
@@ -392,10 +406,22 @@ impl Node {
 
 /// Picks the splitting plane among a few evenly spaced candidates by the usual heuristic:
 /// penalise splits heavily and imbalance lightly. Cheap, and it keeps trees for boxes and
-/// cylinders shallow where "take the first polygon" would produce a linked list.
+/// cylinders shallow where "take the first polygon" would produce a linked list. It can
+/// only rank the planes it is given, though, and on a convex body they are all equally
+/// bad: see the module header.
 fn choose_plane(polygons: &[CsgPolygon]) -> SplitPlane {
     const CANDIDATES: usize = 6;
+    /// Polygons each candidate is scored against; see the sampling note below.
+    const SCORE_SAMPLE: usize = 64;
     let step = (polygons.len() / CANDIDATES).max(1);
+    // Scored against a bounded sample rather than the whole set. Scoring every polygon
+    // against every candidate costs `CANDIDATES · n` at a node whose subtree will visit
+    // `O(n)` nodes, which made the ranking itself the dominant term: on a 14k-facet
+    // fillet tool it was 1.0e9 vertex classifications against 2.0e8 for all the actual
+    // splitting, and dropping it to a sample took the boolean from 14.7 s to 7.9 s for
+    // the same volume. A ranking is a guess either way, and a sample of this size still
+    // separates a plane that halves the set from one that shaves it.
+    let sample_step = (polygons.len() / SCORE_SAMPLE).max(1);
     let mut best: Option<(f64, SplitPlane)> = None;
     for candidate in polygons.iter().step_by(step).take(CANDIDATES) {
         let plane = SplitPlane {
@@ -403,7 +429,7 @@ fn choose_plane(polygons: &[CsgPolygon]) -> SplitPlane {
             w: candidate.w,
         };
         let (mut f, mut b, mut s) = (0i64, 0i64, 0i64);
-        for p in polygons {
+        for p in polygons.iter().step_by(sample_step) {
             let mut t = 0u8;
             for v in &p.vertices {
                 t |= plane.classify(*v);

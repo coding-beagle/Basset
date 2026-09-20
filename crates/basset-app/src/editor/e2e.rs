@@ -752,6 +752,135 @@ fn the_offset_distance_is_dragged_on_the_geometry() {
     );
 }
 
+/// Every modelling tool button carries a painted icon, and the icon is part of the
+/// button rather than a picture beside it. The sketch variant menus had exactly this
+/// bug once — a symbol that lit up on hover and did nothing when clicked — so the
+/// assertion is that the click lands on the symbol, not merely somewhere on the row.
+#[test]
+fn clicking_a_modelling_tool_symbol_starts_the_tool() {
+    let mut h = Harness::new();
+    h.editor.set_window_size([1280, 800]);
+    h.frame();
+
+    let symbol = h
+        .symbol_of("toolbar", ToolKind::Extrude)
+        .expect("the toolbar shows an Extrude button");
+    h.click_at_ui(symbol);
+    assert_eq!(
+        h.editor.tool.as_ref().map(|t| t.kind),
+        Some(ToolKind::Extrude),
+        "the symbol is the button"
+    );
+    h.cancel_tool();
+
+    // And in the menus, which are the other way to every one of these tools.
+    h.frame();
+    assert!(h.click_ui("Modify"), "the menu bar has a Modify menu");
+    let symbol = h
+        .symbol_of("modify-menu", ToolKind::Chamfer)
+        .expect("the menu lists Chamfer with its icon");
+    h.click_at_ui(symbol);
+    assert_eq!(
+        h.editor.tool.as_ref().map(|t| t.kind),
+        Some(ToolKind::Chamfer),
+        "clicking the menu row's symbol started it"
+    );
+}
+
+/// Not one modelling tool is text alone: every button in the 3D toolbar and in the
+/// Create and Modify menus has a painted symbol beside its name, filed under the tool's
+/// own id. A tool added later without one fails here rather than shipping as a word.
+#[test]
+fn every_modelling_tool_button_carries_an_icon() {
+    let mut h = Harness::new();
+    h.editor.set_window_size([1600, 900]);
+    h.frame();
+    for kind in [
+        ToolKind::Sketch,
+        ToolKind::Extrude,
+        ToolKind::Revolve,
+        ToolKind::Sweep,
+        ToolKind::Loft,
+        ToolKind::Fillet,
+        ToolKind::Chamfer,
+        ToolKind::Combine,
+        ToolKind::Move,
+        ToolKind::OffsetPlane,
+        ToolKind::AngledPlane,
+    ] {
+        assert!(
+            h.icon_rect("toolbar", kind).is_some(),
+            "{} has an icon in the toolbar",
+            kind.title()
+        );
+    }
+    // Component is a menu-only tool, and the menus hold the same buttons.
+    assert!(h.click_ui("Create"));
+    for kind in [
+        ToolKind::Sketch,
+        ToolKind::Extrude,
+        ToolKind::Revolve,
+        ToolKind::Sweep,
+        ToolKind::Loft,
+        ToolKind::OffsetPlane,
+        ToolKind::AngledPlane,
+        ToolKind::Component,
+    ] {
+        assert!(
+            h.icon_rect("create-menu", kind).is_some(),
+            "{} has an icon in the Create menu",
+            kind.title()
+        );
+    }
+}
+
+/// The sketch fillet, through the real interface: it is folded under the modify button
+/// beside Trim and Break, a click on the corner rounds it, and OK keeps the arc.
+#[test]
+fn the_sketch_fillet_is_reachable_and_rounds_the_corner_clicked() {
+    let mut h = Harness::new();
+    h.editor.set_window_size([1280, 800]);
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    h.rectangle(Vec2::new(0.0, 0.0), Vec2::new(40.0, 20.0));
+    h.sketch().set_tool(SketchTool::Trim);
+    h.sketch().fillet.radius = 4.0;
+    h.frame();
+    h.frame();
+
+    // The folded button shows Trim; the fillet is one of its variants.
+    let button = h
+        .icon_rect("toolbar", SketchTool::Trim)
+        .expect("the sketch toolbar shows the modify button");
+    h.right_click_ui(button.center());
+    let menu = h.frame();
+    let name = menu
+        .rect_of("Fillet")
+        .expect("the menu lists the fillet among the modify tools");
+    h.click_at_ui(egui::pos2(name.left() - 16.0, name.center().y));
+    assert_eq!(
+        h.sketch().tool,
+        SketchTool::Fillet,
+        "clicking its icon armed it"
+    );
+
+    h.click_world(Vec3::ZERO);
+    assert!(
+        h.sketch().fillet_in_progress(),
+        "one click on the corner started the fillet"
+    );
+    h.frame();
+    h.frame();
+    assert!(h.click_ui("OK"), "{:?}", h.frame().text());
+    assert!(!h.sketch().fillet_in_progress());
+    let arcs = h
+        .sketch()
+        .sketch
+        .entities()
+        .filter(|(_, d)| matches!(d.entity, basset_sketch::Entity::Arc { .. }))
+        .count();
+    assert_eq!(arcs, 1, "the corner is an arc now");
+}
+
 /// Hovering a badge lights up the geometry it holds, and hovering the geometry lights up
 /// its badges. The palette's constraint list already pointed from a row to the drawing;
 /// this is the same link read from the drawing, which is where the user is looking.
@@ -809,4 +938,153 @@ fn amber_segments(h: &mut Harness) -> usize {
         .filter(|b| b.color == [1.0, 0.85, 0.3, 1.0])
         .map(|b| b.segments.len())
         .sum()
+}
+
+/// Grid snapping is one rule, so it has to hold for a handle that moves geometry as well
+/// as for one that sets a size. This is the sketch's move arrow, grabbed where it is
+/// drawn and dragged: the offset it leaves behind lands on the grid, and the same
+/// gesture with shift held lands wherever it was dropped.
+#[test]
+fn the_sketch_move_arrow_snaps_and_shift_lets_go() {
+    let mut h = Harness::new();
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    h.rectangle(Vec2::ZERO, Vec2::new(40.0, 20.0));
+    {
+        let s = h.sketch();
+        s.set_tool(SketchTool::Select);
+        s.selected = s
+            .sketch
+            .entities()
+            .filter(|(_, d)| d.entity.is_curve())
+            .map(|(id, _)| id)
+            .collect();
+        // A coarse grid, pinned so the zoom cannot move it under the test.
+        s.fixed_grid_step = Some(5.0);
+        s.grid_step = 5.0;
+        assert!(s.begin_move(), "the selection can be moved");
+    }
+    h.frame();
+
+    let camera = h.editor.camera;
+    let window = h.editor.window_px;
+    let ppp = h.points_per_pixel();
+    let grab = |h: &Harness, reach: f64| {
+        let g = super::gizmo::current(&h.editor).expect("the move has a manipulator");
+        let arm = g.arm(&camera, window);
+        let dir = g.arrows[0].dir;
+        let from = h.at_world(g.origin + dir * arm, ppp).expect("on screen");
+        let to = h
+            .at_world(g.origin + dir * (arm + reach), ppp)
+            .expect("on screen");
+        (from, to)
+    };
+
+    let (from, to) = grab(&h, 12.0);
+    let during = h.drag_ui(from, to, egui::Modifiers::default());
+    let dx = h.sketch().move_op.as_ref().expect("still moving").dx;
+    assert!((dx - 12.0).abs() < 4.0, "the drag moved the geometry: {dx}");
+    assert!((dx / 5.0).fract().abs() < 1e-9, "onto the grid: {dx}");
+    assert!(
+        during.iter().any(|t| t.contains("grid 5")),
+        "and said so while it was happening: {during:?}"
+    );
+
+    // The same gesture with shift held: no grid, and the label says as much.
+    let (from, to) = grab(&h, 7.3);
+    let during = h.drag_ui(
+        from,
+        to,
+        egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        },
+    );
+    let freed = h.sketch().move_op.as_ref().expect("still moving").dx;
+    assert!(
+        (freed / 5.0).fract().abs() > 1e-6,
+        "shift freed the drag from the grid: {freed} (was {dx})"
+    );
+    assert!(
+        during.iter().any(|t| t.contains("free")),
+        "and the label says the grid is not holding: {during:?}"
+    );
+}
+
+/// The same rule on a feature's size arrow, which is a different code path entirely: the
+/// extrude distance is dragged on the geometry, lands on the grid, and gets out of its
+/// way while shift is held.
+#[test]
+fn the_extrude_distance_arrow_snaps_and_shift_lets_go() {
+    let mut h = Harness::new();
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    h.rectangle(Vec2::ZERO, Vec2::new(40.0, 20.0));
+    h.finish_sketch(true);
+    let sketch = h.last_feature();
+    h.start_tool(ToolKind::Extrude);
+    h.select_region(sketch, Vec2::new(20.0, 10.0));
+    h.sync_tool();
+    h.frame();
+
+    let handle = super::tools::handle(&h.editor).expect("the extrude has an arrow");
+    // The increment a modelling handle snaps to follows the zoom, so the test asks for
+    // the same one the handle will rather than assuming a number.
+    let step = basset_viewport::grid::snap_step_for(
+        h.editor
+            .camera
+            .pixel_size_at(handle.tip, h.editor.window_px),
+    );
+    let ppp = h.points_per_pixel();
+    let grab = |h: &Harness, reach: f64| {
+        let handle = super::tools::handle(&h.editor).expect("still running");
+        let from = h.at_world(handle.tip, ppp).expect("on screen");
+        let to = h
+            .at_world(handle.tip + handle.dir * reach, ppp)
+            .expect("on screen");
+        (from, to)
+    };
+    let distance = |h: &Harness| h.editor.tool.as_ref().expect("running").params.distance;
+
+    let before = distance(&h);
+    let (from, to) = grab(&h, step * 3.0);
+    let during = h.drag_ui(from, to, egui::Modifiers::default());
+    let snapped = distance(&h);
+    assert!(
+        snapped > before,
+        "the drag grew the extrude: {before} -> {snapped}"
+    );
+    assert!(
+        (snapped / step).fract().abs() < 1e-9,
+        "onto the grid ({step}): {snapped}"
+    );
+    assert!(
+        during.iter().any(|t| t.contains("grid")),
+        "and said so while it was happening: {during:?}"
+    );
+
+    let (from, to) = grab(&h, step * 2.37);
+    h.drag_ui(
+        from,
+        to,
+        egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        },
+    );
+    let freed = distance(&h);
+    assert!(
+        (freed / step).fract().abs() > 1e-6,
+        "shift freed the drag from the grid: {freed} (step {step})"
+    );
+
+    // The master switch reaches the modelling handles as well as the sketch: off means
+    // off, with nothing held. A snapping drag would have rounded this back onto a
+    // multiple of the step.
+    h.editor.set_snapping(false);
+    let (from, to) = grab(&h, step * 1.41);
+    h.drag_ui(from, to, egui::Modifiers::default());
+    let off = distance(&h);
+    assert!(
+        (off / step).fract().abs() > 1e-6,
+        "the switch is off, so nothing snapped: {off} (step {step})"
+    );
 }

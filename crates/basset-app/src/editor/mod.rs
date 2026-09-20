@@ -7,10 +7,12 @@
 
 mod files;
 mod gizmo;
+mod measure;
 mod panels;
 mod scene;
 mod selection;
 mod sketch_mode;
+pub(crate) mod snap;
 mod tools;
 mod viewcube;
 
@@ -35,6 +37,7 @@ use basset_viewport::{Camera, MeshHandle, MeshStyle, Projection, ViewPreset};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{Key, NamedKey};
 
+pub use measure::Measure;
 pub use selection::{Pick, SelectMode, Selection};
 pub use sketch_mode::SketchEditor;
 pub use tools::Tool;
@@ -129,6 +132,28 @@ impl DisplayMode {
     }
 }
 
+/// Every model-mode value a handle can drag, each remembering its own gesture.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ModelDrags {
+    pub translate: [snap::Drag; 3],
+    pub rotate: [snap::Drag; 3],
+    pub slide: snap::Drag,
+}
+
+impl ModelDrags {
+    /// Forgets every total, at the end of a drag. See [`snap::Drag::release`].
+    pub fn release(&mut self) {
+        for drag in self
+            .translate
+            .iter_mut()
+            .chain(self.rotate.iter_mut())
+            .chain(std::iter::once(&mut self.slide))
+        {
+            drag.release();
+        }
+    }
+}
+
 pub struct Editor {
     pub doc: Document,
     pub path: Option<PathBuf>,
@@ -139,6 +164,17 @@ pub struct Editor {
     pub hidden_sketches: HashSet<FeatureId>,
     pub show_origin: bool,
     pub show_grid: bool,
+    /// How every drag in the viewport meets the grid: the master toggle and whether
+    /// shift is letting go of it right now. One copy for the whole editor, so the sketch
+    /// palette's checkbox governs the modelling handles too.
+    pub snapping: snap::Snapping,
+    /// The running totals of the model-mode handles: the three move arrows, the three
+    /// rotation rings, and the one slider a running feature shows. Kept so a drag snaps
+    /// the travel the pointer made rather than each frame's slice of it.
+    pub drags: ModelDrags,
+    /// What the drag in progress has snapped to, for one frame. Set by whichever handle
+    /// is being dragged and cleared at the top of the next pass.
+    pub(crate) snap_hint: Option<snap::Hint>,
     pub display: DisplayMode,
     pub selection: Selection,
     /// What a click may land on. Narrows a running tool's own filter.
@@ -146,6 +182,9 @@ pub struct Editor {
     pub hover: Option<Pick>,
     pub mode: Mode,
     pub tool: Option<Tool>,
+    /// The Measure tool, which is not a [`Tool`]: it owns no feature and never writes to
+    /// the document. See [`measure`].
+    pub measure: Option<Measure>,
     pub selected_feature: Option<FeatureId>,
     pub status: String,
     pub error: Option<String>,
@@ -185,12 +224,16 @@ impl Editor {
             hidden_sketches: HashSet::new(),
             show_origin: false,
             show_grid: true,
+            snapping: snap::Snapping::default(),
+            drags: ModelDrags::default(),
+            snap_hint: None,
             display: DisplayMode::default(),
             selection: Selection::default(),
             select_mode: SelectMode::default(),
             hover: None,
             mode: Mode::Model,
             tool: None,
+            measure: None,
             selected_feature: None,
             status: "Ready".into(),
             error: None,
@@ -341,6 +384,15 @@ impl Editor {
 
     pub(crate) fn pick_body(&self, id: BodyRef) -> Option<&PickBody> {
         self.pick_bodies.get(&id)
+    }
+
+    /// The name the browser shows for a body, for anything that names one to the user.
+    pub fn body_name(&self, id: BodyRef) -> String {
+        self.cached_bodies
+            .iter()
+            .find(|(b, _)| *b == id)
+            .map(|(_, name)| name.clone())
+            .unwrap_or_else(|| format!("{}", id.0))
     }
 
     // --- Meshes ------------------------------------------------------------------------
@@ -533,6 +585,7 @@ impl Editor {
                 self.pointer.ctrl = m.state().control_key();
                 // Shift lets go of the grid for as long as it is held, and the drawing
                 // path reads the sketch's own copy of it rather than reaching back here.
+                self.snapping.free = self.pointer.shift;
                 if let Mode::Sketch(s) = &mut self.mode {
                     s.set_free_snap(self.pointer.shift);
                 }
@@ -689,7 +742,11 @@ impl Editor {
             }
             Mode::Model if clicked => {
                 let pick = selection::pick(self, &ray, &self.pick_filter(), 8.0);
-                self.apply_pick(pick, shift);
+                // Measuring takes the click whole: its picks are not a selection any
+                // later tool should act on, so they never reach `apply_pick`.
+                if !measure::clicked(self, pick.as_ref(), self.pointer.ctrl) {
+                    self.apply_pick(pick, shift);
+                }
             }
             Mode::Model => {}
         }
@@ -699,9 +756,10 @@ impl Editor {
     /// What a click may land on right now: the selection mode, narrowed by a running
     /// tool's own requirements.
     pub fn pick_filter(&self) -> selection::SelectionFilter {
-        match self.tool.as_ref() {
-            Some(tool) => self.select_mode.narrow(tool.filter()),
-            None => self.select_mode.filter(),
+        match (self.tool.as_ref(), self.measure.is_some()) {
+            (Some(tool), _) => self.select_mode.narrow(tool.filter()),
+            (None, true) => self.select_mode.narrow(measure::FILTER),
+            (None, false) => self.select_mode.filter(),
         }
     }
 
@@ -710,6 +768,9 @@ impl Editor {
     /// keeps its selection: the mode only narrows what can be added to it.
     pub fn set_select_mode(&mut self, mode: SelectMode) {
         self.select_mode = mode;
+        if let Some(m) = self.measure.as_mut() {
+            m.subjects.clear();
+        }
         if self.tool.is_none() {
             self.selection.clear();
             self.hover = None;
@@ -761,7 +822,9 @@ impl Editor {
                 }
             }
             Mode::Model => {
-                if self.tool.is_some() {
+                if self.measure.is_some() {
+                    measure::stop(self);
+                } else if self.tool.is_some() {
                     tools::cancel_tool(self);
                 } else {
                     self.selection.clear();
@@ -792,6 +855,17 @@ impl Editor {
                 self.set_status(match made {
                     Some(n) => format!("Offset added {n} curves"),
                     None => "Offset cancelled: there was nothing it could make".to_string(),
+                });
+                self.repaint = true;
+                return;
+            }
+            if s.fillet_in_progress() {
+                let kept = s.finish_fillet(true);
+                self.commit_sketch();
+                self.set_status(if kept {
+                    "Corner rounded"
+                } else {
+                    "Fillet cancelled: that radius does not fit"
                 });
                 self.repaint = true;
                 return;
@@ -903,6 +977,7 @@ impl Editor {
         if self.tool.is_some() || self.is_sketching() {
             return;
         }
+        measure::stop(self);
         let Some(feature) = self.doc.timeline().get(id) else {
             return;
         };
@@ -938,6 +1013,42 @@ impl Editor {
         }) {
             self.report_error(e);
         }
+        self.repaint = true;
+    }
+
+    /// How a drag happening at `at` should meet the grid: the increment the grid is
+    /// drawn at from this distance, unless the toggle is off or shift is held.
+    ///
+    /// The increment comes from the camera rather than being fixed, so the handle snaps
+    /// to lines the user can actually see: zoomed out it lands on the coarse ones,
+    /// zoomed in on the fine ones, and never on a line too close to its neighbour to aim
+    /// between.
+    pub(crate) fn snap_at(&self, at: Vec3) -> snap::Snap {
+        // A sketch may have its increment pinned to a stated value, and that is exactly
+        // the case where following the zoom instead would be wrong. It is also the rule
+        // the sketch's own handles apply, so asking it here keeps the number the
+        // feedback reports and the number the drag lands on the same one.
+        if let Mode::Sketch(s) = &self.mode {
+            return s.snap_rule();
+        }
+        let step =
+            basset_viewport::grid::snap_step_for(self.camera.pixel_size_at(at, self.window_px));
+        self.snapping.at(step)
+    }
+
+    /// Turns snapping on or off everywhere. The sketch keeps its own copy because the
+    /// drawing path comes from winit and cannot see egui's, so both are written here
+    /// rather than left to whichever screen the user happened to change it on.
+    pub fn set_snapping(&mut self, on: bool) {
+        self.snapping.to_grid = on;
+        if let Mode::Sketch(s) = &mut self.mode {
+            s.snap_to_grid = on;
+        }
+        self.status = if on {
+            "Snapping to the grid (hold shift to override)".into()
+        } else {
+            "Snapping off".into()
+        };
         self.repaint = true;
     }
 

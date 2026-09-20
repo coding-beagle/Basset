@@ -136,6 +136,21 @@ constraints written *between* them, so every copy holds its shape; copies are no
 back to the seed, because a sketch-level pattern entity to regenerate from does not exist
 yet and a silently broken copy would be worse than honest plain geometry.
 
+Filleting a sketch corner (`fillet`) finds the arc by offsetting both curves by the
+radius and intersecting the offsets: every point that distance from both is a possible
+centre and the tangent points are its feet, which covers line–line, line–arc and arc–arc
+with one construction instead of a case each. Up to four candidates come back, one per
+corner of the crossing, so the caller passes the point on each curve it picked and the
+candidate whose tangent points lie on those sides is the one meant — which is also why
+the tool takes picks rather than just two ids. Everything that can fail is decided before
+anything is edited (`plan`), so a radius that does not fit is refused with the sketch
+untouched; then each curve's corner-end point is moved to its tangent point, which keeps
+the curve's own entity and with it every dimension written on it, the arc is added sharing
+those two points, and two `Tangent` constraints are written down. Without them the corner
+is rounded only until the next solve. The corner point the two curves used to share is
+pruned exactly as a trim prunes its orphans, so a dimension still written to it keeps it
+alive rather than silently vanishing.
+
 Offsetting (`offset`) orders the picked curves into one chain end to end — refusing a
 branch, where three curves meet and there is no single answer — normalises a closed chain
 counter-clockwise so that "outward" means something, moves every curve sideways, and then
@@ -201,7 +216,7 @@ view of the same surface (egui blends in gamma space, the viewport in linear). T
   on every parameter change, so the viewport is a live preview; the document's transaction
   API makes the whole interaction one undo step and Cancel a rollback.
 * **Sketch mode** draws on one plane with the same shape builders the sketch crate tests
-  use, trims and breaks existing curves, patterns, offsets and moves a selection, names closed
+  use, trims and breaks existing curves, rounds corners, patterns, offsets and moves a selection, names closed
   regions by a point inside them so `E` can hand them straight to Extrude, writes the
   working copy back into the feature after each change (so downstream
   features update live), and keeps its own undo stack for the session. The grid is drawn
@@ -212,7 +227,7 @@ view of the same surface (egui blends in gamma space, the viewport in linear). T
   constraint is picked first and its geometry after, and `constraints_for` decides what a
   set of picks means without caring about their order — which is also the question the
   toolbar asks to decide whether a button would do anything. The modal operations (move,
-  pattern, offset) keep the sketch they started from and re-derive the result from it on every
+  pattern, offset, fillet) keep the sketch they started from and re-derive the result from it on every
   change, so editing a number twice replaces the result rather than compounding it;
   cancelling is putting that copy back, and keeping is pushing it onto the undo stack,
   which is why a modal operation is exactly one step of undo and never pops a checkpoint
@@ -264,9 +279,24 @@ from under the pointer as it is dragged. It is still there at a distance the off
 refuses, which is how the user drags back out of one that does not fit, and taking it
 through zero is how the side gets chosen, so there is no flip button to go and press.
 
+A sketch fillet's radius is the other slider. Its anchor is the corner and its direction
+the bisector, so the grip sits exactly the radius out along it: the distance from the
+corner to the grip *is* the number, and pulling away from the corner grows the fillet the
+way the arc itself travels. Unlike an offset there is no far side to cross into, so a drag
+back through the corner stops at the smallest fillet there is rather than turning the arc
+inside out.
+
+Every tool button, sketch or modelling, in the toolbar or in a menu, carries a symbol
+painted by `panels::tool_button` — the bundled fonts have no usable glyphs for these
+shapes, and a drawn one reads the same on every machine. One `AnyTool` covers both tool
+enums so there is a single icon mechanism rather than two that drift. Icon and label are
+one widget with one id and one click sense, which is the fix for a bug that kept coming
+back: a symbol drawn beside a button lights up under the pointer, and then the click does
+nothing because only the word next to it was the button.
+
 Every handle that snaps answers to shift. `SketchEditor::snapping()` is the single
 question — the palette's toggle *and* shift not being held — and the drawing path, the
-move's arrows and ring, and the offset's slider all ask it rather than reading the toggle
+move's arrows and ring, and the offset's and fillet's sliders all ask it rather than reading the toggle
 directly. The modifier reaches the sketch from two places, because the drawing path comes
 from winit and the manipulators come from egui and neither sees the other's events; both
 write it through `set_free_snap`. egui carries modifiers as a standing state set by

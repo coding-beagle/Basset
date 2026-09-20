@@ -238,6 +238,13 @@ fn chain_ends(edges: &[Edge]) -> Vec<ChainEnd> {
 
 /// Parameters `(t, u)` of the closest points between the ray (`origin + t·dir`) and the
 /// segment `a + u·(b − a)`, `u` clamped to the segment.
+///
+/// Setting both partial derivatives of the squared distance to zero gives
+/// `[[a11, -a12], [-a12, a22]] · [t, u] = [b1, b2]`, so Cramer's rule *adds* the
+/// off-diagonal term in `u`. Subtracting it — as this once did — makes no difference
+/// when the ray meets the segment at a right angle, which is every axis-aligned case a
+/// test tends to look at; from any other angle, and the default view is isometric, the
+/// closest point landed elsewhere along the edge and edge picking simply missed.
 fn closest_params(ray: &Ray, a: Vec3, b: Vec3) -> (f64, f64) {
     let d1 = ray.direction;
     let d2 = b - a;
@@ -248,7 +255,7 @@ fn closest_params(ray: &Ray, a: Vec3, b: Vec3) -> (f64, f64) {
     let mut u = if det.abs() < 1e-18 {
         0.0
     } else {
-        (a11 * b2 - a12 * b1) / det
+        (a11 * b2 + a12 * b1) / det
     };
     u = u.clamp(0.0, 1.0);
     let t = (b1 + a12 * u) / a11;
@@ -378,6 +385,22 @@ mod tests {
             vec![key],
             "a cube's edges meet at corners, not tangents"
         );
+    }
+
+    /// An oblique ray aimed straight at the middle of an edge finds it. Every other test
+    /// here looks down an axis, where the ray meets the edge at a right angle and the
+    /// closest-point solve is insensitive to its own cross term; the app's default view is
+    /// isometric, so this is the case that actually matters.
+    #[test]
+    fn picks_an_edge_the_ray_meets_at_an_angle() {
+        let c = cuboid(OpId::new(1), Vec3::ZERO, Vec3::new(10.0, 10.0, 2.0));
+        let edges = c.edges();
+        let target = Vec3::new(5.0, 0.0, 2.0);
+        let direction = Vec3::new(-1.0, 1.5, -1.2).normalize();
+        let ray = Ray::new(target - direction * 40.0, direction);
+        let hit = pick_edge(&edges, &ray, 0.05).expect("the edge under the ray");
+        assert!(hit.point.distance(target) < 1e-6, "{:?}", hit.point);
+        assert_relative_eq!(hit.distance, 0.0, epsilon = 1e-9);
     }
 
     /// Two edges the same distance from the cursor but at different depths: the near one

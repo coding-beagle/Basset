@@ -12,6 +12,7 @@ use basset_core::{
 use basset_math::{Aabb, Affine3, Quat, Vec3};
 
 use super::selection::{Pick, Selection, SelectionFilter};
+use super::snap::Hint;
 use super::{Editor, sketch_mode};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -308,6 +309,9 @@ pub fn start_tool(editor: &mut Editor, kind: ToolKind) {
     if editor.tool.is_some() {
         cancel_tool(editor);
     }
+    // Measuring and modelling are different jobs: a tool takes over the picking, so the
+    // readout would stop agreeing with what a click does.
+    super::measure::stop(editor);
     let mut params = Params::default();
     match kind {
         ToolKind::Fillet => params.radius = 2.0,
@@ -896,26 +900,41 @@ fn handle_drag(editor: &mut Editor, ctx: &egui::Context) -> bool {
     let along =
         (f64::from(delta.x) * ppp) * screen_dir.x + (f64::from(delta.y) * ppp) * screen_dir.y;
     let world = along * camera.pixel_size_at(h.tip, window);
+    // The same rule every other handle in the app obeys: the size lands on the grid the
+    // user can see, and shift lets go of it for as long as it is held. A dragged extrude
+    // that stopped at 12.37 mm would make the grid decorative.
+    let snap = editor.snap_at(h.tip);
     let Some(tool) = editor.tool.as_mut() else {
         return false;
     };
     let p = &mut tool.params;
-    match tool.kind {
+    let value = match tool.kind {
         ToolKind::Extrude => {
             let scale = if p.extent == ExtentKind::Symmetric {
                 2.0
             } else {
                 1.0
             };
-            p.distance += world * scale;
+            p.distance = snap.value(p.distance + world * scale);
             if p.extent != ExtentKind::OneSide {
                 p.distance = p.distance.max(0.01);
             }
+            p.distance
         }
-        ToolKind::Fillet | ToolKind::Chamfer => p.radius = (p.radius + world).max(0.01),
-        ToolKind::OffsetPlane => p.distance += world,
+        ToolKind::Fillet | ToolKind::Chamfer => {
+            p.radius = snap.value(p.radius + world).max(0.01);
+            p.radius
+        }
+        ToolKind::OffsetPlane => {
+            p.distance = snap.value(p.distance + world);
+            p.distance
+        }
         _ => return false,
-    }
+    };
+    // The arrow has already been laid out for this frame, so the hint goes on the tip
+    // the size now reaches rather than the one it was grabbed at.
+    let at = h.origin + h.dir * value;
+    editor.snap_hint = Some(Hint::value(at, value, " mm", snap));
     true
 }
 

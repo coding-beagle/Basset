@@ -2924,16 +2924,187 @@ fn shift_lets_go_of_the_grid_while_it_is_held() {
     sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
     let s = sketch(&mut editor);
     s.snap_to_grid = true;
-    assert!(s.snapping(), "the grid holds by default");
+    assert!(s.snap_rule().is_on(), "the grid holds by default");
     s.set_free_snap(true);
-    assert!(!s.snapping(), "and lets go while shift is down");
+    assert!(!s.snap_rule().is_on(), "and lets go while shift is down");
     s.set_free_snap(false);
-    assert!(s.snapping(), "and takes hold again when it comes up");
+    assert!(
+        s.snap_rule().is_on(),
+        "and takes hold again when it comes up"
+    );
 
     // The toggle still wins: shift releases a grid that is on, it does not turn one on.
     s.snap_to_grid = false;
     s.set_free_snap(false);
-    assert!(!s.snapping());
+    assert!(!s.snap_rule().is_on());
+}
+
+// ----- sketch fillet -------------------------------------------------------------
+
+/// Arms the fillet tool and clicks at `at`, which is how a corner is picked in the
+/// window: the pointer has to travel there first, because that is what the tool reads.
+fn fillet_click(editor: &mut Editor, at: Vec2) {
+    let camera = editor.camera;
+    let window = editor.window_px;
+    let s = sketch(editor);
+    // Arming is a separate act from picking: re-pressing the toolbar button cancels
+    // what is half-picked, which is what the user means by pressing it again.
+    if s.tool != SketchTool::Fillet {
+        s.set_tool(SketchTool::Fillet);
+    }
+    s.pointer_moved(&click_at(at.x, at.y), &camera, window, false);
+    s.pointer_up(&click_at(at.x, at.y), &camera, window, true, false);
+}
+
+/// Clicking the corner point of a rectangle rounds it: one click says both curves,
+/// which is how a fillet is usually asked for.
+#[test]
+fn clicking_a_corner_rounds_it_and_trims_both_curves() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(40.0, 20.0));
+    sketch(&mut editor).fillet.radius = 5.0;
+
+    fillet_click(&mut editor, Vec2::new(0.0, 0.0));
+    let s = sketch(&mut editor);
+    assert!(s.fillet_in_progress(), "one click on the corner is enough");
+    assert_eq!(
+        s.fillet_status().map(|(made, _)| made),
+        Some(true),
+        "and the arc is already on screen: {:?}",
+        s.fillet_status().and_then(|(_, e)| e.map(str::to_owned))
+    );
+
+    assert!(s.finish_fillet(true), "OK keeps it");
+    let arcs: Vec<EntityId> = s
+        .sketch
+        .entities()
+        .filter(|(_, d)| matches!(d.entity, Entity::Arc { .. }))
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(arcs.len(), 1, "the fillet is the sketch's only arc");
+    let tangents = s
+        .sketch
+        .constraints()
+        .filter(|(_, c)| matches!(c, Constraint::Tangent(..)))
+        .count();
+    assert_eq!(tangents, 2, "held tangent to both edges it joins");
+    // The corner itself is gone: nothing is left at (0, 0).
+    assert!(
+        !s.sketch
+            .entities()
+            .any(|(_, d)| matches!(d.entity, Entity::Point { pos } if pos.length() < 1e-9)),
+        "the corner point went with the corner"
+    );
+    // And the shape still closes, which is what makes it extrudable.
+    assert_eq!(
+        s.sketch.profiles(&Default::default()).len(),
+        1,
+        "the rounded rectangle is still one closed region"
+    );
+}
+
+/// The two-pick route, for a corner the curves make only when extended: two lines that
+/// never touch still have a corner between them, and the fillet reaches it.
+#[test]
+fn picking_two_curves_rounds_the_corner_they_would_make() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_line(&mut editor, Vec2::new(8.0, 0.0), Vec2::new(40.0, 0.0));
+    draw_line(&mut editor, Vec2::new(0.0, 8.0), Vec2::new(0.0, 40.0));
+    sketch(&mut editor).fillet.radius = 6.0;
+
+    fillet_click(&mut editor, Vec2::new(20.0, 0.0));
+    assert!(
+        !sketch(&mut editor).fillet_in_progress(),
+        "one curve is half an answer"
+    );
+    fillet_click(&mut editor, Vec2::new(0.0, 20.0));
+    let s = sketch(&mut editor);
+    assert!(s.fillet_in_progress(), "the second pick starts it");
+    assert_eq!(s.fillet_status().map(|(made, _)| made), Some(true));
+
+    s.finish_fillet(true);
+    let bounds = drawn_bounds(s);
+    assert!(
+        bounds.0.x.abs() < 1e-6 && bounds.0.y.abs() < 1e-6,
+        "both lines were run out to the corner at the origin: {bounds:?}"
+    );
+}
+
+/// A radius that does not fit says so and leaves the sketch alone, and cancelling puts
+/// the corner back exactly as it was.
+#[test]
+fn a_refused_or_cancelled_fillet_leaves_the_drawing_as_it_was() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(40.0, 20.0));
+    let before = sketch(&mut editor).sketch.entities().count();
+    sketch(&mut editor).fillet.radius = 5.0;
+    fillet_click(&mut editor, Vec2::new(0.0, 0.0));
+
+    let s = sketch(&mut editor);
+    s.fillet.radius = 60.0;
+    s.update_fillet();
+    let status = s.fillet_status().expect("still running");
+    assert!(!status.0, "60 mm does not fit a 20 mm corner");
+    assert!(status.1.is_some(), "and the palette is told why");
+    assert_eq!(
+        s.sketch.entities().count(),
+        before,
+        "a refused radius leaves the corner untouched"
+    );
+
+    assert!(!s.finish_fillet(false), "cancelled");
+    assert_eq!(s.sketch.entities().count(), before);
+    assert!(!s.fillet_in_progress());
+}
+
+/// The radius is dragged on the corner itself, not only typed into a field. The handle
+/// sits the radius out along the bisector, so the distance from the corner to the grip
+/// *is* the number, and dragging away from the corner grows the fillet.
+#[test]
+fn the_fillet_radius_is_dragged_by_a_handle_on_the_corner() {
+    use super::gizmo;
+
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(40.0, 20.0));
+    sketch(&mut editor).fillet.radius = 5.0;
+    assert!(gizmo::slider(&editor).is_none(), "nothing has a handle yet");
+
+    fillet_click(&mut editor, Vec2::new(0.0, 0.0));
+    let slider = gizmo::slider(&editor).expect("the fillet has a handle");
+    assert_eq!(slider.anchor, Vec3::ZERO, "anchored on the corner");
+    let grip = slider.grip();
+    assert!(
+        (grip.length() - 5.0).abs() < 1e-9,
+        "the grip is the radius from the corner: {grip:?}"
+    );
+    assert!(
+        (grip.x - grip.y).abs() < 1e-9 && grip.x > 0.0,
+        "on the bisector, inside the corner: {grip:?}"
+    );
+
+    let s = sketch(&mut editor);
+    s.snap_to_grid = false;
+    assert!(s.nudge_fillet(3.0), "dragging it out grows the fillet");
+    assert_eq!(s.fillet.radius, 8.0);
+    let moved = gizmo::slider(&editor).expect("still there").grip().length();
+    assert!(
+        (moved - 8.0).abs() < 1e-9,
+        "and the handle went with it: {moved}"
+    );
+
+    // Dragging back through the corner stops at the smallest fillet there is rather
+    // than turning the arc inside out.
+    let s = sketch(&mut editor);
+    s.nudge_fillet(-100.0);
+    assert!(s.fillet.radius > 0.0, "{}", s.fillet.radius);
 }
 
 /// Every handle that snaps has to answer to shift, or the escape is only half an escape.
@@ -2966,8 +3137,12 @@ fn shift_frees_the_manipulators_as_well_as_the_drawing() {
     s.turn_move(2.0);
     {
         let op = s.move_op.as_ref().expect("moving");
+        // The pointer has travelled 5.3 mm and turned 4° in total, and letting go of
+        // the grid puts the handle where the pointer is — not where the snapped value
+        // had got to plus the last slice, which would leave the grip ahead of the mouse
+        // by however much the grid had been holding it back.
         assert!(
-            (op.dx - 6.3).abs() < 1e-9 && (op.angle_deg - 2.0).abs() < 1e-9,
+            (op.dx - 5.3).abs() < 1e-9 && (op.angle_deg - 4.0).abs() < 1e-9,
             "{op:?}"
         );
     }
@@ -2981,12 +3156,29 @@ fn shift_frees_the_manipulators_as_well_as_the_drawing() {
     assert_eq!(s.offset.distance, 5.0, "snapped");
     s.set_free_snap(true);
     s.nudge_offset(1.3);
+    // 5.3 mm of travel, so 5.3 mm once the grid lets go — see the move above.
     assert!(
-        (s.offset.distance - 6.3).abs() < 1e-9,
+        (s.offset.distance - 5.3).abs() < 1e-9,
         "{}",
         s.offset.distance
     );
     s.finish_offset(false);
+
+    // And the fillet's radius handle, which is the newest of them.
+    s.set_free_snap(false);
+    fillet_click(&mut editor, Vec2::new(0.0, 0.0));
+    let s = sketch(&mut editor);
+    s.fixed_grid_step = Some(5.0);
+    s.grid_step = 5.0;
+    s.fillet.radius = 5.0;
+    s.nudge_fillet(4.0);
+    assert_eq!(s.fillet.radius, 10.0, "snapped to the grid");
+    s.set_free_snap(true);
+    s.nudge_fillet(1.3);
+    // Started at 5, pulled out 5.3 in total: 10.3 free, where the grid had been showing
+    // 10.0.
+    assert!((s.fillet.radius - 10.3).abs() < 1e-9, "{}", s.fillet.radius);
+    s.finish_fillet(false);
 }
 
 /// A rectangle whose four sides are all tied to one of them, which puts four badges on
@@ -3280,4 +3472,244 @@ fn dragging_a_dimension_value_snaps_it_to_the_grid() {
         (free.x - 7.3).abs() < 1e-9 && (free.y + 9.4).abs() < 1e-9,
         "shift let go of the grid: {free:?}"
     );
+}
+
+/// The Measure tool. Every test here drives the real click path, and every one of them
+/// checks that the document came out the other side untouched: a measurement that dirties
+/// the file is the one failure mode this tool must never have.
+mod measure {
+    use basset_math::Vec3;
+
+    use crate::editor::harness::{Frame, Harness};
+    use crate::editor::measure::Subject;
+
+    /// A 10 x 10 x 2 block, framed, with the Measure tool running, plus the number of
+    /// features the tests assert nothing changed about.
+    ///
+    /// One frame is drawn before the tests start clicking: egui settles a panel's layout
+    /// over two passes, so the very first frame of a window is missing its overlays, and
+    /// a test asserting on it would be reading a picture no user ever sees.
+    fn measuring() -> (Harness, usize) {
+        let mut h = Harness::new();
+        h.block();
+        h.editor.zoom_to_fit();
+        h.editor.refresh_cache();
+        crate::editor::measure::start(&mut h.editor);
+        h.frame();
+        let features = h.editor.doc.timeline().features().len();
+        (h, features)
+    }
+
+    /// Whether the viewport overlay painted this exactly, as opposed to the status bar
+    /// echoing it inside a longer line. The overlay gives every value a line of its own,
+    /// so an exact match is the readout and nothing else.
+    fn overlaid(frame: &Frame, needle: &str) -> bool {
+        frame.texts.iter().any(|(_, t)| t.trim() == needle)
+    }
+
+    /// Two frames, and the second is the one to read. A readout that has just appeared is
+    /// a brand new egui area, and egui spends its first frame measuring one before it
+    /// paints it; the window redraws continuously, so the user never sees that frame.
+    fn settled(h: &mut Harness) -> &Frame {
+        h.frame();
+        h.frame()
+    }
+
+    fn unchanged(h: &mut Harness, features: usize) {
+        assert_eq!(
+            h.editor.doc.timeline().features().len(),
+            features,
+            "measuring added or removed a feature"
+        );
+        assert!(
+            !h.editor.doc.in_transaction(),
+            "measuring left a transaction open"
+        );
+    }
+
+    /// The button's icon is a widget in its own right, not decoration beside the label.
+    #[test]
+    fn the_painted_caliper_starts_the_tool() {
+        let mut h = Harness::new();
+        h.block();
+        let rect = h.measure_icon_rect().expect("the caliper is painted");
+        h.click_at_ui(rect.center());
+        assert!(h.editor.measure.is_some(), "the icon started the tool");
+        // And the name beside it does the same, which is what closes the loop: both
+        // halves of the button mean the same thing.
+        h.click_at_ui(rect.center());
+        assert!(h.editor.measure.is_none(), "clicking again left the tool");
+        assert!(h.click_ui("Measure"), "the name is a button too");
+        assert!(h.editor.measure.is_some());
+    }
+
+    #[test]
+    fn one_edge_reports_its_length_beside_itself() {
+        let (mut h, features) = measuring();
+        h.click_world(Vec3::new(5.0, 0.0, 2.0));
+        let midpoint = h
+            .at_world(Vec3::new(5.0, 0.0, 2.0), h.points_per_pixel())
+            .expect("the edge is on screen");
+        let frame = settled(&mut h);
+        let rect = frame
+            .rect_of("Length 10.000 mm")
+            .unwrap_or_else(|| panic!("no length in {:?}", frame.text()));
+        // In the viewport, beside the edge it measured, rather than in a side panel.
+        assert!(
+            rect.center().distance(midpoint) < 160.0,
+            "the readout sat at {:?}, the edge at {midpoint:?}",
+            rect.center()
+        );
+        unchanged(&mut h, features);
+    }
+
+    #[test]
+    fn one_face_reports_area_and_perimeter_and_ctrl_gives_the_body() {
+        let (mut h, features) = measuring();
+        h.click_world(Vec3::new(5.0, 5.0, 2.0));
+        let frame = settled(&mut h);
+        assert!(overlaid(frame, "Area 100.000 mm²"), "{:?}", frame.text());
+        assert!(overlaid(frame, "Perimeter 40.000 mm"), "{:?}", frame.text());
+
+        // Ctrl asks about the whole body instead, which is the one measurement with no
+        // target of its own to click.
+        h.set_modifiers(false, true);
+        h.click_world(Vec3::new(5.0, 5.0, 2.0));
+        h.set_modifiers(false, false);
+        let frame = settled(&mut h);
+        assert!(overlaid(frame, "Volume 200.000 mm³"), "{:?}", frame.text());
+        assert!(
+            overlaid(frame, "Surface area 280.000 mm²"),
+            "{:?}",
+            frame.text()
+        );
+        assert!(
+            overlaid(frame, "Bounding box 10.000 × 10.000 × 2.000 mm"),
+            "{:?}",
+            frame.text()
+        );
+        unchanged(&mut h, features);
+    }
+
+    #[test]
+    fn two_corners_report_the_distance_between_them() {
+        let (mut h, features) = measuring();
+        h.click_world(Vec3::new(0.0, 0.0, 2.0));
+        h.click_world(Vec3::new(10.0, 0.0, 2.0));
+        assert_eq!(
+            h.editor.measure.as_ref().expect("measuring").subjects.len(),
+            2
+        );
+        // The span between them is drawn too, so the number is visibly attached.
+        let readout = crate::editor::measure::readout(&h.editor).expect("a readout");
+        assert!(readout.leader.is_some());
+        let frame = settled(&mut h);
+        assert!(overlaid(frame, "Distance 10.000 mm"), "{:?}", frame.text());
+        assert!(overlaid(frame, "ΔX 10.000 mm"), "{:?}", frame.text());
+        unchanged(&mut h, features);
+    }
+
+    #[test]
+    fn two_edges_report_their_angle_and_their_gap() {
+        let (mut h, features) = measuring();
+        // Two top edges meeting at a corner: perpendicular, and touching.
+        h.click_world(Vec3::new(5.0, 0.0, 2.0));
+        h.click_world(Vec3::new(10.0, 5.0, 2.0));
+        let frame = settled(&mut h);
+        assert!(overlaid(frame, "Angle 90.00°"), "{:?}", frame.text());
+        assert!(
+            overlaid(frame, "Minimum distance 0.000 mm"),
+            "{:?}",
+            frame.text()
+        );
+
+        // Opposite edges are parallel, so the gap is the measurement and an angle of zero
+        // is not worth printing.
+        h.click_world(Vec3::new(5.0, 0.0, 2.0));
+        h.click_world(Vec3::new(5.0, 10.0, 2.0));
+        let frame = settled(&mut h);
+        assert!(overlaid(frame, "Parallel"), "{:?}", frame.text());
+        assert!(
+            overlaid(frame, "Minimum distance 10.000 mm"),
+            "{:?}",
+            frame.text()
+        );
+        unchanged(&mut h, features);
+    }
+
+    /// Two faces: parallel ones give the thickness between them, the rest an angle.
+    #[test]
+    fn two_faces_report_a_distance_or_an_angle() {
+        let (mut h, features) = measuring();
+        h.click_world(Vec3::new(5.0, 5.0, 2.0));
+        h.click_world(Vec3::new(5.0, 0.0, 1.0));
+        let frame = settled(&mut h);
+        assert!(overlaid(frame, "Angle 90.00°"), "{:?}", frame.text());
+        unchanged(&mut h, features);
+    }
+
+    /// A sketch point measures like a corner of a body, and highlights like one: the two
+    /// are the same thing to the tool, so a point drawn on a sketch can be measured
+    /// against the solid it drove.
+    #[test]
+    fn a_sketch_point_measures_like_a_corner() {
+        use basset_core::{OriginPlane, PlaneRef};
+        use basset_math::Vec2;
+
+        let mut h = Harness::new();
+        h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+        h.line(Vec2::new(20.0, 0.0), Vec2::new(30.0, 0.0));
+        h.finish_sketch(true);
+        h.editor.zoom_to_fit();
+        h.editor.refresh_cache();
+        crate::editor::measure::start(&mut h.editor);
+        h.frame();
+
+        h.click_world(Vec3::new(20.0, 0.0, 0.0));
+        h.click_world(Vec3::new(30.0, 0.0, 0.0));
+        assert_eq!(
+            h.editor.selection.points.len(),
+            2,
+            "both ends lit up: {:?}",
+            h.editor.selection.points
+        );
+        let frame = settled(&mut h);
+        assert!(overlaid(frame, "Distance 10.000 mm"), "{:?}", frame.text());
+    }
+
+    /// A third pick starts a new measurement rather than piling up, and leaving the tool
+    /// takes the readout with it.
+    #[test]
+    fn a_third_pick_starts_again_and_escape_clears_the_readout() {
+        let (mut h, features) = measuring();
+        h.click_world(Vec3::new(0.0, 0.0, 2.0));
+        h.click_world(Vec3::new(10.0, 0.0, 2.0));
+        h.click_world(Vec3::new(10.0, 10.0, 2.0));
+        let subjects = &h.editor.measure.as_ref().expect("measuring").subjects;
+        assert_eq!(subjects.len(), 1, "{subjects:?}");
+        assert!(matches!(subjects[0], Subject::Point(_)));
+
+        h.key(winit::keyboard::NamedKey::Escape);
+        assert!(h.editor.measure.is_none(), "Escape left the tool");
+        assert!(crate::editor::measure::readout(&h.editor).is_none());
+        let frame = settled(&mut h);
+        assert!(!frame.has_text("Distance"), "{:?}", frame.text());
+        unchanged(&mut h, features);
+    }
+
+    /// Starting a modelling tool ends the measurement rather than leaving a readout
+    /// hanging over geometry the new tool is about to change.
+    #[test]
+    fn a_modelling_tool_takes_over_from_measuring() {
+        let (mut h, features) = measuring();
+        h.click_world(Vec3::new(5.0, 0.0, 2.0));
+        h.start_tool(crate::editor::tools::ToolKind::Fillet);
+        assert!(h.editor.measure.is_none());
+        assert!(
+            h.editor.selection.edges.is_empty(),
+            "the measured edge did not become the fillet's input"
+        );
+        h.editor.cancel();
+        unchanged(&mut h, features);
+    }
 }

@@ -20,11 +20,12 @@ use basset_math::{Frame, Ray, Vec2, Vec3};
 pub use basset_sketch::offset::Corner;
 use basset_sketch::{
     Constraint, ConstraintId, Entity, EntityId, Hit, Profile, Sketch, SketchError, SolveError,
-    SolveReport, Tessellation, edit, offset, pattern, shapes,
+    SolveReport, Tessellation, edit, fillet, offset, pattern, shapes,
 };
 use basset_viewport::{Camera, LineBatch, PointBatch, TriBatch, grid};
 
 use super::Editor;
+use super::snap::{self, Snap, Snapping};
 
 /// Half-length of a crosshair arm, in pixels.
 const CURSOR_ARM_PX: f64 = 14.0;
@@ -51,9 +52,10 @@ pub const CONFLICT_COLOR: [f32; 4] = [0.95, 0.35, 0.3, 1.0];
 const REGION_HOVER_FILL: [f32; 4] = [1.0, 0.85, 0.3, 0.16];
 /// A region the user has picked, in the selection blue.
 const REGION_SELECT_FILL: [f32; 4] = [0.25, 0.6, 1.0, 0.22];
-/// The step a dragged rotation snaps to while grid snapping is on. Fine enough to place
-/// a part by eye, coarse enough that the common angles land exactly.
-const ANGLE_SNAP_DEG: f64 = 5.0;
+/// The smallest fillet a drag may land on, in mm. A radius is a size, not an offset:
+/// dragging the handle back through the corner has nowhere further to go, and a zero
+/// radius is a corner that was never rounded rather than a fillet turned inside out.
+const MIN_FILLET_RADIUS: f64 = 0.01;
 /// Half-extent of a constraint badge.
 const GLYPH_PX: f64 = 5.0;
 /// Clearance between the geometry and the first badge on it. Measured from the anchor,
@@ -265,6 +267,9 @@ pub enum SketchTool {
     Trim,
     /// Cuts a curve at its crossings without removing anything.
     Break,
+    /// Rounds the corner between two curves with a tangent arc of a chosen radius,
+    /// trimming both of them back to it.
+    Fillet,
     /// Applies one geometric constraint to the entities picked next.
     Constrain(ConstraintKind),
 }
@@ -339,7 +344,7 @@ impl ToolGroup {
             ],
             ToolGroup::Text => &[SketchTool::Text],
             ToolGroup::Dimension => &[SketchTool::Dimension],
-            ToolGroup::Trim => &[SketchTool::Trim, SketchTool::Break],
+            ToolGroup::Trim => &[SketchTool::Trim, SketchTool::Break, SketchTool::Fillet],
             ToolGroup::Constrain => &[],
         }
     }
@@ -365,6 +370,7 @@ impl SketchTool {
             SketchTool::Dimension => "Dimension",
             SketchTool::Trim => "Trim",
             SketchTool::Break => "Break",
+            SketchTool::Fillet => "Fillet",
             SketchTool::Constrain(kind) => kind.name(),
         }
     }
@@ -384,7 +390,7 @@ impl SketchTool {
             }
             SketchTool::Text => ToolGroup::Text,
             SketchTool::Dimension => ToolGroup::Dimension,
-            SketchTool::Trim | SketchTool::Break => ToolGroup::Trim,
+            SketchTool::Trim | SketchTool::Break | SketchTool::Fillet => ToolGroup::Trim,
             SketchTool::Constrain(_) => ToolGroup::Constrain,
         }
     }
@@ -397,6 +403,7 @@ impl SketchTool {
             | SketchTool::Dimension
             | SketchTool::Trim
             | SketchTool::Break
+            | SketchTool::Fillet
             | SketchTool::Constrain(_) => 0,
             SketchTool::Text => 1,
             SketchTool::Circle3Point
@@ -770,6 +777,48 @@ pub struct OffsetOp {
     pub created: usize,
 }
 
+/// Settings of the sketch fillet tool, kept between uses the way the offset's are: the
+/// radius of the last corner rounded is nearly always the radius of the next one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FilletParams {
+    pub radius: f64,
+}
+
+impl Default for FilletParams {
+    fn default() -> Self {
+        Self { radius: 5.0 }
+    }
+}
+
+/// A corner fillet being set up. Like an offset, the arc is made in the live sketch so
+/// the user is looking at the real thing, and every change of the radius re-makes it
+/// from `base` — the sketch as it was before the tool started — so the radius can be
+/// changed twice without the corner being eaten twice.
+/// Every value in the sketch that a handle can drag, each remembering its own gesture.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Drags {
+    offset: snap::Drag,
+    fillet: snap::Drag,
+    /// The move's two axes, X then Y.
+    move_xy: [snap::Drag; 2],
+    turn: snap::Drag,
+}
+
+pub struct FilletOp {
+    a: EntityId,
+    hint_a: Vec2,
+    b: EntityId,
+    hint_b: Vec2,
+    base: Sketch,
+    /// Where the arc went, for the handle that drags its radius. `None` when the last
+    /// attempt made nothing.
+    plan: Option<fillet::Plan>,
+    /// Why the last attempt made nothing, for the palette to say. A fillet refuses often
+    /// — a radius bigger than the edges, a corner the curves do not actually make — and
+    /// the reason is the difference between a tool that is broken and one that is busy.
+    pub error: Option<String>,
+}
+
 /// Rubber-band selection in progress.
 #[derive(Clone, Copy)]
 struct Marquee {
@@ -864,6 +913,10 @@ pub struct SketchEditor {
     /// thing to say about it.
     pub report: Option<Result<SolveReport, SolveError>>,
     pub snap_to_grid: bool,
+    /// The running totals of the handles that can be dragged, so each one snaps the
+    /// travel the pointer has actually made rather than one frame's slice of it. See
+    /// [`snap::Drag`].
+    drags: Drags,
     /// Shift is down, so the grid lets go for as long as it is. The toggle says whether
     /// the drawing is built on a grid at all; this says "not this one placement", which
     /// is the far commoner thing to want and is not worth a trip to the palette and back.
@@ -898,6 +951,14 @@ pub struct SketchEditor {
     pub offset: OffsetParams,
     /// The offset being set up, if any.
     offset_op: Option<OffsetOp>,
+    /// Settings of the fillet tool, kept between uses.
+    pub fillet: FilletParams,
+    /// The corner fillet being set up, if any.
+    fillet_op: Option<FilletOp>,
+    /// The first curve of a fillet and where it was clicked, while the second is awaited.
+    /// The click position is kept because it is what says which side of the corner the
+    /// user means — the same pick that chooses between the four arcs that would fit.
+    fillet_pick: Option<(EntityId, Vec2)>,
     /// Editable text of the parameter panel: what the user is typing, which is not the
     /// same as what the sketch has accepted.
     pub param_drafts: Vec<(String, String)>,
@@ -944,6 +1005,7 @@ impl SketchEditor {
             report: None,
             snap_to_grid: true,
             free_snap: false,
+            drags: Drags::default(),
             fixed_grid_step: None,
             grid_step: 1.0,
             clicks: Vec::new(),
@@ -959,6 +1021,9 @@ impl SketchEditor {
             pattern_op: None,
             offset: OffsetParams::default(),
             offset_op: None,
+            fillet: FilletParams::default(),
+            fillet_op: None,
+            fillet_pick: None,
             param_drafts: Vec::new(),
             new_param: (String::new(), String::new()),
             param_error: None,
@@ -984,6 +1049,8 @@ impl SketchEditor {
             || self.dim_first.is_some()
             || self.move_op.is_some()
             || self.offset_op.is_some()
+            || self.fillet_op.is_some()
+            || self.fillet_pick.is_some()
     }
 
     pub fn move_in_progress(&self) -> bool {
@@ -998,7 +1065,10 @@ impl SketchEditor {
     /// modal operation runs at a time: a second begun on top of the first would take the
     /// first one's preview for its base and keep it on cancelling.
     pub fn modal(&self) -> bool {
-        self.move_op.is_some() || self.pattern_op.is_some() || self.offset_op.is_some()
+        self.move_op.is_some()
+            || self.pattern_op.is_some()
+            || self.offset_op.is_some()
+            || self.fillet_op.is_some()
     }
 
     /// What the modal operation in progress is called, for the messages that have to
@@ -1008,10 +1078,12 @@ impl SketchEditor {
             self.move_op.is_some(),
             self.pattern_op.is_some(),
             self.offset_op.is_some(),
+            self.fillet_op.is_some(),
         ) {
             (true, ..) => Some("Move"),
-            (_, true, _) => Some("Pattern"),
-            (.., true) => Some("Offset"),
+            (_, true, ..) => Some("Pattern"),
+            (_, _, true, _) => Some("Offset"),
+            (.., true) => Some("Fillet"),
             _ => None,
         }
     }
@@ -1021,6 +1093,7 @@ impl SketchEditor {
         self.finish_move(keep);
         self.finish_pattern(keep);
         self.finish_offset(keep);
+        self.finish_fillet(keep);
     }
 
     pub fn select_tool(&mut self) {
@@ -1068,6 +1141,7 @@ impl SketchEditor {
     /// away. Only what is half-drawn goes.
     pub fn finish_current(&mut self) {
         self.trim_preview = None;
+        self.fillet_pick = None;
         self.clicks.clear();
         self.chain_end = None;
         self.dim_first = None;
@@ -1108,6 +1182,18 @@ impl SketchEditor {
             }];
             self.entry_focus = Some(0);
             self.mirror_offset_entry();
+            return;
+        }
+        // A fillet is one number too, and the box is where it is stated exactly; the
+        // handle on the drawing is the way it is found.
+        if self.fillet_op.is_some() {
+            self.entries = vec![Entry {
+                dim: Dim::Radius,
+                text: String::new(),
+                locked: false,
+            }];
+            self.entry_focus = Some(0);
+            self.mirror_fillet_entry();
             return;
         }
         self.entries = self
@@ -1308,18 +1394,29 @@ impl SketchEditor {
     }
 
     fn to_grid(&self, pos: Vec2) -> Vec2 {
-        if self.snapping() {
-            grid::snap_to(pos, self.grid_step)
-        } else {
-            pos
-        }
+        self.snap_rule().point(pos)
     }
 
-    /// Whether the grid is holding right now. Snapping to an existing *point* is a
-    /// different thing and is never given up: it is how geometry gets joined, and shift
-    /// is for escaping the grid, not for drawing something that only looks attached.
-    pub fn snapping(&self) -> bool {
-        self.snap_to_grid && !self.free_snap
+    /// How a drag in this sketch meets the grid right now. Everything the sketch snaps
+    /// goes through this, so the toggle, shift and the increment are read once.
+    ///
+    /// Snapping to an existing *point* is a different thing and is never given up: it is
+    /// how geometry gets joined, and shift is for escaping the grid, not for drawing
+    /// something that only looks attached.
+    pub fn snap_rule(&self) -> Snap {
+        Snapping {
+            to_grid: self.snap_to_grid,
+            free: self.free_snap,
+        }
+        .at(self.grid_step)
+    }
+
+    /// Forgets every handle's running total, at the end of a drag. Without this the
+    /// next gesture would carry on from the last one's raw position rather than from
+    /// where the value now is, and a value changed in between — typed into a box, or
+    /// undone — would be overwritten by travel the pointer made before it.
+    pub fn release_drags(&mut self) {
+        self.drags = Drags::default();
     }
 
     /// Tells the sketch whether shift is down. Called from wherever the modifier is
@@ -1452,6 +1549,10 @@ impl SketchEditor {
         }
         if self.offset_op.is_some() {
             self.drive_offset_from_entry();
+            return;
+        }
+        if self.fillet_op.is_some() {
+            self.drive_fillet_from_entry();
             return;
         }
         if let Some(raw) = self.raw_cursor {
@@ -1792,6 +1893,7 @@ impl SketchEditor {
             SketchTool::Dimension => self.dimension_click(pos, tol),
             SketchTool::Constrain(kind) => self.constraint_click(kind, pos, tol),
             SketchTool::Trim | SketchTool::Break => self.trim_click(pos, tol),
+            SketchTool::Fillet => self.fillet_click(pos, tol),
             SketchTool::Line => self.line_click(self.aim(pos, tol)),
             _ => self.shape_click(self.aim(pos, tol)),
         }
@@ -1967,12 +2069,13 @@ impl SketchEditor {
     /// a grid stays on it, and a dragged arrow that left geometry at 49.87 mm would
     /// quietly undo the point of drawing on a grid at all.
     pub fn nudge_move(&mut self, along_x: bool, distance: f64) -> bool {
-        let (snap, step) = (self.snapping(), self.grid_step);
+        let snap = self.snap_rule();
         let Some(op) = self.move_op.as_mut() else {
             return false;
         };
+        let drag = &mut self.drags.move_xy[usize::from(!along_x)];
         let offset = if along_x { &mut op.dx } else { &mut op.dy };
-        *offset = snapped(*offset + distance, snap.then_some(step));
+        *offset = drag.advance(*offset, distance, snap);
         true
     }
 
@@ -1980,11 +2083,11 @@ impl SketchEditor {
     /// whole steps for the same reason the offsets are; a ring dragged to 37.4° is
     /// almost never what was meant.
     pub fn turn_move(&mut self, degrees: f64) -> bool {
-        let snap = self.snapping();
+        let snap = self.snap_rule();
         let Some(op) = self.move_op.as_mut() else {
             return false;
         };
-        op.angle_deg = snapped(op.angle_deg + degrees, snap.then_some(ANGLE_SNAP_DEG));
+        op.angle_deg = self.drags.turn.advance_angle(op.angle_deg, degrees, snap);
         true
     }
 
@@ -2204,9 +2307,14 @@ impl SketchEditor {
     /// The entities the pattern preview added, so they can be drawn as the provisional
     /// things they are rather than as geometry the user has already committed to.
     fn previewed(&self) -> std::collections::HashSet<EntityId> {
-        let base = match (self.pattern_op.as_ref(), self.offset_op.as_ref()) {
-            (Some(op), _) => &op.base,
-            (_, Some(op)) => &op.base,
+        let base = match (
+            self.pattern_op.as_ref(),
+            self.offset_op.as_ref(),
+            self.fillet_op.as_ref(),
+        ) {
+            (Some(op), ..) => &op.base,
+            (_, Some(op), _) => &op.base,
+            (.., Some(op)) => &op.base,
             _ => return std::collections::HashSet::new(),
         };
         self.sketch
@@ -2348,8 +2456,8 @@ impl SketchEditor {
         if self.offset_op.is_none() {
             return false;
         }
-        let step = self.snapping().then_some(self.grid_step);
-        self.offset.distance = snapped(self.offset.distance + by, step);
+        let snap = self.snap_rule();
+        self.offset.distance = self.drags.offset.advance(self.offset.distance, by, snap);
         // A drag is the user saying the distance again, so it takes the box back off
         // whatever was typed into it rather than leaving a number that disagrees with
         // the geometry under the pointer.
@@ -2382,6 +2490,227 @@ impl SketchEditor {
     pub fn offset_status(&self) -> Option<(usize, Option<&str>)> {
         let op = self.offset_op.as_ref()?;
         Some((op.created, op.error.as_deref()))
+    }
+
+    // --- Fillet ----------------------------------------------------------------------
+
+    /// A click with the fillet tool armed: pick a corner, or the two curves either side
+    /// of one.
+    ///
+    /// Pointing at the corner itself is the shorter way to say the same thing and is how
+    /// most fillets are asked for, so a click on a point where exactly two curves end
+    /// takes both of them at once. Anything else is the two-pick route, which is what a
+    /// corner the curves do not actually reach needs.
+    fn fillet_click(&mut self, pos: Vec2, tol: f64) {
+        if let Some(point) = self.point_at(pos, tol)
+            && let Some((a, b)) = fillet::curves_at(&self.sketch, point)
+            && let Some(corner) = self.sketch.point_pos(point)
+            && let (Some(hint_a), Some(hint_b)) = (
+                fillet::hint_along(&self.sketch, a, corner),
+                fillet::hint_along(&self.sketch, b, corner),
+            )
+        {
+            self.begin_fillet(a, hint_a, b, hint_b);
+            return;
+        }
+        let Some(curve) = self.curve_at(pos, tol) else {
+            // A click on nothing takes back a half-made pick rather than leaving a curve
+            // lit up that the next click would silently pair with something far away.
+            self.fillet_pick = None;
+            return;
+        };
+        match self.fillet_pick.take() {
+            Some((first, hint)) if first != curve => {
+                self.begin_fillet(first, hint, curve, pos);
+            }
+            _ => self.fillet_pick = Some((curve, pos)),
+        }
+    }
+
+    /// The point entity under the pointer, if the pointer is on one.
+    fn point_at(&self, pos: Vec2, tol: f64) -> Option<EntityId> {
+        self.sketch
+            .hit_test(pos, tol)
+            .into_iter()
+            .find(|h| {
+                self.sketch
+                    .entity(h.entity)
+                    .is_some_and(|d| d.entity.is_point())
+            })
+            .map(|h| h.entity)
+    }
+
+    /// Starts a fillet between two curves, at the radius last used. `false` when
+    /// something modal is already running, so the caller can say why.
+    pub fn begin_fillet(&mut self, a: EntityId, hint_a: Vec2, b: EntityId, hint_b: Vec2) -> bool {
+        if self.modal() {
+            return false;
+        }
+        self.fillet_pick = None;
+        self.fillet_op = Some(FilletOp {
+            a,
+            hint_a,
+            b,
+            hint_b,
+            base: self.sketch.clone(),
+            plan: None,
+            error: None,
+        });
+        self.update_fillet();
+        // The box appears with the arc and takes the keyboard straight away, so a fillet
+        // can be finished by typing the radius and pressing Enter.
+        self.reset_entries();
+        true
+    }
+
+    pub fn fillet_in_progress(&self) -> bool {
+        self.fillet_op.is_some()
+    }
+
+    /// Re-makes the fillet from the sketch as it was before the tool started, so changing
+    /// the radius replaces the arc rather than rounding the rounded corner.
+    pub fn update_fillet(&mut self) {
+        let Some(op) = self.fillet_op.as_ref() else {
+            return;
+        };
+        let (a, hint_a, b, hint_b) = (op.a, op.hint_a, op.b, op.hint_b);
+        let base = op.base.clone();
+        let radius = self.fillet.radius;
+        self.sketch = base;
+        let result = fillet::fillet(&mut self.sketch, a, hint_a, b, hint_b, radius);
+        let Some(op) = self.fillet_op.as_mut() else {
+            return;
+        };
+        match result {
+            Ok(made) => {
+                op.plan = Some(made.plan);
+                op.error = None;
+            }
+            Err(e) => {
+                op.plan = None;
+                op.error = Some(e.to_string());
+                // A refused fillet leaves the sketch the user had, never a half-cut
+                // corner.
+                self.sketch = op.base.clone();
+            }
+        }
+        self.solve();
+        self.mirror_fillet_entry();
+        self.dirty = true;
+    }
+
+    /// Writes the radius into the box, so the handle and the box always agree. Same rule
+    /// as the offset's: a box still saying what the arc is made at is left alone, one
+    /// saying something else has been overtaken and goes back to mirroring.
+    fn mirror_fillet_entry(&mut self) {
+        let radius = self.fillet.radius;
+        for entry in self.entries.iter_mut().filter(|e| e.dim == Dim::Radius) {
+            if entry.locked
+                && entry
+                    .text
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .is_none_or(|typed| typed == radius)
+            {
+                continue;
+            }
+            entry.locked = false;
+            entry.text = format!("{radius:.2}");
+        }
+    }
+
+    /// Re-makes the fillet at whatever has been typed into the box. A typed radius is
+    /// taken exactly: the grid steadies a pointer, and a user who typed 3.2 has said
+    /// what they want.
+    fn drive_fillet_from_entry(&mut self) {
+        let Some(v) = typed_value(&self.entries, Dim::Radius) else {
+            return;
+        };
+        if self.fillet_op.is_none() || v == self.fillet.radius {
+            return;
+        }
+        self.fillet.radius = v;
+        self.update_fillet();
+    }
+
+    /// Where the fillet's drag handle belongs in the sketch plane, and which way its
+    /// radius grows from there: on the bisector of the corner, pointing into the round.
+    ///
+    /// The handle sits exactly the radius from the corner, so what the user is dragging
+    /// *is* the number — pull away from the corner and the fillet grows, which is also
+    /// the way the arc itself travels. `None` before the first radius that fits, because
+    /// there is no corner drawn to put a handle on.
+    pub fn fillet_handle(&self) -> Option<(Vec2, Vec2)> {
+        let plan = self.fillet_op.as_ref()?.plan?;
+        Some((plan.corner, plan.bisector()))
+    }
+
+    /// Drags the fillet's radius by `by` along the handle's direction.
+    ///
+    /// Unlike an offset's distance a radius has no far side to cross into: dragging back
+    /// through the corner stops at the smallest fillet there is rather than turning it
+    /// inside out.
+    pub fn nudge_fillet(&mut self, by: f64) -> bool {
+        if self.fillet_op.is_none() {
+            return false;
+        }
+        // The shared rule, so the radius snaps and shift frees it exactly as every other
+        // dragged value does.
+        let snap = self.snap_rule();
+        let floor = snap
+            .step()
+            .unwrap_or(MIN_FILLET_RADIUS)
+            .max(MIN_FILLET_RADIUS);
+        self.fillet.radius = self
+            .drags
+            .fillet
+            .advance_above(self.fillet.radius, by, snap, floor);
+        // A drag is the user saying the radius again, so it takes the box back off
+        // whatever was typed into it.
+        for entry in self.entries.iter_mut().filter(|e| e.dim == Dim::Radius) {
+            entry.locked = false;
+        }
+        self.mirror_fillet_entry();
+        true
+    }
+
+    /// Ends the fillet. Keeping it makes the whole thing one step of undo; cancelling
+    /// puts back the sketch the tool started from. `true` when a rounded corner was kept.
+    pub fn finish_fillet(&mut self, keep: bool) -> bool {
+        let Some(op) = self.fillet_op.take() else {
+            return false;
+        };
+        // The radius box belongs to the fillet, not to the sketch it leaves behind.
+        self.reset_entries();
+        if keep && op.error.is_none() && op.plan.is_some() {
+            self.push_undo(op.base);
+            self.after_change();
+            true
+        } else {
+            self.sketch = op.base;
+            self.after_change();
+            false
+        }
+    }
+
+    /// What the palette needs to say: whether there is an arc on screen, and why there is
+    /// none if there is none.
+    pub fn fillet_status(&self) -> Option<(bool, Option<&str>)> {
+        let op = self.fillet_op.as_ref()?;
+        Some((op.plan.is_some(), op.error.as_deref()))
+    }
+
+    /// What the fillet tool is waiting for, for the status line. `None` when it is not
+    /// the armed tool or is already running.
+    pub fn fillet_prompt(&self) -> Option<&'static str> {
+        if self.tool != SketchTool::Fillet || self.fillet_op.is_some() {
+            return None;
+        }
+        Some(match self.fillet_pick {
+            Some(_) => "Fillet: pick the second curve",
+            None => "Fillet: pick a corner, or the first of two curves",
+        })
     }
 
     // --- Parameters ------------------------------------------------------------------
@@ -2458,6 +2787,10 @@ impl SketchEditor {
         {
             return false;
         }
+        // A typed number replaces the value outright, so whatever travel a drag had
+        // banked no longer refers to anything. Without this the next drag would carry on
+        // from the old raw total and the typed figure would vanish under it.
+        self.release_drags();
         // Typing continues in the box that is taking focus, otherwise starts in the
         // first one still following the pointer, so "10 Tab 5" fills width then height.
         // The first keystroke replaces the live value rather than appending to it.
@@ -2488,6 +2821,10 @@ impl SketchEditor {
         // does; an offset that made nothing is a cancel, and `finish_offset` says so.
         if self.offset_op.is_some() {
             self.finish_offset(true);
+            return;
+        }
+        if self.fillet_op.is_some() {
+            self.finish_fillet(true);
             return;
         }
         let Some(cursor) = self.cursor else { return };
@@ -3094,6 +3431,9 @@ impl SketchEditor {
         if let Some((anchor, dir)) = self.offset_handle() {
             return Some(self.frame.to_world(anchor + dir * self.offset.distance));
         }
+        if let Some((anchor, dir)) = self.fillet_handle() {
+            return Some(self.frame.to_world(anchor + dir * self.fillet.radius));
+        }
         let pos = match self.tool {
             SketchTool::Line => self.chain_end.and_then(|id| self.sketch.point_pos(id)),
             _ => self.clicks.last().map(|c| c.pos),
@@ -3215,6 +3555,7 @@ impl SketchEditor {
                 || self.dim_first == Some(id)
                 || region_curves.contains(&id)
                 || self.constraint_picks.contains(&id)
+                || self.fillet_pick.is_some_and(|(pick, _)| pick == id)
                 || self.highlighted.contains(&id)
                 || held_by_badge.contains(&id);
             if let Entity::Point { pos } = data.entity {
@@ -4304,6 +4645,7 @@ fn build_shape(
         | SketchTool::Dimension
         | SketchTool::Trim
         | SketchTool::Break
+        | SketchTool::Fillet
         | SketchTool::Constrain(_) => {}
     }
     for (created, click) in tie {
@@ -4448,14 +4790,6 @@ fn line_intersection(a0: Vec2, a1: Vec2, b0: Vec2, b1: Vec2) -> Option<Vec2> {
     Some(a0 + da * t)
 }
 
-/// `v` rounded to the nearest whole `step`, or left alone when there is no step.
-fn snapped(v: f64, step: Option<f64>) -> f64 {
-    match step {
-        Some(step) if step.is_finite() && step > 0.0 => (v / step).round() * step,
-        _ => v,
-    }
-}
-
 fn point_in_rect(p: Vec2, min: Vec2, max: Vec2) -> bool {
     p.x >= min.x && p.x <= max.x && p.y >= min.y && p.y <= max.y
 }
@@ -4561,6 +4895,10 @@ fn start(
     editor.tool = None;
     let mut sketch_editor = SketchEditor::new(id, frame, sketch, saved);
     sketch_editor.restore_cursor = restore_cursor;
+    // A sketch opens with snapping as the user left it, not as a fresh one would have
+    // it: a switch that quietly turns itself back on is a switch nobody trusts.
+    sketch_editor.snap_to_grid = editor.snapping.to_grid;
+    sketch_editor.set_free_snap(editor.pointer.shift);
     editor.mode = super::Mode::Sketch(Box::new(sketch_editor));
     editor.set_status(
         "Sketching: type a size and Enter to place it, M moves the selection, E extrudes \
@@ -4675,7 +5013,10 @@ mod offset_entry_tests {
         assert_eq!(s.entry_focus, Some(0), "and it has the keyboard");
         assert_eq!(box_text(&s), Some("5.00"), "showing the distance in use");
 
-        assert!(s.snapping(), "the grid is on, so this measures the typing");
+        assert!(
+            s.snap_rule().is_on(),
+            "the grid is on, so this measures the typing"
+        );
         for c in ["3", ".", "2"] {
             assert!(s.type_into_entry(c));
         }
@@ -4725,10 +5066,62 @@ mod offset_entry_tests {
         assert_eq!(s.offset.distance, 4.0, "snapped to the grid");
         s.set_free_snap(true);
         assert!(s.nudge_offset(0.3));
+        // 4.7 mm of pointer travel in one gesture, so that is where the handle goes the
+        // moment the grid stops holding it. Reading 4.3 — the snapped 4.0 plus the last
+        // slice — would mean the grip had quietly fallen behind the mouse.
         assert!(
-            (s.offset.distance - 4.3).abs() < 1e-9,
+            (s.offset.distance - 4.7).abs() < 1e-9,
             "shift lets go of it: {}",
             s.offset.distance
+        );
+    }
+
+    /// A drag does not arrive as one gesture, it arrives as one small delta per frame,
+    /// and the value has to reach the pointer either way.
+    ///
+    /// The regression is the one users describe as snapping that "does not follow the
+    /// mouse": rounding each frame's slice instead of the running total returns the same
+    /// number every frame — a tenth of a millimetre never survives rounding to a
+    /// millimetre — so the handle sits still while the pointer walks away from it, and
+    /// only a flick fast enough to cross half a step in a single frame moves anything.
+    #[test]
+    fn a_drag_delivered_frame_by_frame_still_reaches_the_pointer() {
+        let mut s = with_rectangle();
+        s.grid_step = 1.0;
+        s.offset.distance = 0.0;
+        assert!(s.begin_offset());
+        // 4.4 mm of pointer travel, as sixty frames of a slow drag.
+        for _ in 0..60 {
+            s.nudge_offset(4.4 / 60.0);
+        }
+        assert_eq!(
+            s.offset.distance, 4.0,
+            "the pointer moved 4.4 mm, so the handle belongs on the 4 mm line"
+        );
+        // And the gesture, once it ends, does not lend its travel to the next one.
+        s.release_drags();
+        s.nudge_offset(0.4);
+        assert_eq!(s.offset.distance, 4.0, "0.4 mm from 4.0 stays on 4.0");
+    }
+
+    /// The same, for every other handle a sketch offers: one slow drag, one grid line.
+    #[test]
+    fn every_sketch_handle_reaches_the_pointer_frame_by_frame() {
+        let mut s = with_rectangle();
+        s.grid_step = 1.0;
+
+        assert!(s.begin_move());
+        for _ in 0..60 {
+            s.nudge_move(true, 4.4 / 60.0);
+            s.nudge_move(false, -2.6 / 60.0);
+            // 12° of turn, which the 5° step rounds to 10.
+            s.turn_move(12.0 / 60.0);
+        }
+        let op = s.move_op.as_ref().expect("moving");
+        assert_eq!(
+            (op.dx, op.dy, op.angle_deg),
+            (4.0, -3.0, 10.0),
+            "each axis and the ring land on their own step"
         );
     }
 

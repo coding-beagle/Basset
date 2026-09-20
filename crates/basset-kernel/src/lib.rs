@@ -29,6 +29,7 @@ pub mod error;
 pub mod generate;
 pub mod geometry;
 pub mod ids;
+pub mod measure;
 pub mod pick;
 pub mod primitives;
 pub mod solid;
@@ -39,5 +40,10 @@ pub use error::KernelError;
 pub use generate::{extrude, loft, revolve, sweep};
 pub use geometry::{Axis, Contour, Extent, Path3, Profile, Segment, SegmentKind, Tessellation};
 pub use ids::{EdgeKey, FaceKey, FaceRole, OpId};
+pub use measure::{
+    EdgeCircle, direction_angle, edge_angle, edge_circle, edge_direction, edge_distance,
+    edge_face_angle, edge_face_distance, face_angle, face_perimeter, face_plane, face_radius,
+    parallel, parallel_face_distance, point_edge_distance, point_face_distance,
+};
 pub use pick::{EdgePick, FacePick, VertexPick, corners, pick_edge, pick_face, pick_vertex};
 pub use solid::{Edge, EdgeSegment, Face, Polygon, Solid, SurfaceKind, Tessellated};
