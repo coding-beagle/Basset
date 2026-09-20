@@ -935,13 +935,16 @@ fn extrude_lands_on(editor: &Editor) -> Option<BodyRef> {
 }
 
 /// Every edge bordering a face, so a face pick can stand for all of them.
+///
+/// Smooth edges are left out: where the face simply carries on into its neighbour there
+/// is nothing drawn to round, and a blend tool built along one has no dihedral to fill.
 pub fn edges_of_face(editor: &Editor, face: &basset_core::FaceRef) -> Vec<basset_core::EdgeRef> {
     let Some(body) = editor.pick_body(face.body) else {
         return Vec::new();
     };
     body.edges
         .iter()
-        .filter(|e| e.key.touches(face.key))
+        .filter(|e| !e.smooth && e.key.touches(face.key))
         .map(|e| basset_core::EdgeRef {
             body: face.body,
             key: e.key,

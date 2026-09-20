@@ -1578,6 +1578,64 @@ fn geometric_constraints_are_drawn_on_the_geometry() {
     }
 }
 
+/// A sketch that cannot solve says which constraints disagree, and marks them on the
+/// drawing. "solver did not converge (residual 2.7e+00)" is not something a user can act
+/// on; "these two dimensions of the same edge disagree" is.
+#[test]
+fn a_conflicting_sketch_names_and_marks_the_constraints_at_fault() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+    let s = sketch(&mut editor);
+    let bottom = s
+        .sketch
+        .entities()
+        .find(|(id, d)| {
+            matches!(d.entity, Entity::Line { .. })
+                && s.sketch
+                    .entity_bounds(*id)
+                    .is_some_and(|(min, max)| min.y == 0.0 && max.y == 0.0)
+        })
+        .map(|(id, _)| id)
+        .expect("bottom edge");
+    let Entity::Line { start, end } = s.sketch.entity(bottom).unwrap().entity else {
+        unreachable!()
+    };
+    for value in [20.0, 30.0] {
+        s.add_constraint(basset_sketch::Constraint::Distance {
+            a: start,
+            b: end,
+            value,
+        })
+        .unwrap();
+    }
+
+    let blamed = s.conflicting().to_vec();
+    assert_eq!(
+        blamed.len(),
+        2,
+        "both dimensions of that edge, and nothing else"
+    );
+    for id in &blamed {
+        let c = s.sketch.constraint(*id).expect("a live constraint");
+        assert!(
+            matches!(c, basset_sketch::Constraint::Distance { .. }),
+            "the rectangle's own horizontal and vertical constraints are satisfiable"
+        );
+    }
+
+    // The badges of the offenders are drawn in their own batch, so they read as red.
+    let mut lines = Vec::new();
+    let mut points = Vec::new();
+    s.draw(&mut lines, &mut points);
+    let red = lines
+        .iter()
+        .find(|b| b.color == sketch_mode::CONFLICT_COLOR)
+        .expect("a batch for what is in conflict");
+    assert!(!red.segments.is_empty(), "the marks are actually drawn");
+}
+
 /// Dimensions keep drawing their own value and leader; they must not gain a second badge.
 #[test]
 fn dimensions_are_not_given_constraint_badges() {

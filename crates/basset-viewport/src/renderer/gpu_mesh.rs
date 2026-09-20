@@ -1,4 +1,4 @@
-//! Conversion of a [`TriMesh`] into GPU buffers, plus feature-edge extraction.
+//! Conversion of a [`TriMesh`] into GPU buffers.
 
 use std::collections::HashMap;
 
@@ -58,20 +58,18 @@ pub(crate) struct GpuMesh {
     pub highlight_words: u32,
 }
 
-/// Adjacent triangles whose normals differ by more than this are separated by a crease
-/// edge even when they belong to the same kernel face (e.g. coarse cylinder facets do not
-/// qualify, a folded sheet does).
-const CREASE_ANGLE_COS: f64 = 0.5; // 60°
-
-/// Positions closer than this are merged when finding shared edges. Flat-shaded meshes
-/// duplicate vertices per face, so edges cannot be matched by index alone.
-const WELD_QUANTUM: f64 = 1e-6;
-
 impl GpuMesh {
-    pub fn upload(device: &wgpu::Device, mesh: &TriMesh) -> Result<Self, ViewportError> {
+    pub fn upload(
+        device: &wgpu::Device,
+        mesh: &TriMesh,
+        edges: &[[Vec3; 2]],
+    ) -> Result<Self, ViewportError> {
         validate(mesh)?;
         let (vertices, indices) = split_vertices_by_face(mesh);
-        let edges = feature_edges(mesh);
+        let edges: Vec<SegmentInstance> = edges
+            .iter()
+            .map(|[a, b]| SegmentInstance::new(*a, *b))
+            .collect();
         let max_face_id = mesh.face_ids.iter().copied().max().unwrap_or(0);
 
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -172,80 +170,6 @@ fn split_vertices_by_face(mesh: &TriMesh) -> (Vec<MeshVertex>, Vec<u32>) {
     (vertices, indices)
 }
 
-struct EdgeRecord {
-    face_id: u32,
-    normal: Vec3,
-    /// Number of triangles seen so far sharing this edge.
-    uses: u32,
-    feature: bool,
-}
-
-/// Edges between different kernel faces, creases sharper than [`CREASE_ANGLE_COS`], and
-/// open borders. Silhouettes are view-dependent and intentionally not included.
-fn feature_edges(mesh: &TriMesh) -> Vec<SegmentInstance> {
-    let mut welded: HashMap<[i64; 3], u32> = HashMap::new();
-    let weld = |p: Vec3, welded: &mut HashMap<[i64; 3], u32>| {
-        let key = [
-            (p.x / WELD_QUANTUM).round() as i64,
-            (p.y / WELD_QUANTUM).round() as i64,
-            (p.z / WELD_QUANTUM).round() as i64,
-        ];
-        let next = welded.len() as u32;
-        *welded.entry(key).or_insert(next)
-    };
-
-    let mut edges: HashMap<(u32, u32), EdgeRecord> = HashMap::new();
-    let mut endpoints: HashMap<(u32, u32), [Vec3; 2]> = HashMap::new();
-    for (i, &face_id) in mesh.face_ids.iter().enumerate() {
-        let tri = mesh.triangle(i);
-        let normal = (tri[1] - tri[0]).cross(tri[2] - tri[0]).normalize_or_zero();
-        let keys = [
-            weld(tri[0], &mut welded),
-            weld(tri[1], &mut welded),
-            weld(tri[2], &mut welded),
-        ];
-        for k in 0..3 {
-            let (ka, kb) = (keys[k], keys[(k + 1) % 3]);
-            if ka == kb {
-                continue; // degenerate triangle edge
-            }
-            let key = (ka.min(kb), ka.max(kb));
-            match edges.get_mut(&key) {
-                None => {
-                    edges.insert(
-                        key,
-                        EdgeRecord {
-                            face_id,
-                            normal,
-                            uses: 1,
-                            feature: false,
-                        },
-                    );
-                    endpoints.insert(key, [tri[k], tri[(k + 1) % 3]]);
-                }
-                Some(record) => {
-                    record.uses += 1;
-                    if record.face_id != face_id || record.normal.dot(normal) < CREASE_ANGLE_COS {
-                        record.feature = true;
-                    }
-                }
-            }
-        }
-    }
-
-    let mut segments: Vec<(&(u32, u32), SegmentInstance)> = edges
-        .iter()
-        .filter(|(_, r)| r.feature || r.uses == 1)
-        .map(|(key, _)| {
-            let [a, b] = endpoints[key];
-            (key, SegmentInstance::new(a, b))
-        })
-        .collect();
-    // HashMap order is arbitrary; sort so uploads are deterministic frame to frame.
-    segments.sort_by_key(|(key, _)| **key);
-    segments.into_iter().map(|(_, s)| s).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,23 +191,6 @@ mod tests {
             m.push_triangle([q[0], q[2], q[3]], id as u32);
         }
         m
-    }
-
-    #[test]
-    fn cube_has_twelve_feature_edges() {
-        let edges = feature_edges(&cube());
-        assert_eq!(
-            edges.len(),
-            12,
-            "diagonals within a face are not feature edges"
-        );
-    }
-
-    #[test]
-    fn open_border_is_an_edge() {
-        let mut m = TriMesh::default();
-        m.push_triangle([Vec3::ZERO, Vec3::X, Vec3::Y], 0);
-        assert_eq!(feature_edges(&m).len(), 3);
     }
 
     #[test]

@@ -11,7 +11,7 @@ rewritten when the next tool arrives.
 | Area | What exists |
 | --- | --- |
 | Object model | Document, Components, origin & construction Planes/Axes, Sketches, Bodies |
-| Sketching | points, lines, arcs, circles, construction geometry, text; rectangles (2-point, centre), circles (centre, 2-point, 3-point), polygons, slots, arcs; geometric constraints and driving dimensions; Levenberg–Marquardt solver; selection / hit testing including box select; grid snapping; closed-region detection with curves split at their crossings; trim and break; rectangular and circular patterns; named parameters driving dimensions |
+| Sketching | points, lines, arcs, circles, construction geometry, text; rectangles (2-point, centre), circles (centre, 2-point, 3-point), polygons, slots, arcs; geometric constraints and driving dimensions; Levenberg–Marquardt solver that names both the loose geometry and, when a sketch will not solve, the constraints that disagree; selection / hit testing including box select; grid snapping; closed-region detection with curves split at their crossings; trim and break; rectangular and circular patterns; named parameters driving dimensions |
 | Solids | extrude (one side / symmetric / two sides), revolve, sweep, loft, from a sketch region or a planar face; join / cut / intersect; fillet, chamfer, combine, move |
 | Construction | offset plane, plane at an angle, sketch on a planar face |
 | Timeline | insert at cursor, edit, suppress, reorder, delete, roll back / forward; edits replay forward with per-feature caching; per-feature failure reporting |
@@ -59,7 +59,9 @@ cargo clippy --workspace --all-targets -- -D warnings
   arrowheads and leaders; drag the value to place one, click it to change it — with a
   number, or with an expression such as `bore / 2`, which binds it to the sketch's named
   parameters (the palette's Parameters section adds those, and a driven dimension is
-  drawn with an ƒ). Trim takes the piece of a curve you click, cut at the curves that
+  drawn with an ƒ). If the sketch cannot be solved, the constraints that disagree turn red
+  on the drawing and the palette lists them with a delete beside each, rather than
+  reporting a residual. Trim takes the piece of a curve you click, cut at the curves that
   cross it, and draws that piece in red before you commit to it; Break cuts a curve at
   its crossings and keeps everything. `M` moves the selection by offsets and a rotation
   you type — Enter applies, Esc puts it back — and the palette's Pattern section repeats

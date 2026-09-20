@@ -7,16 +7,19 @@ they hold (selectable, with a delete in their context menu), everything the solv
 free is drawn in blue, the palette lists every constraint with hover-to-highlight, and a
 loose sketch that a later feature builds from warns from the timeline and the status bar.
 `SolveReport::under_constrained` is where the naming comes from: the null space of the
-hard Jacobian, per parameter.
+hard Jacobian, per parameter. A sketch that will not solve now names the constraints that
+disagree rather than quoting a residual: `SolveError::DidNotConverge::conflicting` lists
+them worst first (the per-equation residual, attributed back to the constraint that
+compiled it), the palette offers each one for deletion, and their badges, leader lines and
+value boxes are drawn red.
 
 What is left here:
 
+- Clicking on tool symbol doesn't select it (in the variant dropdown), only the text (IMPORTANT!) - this is bad and misleading, make it so the tool symbol can be clicked to change tool as well.
+- Patterns don't make sense. Make it closer to fusion.
 - Badge placement is naive: several constraints on one entity stack outwards from its
   midpoint, which is enough for a tidy sketch and will collide on a dense one. No
   decluttering, and badges do not dodge the geometry or each other
-- A conflicting sketch says "Constraints conflict" without naming the constraints that
-  disagree. The solver knows the residual per equation, so the worst offenders could be
-  listed the way the free parameters now are
 - Nothing distinguishes a *redundant* constraint from a driving one, so a sketch can be
   quietly over-constrained but consistent
 - The degrees-of-freedom estimate is instantaneous (first order), so a point pinned only
@@ -47,10 +50,27 @@ Extrude tool:
 
 - Draggable arrow in the viewport for the distance: done (`tools::handle`), and the dialog
   has the distance entry box beside it
-- Extrudes need to clean up the geometry that they create.
+- The geometry an extrude creates is clean: what the user sees as an edge comes from
+  `Solid::display_edges` (topology) rather than from the triangles, so faces read as flat
+  shapes and arcs as curves, and two faces on one surface — a sketch line cut in two —
+  meet at a smooth edge that is neither drawn nor pickable. Generators heal and validate
+  what they return, so a profile that doubles back on itself is repaired or fails its own
+  feature instead of seeding a leaking shell
+- Booleans still heal without validating, so a leak from the BSP splitter is now neither
+  drawn nor reported (it used to show as stray triangle edges). Validating there would
+  fail features that presently work, so it wants measuring before it is turned on
+- Still open there: a silhouette is not drawn, so a cylinder standing against the
+  background is bounded only by its shading; and `DISPLAY_CREASE_COS` (45°) is shared with
+  the shading cut-off, which is right for a fold but arbitrary for a tangent edge, where
+  a fillet meets the face it blends into
 
-Filet tool:
+Fillet tool:
 
-- Multiple edges select reliably; picking works against the unfilleted body while the preview shows (NOT DONE)
-  - Are edges not automatically created when we create geometry?
+- Fillet arrow should go other way around.
+- Multiple edges select reliably: picking runs against the state *before* the running
+  feature (`Editor::refresh_pick_bodies` via `Document::state_before`), so a second pick
+  lands on the unfilleted body while the preview shows. Covered by
+  `fillet_picks_faces_as_edge_rings_and_edges_of_the_unfilleted_body`
 - Slow for some geometries, needs optimisation
+- Where several blended edges meet, the result is the intersection of their tools rather
+  than a corner patch, and a radius larger than the neighbouring face is not detected

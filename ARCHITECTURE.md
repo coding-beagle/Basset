@@ -60,7 +60,10 @@ Details worth knowing:
 
 * Polygons are convex (caps are ear-clipped) because the BSP splitter relies on it.
 * Booleans heal T-junctions afterwards so edge extraction and `Solid::is_closed` see a
-  vertex-for-vertex matched shell; vertices merge within `MERGE_TOL` (1 µm).
+  vertex-for-vertex matched shell; vertices merge within `MERGE_TOL` (1 µm). Generators
+  heal too, and then check that the shell is closed before returning it, so a profile
+  that doubles back on itself is either repaired by the heal or fails its own feature
+  rather than seeding every later operation with a hole.
 * Fillets and chamfers are built as prismatic tool solids per edge chain (mitred at every
   polyline joint) and applied with a boolean: subtract for convex edges, union for
   concave ones. Where several blended edges meet the result is the intersection of their
@@ -69,8 +72,21 @@ Details worth knowing:
 * Overlapping coplanar faces with the same orientation survive a union twice; the
   volume is right but the face is doubled. Coplanar opposite faces (extruding from a
   face, cutting from a face) are handled.
+* Booleans heal but do not validate, so a BSP result that leaks is neither reported nor
+  visible: `display_edges` draws nothing along an edge only one polygon uses, on the
+  grounds that painting the triangle soup helps nobody. Generators do validate, so the
+  input to a boolean is sound; the boolean itself is the gap. `Solid::validate` is there
+  when a caller wants the check.
 * Curved faces are shaded smoothly by averaging facet normals within 45°; the analytic
   `SurfaceKind` is what selection reports.
+* What the user sees as an edge is `Solid::display_edges`, worked out from the topology:
+  every fold sharper than 45° and every change of surface, and nothing else. The mesh is
+  never the source — welding the triangles on rounded coordinates misses vertices that a
+  boolean left agreeing only to `MERGE_TOL`, and each miss draws a triangle edge as if
+  the body had a hole. Two faces on one surface (a sketch line cut in two extrudes into
+  two coplanar faces) meet at a *smooth* edge: nothing is drawn along it, nothing can be
+  picked on it, and its ends are not corners. `Solid::edges` still reports it, because
+  face boundaries are what `face_profile` traces and what booleans key from.
 
 ## Sketch representation
 

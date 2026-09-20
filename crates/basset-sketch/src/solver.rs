@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dual::{DVec, Dual, MAX_LOCAL_VARS};
 use crate::linalg::{Mat, solve_spd};
-use crate::{Constraint, Entity, EntityId, Sketch, SolveError};
+use crate::{Constraint, ConstraintId, Entity, EntityId, Sketch, SolveError};
 
 /// Not `Copy`: it carries the list of loose entities, which is the whole point of
 /// reporting more than a count.
@@ -188,6 +188,9 @@ struct Equation {
     formula: Formula,
     /// Soft equations shape the least-squares objective but do not count as constraints.
     hard: bool,
+    /// The constraint this equation came from. Equations the sketch implies rather than
+    /// the user wrote — an arc's two radii, the drag goal — have none.
+    source: Option<ConstraintId>,
 }
 
 /// Evaluated residuals of one equation, at most two.
@@ -359,6 +362,9 @@ pub(crate) struct System {
     /// Current value of every point, including fixed ones, for constant lookup.
     point_values: HashMap<EntityId, Vec2>,
     equations: Vec<Equation>,
+    /// The constraint being compiled, so every equation remembers who asked for it and a
+    /// failed solve can name the constraints that disagree.
+    current: Option<ConstraintId>,
     /// Characteristic size of the sketch, for scale-relative tolerances.
     scale: f64,
 }
@@ -381,6 +387,7 @@ impl System {
             index: HashMap::new(),
             point_values: HashMap::new(),
             equations: Vec::new(),
+            current: None,
             scale: 1.0,
         };
         let mut min = Vec2::splat(f64::INFINITY);
@@ -408,9 +415,11 @@ impl System {
         if min.x.is_finite() {
             sys.scale = (max - min).max_element().max(1.0);
         }
-        for (_, c) in sketch.constraints() {
+        for (id, c) in sketch.constraints() {
+            sys.current = Some(id);
             sys.compile_constraint(sketch, c);
         }
+        sys.current = None;
         // Implicit arc consistency: |end − c| == |start − c|.
         for (_, data) in sketch.entities() {
             if let Entity::Arc { center, start, end } = data.entity {
@@ -528,6 +537,7 @@ impl System {
             vars: l.vars,
             formula,
             hard,
+            source: self.current,
         });
     }
 
@@ -951,6 +961,37 @@ impl System {
         Ok((r, j))
     }
 
+    /// The constraints still unsatisfied at the end of a solve, worst first.
+    ///
+    /// A sketch that will not solve is usually two or three constraints asking for
+    /// incompatible things; the rest are satisfied and innocent. Which ones those are is
+    /// in the residual vector, one entry per equation, so it costs nothing to say. Rows
+    /// follow [`Self::evaluate`]'s order: hard equations first.
+    fn conflicts(&self, r: &[f64]) -> Vec<ConstraintId> {
+        let tol = self.convergence_tolerance();
+        let mut worst: Vec<(ConstraintId, f64)> = Vec::new();
+        let mut row = 0;
+        for eq in self.equations.iter().filter(|e| e.hard) {
+            let count = eq.residual_count();
+            let norm = r[row..row + count]
+                .iter()
+                .map(|v| v * v)
+                .sum::<f64>()
+                .sqrt();
+            row += count;
+            let Some(id) = eq.source else { continue };
+            if norm <= tol {
+                continue;
+            }
+            match worst.iter_mut().find(|(c, _)| *c == id) {
+                Some(entry) => entry.1 = entry.1.max(norm),
+                None => worst.push((id, norm)),
+            }
+        }
+        worst.sort_by(|a, b| b.1.total_cmp(&a.1));
+        worst.into_iter().map(|(id, _)| id).collect()
+    }
+
     fn convergence_tolerance(&self) -> f64 {
         1e-10 * self.scale
     }
@@ -1036,11 +1077,17 @@ impl System {
 
     fn outcome(&self, iterations: usize, r: &[f64], j: &Mat, converged: bool) -> LmOutcome {
         let residual = self.hard_norm(r);
+        let converged = converged || residual <= self.convergence_tolerance();
         LmOutcome {
             iterations,
             residual,
-            converged: converged || residual <= self.convergence_tolerance(),
+            converged,
             rank_matrix: j.clone(),
+            conflicting: if converged {
+                Vec::new()
+            } else {
+                self.conflicts(r)
+            },
         }
     }
 
@@ -1122,6 +1169,8 @@ struct LmOutcome {
     residual: f64,
     converged: bool,
     rank_matrix: Mat,
+    /// Constraints still unsatisfied, worst first; empty when the solve converged.
+    conflicting: Vec<ConstraintId>,
 }
 
 /// Solves the sketch's constraints in place.
@@ -1153,6 +1202,7 @@ fn finish(sketch: &mut Sketch, sys: &System, out: LmOutcome) -> Result<SolveRepo
         return Err(SolveError::DidNotConverge {
             residual: out.residual,
             iterations: out.iterations,
+            conflicting: out.conflicting,
         });
     }
     sys.write_back(sketch);

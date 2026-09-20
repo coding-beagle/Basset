@@ -21,6 +21,14 @@ use crate::ids::{EdgeKey, FaceKey};
 /// `LINEAR_TOL` because BSP splitting accumulates a little error per split.
 pub const MERGE_TOL: f64 = 1e-6;
 
+/// Surfaces meeting at a sharper angle than this are separated by a visible crease.
+/// [`smooth_normals`] shades to the same cut-off, so an edge that reads as sharp is also
+/// drawn as one.
+const DISPLAY_CREASE_COS: f64 = 0.7; // ≈ 45.6°
+
+/// One polygon's use of an edge: (face index, directed a→b, polygon normal).
+type EdgeUser = (usize, bool, Vec3);
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SurfaceKind {
     Planar {
@@ -72,6 +80,51 @@ impl SurfaceKind {
                 half_angle,
             },
             SurfaceKind::Freeform => SurfaceKind::Freeform,
+        }
+    }
+
+    /// Whether two faces meeting along an edge lie on one and the same surface, so the
+    /// boundary between them is a bookkeeping seam and not something the user can see.
+    ///
+    /// Two planar faces that share an edge and agree on their normal are necessarily the
+    /// same plane, so the normal settles it. `Freeform` never continues: with no analytic
+    /// surface to compare there is nothing to be sure about, and an edge drawn where the
+    /// shape is smooth is a smaller fault than a missing one where it is not.
+    fn continues(&self, other: &SurfaceKind) -> bool {
+        let same_dir = |a: Vec3, b: Vec3| a.dot(b) > 1.0 - 1e-9;
+        match (*self, *other) {
+            (SurfaceKind::Planar { normal: a }, SurfaceKind::Planar { normal: b }) => {
+                same_dir(a, b)
+            }
+            (
+                SurfaceKind::Cylindrical {
+                    origin: oa,
+                    axis: aa,
+                    radius: ra,
+                },
+                SurfaceKind::Cylindrical {
+                    origin: ob,
+                    axis: ab,
+                    radius: rb,
+                },
+            ) => {
+                same_dir(aa, ab)
+                    && (ra - rb).abs() < MERGE_TOL
+                    && (ob - oa).reject_from_normalized(aa).length() < MERGE_TOL
+            }
+            (
+                SurfaceKind::Conical {
+                    apex: pa,
+                    axis: aa,
+                    half_angle: ha,
+                },
+                SurfaceKind::Conical {
+                    apex: pb,
+                    axis: ab,
+                    half_angle: hb,
+                },
+            ) => same_dir(aa, ab) && (ha - hb).abs() < 1e-9 && pa.distance(pb) < MERGE_TOL,
+            _ => false,
         }
     }
 
@@ -256,6 +309,11 @@ pub struct EdgeSegment {
 pub struct Edge {
     pub key: EdgeKey,
     pub segments: Vec<EdgeSegment>,
+    /// The two faces continue into each other here: one surface, split only because two
+    /// features happened to name the halves. A sketch line cut in two makes a wall like
+    /// this. Nothing is drawn along such an edge and nothing can be picked on it, because
+    /// to the user there is no edge there.
+    pub smooth: bool,
 }
 
 impl Edge {
@@ -574,13 +632,12 @@ impl Solid {
         }
     }
 
-    /// Boundaries between distinct faces. Requires a healed solid (every operation that
-    /// returns a `Solid` guarantees this).
-    pub fn edges(&self) -> Vec<Edge> {
+    /// Every polygon edge with the polygons that use it, keyed by the undirected pair of
+    /// welded vertex ids. Welding is by [`VertexIndex`], which probes neighbouring cells,
+    /// so vertices that a boolean left agreeing only to `MERGE_TOL` still pair up.
+    fn shared_polygon_edges(&self) -> (VertexIndex, HashMap<(u32, u32), Vec<EdgeUser>>) {
         let mut index = VertexIndex::default();
-        // (face index, directed a→b, polygon normal), keyed by undirected vertex pair.
-        type User = (usize, bool, Vec3);
-        let mut shared: HashMap<(u32, u32), Vec<User>> = HashMap::new();
+        let mut shared: HashMap<(u32, u32), Vec<EdgeUser>> = HashMap::new();
         for (fi, f) in self.faces.iter().enumerate() {
             for p in &f.polygons {
                 let ids: Vec<u32> = p.vertices.iter().map(|v| index.id(*v)).collect();
@@ -601,7 +658,63 @@ impl Solid {
                 }
             }
         }
-        let mut edges: HashMap<EdgeKey, Vec<EdgeSegment>> = HashMap::new();
+        (index, shared)
+    }
+
+    /// Whether two polygons meeting along an edge join without anything to see: they
+    /// belong to one face, or to two faces of the same surface, and they do not fold.
+    fn continuous(&self, a: (usize, Vec3), b: (usize, Vec3)) -> bool {
+        if a.1.dot(b.1) < DISPLAY_CREASE_COS {
+            return false;
+        }
+        a.0 == b.0 || self.faces[a.0].surface.continues(&self.faces[b.0].surface)
+    }
+
+    /// The straight pieces a viewer should see as the body's outline: every fold or change
+    /// of surface, whether or not the topology calls it a face boundary.
+    ///
+    /// These are segments, not polylines: one visual line comes back cut wherever a
+    /// neighbouring face happens to end against it. That suits a line batch, and nothing
+    /// downstream counts them.
+    ///
+    /// The viewport cannot work these out from the triangles alone. A boolean leaves the
+    /// vertices of two neighbouring polygons agreeing only to within `MERGE_TOL`, so a
+    /// weld done on rounded coordinates misses the pair and every triangle edge it misses
+    /// reads as an open border: the user sees the mesh. The topology is known exactly
+    /// here, so it is answered here.
+    ///
+    /// Edges used by a single polygon are left out. In a closed solid there are none, and
+    /// where a construction has leaked, drawing the leak paints the triangle soup the
+    /// user is least able to act on; [`Solid::validate`] is how brokenness is reported.
+    pub fn display_edges(&self) -> Vec<[Vec3; 2]> {
+        let (index, shared) = self.shared_polygon_edges();
+        let mut out: Vec<((u32, u32), [Vec3; 2])> = shared
+            .into_iter()
+            .filter(|(_, users)| {
+                // Every pair, not only each against the first: a non-manifold edge, where
+                // two solids were joined along a line, has more than two polygons on it
+                // and any one pair of them can be the one that folds.
+                users.iter().enumerate().any(|(i, (fa, _, na))| {
+                    users[i + 1..]
+                        .iter()
+                        .any(|(fb, _, nb)| !self.continuous((*fa, *na), (*fb, *nb)))
+                })
+            })
+            .map(|((a, b), _)| ((a, b), [index.points[a as usize], index.points[b as usize]]))
+            .collect();
+        // Hash-map order is arbitrary; sort so the upload is the same for the same solid.
+        out.sort_by_key(|(key, _)| *key);
+        out.into_iter().map(|(_, seg)| seg).collect()
+    }
+
+    /// Boundaries between distinct faces. Requires a healed solid (every operation that
+    /// returns a `Solid` guarantees this).
+    pub fn edges(&self) -> Vec<Edge> {
+        let (index, shared) = self.shared_polygon_edges();
+        // Segments carry whether they are smooth, decided from the face *indices* here.
+        // Looking the faces up again by key would not do: a union can leave two faces
+        // under one key, and then the key names the wrong one.
+        let mut edges: HashMap<EdgeKey, Vec<(EdgeSegment, bool)>> = HashMap::new();
         for ((ia, ib), users) in shared {
             // Interior to one face: both sides belong to the same face. Not an edge.
             let Some(&(f0, fwd0, n0)) = users.first() else {
@@ -622,25 +735,33 @@ impl Solid {
                     (e, s, n1, n0)
                 }
             };
-            edges.entry(key).or_default().push(EdgeSegment {
-                start,
-                end,
-                normal_a: na,
-                normal_b: nb,
-            });
+            let (fa, fb) = if key.a == key0 { (f0, f1) } else { (f1, f0) };
+            edges.entry(key).or_default().push((
+                EdgeSegment {
+                    start,
+                    end,
+                    normal_a: na,
+                    normal_b: nb,
+                },
+                self.continuous((fa, na), (fb, nb)),
+            ));
         }
         // Hash-map order would make the chain start point (and so blend tool geometry)
         // vary between runs; sort so identical inputs always give identical solids.
         let mut out: Vec<Edge> = edges
             .into_iter()
-            .map(|(key, mut segments)| {
-                segments.sort_by(|x, y| {
-                    x.start
+            .map(|(key, mut pieces)| {
+                pieces.sort_by(|x, y| {
+                    x.0.start
                         .to_array()
-                        .partial_cmp(&y.start.to_array())
+                        .partial_cmp(&y.0.start.to_array())
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
-                Edge { key, segments }
+                Edge {
+                    key,
+                    smooth: pieces.iter().all(|(_, smooth)| *smooth),
+                    segments: pieces.into_iter().map(|(s, _)| s).collect(),
+                }
             })
             .collect();
         out.sort_by_key(|e| e.key);
@@ -685,7 +806,6 @@ impl Solid {
 /// vertex with a similar orientation. The angle cut-off keeps genuine creases inside a
 /// face (text glyph corners, for example) sharp while smoothing facet seams.
 fn smooth_normals(face: &Face) -> Vec<Vec<Vec3>> {
-    const CREASE_COS: f64 = 0.7; // ≈ 45°
     let mut index = VertexIndex::default();
     let mut at_vertex: HashMap<u32, Vec<Vec3>> = HashMap::new();
     let ids: Vec<Vec<u32>> = face
@@ -710,7 +830,7 @@ fn smooth_normals(face: &Face) -> Vec<Vec<Vec3>> {
                 .map(|id| {
                     let n = at_vertex[id]
                         .iter()
-                        .filter(|m| m.dot(p.plane.normal) > CREASE_COS)
+                        .filter(|m| m.dot(p.plane.normal) > DISPLAY_CREASE_COS)
                         .sum::<Vec3>();
                     n.try_normalize().unwrap_or(p.plane.normal)
                 })
@@ -849,6 +969,10 @@ mod tests {
     use crate::ids::{FaceRole, OpId};
     use approx::assert_relative_eq;
 
+    fn corners_of(s: &Solid) -> Vec<Vec3> {
+        crate::pick::corners(&s.edges())
+    }
+
     /// Unit cube built by hand, faces outward.
     pub(crate) fn unit_cube() -> Solid {
         let op = OpId::new(1);
@@ -925,10 +1049,180 @@ mod tests {
         assert!(mirrored.is_closed());
     }
 
+    /// The split face's own diagonal is no more a display edge than a triangulation
+    /// diagonal is: one face is one shape however many polygons fill it.
     #[test]
-    fn heal_removes_t_junctions() {
+    fn display_edges_ignore_polygons_inside_a_face() {
         let mut c = unit_cube();
-        // Split the +x face into two halves without telling its neighbours.
+        let i = c
+            .faces
+            .iter()
+            .position(|f| f.key.role == FaceRole::Side(1))
+            .unwrap();
+        let v = |x: f64, y: f64, z: f64| Vec3::new(x, y, z);
+        c.faces[i].polygons = vec![
+            Polygon::new(vec![v(1., 0., 0.), v(1., 1., 0.), v(1., 0., 1.)]).unwrap(),
+            Polygon::new(vec![v(1., 1., 0.), v(1., 1., 1.), v(1., 0., 1.)]).unwrap(),
+        ];
+        assert_eq!(c.display_edges().len(), 12);
+    }
+
+    /// A fold inside one face is drawn although no face boundary runs along it: the user
+    /// sees a crease there, so the outline must show one.
+    #[test]
+    fn display_edges_include_a_crease_inside_a_face() {
+        let mut c = unit_cube();
+        let i = c
+            .faces
+            .iter()
+            .position(|f| f.key.role == FaceRole::Side(1))
+            .unwrap();
+        let v = |x: f64, y: f64, z: f64| Vec3::new(x, y, z);
+        // Tent the +x face outwards along y = 0.5.
+        c.faces[i].polygons = vec![
+            Polygon::new(vec![
+                v(1., 0., 0.),
+                v(1.5, 0.5, 0.),
+                v(1.5, 0.5, 1.),
+                v(1., 0., 1.),
+            ])
+            .unwrap(),
+            Polygon::new(vec![
+                v(1.5, 0.5, 0.),
+                v(1., 1., 0.),
+                v(1., 1., 1.),
+                v(1.5, 0.5, 1.),
+            ])
+            .unwrap(),
+        ];
+        let ridge = c.display_edges().into_iter().find(|[a, b]| {
+            a.distance(Vec3::new(1.5, 0.5, 0.)) < 1e-9 && b.distance(Vec3::new(1.5, 0.5, 1.)) < 1e-9
+                || b.distance(Vec3::new(1.5, 0.5, 0.)) < 1e-9
+                    && a.distance(Vec3::new(1.5, 0.5, 1.)) < 1e-9
+        });
+        assert!(ridge.is_some(), "the ridge of the tent is a visible edge");
+    }
+
+    /// The curved arms of the continuity test, which decide whether a hole drilled in two
+    /// steps reads as one bore or as two stacked ones.
+    #[test]
+    fn a_surface_continues_only_into_the_same_surface() {
+        let cyl = |origin: Vec3, radius: f64| SurfaceKind::Cylindrical {
+            origin,
+            axis: Vec3::Z,
+            radius,
+        };
+        // Same axis line, different point on it: still the same cylinder.
+        assert!(cyl(Vec3::ZERO, 4.0).continues(&cyl(Vec3::new(0.0, 0.0, 12.0), 4.0)));
+        assert!(!cyl(Vec3::ZERO, 4.0).continues(&cyl(Vec3::ZERO, 4.001)));
+        assert!(!cyl(Vec3::ZERO, 4.0).continues(&cyl(Vec3::new(0.1, 0.0, 0.0), 4.0)));
+        assert!(
+            !cyl(Vec3::ZERO, 4.0).continues(&SurfaceKind::Planar { normal: Vec3::Z }),
+            "a bore does not continue into the face it breaks through"
+        );
+
+        let cone = |apex: Vec3, half_angle: f64| SurfaceKind::Conical {
+            apex,
+            axis: Vec3::Z,
+            half_angle,
+        };
+        assert!(cone(Vec3::ZERO, 0.5).continues(&cone(Vec3::ZERO, 0.5)));
+        assert!(!cone(Vec3::ZERO, 0.5).continues(&cone(Vec3::ZERO, 0.6)));
+        assert!(!cone(Vec3::ZERO, 0.5).continues(&cone(Vec3::new(0.0, 0.0, 1.0), 0.5)));
+        // Nothing is known about a freeform surface, so nothing is assumed.
+        assert!(!SurfaceKind::Freeform.continues(&SurfaceKind::Freeform));
+    }
+
+    /// A sketch line cut in two extrudes into two faces of one flat wall. The user drew a
+    /// wall, not two, and no line belongs down the middle of it.
+    #[test]
+    fn display_edges_ignore_a_seam_between_coplanar_faces() {
+        let mut c = unit_cube();
+        let i = c
+            .faces
+            .iter()
+            .position(|f| f.key.role == FaceRole::Side(1))
+            .unwrap();
+        let v = |x: f64, y: f64, z: f64| Vec3::new(x, y, z);
+        let lower = Polygon::new(vec![
+            v(1., 0., 0.),
+            v(1., 1., 0.),
+            v(1., 1., 0.5),
+            v(1., 0., 0.5),
+        ])
+        .unwrap();
+        c.faces[i].polygons = vec![lower];
+        c.faces.push(Face {
+            key: FaceKey::new(OpId::new(1), FaceRole::Side(4)),
+            surface: c.faces[i].surface,
+            polygons: vec![
+                Polygon::new(vec![
+                    v(1., 0., 0.5),
+                    v(1., 1., 0.5),
+                    v(1., 1., 1.),
+                    v(1., 0., 1.),
+                ])
+                .unwrap(),
+            ],
+        });
+        c.heal();
+        assert!(c.is_closed());
+        let seam = c
+            .edges()
+            .into_iter()
+            .find(|e| e.key.touches(FaceKey::new(OpId::new(1), FaceRole::Side(4))) && e.smooth);
+        assert!(seam.is_some(), "the two halves of the wall meet smoothly");
+        assert_eq!(
+            c.display_edges().len(),
+            // The wall's four edges are each cut in two by the seam's endpoints.
+            14,
+            "nothing is drawn along the seam itself"
+        );
+        assert!(
+            !corners_of(&c)
+                .iter()
+                .any(|p| p.distance(Vec3::new(1., 0., 0.5)) < MERGE_TOL),
+            "the seam's ends are not corners the user can snap to"
+        );
+    }
+
+    /// Healing is entitled to leave two polygons' copies of a shared vertex disagreeing
+    /// by up to `MERGE_TOL`, and a boolean routinely does. The outline must not notice:
+    /// the viewport used to weld on rounded coordinates, miss such a pair, and draw the
+    /// unmatched triangle edge as if the body had a hole there.
+    #[test]
+    fn display_edges_survive_vertices_that_agree_only_to_merge_tol() {
+        let mut c = split_and_healed_cube();
+        let before = c.display_edges().len();
+        let mut n = 0.0_f64;
+        for p in c.faces.iter_mut().flat_map(|f| f.polygons.iter_mut()) {
+            for v in &mut p.vertices {
+                // Deterministic, always inside the tolerance, never the same twice.
+                n += 1.0;
+                let dir = Vec3::new(n.sin(), n.cos(), (n * 0.7).sin()).normalize();
+                // Half the tolerance each way, so any two copies of a vertex stay the
+                // same vertex by the kernel's own definition.
+                *v += dir * (0.45 * MERGE_TOL);
+            }
+        }
+        assert_eq!(
+            c.display_edges().len(),
+            before,
+            "outline changed under a nudge inside MERGE_TOL"
+        );
+    }
+
+    /// The cube with its +x face split in two and the T-junctions that leaves healed:
+    /// the shape of a face a boolean has cut through.
+    fn split_and_healed_cube() -> Solid {
+        let mut c = split_cube();
+        c.heal();
+        c
+    }
+
+    /// The same cube before healing: the +x face is split without telling its neighbours.
+    fn split_cube() -> Solid {
+        let mut c = unit_cube();
         let i = c
             .faces
             .iter()
@@ -951,6 +1245,12 @@ mod tests {
             ])
             .unwrap(),
         ];
+        c
+    }
+
+    #[test]
+    fn heal_removes_t_junctions() {
+        let mut c = split_cube();
         assert!(!c.is_closed());
         c.heal();
         assert!(c.is_closed());

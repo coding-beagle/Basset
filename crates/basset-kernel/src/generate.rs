@@ -16,6 +16,17 @@ use crate::geometry::{
 use crate::ids::{FaceKey, FaceRole, OpId};
 use crate::solid::{Solid, SolidBuilder, SurfaceKind};
 
+/// Closes a generator: heals the T-junctions its sections left and refuses to hand back a
+/// shell that leaks. A profile that touches itself makes faces that cancel out, and the
+/// solid that results looks right until a boolean or an export meets it; the feature that
+/// asked for it should fail visibly instead.
+fn seal(b: SolidBuilder) -> Result<Solid, KernelError> {
+    let mut solid = b.finish();
+    solid.heal();
+    solid.validate()?;
+    Ok(solid)
+}
+
 /// One placement of a profile: the 3D points of every loop, outer first, in the same
 /// order as the profile's contours.
 struct Section {
@@ -142,7 +153,7 @@ pub fn extrude(op: OpId, profile: &Profile, extent: Extent) -> Result<Solid, Ker
             },
         },
     )?;
-    Ok(b.finish())
+    seal(b)
 }
 
 /// Rotates the profile about `axis` by `angle` radians (right-handed). The axis must lie
@@ -231,7 +242,7 @@ pub fn revolve(
             }
         }
     })?;
-    Ok(b.finish())
+    seal(b)
 }
 
 /// Moves the profile along `path`, keeping it perpendicular to the path. The profile
@@ -306,7 +317,7 @@ pub fn sweep(op: OpId, profile: &Profile, path: &Path3) -> Result<Solid, KernelE
             _ => SurfaceKind::Freeform,
         }
     })?;
-    Ok(b.finish())
+    seal(b)
 }
 
 /// Skins a ruled surface through the sections in order. Every section must have the same
@@ -395,9 +406,7 @@ pub fn loft(op: OpId, profiles: &[Profile]) -> Result<Solid, KernelError> {
     );
     // Caps use each section's own vertices while the strips use the merged rings, so the
     // seams between them have T-junctions until healed.
-    let mut solid = b.finish();
-    solid.heal();
-    Ok(solid)
+    seal(b)
 }
 
 fn centroid2(c: &Contour) -> Vec2 {
@@ -515,6 +524,31 @@ mod tests {
             chord_tolerance: 1e-4,
             max_segment_angle: 2f64.to_radians(),
         }
+    }
+
+    /// A profile that doubles back on itself builds side faces that cancel out, and the
+    /// shell used to come back with a hole in it: closed enough to look right, and wrong
+    /// the moment a boolean or an export met it. Generators now heal and check, so what
+    /// they return is closed or is an error — never a leaking body.
+    #[test]
+    fn a_profile_that_touches_itself_still_yields_a_closed_shell() {
+        let points = vec![
+            Vec2::ZERO,
+            Vec2::new(10.0, 0.0),
+            Vec2::new(10.0, 10.0),
+            // Out to a spike and back to within a whisker of where it left.
+            Vec2::new(10.0, 15.0),
+            Vec2::new(10.0, 10.000_1),
+            Vec2::new(0.0, 10.0),
+        ];
+        let profile = Profile {
+            frame: Frame::XY,
+            outer: Contour::polygon(points, 0),
+            holes: vec![],
+        };
+        let s = extrude(OpId::new(1), &profile, Extent::OneSide(5.0)).expect("healed");
+        assert!(s.is_closed(), "{:?}", s.validate());
+        assert_relative_eq!(s.volume(), 500.0, epsilon = 1e-2);
     }
 
     #[test]

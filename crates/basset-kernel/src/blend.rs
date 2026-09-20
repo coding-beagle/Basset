@@ -164,6 +164,9 @@ fn tool_for_chain(
     let (t0, _, db, _) = dihedral(first);
     let turn = first.normal_a.dot(db);
     if turn.abs() < 1e-6 {
+        // The faces do not fold here, so there is no dihedral to fill. This is the same
+        // condition `Edge::smooth` reports, which is why the editor never offers such an
+        // edge; a saved feature whose edge has since flattened arrives here instead.
         return Err(KernelError::TangentEdge(key));
     }
     let convex = turn < 0.0;

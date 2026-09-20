@@ -39,6 +39,28 @@ fn gpu() -> Option<Gpu> {
     Some(Gpu { device, queue })
 }
 
+/// The twelve real edges of [`cube`]: what the modeller would hand the renderer.
+fn cube_edges(size: f64) -> Vec<[Vec3; 2]> {
+    let h = size / 2.0;
+    let mut out = Vec::new();
+    for axis in 0..3 {
+        for a in [-h, h] {
+            for b in [-h, h] {
+                let mut lo = [0.0; 3];
+                let mut hi = [0.0; 3];
+                lo[(axis + 1) % 3] = a;
+                hi[(axis + 1) % 3] = a;
+                lo[(axis + 2) % 3] = b;
+                hi[(axis + 2) % 3] = b;
+                lo[axis] = -h;
+                hi[axis] = h;
+                out.push([Vec3::from_array(lo), Vec3::from_array(hi)]);
+            }
+        }
+    }
+    out
+}
+
 fn cube(size: f64) -> TriMesh {
     let mut m = TriMesh::default();
     let h = size / 2.0;
@@ -210,7 +232,7 @@ fn cube_covers_centre_but_not_corner() {
     for msaa in [1, 4] {
         let mut renderer = Renderer::new(&gpu.device, FORMAT, msaa);
         let handle = renderer
-            .upload_mesh(&gpu.device, &gpu.queue, &cube(20.0))
+            .upload_mesh(&gpu.device, &gpu.queue, &cube(20.0), &cube_edges(20.0))
             .expect("valid cube");
         let camera = looking_at_origin();
         let mut scene = Scene::new(&camera);
@@ -242,7 +264,7 @@ fn highlighted_face_changes_colour() {
     let Some(gpu) = gpu() else { return };
     let mut renderer = Renderer::new(&gpu.device, FORMAT, 1);
     let handle = renderer
-        .upload_mesh(&gpu.device, &gpu.queue, &cube(20.0))
+        .upload_mesh(&gpu.device, &gpu.queue, &cube(20.0), &cube_edges(20.0))
         .expect("valid cube");
     let camera = looking_at_origin();
     let mut scene = Scene::new(&camera);
@@ -306,7 +328,7 @@ fn line_batch_draws_pixels_and_overlays_geometry() {
     // Same line with depth test off still shows through an opaque cube in front of it.
     let mut renderer = Renderer::new(&gpu.device, FORMAT, 1);
     let handle = renderer
-        .upload_mesh(&gpu.device, &gpu.queue, &cube(20.0))
+        .upload_mesh(&gpu.device, &gpu.queue, &cube(20.0), &cube_edges(20.0))
         .expect("valid cube");
     scene.meshes.push(MeshInstance {
         style: MeshStyle::ShadedWithEdges,
@@ -325,7 +347,7 @@ fn depth_tested_line_is_hidden_by_geometry() {
     let Some(gpu) = gpu() else { return };
     let mut renderer = Renderer::new(&gpu.device, FORMAT, 1);
     let handle = renderer
-        .upload_mesh(&gpu.device, &gpu.queue, &cube(20.0))
+        .upload_mesh(&gpu.device, &gpu.queue, &cube(20.0), &cube_edges(20.0))
         .expect("valid cube");
     let camera = looking_at_origin();
     let mut scene = Scene::new(&camera);
@@ -386,7 +408,7 @@ fn resize_and_ghost_instances_survive_frames() {
     let mut renderer = Renderer::new(&gpu.device, FORMAT, 4);
     renderer.resize(&gpu.device, [64, 64]);
     let handle = renderer
-        .upload_mesh(&gpu.device, &gpu.queue, &cube(20.0))
+        .upload_mesh(&gpu.device, &gpu.queue, &cube(20.0), &cube_edges(20.0))
         .expect("valid cube");
     let camera = looking_at_origin();
     let mut scene = Scene::new(&camera);

@@ -181,16 +181,21 @@ impl Renderer {
         self.ensure_targets(device, size);
     }
 
-    /// Converts the mesh to `f32` GPU buffers. The `queue` is unused today because upload
-    /// goes through mapped-at-creation buffers, but it is part of the signature so a future
-    /// streaming path does not change callers.
+    /// Converts the mesh to `f32` GPU buffers. `edges` are the segments drawn for
+    /// [`MeshStyle::ShadedWithEdges`]; the caller supplies them because only the modeller
+    /// that built the mesh knows which of its triangle edges are real geometry, and a
+    /// guess made from the triangles alone shows the user the mesh.
+    ///
+    /// The `queue` is unused today because upload goes through mapped-at-creation buffers,
+    /// but it is part of the signature so a future streaming path does not change callers.
     pub fn upload_mesh(
         &mut self,
         device: &wgpu::Device,
         _queue: &wgpu::Queue,
         mesh: &TriMesh,
+        edges: &[[Vec3; 2]],
     ) -> Result<MeshHandle, ViewportError> {
-        let gpu = GpuMesh::upload(device, mesh)?;
+        let gpu = GpuMesh::upload(device, mesh, edges)?;
         let handle = MeshHandle(self.next_handle);
         self.next_handle += 1;
         self.meshes.insert(handle, gpu);

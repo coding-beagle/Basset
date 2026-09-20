@@ -601,6 +601,37 @@ fn conflicting_constraints_do_not_converge() {
     assert_eq!(pos(&s, b), v(3.0, 0.0));
 }
 
+/// Which constraints disagree is the only actionable thing about a conflict, and the
+/// solver has it in the residual vector already.
+#[test]
+fn a_conflict_names_the_constraints_that_disagree() {
+    let mut s = Sketch::new();
+    let a = s.add_point(v(0.0, 0.0));
+    let b = s.add_point(v(3.0, 0.0));
+    let c = s.add_point(v(3.0, 4.0));
+    let d = s.add_point(v(3.0, 9.0));
+    let side = s.add_line(c, d).unwrap();
+    // Innocent bystander: satisfied, and satisfiable whatever the others ask for.
+    let vertical = s.add_constraint(Constraint::Vertical(side)).unwrap();
+    let three = s
+        .add_constraint(Constraint::Distance { a, b, value: 3.0 })
+        .unwrap();
+    let five = s
+        .add_constraint(Constraint::Distance { a, b, value: 5.0 })
+        .unwrap();
+    match s.solve() {
+        Err(SolveError::DidNotConverge { conflicting, .. }) => {
+            assert!(conflicting.contains(&three), "{conflicting:?}");
+            assert!(conflicting.contains(&five), "{conflicting:?}");
+            assert!(
+                !conflicting.contains(&vertical),
+                "a satisfied constraint is not to blame: {conflicting:?}"
+            );
+        }
+        other => panic!("expected a conflict, got {other:?}"),
+    }
+}
+
 #[test]
 fn all_fixed_conflict_reports_immediately() {
     let mut s = Sketch::new();

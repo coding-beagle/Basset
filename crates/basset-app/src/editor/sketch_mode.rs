@@ -18,8 +18,8 @@
 use basset_core::{FeatureId, FeatureKind, PlaneRef, ProfileRef};
 use basset_math::{Frame, Ray, Vec2, Vec3};
 use basset_sketch::{
-    Constraint, ConstraintId, Entity, EntityId, Hit, Profile, Sketch, SketchError, SolveReport,
-    Tessellation, edit, pattern, shapes,
+    Constraint, ConstraintId, Entity, EntityId, Hit, Profile, Sketch, SketchError, SolveError,
+    SolveReport, Tessellation, edit, pattern, shapes,
 };
 use basset_viewport::{Camera, LineBatch, PointBatch, grid};
 
@@ -40,6 +40,10 @@ const LABEL_GAP_PX: f64 = 28.0;
 /// Geometry the constraints do not pin down, drawn in Fusion's convention of blue for
 /// under-constrained and white for solved.
 const LOOSE_COLOR: [f32; 4] = [0.55, 0.72, 1.0, 1.0];
+/// Constraints and dimensions the solver could not satisfy, drawn red wherever they are
+/// drawn at all: the palette names them, but the answer to "which one is fighting?"
+/// belongs on the drawing.
+pub const CONFLICT_COLOR: [f32; 4] = [0.95, 0.35, 0.3, 1.0];
 /// Half-extent of a constraint badge.
 const GLYPH_PX: f64 = 5.0;
 /// Clearance between the geometry and the first badge on it.
@@ -457,7 +461,10 @@ pub struct SketchEditor {
     /// starts typing a number with the pointer in the viewport.
     pub entry_focus: Option<usize>,
     pub dim_edit: Option<(ConstraintId, String)>,
-    pub report: Option<Result<SolveReport, String>>,
+    /// The last solve. The error is kept whole rather than as a message because a failed
+    /// solve names the constraints that disagree, and pointing at them is the only useful
+    /// thing to say about it.
+    pub report: Option<Result<SolveReport, SolveError>>,
     pub snap_to_grid: bool,
     /// A step the user pinned, or `None` to follow the zoom.
     pub fixed_grid_step: Option<f64>,
@@ -656,7 +663,7 @@ impl SketchEditor {
     }
 
     fn solve(&mut self) {
-        self.report = Some(self.sketch.solve().map_err(|e| e.to_string()));
+        self.report = Some(self.sketch.solve());
         self.profiles = self.sketch.profiles(&self.tess);
         self.hover_region = None;
     }
@@ -1926,6 +1933,15 @@ impl SketchEditor {
         Some(self.frame.to_world(pos))
     }
 
+    /// The constraints the last solve could not satisfy, worst first. Empty unless the
+    /// sketch is conflicting.
+    pub fn conflicting(&self) -> &[ConstraintId] {
+        match &self.report {
+            Some(Err(SolveError::DidNotConverge { conflicting, .. })) => conflicting,
+            _ => &[],
+        }
+    }
+
     /// Everything the constraints leave free to move, curves included.
     ///
     /// The solver names the points and circles that own a loose parameter; a curve is
@@ -2078,14 +2094,30 @@ impl SketchEditor {
         }
         let mut dims = LineBatch::new([0.55, 0.75, 0.95, 0.9]);
         dims.depth_test = false;
+        // Red for the ones the solver could not satisfy: the palette names them, but the
+        // answer to "which constraint is fighting?" belongs on the drawing.
+        let mut conflicting = LineBatch::new(CONFLICT_COLOR);
+        conflicting.width_px = 2.0;
+        conflicting.depth_test = false;
+        let in_conflict = self.conflicting().to_vec();
         for g in self.dimension_graphics() {
-            dims.segments.extend(g.segments);
+            let batch = if in_conflict.contains(&g.id) {
+                &mut conflicting
+            } else {
+                &mut dims
+            };
+            batch.segments.extend(g.segments);
         }
         // Amber, so a constraint mark is never mistaken for a dimension or for geometry.
         let mut glyphs = LineBatch::new([0.95, 0.72, 0.30, 0.95]);
         glyphs.depth_test = false;
         for g in self.constraint_glyphs() {
-            glyphs.segments.extend(g.segments);
+            let batch = if in_conflict.contains(&g.id) {
+                &mut conflicting
+            } else {
+                &mut glyphs
+            };
+            batch.segments.extend(g.segments);
         }
         lines.extend([
             normal,
@@ -2096,6 +2128,7 @@ impl SketchEditor {
             selected,
             dims,
             glyphs,
+            conflicting,
         ]);
         points.extend([pts, loose_pts, sel_pts]);
         // Crosshair on the snapped position, so the user aims at where the point will

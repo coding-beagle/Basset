@@ -4,10 +4,10 @@
 //! edges and corners are picked against the kernel's edge polylines with a screen-space
 //! tolerance converted by the caller into world units at the hit depth.
 
-use basset_math::{Ray, RayHit, Vec3};
+use basset_math::{ANGULAR_TOL, Ray, RayHit, Vec3};
 
 use crate::ids::{EdgeKey, FaceKey};
-use crate::solid::{Edge, MERGE_TOL, Tessellated};
+use crate::solid::{Edge, MERGE_TOL, Tessellated, VertexIndex};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FacePick {
@@ -35,9 +35,13 @@ pub fn pick_face(tess: &Tessellated, ray: &Ray) -> Option<FacePick> {
 
 /// Nearest edge within `tolerance` (world units) of the ray. Among edges within
 /// tolerance the closest to the ray origin wins, so foreground edges beat hidden ones.
+///
+/// Smooth edges are not targets: nothing is drawn along them, so aiming at one would be
+/// aiming at nothing, and a fillet across a surface that does not fold has no radius to
+/// build.
 pub fn pick_edge(edges: &[Edge], ray: &Ray, tolerance: f64) -> Option<EdgePick> {
     let mut best: Option<EdgePick> = None;
-    for e in edges {
+    for e in edges.iter().filter(|e| !e.smooth) {
         for s in &e.segments {
             let (t, u) = closest_params(ray, s.start, s.end);
             if t < 0.0 {
@@ -75,22 +79,59 @@ pub struct VertexPick {
 ///
 /// A closed edge — a cylinder's seam, a circular cap boundary — has no ends and so
 /// contributes nothing, which is right: there is no corner there for the user to aim at.
+///
+/// A chain end where the edge simply carries on straight into the next face is not a
+/// corner either. Healing plants a vertex wherever one feature's face happens to end
+/// against another, and offering those as snap targets scatters points along edges that
+/// the user drew as one.
 pub fn corners(edges: &[Edge]) -> Vec<Vec3> {
+    // One sweep builds the directions leaving every vertex, so deciding a candidate is a
+    // lookup rather than another scan of the body. The scene asks for this every frame.
+    let mut index = VertexIndex::default();
+    let mut leaving: Vec<Vec<Vec3>> = Vec::new();
+    let visible = || edges.iter().filter(|e| !e.smooth);
+    for e in visible() {
+        for s in &e.segments {
+            let Some(d) = (s.end - s.start).try_normalize() else {
+                continue;
+            };
+            for (p, d) in [(s.start, d), (s.end, -d)] {
+                let id = index.id(p) as usize;
+                if leaving.len() <= id {
+                    leaving.resize(id + 1, Vec::new());
+                }
+                leaving[id].push(d);
+            }
+        }
+    }
     let mut out: Vec<Vec3> = Vec::new();
-    for e in edges {
+    let mut taken = vec![false; leaving.len()];
+    for e in visible() {
         for chain in e.chains() {
             let (first, last) = (chain[0].start, chain.last().unwrap().end);
             if first.distance(last) <= MERGE_TOL {
                 continue;
             }
             for p in [first, last] {
-                if !out.iter().any(|q| q.distance(p) <= MERGE_TOL) {
-                    out.push(p);
+                let id = index.id(p) as usize;
+                if taken.get(id).copied().unwrap_or(false) || straight_through(&leaving, id) {
+                    continue;
                 }
+                taken[id] = true;
+                out.push(p);
             }
         }
     }
     out
+}
+
+/// Whether exactly two edge segments meet at this vertex and continue each other in a
+/// straight line: the edge passes through, so there is no corner here.
+fn straight_through(leaving: &[Vec<Vec3>], vertex: usize) -> bool {
+    match leaving.get(vertex).map(Vec::as_slice) {
+        Some([a, b]) => a.dot(*b) < -1.0 + ANGULAR_TOL,
+        _ => false,
+    }
 }
 
 /// Nearest corner within `tolerance` (world units) of the ray.
@@ -170,5 +211,42 @@ mod tests {
         let ray = Ray::new(Vec3::new(5.0, 10.0, 20.0), -Vec3::Z);
         assert!(pick_edge(&edges, &ray, 0.5).is_some());
         assert!(pick_vertex(&edges, &ray, 0.5).is_none());
+    }
+
+    /// Where two faces of one plane meet there is nothing drawn, so there is nothing to
+    /// aim at either: the click goes through to whatever is really there, and the seam's
+    /// ends are not offered as snap targets.
+    #[test]
+    fn a_smooth_edge_is_not_a_target() {
+        let mut c = cuboid(OpId::new(1), Vec3::ZERO, Vec3::splat(10.0));
+        // Split the top face in two along y = 5, giving the halves separate keys.
+        let top = FaceKey::new(OpId::new(1), FaceRole::EndCap);
+        let i = c.faces.iter().position(|f| f.key == top).unwrap();
+        let v = |x: f64, y: f64| Vec3::new(x, y, 10.0);
+        let surface = c.faces[i].surface;
+        c.faces[i].polygons = vec![
+            crate::solid::Polygon::new(vec![v(0., 0.), v(10., 0.), v(10., 5.), v(0., 5.)]).unwrap(),
+        ];
+        c.faces.push(crate::solid::Face {
+            key: FaceKey::new(OpId::new(1), FaceRole::Side(9)),
+            surface,
+            polygons: vec![
+                crate::solid::Polygon::new(vec![v(0., 5.), v(10., 5.), v(10., 10.), v(0., 10.)])
+                    .unwrap(),
+            ],
+        });
+        c.heal();
+        let edges = c.edges();
+        assert!(
+            edges.iter().any(|e| e.smooth),
+            "the halves of the top meet smoothly"
+        );
+
+        // Straight down onto the seam: the top face is there, the seam is not.
+        let ray = Ray::new(Vec3::new(5.0, 5.0, 20.0), -Vec3::Z);
+        assert!(pick_edge(&edges, &ray, 0.5).is_none());
+        // Nor are the seam's ends corners, though the cube's eight still are.
+        let corners = corners(&edges);
+        assert_eq!(corners.len(), 8, "{corners:?}");
     }
 }

@@ -307,7 +307,9 @@ impl Editor {
                 Some(p) if Arc::ptr_eq(&p.solid, &solid) => p.tess.clone(),
                 _ => Arc::new(solid.tessellate()),
             };
-            match renderer.upload_mesh(device, queue, &tess.mesh) {
+            // The edges come from the kernel's topology, not from the triangles: a face
+            // is one shape to the user however many triangles it took to fill it.
+            match renderer.upload_mesh(device, queue, &tess.mesh, &solid.display_edges()) {
                 Ok(handle) => {
                     if let Some(old) = self.meshes.insert(
                         id,

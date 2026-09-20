@@ -48,8 +48,17 @@ impl SketchError {
 pub enum SolveError {
     /// The constraint system has no solution reachable from the current state: it is
     /// either conflicting (over-constrained) or the solver got stuck in a local minimum.
-    #[error("solver did not converge after {iterations} iterations (residual {residual:.3e})")]
-    DidNotConverge { residual: f64, iterations: usize },
+    ///
+    /// `conflicting` names the constraints still unsatisfied when the solver gave up,
+    /// worst first, so the editor can point at them instead of quoting a residual at the
+    /// user. It is empty when nothing can be attributed — a solve that failed with no
+    /// constraint left over is a local minimum, not a disagreement.
+    #[error("constraints conflict (residual {residual:.3e} after {iterations} iterations)")]
+    DidNotConverge {
+        residual: f64,
+        iterations: usize,
+        conflicting: Vec<ConstraintId>,
+    },
     /// A residual or derivative became NaN/inf, usually from degenerate geometry such as a
     /// zero-length line in a parallel constraint.
     #[error("numerical failure: {0}")]

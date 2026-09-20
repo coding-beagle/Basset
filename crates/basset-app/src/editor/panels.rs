@@ -1112,13 +1112,8 @@ fn sketch_palette(editor: &mut Editor, ui: &mut egui::Ui, commands: &mut Vec<Com
                         .weak(),
                     );
                 }
-                if !r.converged {
-                    ui.colored_label(egui::Color32::YELLOW, "Constraints conflict");
-                }
             }
-            Some(Err(e)) => {
-                ui.colored_label(egui::Color32::from_rgb(230, 120, 100), e);
-            }
+            Some(Err(e)) => conflict_report(s, e, ui, commands),
             None => {}
         }
         // Directly under the degrees-of-freedom readout, because that is the line that
@@ -1234,6 +1229,70 @@ fn sketch_palette(editor: &mut Editor, ui: &mut egui::Ui, commands: &mut Vec<Com
 /// one whose badges are hard to read. The list is the fallback that always works:
 /// hovering a row lights up the geometry the constraint holds, and every row can be
 /// deleted from here.
+/// What a failed solve has to say. A residual and an iteration count mean nothing to
+/// someone drawing a bracket; the constraints that could not be satisfied are the thing
+/// to act on, and they are also drawn red on the sketch.
+fn conflict_report(
+    s: &super::SketchEditor,
+    error: &basset_sketch::SolveError,
+    ui: &mut egui::Ui,
+    commands: &mut Vec<Command>,
+) {
+    let basset_sketch::SolveError::DidNotConverge { conflicting, .. } = error else {
+        ui.colored_label(egui::Color32::from_rgb(230, 120, 100), error.to_string());
+        return;
+    };
+    ui.colored_label(egui::Color32::YELLOW, "Constraints conflict");
+    if conflicting.is_empty() {
+        ui.label(
+            egui::RichText::new(
+                "No single constraint is left over: the solver could not find its way \
+                 there from the current shape. Drag the geometry nearer to what you \
+                 want and it will usually take.",
+            )
+            .weak(),
+        );
+        return;
+    }
+    ui.label(egui::RichText::new("These ask for incompatible things; delete or relax one:").weak());
+    for id in conflicting {
+        let Some(c) = s.sketch.constraint(*id) else {
+            continue;
+        };
+        ui.horizontal(|ui| {
+            if ui
+                .add(egui::Button::new("\u{2715}").frame(false))
+                .on_hover_text("Delete")
+                .clicked()
+            {
+                commands.push(Command::SketchRemoveConstraint(*id));
+            }
+            let response = ui.add(
+                egui::Label::new(
+                    egui::RichText::new(constraint_label(c))
+                        .color(egui::Color32::from_rgb(240, 150, 140)),
+                )
+                .sense(egui::Sense::click()),
+            );
+            if response.clicked() {
+                commands.push(Command::SketchSelect(c.references()));
+            }
+        });
+    }
+}
+
+/// A constraint as the user reads it: its name, and its value when it has one.
+fn constraint_label(c: &basset_sketch::Constraint) -> String {
+    match c.dimension_value() {
+        // Angles are stored in radians and shown in degrees, as everywhere else.
+        Some(v) if matches!(c, basset_sketch::Constraint::Angle { .. }) => {
+            format!("{} {:.2}\u{b0}", constraint_name(c), v.to_degrees())
+        }
+        Some(v) => format!("{} {v:.3} mm", constraint_name(c)),
+        None => constraint_name(c).to_string(),
+    }
+}
+
 fn constraint_list(s: &mut super::SketchEditor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
     let rows: Vec<(
         basset_sketch::ConstraintId,
@@ -1242,17 +1301,7 @@ fn constraint_list(s: &mut super::SketchEditor, ui: &mut egui::Ui, commands: &mu
     )> = s
         .sketch
         .constraints()
-        .map(|(id, c)| {
-            let label = match c.dimension_value() {
-                // Angles are stored in radians and shown in degrees, as everywhere else.
-                Some(v) if matches!(c, basset_sketch::Constraint::Angle { .. }) => {
-                    format!("{} {:.2}\u{b0}", constraint_name(c), v.to_degrees())
-                }
-                Some(v) => format!("{} {v:.3} mm", constraint_name(c)),
-                None => constraint_name(c).to_string(),
-            };
-            (id, label, c.references())
-        })
+        .map(|(id, c)| (id, constraint_label(c), c.references()))
         .collect();
     let mut highlight = Vec::new();
     egui::CollapsingHeader::new(format!("Constraints ({})", rows.len()))
@@ -1536,6 +1585,7 @@ fn dimension_overlay(editor: &mut Editor, ctx: &egui::Context, commands: &mut Ve
             .map(|px| egui::pos2(px[0] as f32 / ppp, px[1] as f32 / ppp))
     };
     let graphics = s.dimension_graphics();
+    let conflicting = s.conflicting().to_vec();
     let mut open_edit: Option<basset_sketch::ConstraintId> = None;
     let mut dragged: Option<basset_sketch::ConstraintId> = None;
     for g in &graphics {
@@ -1547,8 +1597,19 @@ fn dimension_overlay(editor: &mut Editor, ctx: &egui::Context, commands: &mut Ve
             .fixed_pos(pos - size * 0.5)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
-                let button = egui::Button::new(egui::RichText::new(&g.text).small())
-                    .fill(egui::Color32::from_rgba_unmultiplied(20, 40, 70, 200))
+                // A dimension the solver could not satisfy reads red here as well as on
+                // its leader lines, so the number the user must change is the one lit up.
+                let text = egui::RichText::new(&g.text).small();
+                let (text, fill) = if conflicting.contains(&g.id) {
+                    (
+                        text.color(egui::Color32::from_rgb(255, 180, 170)),
+                        egui::Color32::from_rgba_unmultiplied(90, 25, 25, 220),
+                    )
+                } else {
+                    (text, egui::Color32::from_rgba_unmultiplied(20, 40, 70, 200))
+                };
+                let button = egui::Button::new(text)
+                    .fill(fill)
                     .sense(egui::Sense::click_and_drag());
                 let response = ui.add(button);
                 if response.clicked() {
