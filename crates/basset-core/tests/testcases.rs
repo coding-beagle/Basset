@@ -176,6 +176,49 @@ fn a_joined_and_pocketed_body_exports_as_a_closed_manifold_mesh() {
     }
 }
 
+/// The same battery holder, read as faces rather than as triangles. Its 70 × 16 top is
+/// grown by three extrusions — the two end walls and the tray between them all finish at
+/// z = 10 — and the boolean used to hand back one face per extrusion. The user cannot
+/// pick a third of a flat top, sketch on it or read its area, so the join makes them one.
+#[test]
+fn the_tops_of_the_joined_extrusions_are_one_face() {
+    let mut doc = open("ExportAs3MFCreatesBadGeometry.bass");
+    doc.set_cursor(5);
+    let body = doc
+        .state()
+        .bodies
+        .values()
+        .next()
+        .expect("the file builds one body")
+        .clone();
+
+    let top: Vec<_> = body
+        .solid
+        .faces
+        .iter()
+        // The top of the tray: a face looking up, level with the top of the walls. The
+        // normal is the extrude's own, a few 1e-15 off Z, so it is compared as a
+        // direction rather than for equality.
+        .filter(|f| {
+            f.polygons
+                .first()
+                .is_some_and(|p| p.plane.normal.z > 0.99 && f.centroid().z > 9.9)
+        })
+        .collect();
+    assert_eq!(top.len(), 1, "the top of the holder is one face");
+    // Within a merge tolerance: four booleans have moved these corners a few microns.
+    assert_relative_eq!(top[0].area(), 70.0 * 16.0, epsilon = 1e-3);
+
+    // Whole, too, and not a ring of three rectangles: the outline a sketch drawn on it
+    // would inherit is one 70 × 16 loop with nothing inside it.
+    let profile = body.solid.face_profile(top[0].key).unwrap();
+    assert!(profile.holes.is_empty());
+    assert_relative_eq!(profile.outer.signed_area(), 70.0 * 16.0, epsilon = 1e-3);
+    // More than four points: the loop carries a vertex wherever the face it borders
+    // changes, which is what tags each stretch for whatever is grown from it.
+    assert!(profile.outer.points.len() >= 4);
+}
+
 /// Counts (edges not paired with an opposite-direction twin, edges not used by exactly
 /// two triangles), by welded vertex — which is how a 3MF exporter and a slicer decide
 /// that two triangles share an edge.

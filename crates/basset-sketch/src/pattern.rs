@@ -107,12 +107,29 @@ pub fn circular(
     copy_all(sketch, seed, &placements)
 }
 
+/// The most entities one pattern may add.
+///
+/// There is no natural limit on how many instances a pattern should have — a bolt circle
+/// of two hundred is an ordinary thing to ask a CAD program for — but every copy is more
+/// geometry for the solver to carry, and past some size the sketch stops being usable.
+/// The limit is on the work rather than on the count, so a pattern of one circle may go
+/// far further than a pattern of a whole bracket, and exceeding it says so instead of
+/// appearing to hang.
+pub const MAX_PATTERN_ENTITIES: usize = 20_000;
+
 fn copy_all(
     sketch: &mut Sketch,
     seed: &[EntityId],
     placements: &[Placement],
 ) -> Result<Vec<EntityId>, SketchError> {
     let set = closure(sketch, seed)?;
+    let total = set.len().saturating_mul(placements.len());
+    if total > MAX_PATTERN_ENTITIES {
+        return Err(SketchError::InvalidArgument(format!(
+            "that pattern would add {total} entities, over the {MAX_PATTERN_ENTITIES} a \
+             sketch can carry; use fewer instances, or pattern less at a time"
+        )));
+    }
     let mut created = Vec::new();
     for placement in placements {
         created.extend(copy_once(sketch, &set, *placement)?);

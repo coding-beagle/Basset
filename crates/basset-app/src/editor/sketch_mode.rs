@@ -50,10 +50,71 @@ pub const CONFLICT_COLOR: [f32; 4] = [0.95, 0.35, 0.3, 1.0];
 const REGION_HOVER_FILL: [f32; 4] = [1.0, 0.85, 0.3, 0.16];
 /// A region the user has picked, in the selection blue.
 const REGION_SELECT_FILL: [f32; 4] = [0.25, 0.6, 1.0, 0.22];
+/// The step a dragged rotation snaps to while grid snapping is on. Fine enough to place
+/// a part by eye, coarse enough that the common angles land exactly.
+const ANGLE_SNAP_DEG: f64 = 5.0;
 /// Half-extent of a constraint badge.
 const GLYPH_PX: f64 = 5.0;
 /// Clearance between the geometry and the first badge on it.
 const GLYPH_GAP_PX: f64 = 13.0;
+
+/// What a click or a box drag may land on in a sketch.
+///
+/// Model mode has the same filter for the same reason: a corner, the curves meeting
+/// there and the region beyond them are all within a few pixels of each other, so which
+/// of them a drag takes is a question only the user can answer. A box across a drawing
+/// otherwise takes the points as well as the curves, and moving what you meant to
+/// delete is a poor way to find that out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SketchPick {
+    #[default]
+    All,
+    /// Lines, arcs, circles and text — what a drawing is made of.
+    Curves,
+    /// Endpoints, centres and loose points.
+    Points,
+    /// Closed areas, which are what a feature is built from.
+    Regions,
+}
+
+impl SketchPick {
+    pub const ALL: [SketchPick; 4] = [
+        SketchPick::All,
+        SketchPick::Curves,
+        SketchPick::Points,
+        SketchPick::Regions,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            SketchPick::All => "All",
+            SketchPick::Curves => "Curves",
+            SketchPick::Points => "Points",
+            SketchPick::Regions => "Regions",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            SketchPick::All => "Clicks and box drags take curves, points and regions",
+            SketchPick::Curves => "Only lines, arcs, circles and text",
+            SketchPick::Points => "Only endpoints, centres and loose points",
+            SketchPick::Regions => "Only the closed areas a feature is built from",
+        }
+    }
+
+    fn takes_curves(self) -> bool {
+        matches!(self, SketchPick::All | SketchPick::Curves)
+    }
+
+    fn takes_points(self) -> bool {
+        matches!(self, SketchPick::All | SketchPick::Points)
+    }
+
+    fn takes_regions(self) -> bool {
+        matches!(self, SketchPick::All | SketchPick::Regions)
+    }
+}
 
 /// A geometric constraint the toolbar offers. Dimensions are a tool of their own; these
 /// are the ones that carry no number.
@@ -331,6 +392,10 @@ impl SketchTool {
 pub enum Dim {
     Length,
     Angle,
+    /// A move's offset across and up. Unlike a size these are signed and may be zero:
+    /// "50 mm that way and nothing up" is an ordinary thing to ask for.
+    Dx,
+    Dy,
     Width,
     Height,
     Diameter,
@@ -342,6 +407,8 @@ impl Dim {
         match self {
             Dim::Length => "Length",
             Dim::Angle => "Angle",
+            Dim::Dx => "dX",
+            Dim::Dy => "dY",
             Dim::Width => "Width",
             Dim::Height => "Height",
             Dim::Diameter => "Diameter",
@@ -381,6 +448,8 @@ impl Entry {
         }
         match self.dim {
             Dim::Angle => Some(v.to_radians()),
+            // A move's offset keeps its sign, and zero along one axis is a real answer.
+            Dim::Dx | Dim::Dy => Some(v),
             _ => (v != 0.0).then_some(v.abs()),
         }
     }
@@ -634,6 +703,10 @@ pub struct SketchEditor {
     /// can be recomputed when an entry box changes without the pointer moving.
     raw_cursor: Option<Vec2>,
     pub selected: Vec<EntityId>,
+    /// What the Select tool may pick. Drawing, snapping and the constraint tools ignore
+    /// it: it is about choosing between things that are already there, not about what
+    /// the pointer may touch.
+    pub pick: SketchPick,
     /// Whether the next shape drawn is construction geometry. Deciding before drawing is
     /// how Fusion works and is what a centre line or a bolt circle actually needs: the
     /// alternative is drawing a real curve, watching it open or close a profile, and
@@ -718,6 +791,7 @@ impl SketchEditor {
             cursor_px: 1.0,
             raw_cursor: None,
             selected: Vec::new(),
+            pick: SketchPick::default(),
             construction: false,
             polygon_sides: 6,
             text: "Text".into(),
@@ -762,7 +836,10 @@ impl SketchEditor {
     }
 
     pub fn has_pending(&self) -> bool {
-        !self.clicks.is_empty() || self.chain_end.is_some() || self.dim_first.is_some()
+        !self.clicks.is_empty()
+            || self.chain_end.is_some()
+            || self.dim_first.is_some()
+            || self.move_op.is_some()
     }
 
     pub fn move_in_progress(&self) -> bool {
@@ -835,6 +912,24 @@ impl SketchEditor {
     /// Empties the entry boxes. Typed sizes belong to one shape; the next one starts
     /// from what the pointer says, as it does in Fusion.
     fn reset_entries(&mut self) {
+        // A move is typed in the same boxes a shape's sizes are, and for the same
+        // reason: the number is usually known, and clicking into a field to say it is a
+        // step the drawing does not need.
+        if self.move_op.is_some() {
+            self.entries = [Dim::Dx, Dim::Dy, Dim::Angle]
+                .into_iter()
+                .map(|dim| Entry {
+                    dim,
+                    text: String::new(),
+                    locked: false,
+                })
+                .collect();
+            // The first box takes the keyboard straight away, so a move begun with M can
+            // be finished by typing a number and pressing Enter.
+            self.entry_focus = Some(0);
+            self.mirror_move_entries();
+            return;
+        }
         self.entries = self
             .tool
             .dims()
@@ -893,8 +988,47 @@ impl SketchEditor {
         self.hover_region = None;
     }
 
+    /// Narrows or widens what the Select tool takes, dropping anything already selected
+    /// that the new filter no longer covers — being left holding things the mode gives
+    /// no way to see or deselect is worse than having no filter.
+    pub fn set_pick(&mut self, mode: SketchPick) {
+        self.pick = mode;
+        let kept: Vec<EntityId> = self
+            .selected
+            .iter()
+            .copied()
+            .filter(|id| self.pickable(*id))
+            .collect();
+        self.selected = kept;
+        if !self.pick.takes_regions() {
+            self.selected_regions.clear();
+            self.hover_region = None;
+        }
+    }
+
+    /// Whether the Select tool may take this entity under the current filter.
+    fn pickable(&self, id: EntityId) -> bool {
+        match self.sketch.entity(id) {
+            Some(data) if data.entity.is_point() => self.pick.takes_points(),
+            Some(_) => self.pick.takes_curves(),
+            None => false,
+        }
+    }
+
+    /// The nearest thing under `pos` the filter allows.
+    fn pick_at(&self, pos: Vec2, tol: f64) -> Option<EntityId> {
+        self.sketch
+            .hit_test(pos, tol)
+            .into_iter()
+            .map(|h| h.entity)
+            .find(|id| self.pickable(*id))
+    }
+
     /// The smallest closed region around `pos`, if any.
     fn region_at(&self, pos: Vec2) -> Option<usize> {
+        if !self.pick.takes_regions() {
+            return None;
+        }
         self.profiles
             .iter()
             .enumerate()
@@ -1108,6 +1242,12 @@ impl SketchEditor {
     /// Re-derives the cursor from the last pointer position, for when a typed size
     /// changes while the pointer stands still.
     pub fn refresh_cursor(&mut self) {
+        // While a move is running the boxes drive the geometry rather than the pointer,
+        // so there is no cursor to re-derive anything from.
+        if self.move_op.is_some() {
+            self.drive_move_from_entries();
+            return;
+        }
         if let Some(raw) = self.raw_cursor {
             let constrained = self.constrained_cursor(raw);
             if constrained != raw {
@@ -1221,6 +1361,10 @@ impl SketchEditor {
         self.grid_step = self.step_for(pos, camera, window);
         self.cursor_px = camera.pixel_size_at(self.frame.to_world(pos), window);
         let tol = self.tolerance(pos, camera, window);
+        if self.move_in_progress() {
+            self.cursor = None;
+            return;
+        }
         if self.pattern_op.is_some() {
             // The crosshair follows the pointer only while a centre is being picked;
             // nothing else in the sketch may be touched.
@@ -1264,7 +1408,12 @@ impl SketchEditor {
                 return;
             }
         }
-        self.hover = self.sketch.hit_test(pos, tol).first().map(|h| h.entity);
+        // The filter applies to the Select tool alone: the drawing tools need to see
+        // every point to snap to, whatever the user is choosing to select.
+        self.hover = match self.tool {
+            SketchTool::Select => self.pick_at(pos, tol),
+            _ => self.sketch.hit_test(pos, tol).first().map(|h| h.entity),
+        };
         self.hover_region = match (self.tool, self.hover) {
             (SketchTool::Select, None) => self.region_at(pos),
             _ => None,
@@ -1294,11 +1443,12 @@ impl SketchEditor {
     }
 
     pub fn pointer_down(&mut self, ray: &Ray, camera: &Camera, window: [u32; 2], _shift: bool) {
-        // A pattern re-makes the whole sketch from the copy it started with, so a drag
-        // made underneath it would be thrown away by the next change of a number — and
-        // would leave its checkpoint on the undo stack pointing at a state that no
-        // longer follows from anything.
-        if self.tool != SketchTool::Select || self.pattern_op.is_some() {
+        // A modal operation re-makes the whole sketch from the copy it started with, so
+        // a drag made underneath it would be thrown away by the next change of a number
+        // — and would leave its checkpoint on the undo stack pointing at a state that no
+        // longer follows from anything. The manipulator and the boxes are how the
+        // geometry moves while one is running.
+        if self.tool != SketchTool::Select || self.modal() {
             return;
         }
         let Some(pos) = self.to_plane(ray) else {
@@ -1306,14 +1456,13 @@ impl SketchEditor {
         };
         self.grid_step = self.step_for(pos, camera, window);
         let tol = self.tolerance(pos, camera, window);
-        let hit = self.sketch.hit_test(pos, tol).into_iter().next();
-        match hit {
+        match self.pick_at(pos, tol) {
             // Anything can be dragged: a point alone, a curve by all its points, or the
             // whole selection when the press lands on part of it.
-            Some(h) => {
+            Some(id) => {
                 self.checkpoint();
                 self.drag = Some(Drag {
-                    points: self.drag_set(h.entity),
+                    points: self.drag_set(id),
                     press: pos,
                 });
             }
@@ -1362,9 +1511,12 @@ impl SketchEditor {
         };
         self.grid_step = self.step_for(pos, camera, window);
         let tol = self.tolerance(pos, camera, window);
-        // While a pattern is up the viewport belongs to it: a click on a circular
-        // pattern puts its centre where the user pointed, which is how one is actually
-        // placed, and nothing else may edit the sketch underneath it.
+        // While a modal operation is up the viewport belongs to it: a click on a
+        // circular pattern puts its centre where the user pointed, which is how one is
+        // actually placed, and nothing else may edit the sketch underneath it.
+        if self.move_in_progress() {
+            return;
+        }
         if self.pattern_op.is_some() {
             if self.picking_pattern_center() {
                 // Snapping means the centre can be put on an existing point — the middle
@@ -1377,12 +1529,7 @@ impl SketchEditor {
         }
         match self.tool {
             SketchTool::Select => {
-                let hit = self
-                    .sketch
-                    .hit_test(pos, tol)
-                    .into_iter()
-                    .next()
-                    .map(|h| h.entity);
+                let hit = self.pick_at(pos, tol);
                 match hit {
                     Some(id) if shift => match self.selected.iter().position(|s| *s == id) {
                         Some(i) => {
@@ -1443,9 +1590,24 @@ impl SketchEditor {
         if !shift {
             self.clear_selection();
         }
-        for id in hits {
+        let allowed: Vec<EntityId> = hits.into_iter().filter(|id| self.pickable(*id)).collect();
+        for id in allowed {
             if !self.selected.contains(&id) {
                 self.selected.push(id);
+            }
+        }
+        // A box in Regions mode takes the areas it encloses, which is how a handful of
+        // profiles are handed to an extrude in one gesture.
+        if self.pick.takes_regions() {
+            let (min, max) = (m.start.min(m.current), m.start.max(m.current));
+            let enclosed: Vec<Vec2> = (0..self.profiles.len())
+                .filter_map(|i| self.region_sample(i))
+                .filter(|p| point_in_rect(*p, min, max))
+                .collect();
+            for sample in enclosed {
+                if !self.selected_regions.contains(&sample) {
+                    self.selected_regions.push(sample);
+                }
             }
         }
     }
@@ -1568,6 +1730,7 @@ impl SketchEditor {
             base: self.sketch.clone(),
             refused: None,
         });
+        self.reset_entries();
         true
     }
 
@@ -1583,27 +1746,73 @@ impl SketchEditor {
     }
 
     /// Adds to the move's offset along one of the sketch plane's axes, for the viewport
-    /// manipulator. The numbers it changes are the ones the palette shows, so dragging
-    /// and typing are two ways of saying the same thing.
+    /// manipulator. The numbers it changes are the ones the boxes show, so dragging and
+    /// typing are two ways of saying the same thing.
+    ///
+    /// The result is snapped like every other position in the sketch: a drawing built on
+    /// a grid stays on it, and a dragged arrow that left geometry at 49.87 mm would
+    /// quietly undo the point of drawing on a grid at all.
     pub fn nudge_move(&mut self, along_x: bool, distance: f64) -> bool {
+        let (snap, step) = (self.snap_to_grid, self.grid_step);
         let Some(op) = self.move_op.as_mut() else {
             return false;
         };
-        if along_x {
-            op.dx += distance;
-        } else {
-            op.dy += distance;
-        }
+        let offset = if along_x { &mut op.dx } else { &mut op.dy };
+        *offset = snapped(*offset + distance, snap.then_some(step));
         true
     }
 
-    /// Adds to the move's rotation, for the viewport manipulator's ring.
+    /// Adds to the move's rotation, for the viewport manipulator's ring. Snapped to
+    /// whole steps for the same reason the offsets are; a ring dragged to 37.4° is
+    /// almost never what was meant.
     pub fn turn_move(&mut self, degrees: f64) -> bool {
+        let snap = self.snap_to_grid;
         let Some(op) = self.move_op.as_mut() else {
             return false;
         };
-        op.angle_deg += degrees;
+        op.angle_deg = snapped(op.angle_deg + degrees, snap.then_some(ANGLE_SNAP_DEG));
         true
+    }
+
+    /// Writes the move's current numbers into the boxes that are not locked, so a drag
+    /// on the manipulator reads back as a number the moment it happens.
+    fn mirror_move_entries(&mut self) {
+        let Some(op) = self.move_op.as_ref() else {
+            return;
+        };
+        let live = [
+            (Dim::Dx, op.dx),
+            (Dim::Dy, op.dy),
+            (Dim::Angle, op.angle_deg),
+        ];
+        for entry in self.entries.iter_mut().filter(|e| !e.locked) {
+            if let Some((_, v)) = live.iter().find(|(d, _)| *d == entry.dim) {
+                entry.text = format!("{v:.2}");
+            }
+        }
+    }
+
+    /// Takes whatever has been typed into the boxes and moves the geometry by it.
+    fn drive_move_from_entries(&mut self) {
+        let typed = [
+            (Dim::Dx, typed_value(&self.entries, Dim::Dx)),
+            (Dim::Dy, typed_value(&self.entries, Dim::Dy)),
+            (Dim::Angle, typed_value(&self.entries, Dim::Angle)),
+        ];
+        let Some(op) = self.move_op.as_mut() else {
+            return;
+        };
+        for (dim, value) in typed {
+            let Some(v) = value else { continue };
+            match dim {
+                Dim::Dx => op.dx = v,
+                Dim::Dy => op.dy = v,
+                // The box is in degrees but `Entry::value` hands back radians, as the
+                // line tool's angle wants.
+                _ => op.angle_deg = v.to_degrees(),
+            }
+        }
+        self.update_move();
     }
 
     /// Re-applies the move to the sketch as it was when the move began.
@@ -1642,6 +1851,7 @@ impl SketchEditor {
             op.refused = refused;
         }
         self.solve();
+        self.mirror_move_entries();
         self.dirty = true;
     }
 
@@ -1905,6 +2115,11 @@ impl SketchEditor {
     /// the pointer still decides (direction, side, unlocked sizes) from where it is now.
     pub fn submit_entry(&mut self) {
         self.refresh_cursor();
+        // Enter in a move's box applies the move, as it places a shape from its sizes.
+        if self.move_op.is_some() {
+            self.finish_move(true);
+            return;
+        }
         let Some(cursor) = self.cursor else { return };
         let click = Click {
             pos: cursor,
@@ -2501,6 +2716,9 @@ impl SketchEditor {
     /// Plane position the entry boxes hang off: the last click, or the open end of a
     /// line chain. `None` when nothing is being drawn.
     pub fn entry_anchor(&self) -> Option<Vec3> {
+        if let Some(pivot) = self.move_pivot() {
+            return Some(self.frame.to_world(pivot));
+        }
         let pos = match self.tool {
             SketchTool::Line => self.chain_end.and_then(|id| self.sketch.point_pos(id)),
             _ => self.clicks.last().map(|c| c.pos),
@@ -3493,6 +3711,18 @@ fn line_intersection(a0: Vec2, a1: Vec2, b0: Vec2, b1: Vec2) -> Option<Vec2> {
     }
     let t = (b0 - a0).perp_dot(db) / denom;
     Some(a0 + da * t)
+}
+
+/// `v` rounded to the nearest whole `step`, or left alone when there is no step.
+fn snapped(v: f64, step: Option<f64>) -> f64 {
+    match step {
+        Some(step) if step.is_finite() && step > 0.0 => (v / step).round() * step,
+        _ => v,
+    }
+}
+
+fn point_in_rect(p: Vec2, min: Vec2, max: Vec2) -> bool {
+    p.x >= min.x && p.x <= max.x && p.y >= min.y && p.y <= max.y
 }
 
 fn distance_to_line(p: Vec2, a: Vec2, b: Vec2) -> f64 {

@@ -27,6 +27,9 @@ use uniforms::{Globals, LineDraw, MeshDraw, PointDraw, StreamBuffer, TriDraw, Un
 const EDGE_COLOR: [f32; 4] = [0.08, 0.09, 0.10, 1.0];
 const EDGE_WIDTH_PX: f32 = 1.2;
 const DASH_PX: f32 = 8.0;
+/// How far apart two segment ends may be and still count as joined, squared. Curves are
+/// tessellated to shared points, so this only has to absorb the `f32` conversion.
+const JOIN_EPS: f64 = 1e-12;
 const GAP_PX: f32 = 5.0;
 
 pub struct Renderer {
@@ -373,8 +376,19 @@ impl Renderer {
             return;
         }
         let first = (self.line_instances.len() / size_of::<SegmentInstance>()) as u32;
+        // Segments of one polyline arrive in order, each starting where the last ended,
+        // which is how a dash pattern knows to run on across the joins. A segment that
+        // starts somewhere else begins a new run.
+        let mut travelled = 0.0;
+        let mut previous_end: Option<Vec3> = None;
         for [a, b] in &batch.segments {
-            self.line_instances.push(&SegmentInstance::new(*a, *b));
+            if previous_end.is_none_or(|end| end.distance_squared(*a) > JOIN_EPS) {
+                travelled = 0.0;
+            }
+            self.line_instances
+                .push(&SegmentInstance::at(*a, *b, travelled));
+            travelled += a.distance(*b);
+            previous_end = Some(*b);
         }
         let uniform_offset = self.uniforms.push(&LineDraw {
             model: Mat4::IDENTITY.as_mat4().to_cols_array_2d(),

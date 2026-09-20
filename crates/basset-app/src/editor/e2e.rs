@@ -493,3 +493,116 @@ fn the_palette_lists_the_constraints_and_lights_up_what_they_hold() {
     let highlighted = h.sketch().highlighted.clone();
     assert_eq!(highlighted.len(), 2, "the two points the distance spans");
 }
+
+/// The controls a running operation is driven by have to be in front of the user.
+///
+/// Move and Pattern used to sit at the bottom of the sketch palette, below the tool
+/// hints, the degrees-of-freedom readout and the whole constraint list — past the fold
+/// of a scrolling panel on an ordinary window. A pattern whose "Select origin" cannot be
+/// reached is a pattern whose origin cannot be set, which is exactly how it failed.
+#[test]
+fn a_running_sketch_operation_is_reachable_on_a_small_window() {
+    let mut h = Harness::new();
+    h.editor.set_window_size([800, 600]);
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    h.rectangle(Vec2::new(20.0, 0.0), Vec2::new(25.0, 5.0));
+    {
+        let s = h.sketch();
+        s.set_tool(SketchTool::Select);
+        s.selected = s
+            .sketch
+            .entities()
+            .filter(|(_, d)| d.entity.is_curve())
+            .map(|(id, _)| id)
+            .collect();
+        s.pattern.circular = true;
+        s.pattern.count = 4;
+    }
+    h.frame();
+    h.frame();
+    assert!(h.click_ui("Pattern"), "the toolbar offers Pattern");
+    assert!(h.sketch().pattern_in_progress());
+    h.frame();
+    h.frame();
+
+    // Without this the origin cannot be placed at all: the viewport only takes the click
+    // while the mode is on, and the mode is only reachable through this button.
+    assert!(
+        h.click_ui("Select origin"),
+        "and the running pattern's own controls are on screen: {:?}",
+        h.frame().text()
+    );
+    assert!(h.sketch().picking_pattern_center());
+
+    h.click_world(Vec3::ZERO);
+    assert_eq!(
+        h.sketch().pattern.center,
+        Vec2::ZERO,
+        "the click placed the origin"
+    );
+    assert!(!h.sketch().picking_pattern_center(), "and the mode ended");
+    assert_eq!(
+        h.sketch().sketch.profiles(&Default::default()).len(),
+        4,
+        "four instances about the sketch origin"
+    );
+}
+
+/// Construction is a mode you can arm at any time, including with a drawing tool already
+/// in hand, and what gets drawn next comes out as reference geometry.
+#[test]
+fn construction_can_be_armed_with_a_tool_already_chosen() {
+    let mut h = Harness::new();
+    h.editor.set_window_size([1280, 800]);
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    h.frame();
+    h.frame();
+    assert!(h.click_ui("Line"), "pick a drawing tool from the toolbar");
+    assert_eq!(h.sketch().tool, SketchTool::Line);
+
+    assert!(h.click_ui("Construction"), "then arm construction");
+    assert!(h.sketch().construction, "the mode is on");
+    assert_eq!(h.sketch().tool, SketchTool::Line, "and the tool is kept");
+
+    h.line(Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0));
+    let s = h.sketch();
+    assert!(
+        s.sketch
+            .entities()
+            .filter(|(_, d)| d.entity.is_curve())
+            .all(|(_, d)| d.construction),
+        "what was drawn next is reference geometry"
+    );
+}
+
+/// The icon in the variant menu is a button and looks like one, so it has to act like
+/// one: it used to react on hover and do nothing on click, with only the name beside it
+/// actually choosing the variant.
+#[test]
+fn the_variant_menu_icon_picks_the_variant() {
+    let mut h = Harness::new();
+    h.editor.set_window_size([1280, 800]);
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    h.sketch().set_tool(SketchTool::Circle);
+    h.frame();
+    h.frame();
+
+    // Open the Circle button's variant menu with a right-click, then click the *icon* of
+    // the three-point circle rather than its name.
+    let button = h
+        .icon_rect("toolbar", SketchTool::Circle)
+        .expect("the toolbar shows the Circle button");
+    h.right_click_ui(button.center());
+    let menu = h.frame();
+    let name = menu
+        .rect_of("Circle (3 pt)")
+        .expect("the menu lists the other kinds");
+    // The icon sits immediately to the left of the name, in the same row.
+    let icon = egui::pos2(name.left() - 16.0, name.center().y);
+    h.click_at_ui(icon);
+    assert_eq!(
+        h.sketch().tool,
+        SketchTool::Circle3Point,
+        "clicking the icon chose that variant"
+    );
+}

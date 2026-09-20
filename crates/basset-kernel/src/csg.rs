@@ -10,6 +10,11 @@
 //! orientation are both kept, and performance is roughly `O(n log n)` polygons per
 //! clip with a poor worst case for very deep trees. Splitting planes are chosen from a
 //! handful of candidates to keep trees shallow.
+//!
+//! Keeping every fragment under its own key is right for naming and wrong for what the
+//! user sees, because two bodies joined flush leave the one flat face they now share as
+//! two. [`Solid::merge_continuous_faces`] is the other half of the assembly: it puts the
+//! faces different operations have grown into one patch of surface back together.
 
 use basset_math::Vec3;
 
@@ -134,6 +139,7 @@ fn assemble(polys: Vec<CsgPolygon>, sources: &[&Solid; 2]) -> Result<Solid, Kern
         return Err(KernelError::EmptyResult);
     }
     solid.heal();
+    solid.merge_continuous_faces();
     Ok(solid)
 }
 
@@ -474,6 +480,30 @@ mod tests {
             12,
             "every original face survives with a fragment"
         );
+    }
+
+    /// Two blocks joined side by side are one block: the tops that finish at the same
+    /// height are one face the user can pick, sketch on and export, not two.
+    #[test]
+    fn union_joins_faces_that_run_on_into_each_other() {
+        let a = cube(1, Vec3::ZERO, 2.0);
+        let b = cube(2, Vec3::new(2.0, 0.0, 0.0), 2.0);
+        let u = boolean(&a, &b, BoolOp::Union).unwrap();
+        assert_relative_eq!(u.volume(), 16.0, epsilon = 1e-9);
+        assert!(u.is_closed(), "{:?}", u.validate());
+        // Six faces, as for the 4 × 2 × 2 block this is: the tops, the bottoms and the
+        // two long sides each merged, the shared wall between them is gone, and the two
+        // ends are what is left of the cubes' own outer sides.
+        assert_eq!(u.faces.len(), 6, "{:?}", u.face_keys().collect::<Vec<_>>());
+        let top = u
+            .face(crate::ids::FaceKey::new(OpId::new(1), FaceRole::EndCap))
+            .expect("named by the earlier of the two operations");
+        assert_relative_eq!(top.area(), 8.0, epsilon = 1e-9);
+        // And it traces as one region, which is what a sketch or a push on it would use.
+        let profile = u
+            .face_profile(crate::ids::FaceKey::new(OpId::new(1), FaceRole::EndCap))
+            .unwrap();
+        assert_relative_eq!(profile.area(), 8.0, epsilon = 1e-9);
     }
 
     #[test]

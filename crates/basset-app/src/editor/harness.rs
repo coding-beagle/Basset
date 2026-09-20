@@ -163,6 +163,39 @@ impl Harness {
         true
     }
 
+    /// Where a painted tool icon sits, which is the only handle there is on a button
+    /// that shows no text.
+    pub fn icon_rect(&mut self, salt: &str, tool: SketchTool) -> Option<egui::Rect> {
+        self.frame();
+        let id = egui::Id::new(("tool-icon", salt, tool.name()));
+        self.egui.read_response(id).map(|r| r.rect)
+    }
+
+    /// Clicks at a point in egui's coordinates, for a widget that carries no text of its
+    /// own — a painted icon, say — whose position is known from something beside it.
+    pub fn click_at_ui(&mut self, pos: egui::Pos2) {
+        self.press_ui(pos, egui::PointerButton::Primary);
+    }
+
+    /// Right-clicks a widget by its label, which is how the variant menus are opened.
+    pub fn right_click_ui(&mut self, pos: egui::Pos2) {
+        self.press_ui(pos, egui::PointerButton::Secondary);
+    }
+
+    fn press_ui(&mut self, pos: egui::Pos2, button: egui::PointerButton) {
+        self.frame_with(vec![egui::Event::PointerMoved(pos)]);
+        let event = |pressed| egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        self.frame_with(vec![event(true), event(false)]);
+        // Panels queue their commands and run them after the UI closure returns, so the
+        // effect is visible from the next frame on.
+        self.frame();
+    }
+
     // --- Pointer ----------------------------------------------------------------------
 
     fn send(&mut self, event: WindowEvent) {

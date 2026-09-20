@@ -50,7 +50,12 @@ cargo clippy --workspace --all-targets -- -D warnings
   the Select tool, click geometry (shift-click for several), click inside a closed region
   to take the curves around it — the area itself fills so you can see what you are about
   to take — or drag a box (rightwards encloses, leftwards also takes what it touches);
-  drag a point, a curve or the selection to move it under its constraints. A point next
+  drag a point, a curve or the selection to move it under its constraints. The toolbar's
+  Select buttons (keys `1`-`4`) say what a click or a box may take — all of it, curves
+  only, points only, or the closed regions — because a corner, the curves meeting there
+  and the area beyond them all sit within a few pixels of one another; narrowing the
+  filter lets go of whatever it no longer covers. Drawing ignores it, so a line still
+  snaps to a point while the filter says Curves. A point next
   to a curve wins the click over the curve running through it, so endpoints and centres
   are the easy things to hit. Each constraint in the toolbar is a tool: click it and then
   pick the geometry, in whatever order reads naturally, and it goes on as soon as the
@@ -74,8 +79,9 @@ cargo clippy --workspace --all-targets -- -D warnings
   reporting a residual. Trim takes the piece of a curve you click, cut at the curves that
   cross it, and draws that piece in red before you commit to it; Break cuts a curve at
   its crossings and keeps everything. Move (or `M`) moves the selection: arrows and a
-  rotation ring appear on it in the viewport to drag, and the palette holds the same
-  offsets and angle to type — Enter applies, Esc puts it back. Pattern repeats the
+  rotation ring appear on it in the viewport to drag, snapping to the grid and to whole
+  steps of angle, and entry boxes open on it at once — type 50, Tab, Enter, exactly as a
+  shape's sizes are typed. Enter applies, Esc puts it back. Pattern repeats the
   selection in a grid or around a centre, copies keeping the constraints the seed was
   drawn with, except the ones that describe the sketch's axes rather than the shape — a
   turned copy has horizontal and vertical the other way round, and an odd angle has
@@ -83,8 +89,11 @@ cargo clippy --workspace --all-targets -- -D warnings
   copies appear as you set the numbers, drawn as a preview, so a distance stated between
   copies or across the whole span is something you can see before OK keeps it; Select
   origin then places a circular pattern's centre with a click, snapping to a point if one
-  is under the pointer. While either is up the sketch belongs to it, and Ctrl+Z puts it
-  back the way Esc does. A move is rigid, so if the constraints will not take it — asking
+  is under the pointer. Instance counts are not capped — a bolt circle of two hundred is
+  an ordinary thing to ask for — only the total work is, and a pattern that would exceed
+  it says so. While either is up the sketch belongs to it: geometry underneath cannot be
+  dragged away, and Ctrl+Z puts the operation back the way Esc does. A move is rigid, so
+  if the constraints will not take it — asking
   a rectangle held to the axes to turn — it is refused and said so, rather than the
   solver quietly finding some other shape that satisfies them.
   `E` extrudes the region under the pointer (or the ones you clicked inside):

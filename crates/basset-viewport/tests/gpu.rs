@@ -465,3 +465,52 @@ fn tri_batch_fills_a_region_and_lets_the_background_through() {
     );
     assert!(is_background(pixel(&pixels, 1, 1)), "corner is untouched");
 }
+
+/// A dashed curve has to look dashed at the size it is drawn.
+///
+/// The dash pattern is measured in pixels along a segment, and a tessellated curve is
+/// made of segments a few pixels long — shorter than one dash. A pattern that restarted
+/// at every segment therefore put every one of them inside a dash and drew the whole
+/// curve solid, which is exactly how construction geometry stopped being distinguishable
+/// from ordinary geometry on anything small. This draws one such curve as a run of short
+/// segments and insists there are gaps in it.
+#[test]
+fn a_dashed_run_of_short_segments_still_shows_gaps() {
+    let Some(gpu) = gpu() else { return };
+    let camera = looking_at_origin();
+    let row = SIZE[1] / 2;
+
+    // A straight line across the middle of the view, cut into pieces each well under one
+    // dash long on screen, the way a small circle's tessellation is.
+    let span = 40.0;
+    let pieces = 64;
+    let point = |i: u32| {
+        Vec3::new(
+            -span * 0.5 + span * f64::from(i) / f64::from(pieces),
+            0.0,
+            0.0,
+        )
+    };
+    let mut scene = Scene::new(&camera);
+    scene.background = BACKGROUND;
+    scene.show_grid = false;
+    let mut dashed = LineBatch::new([1.0, 1.0, 1.0, 1.0]);
+    dashed.dashed = true;
+    dashed.depth_test = false;
+    for i in 0..pieces {
+        dashed.segments.push([point(i), point(i + 1)]);
+    }
+    scene.lines.push(dashed);
+
+    let pixels = render_to_pixels(&gpu, 1, &scene);
+    let along: Vec<bool> = (0..SIZE[0])
+        .map(|x| !is_background(pixel(&pixels, x, row)))
+        .collect();
+    let drawn = along.iter().filter(|on| **on).count();
+    let gaps = along.iter().filter(|on| !**on).count();
+    assert!(drawn > 0, "the line is drawn at all");
+    assert!(
+        gaps > 0 && along.windows(2).filter(|w| w[0] != w[1]).count() >= 4,
+        "and it alternates between ink and gap rather than running solid: {along:?}"
+    );
+}

@@ -1974,6 +1974,8 @@ fn the_move_manipulator_drives_the_move_numbers() {
     assert_eq!(g.origin, Vec3::new(5.0, 5.0, 0.0), "on what is being moved");
 
     let s = sketch(&mut editor);
+    // Off the grid, so this measures the manipulator rather than the snap.
+    s.snap_to_grid = false;
     // A drag on an arrow and a drag on the ring land in the boxes the palette shows.
     assert!(s.nudge_move(true, 4.0));
     assert!(s.turn_move(15.0));
@@ -2087,6 +2089,7 @@ fn undo_during_a_move_puts_the_move_back() {
         .map(|(id, _)| id)
         .collect();
     assert!(s.begin_move());
+    s.snap_to_grid = false;
     s.nudge_move(true, 4.0);
     s.update_move();
 
@@ -2127,6 +2130,7 @@ fn an_applied_sketch_move_can_be_undone() {
         .map(|(id, _)| id)
         .collect();
     assert!(s.begin_move());
+    s.snap_to_grid = false;
     s.nudge_move(true, 7.0);
     s.update_move();
     s.finish_move(true);
@@ -2405,4 +2409,232 @@ fn a_circular_pattern_centre_is_picked_in_a_mode() {
         .filter_map(|(id, _)| s.sketch.entity_bounds(id))
         .fold(f64::INFINITY, |acc, (min, _)| acc.min(min.x));
     assert!(left < -20.0, "the pattern went round the origin: {left}");
+}
+
+/// A box drag takes what the filter allows and nothing else, so "select every curve in
+/// this corner" and "select every point in it" are two different gestures rather than
+/// one gesture and some tidying up afterwards.
+#[test]
+fn the_sketch_filter_decides_what_a_box_drag_takes() {
+    use sketch_mode::SketchPick;
+
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(10.0, 5.0));
+    let camera = editor.camera;
+    let window = editor.window_px;
+    let s = sketch(&mut editor);
+    s.set_tool(SketchTool::Select);
+
+    // A box enclosing the whole rectangle, dragged rightwards so it encloses rather than
+    // crosses.
+    let sweep = |s: &mut sketch_mode::SketchEditor| {
+        s.pointer_down(&click_at(-5.0, -5.0), &camera, window, false);
+        s.pointer_moved(&click_at(15.0, 10.0), &camera, window, true);
+        s.pointer_up(&click_at(15.0, 10.0), &camera, window, false, false);
+    };
+    let kinds = |s: &sketch_mode::SketchEditor| {
+        let points = s
+            .selected
+            .iter()
+            .filter(|id| s.sketch.entity(**id).is_some_and(|d| d.entity.is_point()))
+            .count();
+        (points, s.selected.len() - points)
+    };
+
+    s.set_pick(SketchPick::All);
+    sweep(s);
+    assert_eq!(kinds(s), (4, 4), "everything: four corners and four edges");
+
+    s.set_pick(SketchPick::Curves);
+    sweep(s);
+    assert_eq!(kinds(s), (0, 4), "curves alone");
+
+    s.set_pick(SketchPick::Points);
+    sweep(s);
+    assert_eq!(kinds(s), (4, 0), "points alone");
+
+    // Regions takes the enclosed area, which is what an extrude is built from.
+    s.set_pick(SketchPick::Regions);
+    sweep(s);
+    assert_eq!(kinds(s), (0, 0), "no curves or points");
+    assert_eq!(s.selected_regions.len(), 1, "the area inside the rectangle");
+}
+
+/// Narrowing the filter lets go of what it no longer covers: being left holding things
+/// the mode gives no way to see or deselect is worse than having no filter at all.
+#[test]
+fn narrowing_the_sketch_filter_drops_what_it_no_longer_covers() {
+    use sketch_mode::SketchPick;
+
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(10.0, 5.0));
+    let s = sketch(&mut editor);
+    s.selected = s.sketch.entities().map(|(id, _)| id).collect();
+    assert!(s.selected.len() > 4);
+
+    s.set_pick(SketchPick::Points);
+    assert!(
+        s.selected
+            .iter()
+            .all(|id| s.sketch.entity(*id).is_some_and(|d| d.entity.is_point())),
+        "only the points are still held"
+    );
+    assert!(!s.selected.is_empty());
+}
+
+/// The filter is about choosing between things already drawn, so it must not get in the
+/// way of drawing: a line still snaps to a point while the filter says Curves.
+#[test]
+fn the_sketch_filter_does_not_change_what_drawing_snaps_to() {
+    use sketch_mode::SketchPick;
+
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(10.0, 5.0));
+    let camera = editor.camera;
+    let window = editor.window_px;
+    let s = sketch(&mut editor);
+    s.set_pick(SketchPick::Curves);
+    s.set_tool(SketchTool::Line);
+    let before = s
+        .sketch
+        .entities()
+        .filter(|(_, d)| d.entity.is_point())
+        .count();
+
+    // Starting a line on the rectangle's corner reuses that point rather than making a
+    // second one on top of it.
+    s.pointer_moved(&click_at(10.0, 5.0), &camera, window, false);
+    assert!(s.cursor_snapped, "the corner is still a snap target");
+    s.pointer_up(&click_at(10.0, 5.0), &camera, window, true, false);
+    s.pointer_up(&click_at(20.0, 5.0), &camera, window, true, false);
+    let after = s
+        .sketch
+        .entities()
+        .filter(|(_, d)| d.entity.is_point())
+        .count();
+    assert_eq!(after, before + 1, "only the far end is a new point");
+}
+
+/// A drawing built on a grid stays on it. A dragged arrow that left geometry at 49.87 mm
+/// would quietly undo the point of drawing on a grid at all, so the manipulator snaps
+/// like every other position in the sketch, and the rotation ring snaps to whole steps.
+#[test]
+fn a_dragged_move_snaps_to_the_grid() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(10.0, 10.0));
+    let s = sketch(&mut editor);
+    s.selected = s
+        .sketch
+        .entities()
+        .filter(|(_, d)| d.entity.is_curve())
+        .map(|(id, _)| id)
+        .collect();
+    s.snap_to_grid = true;
+    s.fixed_grid_step = Some(5.0);
+    s.grid_step = 5.0;
+    assert!(s.begin_move());
+
+    // A drag that lands between grid lines is taken to the nearest one.
+    s.nudge_move(true, 11.3);
+    assert_eq!(s.move_op.as_ref().unwrap().dx, 10.0);
+    // And a second drag carries on from there rather than re-rounding a running total.
+    s.nudge_move(true, 2.6);
+    assert_eq!(s.move_op.as_ref().unwrap().dx, 15.0);
+
+    s.turn_move(37.4);
+    assert_eq!(
+        s.move_op.as_ref().unwrap().angle_deg,
+        35.0,
+        "and the ring lands on a whole step"
+    );
+
+    // Off the grid the drag is taken exactly as given.
+    s.snap_to_grid = false;
+    s.nudge_move(false, 1.23);
+    assert_eq!(s.move_op.as_ref().unwrap().dy, 1.23);
+}
+
+/// A move is driven by its boxes and its manipulator, so the sketch underneath it is not
+/// up for grabs: a drag made there is thrown away by the next change of a number, and
+/// leaves a checkpoint on the undo stack pointing at a state that follows from nothing.
+#[test]
+fn geometry_cannot_be_dragged_out_from_under_a_move() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(10.0, 10.0));
+    let camera = editor.camera;
+    let window = editor.window_px;
+    let s = sketch(&mut editor);
+    s.set_tool(SketchTool::Select);
+    s.selected = s
+        .sketch
+        .entities()
+        .filter(|(_, d)| d.entity.is_curve())
+        .map(|(id, _)| id)
+        .collect();
+    assert!(s.begin_move());
+    let corner = point_at(s, Vec2::new(10.0, 10.0));
+
+    // Press on a corner and drag it well away.
+    s.pointer_down(&click_at(10.0, 10.0), &camera, window, false);
+    s.pointer_moved(&click_at(30.0, 30.0), &camera, window, true);
+    s.pointer_up(&click_at(30.0, 30.0), &camera, window, false, false);
+    assert_eq!(
+        s.sketch.point_pos(corner),
+        Some(Vec2::new(10.0, 10.0)),
+        "the corner stayed where it was"
+    );
+    assert!(s.move_in_progress(), "and the move is still running");
+}
+
+/// The move is typed in the same boxes a shape's sizes are: start it, type the number,
+/// press Enter. Clicking into a field first is a step the drawing does not need.
+#[test]
+fn a_move_can_be_typed_straight_into_its_boxes() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(10.0, 10.0));
+    let s = sketch(&mut editor);
+    s.selected = s
+        .sketch
+        .entities()
+        .filter(|(_, d)| d.entity.is_curve())
+        .map(|(id, _)| id)
+        .collect();
+    assert!(s.begin_move());
+    assert_eq!(
+        s.entries.iter().map(|e| e.dim).collect::<Vec<_>>(),
+        vec![
+            sketch_mode::Dim::Dx,
+            sketch_mode::Dim::Dy,
+            sketch_mode::Dim::Angle
+        ],
+        "the boxes are there as soon as the move starts"
+    );
+    assert_eq!(s.entry_focus, Some(0), "and the first one has the keyboard");
+
+    // "50" with the pointer in the viewport goes straight into dX.
+    assert!(s.type_into_entry("5"));
+    assert!(s.type_into_entry("0"));
+    assert_eq!(s.move_op.as_ref().unwrap().dx, 50.0);
+
+    // Enter applies it, as it places a shape from its sizes.
+    s.submit_entry();
+    assert!(!s.move_in_progress());
+    let left = s
+        .sketch
+        .entities()
+        .filter_map(|(id, _)| s.sketch.entity_bounds(id))
+        .fold(f64::INFINITY, |acc, (min, _)| acc.min(min.x));
+    assert!((left - 50.0).abs() < 1e-6, "moved exactly 50 mm: {left}");
 }

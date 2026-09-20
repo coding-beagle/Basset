@@ -42,6 +42,7 @@ enum Command {
     Activate(ComponentId),
     FinishSketch(bool),
     SketchTool(SketchTool),
+    SketchPick(sketch_mode::SketchPick),
     SketchSelect(Vec<basset_sketch::EntityId>),
     SketchDimension(basset_sketch::ConstraintId, f64),
     SketchRemoveConstraint(basset_sketch::ConstraintId),
@@ -102,6 +103,7 @@ pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
     let free = ui.available_rect_before_wrap();
     let ctx = ui.ctx().clone();
     super::viewcube::show(editor, &ctx, free);
+    sketch_operation_dialog(editor, &ctx, free, &mut commands);
     tools::dialog(editor, &ctx);
     super::gizmo::interact(editor, &ctx);
     entry_overlay(editor, &ctx, &mut commands);
@@ -168,6 +170,13 @@ fn run(editor: &mut Editor, c: Command) {
                     Ok(()) => editor.commit_sketch(),
                     Err(e) => editor.report_error(e),
                 }
+            }
+        }
+        Command::SketchPick(mode) => {
+            if let Mode::Sketch(s) = &mut editor.mode {
+                // Narrowing the filter drops what it no longer covers, so the user is
+                // never left acting on things the new mode gives them no way to see.
+                s.set_pick(mode);
             }
         }
         Command::SketchTool(t) => {
@@ -448,7 +457,7 @@ fn sketch_toolbar(s: &super::SketchEditor, ui: &mut egui::Ui, commands: &mut Vec
         for group in ToolGroup::ALL {
             let variant = s.variant_of(group);
             let selected = s.tool.group() == group;
-            let response = tool_icon(ui, variant, selected).on_hover_ui(|ui| {
+            let response = tool_icon(ui, "toolbar", variant, selected).on_hover_ui(|ui| {
                 ui.label(variant.name());
                 if group.variants().len() > 1 {
                     ui.label(egui::RichText::new("Hold or right-click for other kinds").weak());
@@ -490,8 +499,13 @@ fn sketch_toolbar(s: &super::SketchEditor, ui: &mut egui::Ui, commands: &mut Vec
                         let mut chosen = false;
                         for tool in group.variants() {
                             ui.horizontal(|ui| {
-                                tool_icon(ui, *tool, s.tool == *tool);
-                                if ui.selectable_label(s.tool == *tool, tool.name()).clicked() {
+                                // The icon takes the click as readily as the name does.
+                                // It looks like a button and reacts like one on hover, so
+                                // a click on it that did nothing was the row saying one
+                                // thing and meaning another.
+                                let icon = tool_icon(ui, "menu", *tool, s.tool == *tool);
+                                let label = ui.selectable_label(s.tool == *tool, tool.name());
+                                if icon.clicked() || label.clicked() {
                                     commands.push(Command::SketchTool(*tool));
                                     chosen = true;
                                 }
@@ -510,6 +524,20 @@ fn sketch_toolbar(s: &super::SketchEditor, ui: &mut egui::Ui, commands: &mut Vec
                         egui::Popup::close_id(ui.ctx(), popup_id);
                     }
                 }
+            }
+        }
+        ui.separator();
+        // What a click or a box drag may take. A sketch puts a corner, the curves that
+        // meet there and the region beyond them within a few pixels of each other, and
+        // the filter is how the user says which of them they mean — the same answer, and
+        // the same keys, as the model-mode filter.
+        ui.label("Select:");
+        for (i, mode) in sketch_mode::SketchPick::ALL.iter().enumerate() {
+            let response = ui
+                .add(egui::Button::new(mode.name()).selected(s.pick == *mode))
+                .on_hover_text(format!("{} ({})", mode.hint(), i + 1));
+            if response.clicked() {
+                commands.push(Command::SketchPick(*mode));
             }
         }
         ui.separator();
@@ -702,11 +730,24 @@ fn constraint_button(
     response
 }
 
+/// The id of a painted tool icon, so it can be found without text to search for.
+///
+/// Absolute rather than derived from the surrounding `Ui`: `salt` already separates the
+/// toolbar's copy of an icon from the same icon in a variant menu, and an id that does
+/// not depend on where the button happens to sit is one anything can ask for.
+fn tool_icon_id(salt: &str, tool: SketchTool) -> egui::Id {
+    egui::Id::new(("tool-icon", salt, tool.name()))
+}
+
 /// A tool button with its icon painted rather than typed: the default fonts have no
 /// reliable glyphs for these shapes, and a drawn icon reads the same on every machine.
-fn tool_icon(ui: &mut egui::Ui, tool: SketchTool, selected: bool) -> egui::Response {
+fn tool_icon(ui: &mut egui::Ui, salt: &str, tool: SketchTool, selected: bool) -> egui::Response {
     const SIZE: f32 = 28.0;
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(SIZE, SIZE), egui::Sense::click());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(SIZE, SIZE), egui::Sense::hover());
+    // A stable id rather than an automatic one: these buttons paint no text, so an id is
+    // the only handle anything — a test, or egui's own focus — has on them. `salt` keeps
+    // the toolbar's copy of an icon apart from the same icon in a variant menu.
+    let response = ui.interact(rect, tool_icon_id(salt, tool), egui::Sense::click());
     let visuals = ui.style().interact_selectable(&response, selected);
     let painter = ui.painter();
     painter.rect(
@@ -1133,8 +1174,6 @@ fn sketch_palette(editor: &mut Editor, ui: &mut egui::Ui, commands: &mut Vec<Com
     let Mode::Sketch(s) = &mut editor.mode else {
         return;
     };
-    let mut centre_on_selection = false;
-    let mut pick_center: Option<bool> = None;
     // The palette is taller than the panel on an ordinary window, and without a scroll
     // area whatever overflowed was simply unreachable — which is how a sketch could end
     // up with no way to apply a constraint at all.
@@ -1285,228 +1324,269 @@ fn sketch_palette(editor: &mut Editor, ui: &mut egui::Ui, commands: &mut Vec<Com
         // Directly under the degrees-of-freedom readout, because that is the line that
         // prompts the question the list answers: what *is* holding this sketch?
         constraint_list(s, ui, commands);
-        if let Some(op) = s.move_op.as_mut() {
-            ui.separator();
-            ui.label("Move (M)");
-            let mut changed = false;
-            for (value, label, unit) in [
-                (&mut op.dx, "dX ", " mm"),
-                (&mut op.dy, "dY ", " mm"),
-                (&mut op.angle_deg, "rotate ", "°"),
-            ] {
-                changed |= ui
-                    .add(
-                        egui::DragValue::new(value)
-                            .speed(0.5)
-                            .prefix(label)
-                            .suffix(unit),
-                    )
-                    .changed();
-            }
-            if let Some(why) = s.move_refused() {
-                ui.colored_label(egui::Color32::from_rgb(235, 190, 90), why);
-                ui.label(
-                    egui::RichText::new(
-                        "The geometry is left where it was. Delete or relax what is \
-                         holding it, or move it a way the constraints allow",
-                    )
-                    .weak(),
-                );
-            }
-            ui.label(
-                egui::RichText::new(
-                    "Drag the arrows and the ring in the viewport, or type here. Enter \
-                     applies, Esc puts it back. Constraints still hold",
-                )
-                .weak(),
-            );
-            ui.horizontal(|ui| {
-                if ui.button("Apply").clicked() {
-                    commands.push(Command::SketchMoveFinish(true));
-                }
-                if ui.button("Cancel").clicked() {
-                    commands.push(Command::SketchMoveFinish(false));
-                }
-            });
-            if changed {
-                commands.push(Command::SketchMoveUpdate);
-            }
-        }
-        if s.pattern_in_progress() {
-            ui.separator();
-            ui.label("Pattern");
-            let mut changed = false;
-            let p = &mut s.pattern;
-            ui.horizontal(|ui| {
-                changed |= ui
-                    .selectable_value(&mut p.circular, false, "Rectangular")
-                    .changed();
-                changed |= ui
-                    .selectable_value(&mut p.circular, true, "Circular")
-                    .changed();
-            });
-            if p.circular {
-                changed |= ui
-                    .add(egui::Slider::new(&mut p.count, 2..=64).text("instances"))
-                    .changed();
-                changed |= ui
-                    .add(
-                        egui::DragValue::new(&mut p.angle_deg)
-                            .speed(1.0)
-                            .range(-360.0..=360.0)
-                            .prefix("through ")
-                            .suffix("\u{b0}"),
-                    )
-                    .changed();
-                ui.label(egui::RichText::new("Centre").weak());
-                ui.horizontal(|ui| {
-                    changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut p.center.x)
-                                .speed(0.5)
-                                .prefix("x ")
-                                .suffix(" mm"),
-                        )
-                        .changed();
-                    changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut p.center.y)
-                                .speed(0.5)
-                                .prefix("y ")
-                                .suffix(" mm"),
-                        )
-                        .changed();
-                });
-                ui.horizontal(|ui| {
-                    let picking = s.picking_pattern_center();
-                    if ui
-                        .add(egui::Button::new("Select origin").selected(picking))
-                        .on_hover_text(
-                            "Then click in the viewport: the centre snaps to an existing \
-                             point if there is one under the pointer",
-                        )
-                        .clicked()
-                    {
-                        pick_center = Some(!picking);
-                    }
-                    if ui
-                        .button("Centre on selection")
-                        .on_hover_text("Put the centre at the middle of what is being repeated")
-                        .clicked()
-                    {
-                        centre_on_selection = true;
-                    }
-                });
-                if s.picking_pattern_center() {
-                    ui.colored_label(LOOSE_LABEL, "Click the origin in the viewport");
-                }
-                ui.label(
-                    egui::RichText::new(
-                        "Counts include the original. A full turn spreads the instances \
-                         evenly all the way round; less than one puts the last one \
-                         exactly on the angle",
-                    )
-                    .weak(),
-                );
-                ui.label(
-                    egui::RichText::new(
-                        "The copies on screen are the pattern: OK keeps exactly what you \
-                         are looking at, Esc puts the sketch back",
-                    )
-                    .weak(),
-                );
-            } else {
-                // The count includes the seed, as Fusion's does, so "3" is what the user
-                // ends up looking at rather than what was added to what they drew.
-                ui.horizontal(|ui| {
-                    changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut p.count_x)
-                                .range(1..=64)
-                                .prefix("across "),
-                        )
-                        .changed();
-                    changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut p.distance_x)
-                                .speed(0.5)
-                                .prefix("dX ")
-                                .suffix(" mm"),
-                        )
-                        .changed();
-                });
-                ui.horizontal(|ui| {
-                    changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut p.count_y)
-                                .range(1..=64)
-                                .prefix("up "),
-                        )
-                        .changed();
-                    changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut p.distance_y)
-                                .speed(0.5)
-                                .prefix("dY ")
-                                .suffix(" mm"),
-                        )
-                        .changed();
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Distance is");
-                    changed |= ui
-                        .selectable_value(
-                            &mut p.spacing,
-                            sketch_mode::Spacing::Between,
-                            "between copies",
-                        )
-                        .changed();
-                    changed |= ui
-                        .selectable_value(&mut p.spacing, sketch_mode::Spacing::Total, "in total")
-                        .changed();
-                });
-                ui.label(
-                    egui::RichText::new("Counts include the original; 1 means no copies that way")
-                        .weak(),
-                );
-                ui.label(
-                    egui::RichText::new(
-                        "The copies on screen are the pattern: OK keeps exactly what you \
-                         are looking at, Esc puts the sketch back",
-                    )
-                    .weak(),
-                );
-            }
-            match s.pattern_status() {
-                Some((_, Some(error))) => {
-                    ui.colored_label(egui::Color32::from_rgb(230, 120, 100), error)
-                }
-                Some((copies, None)) => ui.colored_label(
-                    LOOSE_LABEL,
-                    match copies {
-                        1 => "1 copy".to_string(),
-                        n => format!("{n} copies"),
-                    },
-                ),
-                None => ui.label(""),
-            };
-            ui.horizontal(|ui| {
-                if ui.button("OK").clicked() {
-                    commands.push(Command::SketchPatternFinish(true));
-                }
-                if ui.button("Cancel").clicked() {
-                    commands.push(Command::SketchPatternFinish(false));
-                }
-            });
-            if changed {
-                commands.push(Command::SketchPatternUpdate);
-            }
-        }
         ui.separator();
         egui::CollapsingHeader::new("Parameters")
             .default_open(false)
             .show(ui, |ui| parameters_panel(s, ui, commands));
     });
+}
+
+/// The sketch's modal operations — Move and Pattern — in a window of their own.
+///
+/// They used to sit at the bottom of the sketch palette, below the tool hints, the
+/// degrees-of-freedom readout and the whole constraint list. On an ordinary window that
+/// put them past the fold of a scrolling panel, so the controls that a running operation
+/// is *driven by* could not be seen without knowing to scroll for them — and a pattern
+/// whose "Select origin" cannot be reached is a pattern whose origin cannot be set. An
+/// operation that owns the sketch belongs in front of the user for as long as it does,
+/// which is what the modelling tools already do with their dialog.
+fn sketch_operation_dialog(
+    editor: &mut Editor,
+    ctx: &egui::Context,
+    free: egui::Rect,
+    commands: &mut Vec<Command>,
+) {
+    let Mode::Sketch(s) = &mut editor.mode else {
+        return;
+    };
+    let title = match (s.move_in_progress(), s.pattern_in_progress()) {
+        (true, _) => "Move",
+        (_, true) => "Pattern",
+        _ => return,
+    };
+    let mut centre_on_selection = false;
+    let mut pick_center: Option<bool> = None;
+    egui::Window::new(title)
+        .id(egui::Id::new("sketch-operation"))
+        .collapsible(false)
+        .resizable(false)
+        .default_pos(free.right_top() + egui::vec2(-260.0, 16.0))
+        .show(ctx, |ui| {
+            ui.set_max_width(240.0);
+            if let Some(op) = s.move_op.as_mut() {
+                let mut changed = false;
+                for (value, label, unit) in [
+                    (&mut op.dx, "dX ", " mm"),
+                    (&mut op.dy, "dY ", " mm"),
+                    (&mut op.angle_deg, "rotate ", "°"),
+                ] {
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(value)
+                                .speed(0.5)
+                                .prefix(label)
+                                .suffix(unit),
+                        )
+                        .changed();
+                }
+                if let Some(why) = s.move_refused() {
+                    ui.colored_label(egui::Color32::from_rgb(235, 190, 90), why);
+                    ui.label(
+                        egui::RichText::new(
+                            "The geometry is left where it was. Delete or relax what is \
+                             holding it, or move it a way the constraints allow",
+                        )
+                        .weak(),
+                    );
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "Drag the arrows and the ring in the viewport, or type here. Enter \
+                         applies, Esc puts it back. Constraints still hold",
+                    )
+                    .weak(),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Apply").clicked() {
+                        commands.push(Command::SketchMoveFinish(true));
+                    }
+                    if ui.button("Cancel").clicked() {
+                        commands.push(Command::SketchMoveFinish(false));
+                    }
+                });
+                if changed {
+                    commands.push(Command::SketchMoveUpdate);
+                }
+            }
+            if s.pattern_in_progress() {
+                let mut changed = false;
+                let p = &mut s.pattern;
+                ui.horizontal(|ui| {
+                    changed |= ui
+                        .selectable_value(&mut p.circular, false, "Rectangular")
+                        .changed();
+                    changed |= ui
+                        .selectable_value(&mut p.circular, true, "Circular")
+                        .changed();
+                });
+                if p.circular {
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut p.count)
+                                .range(2..=usize::MAX)
+                                .prefix("instances "),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut p.angle_deg)
+                                .speed(1.0)
+                                .range(-360.0..=360.0)
+                                .prefix("through ")
+                                .suffix("\u{b0}"),
+                        )
+                        .changed();
+                    ui.label(egui::RichText::new("Centre").weak());
+                    ui.horizontal(|ui| {
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut p.center.x)
+                                    .speed(0.5)
+                                    .prefix("x ")
+                                    .suffix(" mm"),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut p.center.y)
+                                    .speed(0.5)
+                                    .prefix("y ")
+                                    .suffix(" mm"),
+                            )
+                            .changed();
+                    });
+                    ui.horizontal(|ui| {
+                        let picking = s.picking_pattern_center();
+                        if ui
+                            .add(egui::Button::new("Select origin").selected(picking))
+                            .on_hover_text(
+                                "Then click in the viewport: the centre snaps to an existing \
+                                 point if there is one under the pointer",
+                            )
+                            .clicked()
+                        {
+                            pick_center = Some(!picking);
+                        }
+                        if ui
+                            .button("Centre on selection")
+                            .on_hover_text("Put the centre at the middle of what is being repeated")
+                            .clicked()
+                        {
+                            centre_on_selection = true;
+                        }
+                    });
+                    if s.picking_pattern_center() {
+                        ui.colored_label(LOOSE_LABEL, "Click the origin in the viewport");
+                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "Counts include the original. A full turn spreads the instances \
+                             evenly all the way round; less than one puts the last one \
+                             exactly on the angle",
+                        )
+                        .weak(),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "The copies on screen are the pattern: OK keeps exactly what you \
+                             are looking at, Esc puts the sketch back",
+                        )
+                        .weak(),
+                    );
+                } else {
+                    // The count includes the seed, as Fusion's does, so "3" is what the user
+                    // ends up looking at rather than what was added to what they drew.
+                    ui.horizontal(|ui| {
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut p.count_x)
+                                    .range(1..=usize::MAX)
+                                    .prefix("across "),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut p.distance_x)
+                                    .speed(0.5)
+                                    .prefix("dX ")
+                                    .suffix(" mm"),
+                            )
+                            .changed();
+                    });
+                    ui.horizontal(|ui| {
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut p.count_y)
+                                    .range(1..=usize::MAX)
+                                    .prefix("up "),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut p.distance_y)
+                                    .speed(0.5)
+                                    .prefix("dY ")
+                                    .suffix(" mm"),
+                            )
+                            .changed();
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Distance is");
+                        changed |= ui
+                            .selectable_value(
+                                &mut p.spacing,
+                                sketch_mode::Spacing::Between,
+                                "between copies",
+                            )
+                            .changed();
+                        changed |= ui
+                            .selectable_value(
+                                &mut p.spacing,
+                                sketch_mode::Spacing::Total,
+                                "in total",
+                            )
+                            .changed();
+                    });
+                    ui.label(
+                        egui::RichText::new(
+                            "Counts include the original; 1 means no copies that way",
+                        )
+                        .weak(),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "The copies on screen are the pattern: OK keeps exactly what you \
+                             are looking at, Esc puts the sketch back",
+                        )
+                        .weak(),
+                    );
+                }
+                match s.pattern_status() {
+                    Some((_, Some(error))) => {
+                        ui.colored_label(egui::Color32::from_rgb(230, 120, 100), error)
+                    }
+                    Some((copies, None)) => ui.colored_label(
+                        LOOSE_LABEL,
+                        match copies {
+                            1 => "1 copy".to_string(),
+                            n => format!("{n} copies"),
+                        },
+                    ),
+                    None => ui.label(""),
+                };
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        commands.push(Command::SketchPatternFinish(true));
+                    }
+                    if ui.button("Cancel").clicked() {
+                        commands.push(Command::SketchPatternFinish(false));
+                    }
+                });
+                if changed {
+                    commands.push(Command::SketchPatternUpdate);
+                }
+            }
+        });
     if let Some(on) = pick_center {
         s.pick_pattern_center(on);
     }

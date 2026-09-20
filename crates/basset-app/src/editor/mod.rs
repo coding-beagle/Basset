@@ -500,7 +500,14 @@ impl Editor {
                 ("o", true, _) => self.open(),
                 ("n", true, _) => self.new_document(),
                 ("f", false, _) => self.zoom_to_fit(),
-                // 1-5 switch the selection filter, as in the toolbar.
+                // 1-5 switch the selection filter, as in the toolbar. A sketch has its
+                // own filter over its own kinds of thing, on the same keys.
+                (d @ ("1" | "2" | "3" | "4"), false, _) if matches!(self.mode, Mode::Sketch(_)) => {
+                    let i = d.parse::<usize>().unwrap_or(1) - 1;
+                    if let Mode::Sketch(s) = &mut self.mode {
+                        s.set_pick(sketch_mode::SketchPick::ALL[i]);
+                    }
+                }
                 (d @ ("1" | "2" | "3" | "4" | "5"), false, _) if !self.is_sketching() => {
                     let i = d.parse::<usize>().unwrap_or(1) - 1;
                     self.set_select_mode(SelectMode::ALL[i]);

@@ -1905,3 +1905,31 @@ fn an_odd_turn_drops_the_axis_constraints() {
         assert_relative_eq!(p.distance(q), 10.0, epsilon = 1e-9);
     }
 }
+
+/// A pattern has no arbitrary cap on its instances — a bolt circle of two hundred is an
+/// ordinary thing to ask for — but it does have a limit on the work, and reaching it
+/// says so rather than appearing to hang.
+#[test]
+fn a_pattern_may_be_large_but_not_unbounded() {
+    let mut s = Sketch::new();
+    let c = shapes::circle_center(&mut s, v(50.0, 0.0), 1.0);
+    let created =
+        crate::pattern::circular(&mut s, &[c.circle], Vec2::ZERO, 200, std::f64::consts::TAU)
+            .expect("two hundred holes is a reasonable pattern");
+    assert_eq!(created.len(), 199 * 2, "a centre and a circle per instance");
+
+    let mut s = Sketch::new();
+    let c = shapes::circle_center(&mut s, v(50.0, 0.0), 1.0);
+    let err = crate::pattern::circular(
+        &mut s,
+        &[c.circle],
+        Vec2::ZERO,
+        crate::pattern::MAX_PATTERN_ENTITIES,
+        std::f64::consts::TAU,
+    )
+    .expect_err("but not a hundred thousand");
+    assert!(
+        err.to_string().contains("entities"),
+        "and it says what the limit is: {err}"
+    );
+}

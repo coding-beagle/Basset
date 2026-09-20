@@ -11,6 +11,9 @@ struct VsIn {
     @builtin(vertex_index) vertex_index: u32,
     @location(0) a: vec3<f32>,
     @location(1) b: vec3<f32>,
+    // Distance from the start of the polyline to `a`, in world units, so a dash pattern
+    // runs on across the joins instead of restarting at every segment.
+    @location(2) start: f32,
 };
 
 struct VsOut {
@@ -50,15 +53,23 @@ fn vs_main(in: VsIn) -> VsOut {
     // Quad corners: (end, side) for the two triangles a-b-b', a-b'-a'.
     let use_b = in.vertex_index == 1u || in.vertex_index == 2u || in.vertex_index == 4u;
     let side = select(-1.0, 1.0, in.vertex_index == 2u || in.vertex_index == 4u || in.vertex_index == 5u);
+    // Where this segment starts in the pattern, converted from world units to pixels by
+    // this segment's own foreshortening. Exact for a flat overlay and close enough
+    // elsewhere, since the pattern only has to look even.
+    let world_len = length(in.b - in.a);
+    var base_px = 0.0;
+    if world_len > 1e-9 {
+        base_px = in.start * (len / world_len);
+    }
     // Extending the ends by half the width gives square caps so joined segments
     // don't show notches at corners.
     var pixel = pa - dir * half_width;
     var clip = ca;
-    out.along_px = -half_width;
+    out.along_px = base_px - half_width;
     if use_b {
         pixel = pb + dir * half_width;
         clip = cb;
-        out.along_px = len + half_width;
+        out.along_px = base_px + len + half_width;
     }
     pixel += normal * side * half_width;
 

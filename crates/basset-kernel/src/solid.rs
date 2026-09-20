@@ -546,6 +546,65 @@ impl Solid {
         self.faces.retain(|f| !f.polygons.is_empty());
     }
 
+    /// Joins faces that have grown into one continuous patch of surface.
+    ///
+    /// A boolean regroups the surviving fragments under the key of the face each came
+    /// from, so joining two extrusions that finish at the same height leaves the user's
+    /// one flat top as two or three faces. That is not a naming subtlety they can see:
+    /// they cannot select the top, sketch on the whole of it, or read its area, and an
+    /// exporter writes it as several patches. Faces that share an edge and continue
+    /// across it — the same test [`Solid::display_edges`] uses to draw nothing there —
+    /// are therefore collapsed into one.
+    ///
+    /// The survivor is the group's lowest [`FaceKey`], so the patch is named by the
+    /// earliest operation that made part of it and keeps that name as later features add
+    /// to it; references to the keys that lose fail loudly, like any other reference to a
+    /// face an edit has taken away. Faces of one operation are left alone: two coplanar
+    /// sides there are two named stretches of the profile, and dropping one of their
+    /// names would break a fillet written on it for no gain the user asked for.
+    pub(crate) fn merge_continuous_faces(&mut self) {
+        let (_, shared) = self.shared_polygon_edges();
+        let mut group: Vec<usize> = (0..self.faces.len()).collect();
+        fn root(group: &mut [usize], mut i: usize) -> usize {
+            while group[i] != i {
+                group[i] = group[group[i]];
+                i = group[i];
+            }
+            i
+        }
+        for users in shared.values() {
+            for (i, &(fa, _, na)) in users.iter().enumerate() {
+                for &(fb, _, nb) in &users[i + 1..] {
+                    if self.faces[fa].key.op == self.faces[fb].key.op
+                        || !self.continuous((fa, na), (fb, nb))
+                    {
+                        continue;
+                    }
+                    let (ra, rb) = (root(&mut group, fa), root(&mut group, fb));
+                    group[ra.max(rb)] = ra.min(rb);
+                }
+            }
+        }
+
+        // Rebuild in place: each group lands where its first face was, so face order
+        // stays the deterministic one the boolean produced.
+        let mut merged: Vec<Option<Face>> = (0..self.faces.len()).map(|_| None).collect();
+        for (i, face) in std::mem::take(&mut self.faces).into_iter().enumerate() {
+            let into = root(&mut group, i);
+            match &mut merged[into] {
+                None => merged[into] = Some(face),
+                Some(kept) => {
+                    if face.key < kept.key {
+                        kept.key = face.key;
+                        kept.surface = face.surface;
+                    }
+                    kept.polygons.extend(face.polygons);
+                }
+            }
+        }
+        self.faces = merged.into_iter().flatten().collect();
+    }
+
     /// Whether every polygon edge is shared by exactly one other polygon with opposite
     /// direction. Anything else means the shell leaks and later booleans will misbehave.
     pub fn is_closed(&self) -> bool {
@@ -1205,6 +1264,53 @@ mod tests {
         assert!(!cone(Vec3::ZERO, 0.5).continues(&cone(Vec3::new(0.0, 0.0, 1.0), 0.5)));
         // Nothing is known about a freeform surface, so nothing is assumed.
         assert!(!SurfaceKind::Freeform.continues(&SurfaceKind::Freeform));
+    }
+
+    /// The wall of one body carried on upwards by another: to the user that is one flat
+    /// face, and after a boolean it is one face here too, named by the earlier operation.
+    /// The same two halves made by *one* operation stay apart, because each is a named
+    /// stretch of that operation's profile.
+    #[test]
+    fn continuous_faces_of_different_operations_merge_into_one() {
+        for (op, faces, area) in [(1, 7, 0.5), (2, 6, 1.0)] {
+            let mut c = unit_cube();
+            let i = c
+                .faces
+                .iter()
+                .position(|f| f.key.role == FaceRole::Side(1))
+                .unwrap();
+            let v = |x: f64, y: f64, z: f64| Vec3::new(x, y, z);
+            c.faces[i].polygons = vec![
+                Polygon::new(vec![
+                    v(1., 0., 0.),
+                    v(1., 1., 0.),
+                    v(1., 1., 0.5),
+                    v(1., 0., 0.5),
+                ])
+                .unwrap(),
+            ];
+            c.faces.push(Face {
+                key: FaceKey::new(OpId::new(op), FaceRole::Side(4)),
+                surface: c.faces[i].surface,
+                polygons: vec![
+                    Polygon::new(vec![
+                        v(1., 0., 0.5),
+                        v(1., 1., 0.5),
+                        v(1., 1., 1.),
+                        v(1., 0., 1.),
+                    ])
+                    .unwrap(),
+                ],
+            });
+            c.heal();
+            c.merge_continuous_faces();
+            assert_eq!(c.faces.len(), faces, "op {op}");
+            assert!(c.is_closed(), "merging only regroups polygons");
+            let wall = c
+                .face(FaceKey::new(OpId::new(1), FaceRole::Side(1)))
+                .unwrap();
+            assert_relative_eq!(wall.area(), area);
+        }
     }
 
     /// A sketch line cut in two extrudes into two faces of one flat wall. The user drew a

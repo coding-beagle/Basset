@@ -24,25 +24,42 @@ impl MeshVertex {
     };
 }
 
-/// A line segment as stored in an instance buffer: both endpoints, `f32`.
+/// A line segment as stored in an instance buffer: both endpoints, `f32`, and how far
+/// along its polyline the segment starts.
+///
+/// `start` is what makes a dashed curve look dashed. The dash pattern is measured in
+/// pixels along the segment, and a tessellated curve is made of segments a few pixels
+/// long — shorter than one dash — so a pattern that restarted at every segment put every
+/// one of them inside a dash and drew the whole curve solid. Carrying the distance
+/// already travelled lets the pattern run on across the joins, so a dashed circle reads
+/// as dashed at the size it is actually drawn rather than only when zoomed into.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub(crate) struct SegmentInstance {
     pub a: [f32; 3],
     pub b: [f32; 3],
+    /// Distance from the start of this polyline to `a`, in world units.
+    pub start: f32,
+    _pad: f32,
 }
 
 impl SegmentInstance {
     pub const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
         array_stride: size_of::<SegmentInstance>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Instance,
-        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32],
     };
 
     pub fn new(a: Vec3, b: Vec3) -> Self {
+        Self::at(a, b, 0.0)
+    }
+
+    pub fn at(a: Vec3, b: Vec3, start: f64) -> Self {
         Self {
             a: a.as_vec3().to_array(),
             b: b.as_vec3().to_array(),
+            start: start as f32,
+            _pad: 0.0,
         }
     }
 }

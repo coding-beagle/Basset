@@ -72,6 +72,13 @@ Details worth knowing:
 * Overlapping coplanar faces with the same orientation survive a union twice; the
   volume is right but the face is doubled. Coplanar opposite faces (extruding from a
   face, cutting from a face) are handled.
+* A boolean regroups fragments under the key of the face each came from, which would
+  leave the flat top of two extrusions that finish at the same height as two faces, so
+  `merge_continuous_faces` collapses faces of *different* operations that share an edge
+  and continue across it into one, named by the group's lowest `FaceKey` — the earliest
+  operation that made part of it. Faces of one operation are left alone: two coplanar
+  sides there are two named stretches of one profile, and a fillet may be written on
+  either.
 * Booleans heal but do not validate, so a BSP result that leaks is neither reported nor
   visible: `display_edges` draws nothing along an edge only one polygon uses, on the
   grounds that painting the triangle soup helps nobody. Generators do validate, so the
@@ -195,6 +202,25 @@ view of the same surface (egui blends in gamma space, the viewport in linear). T
   was turned through (`pattern::turned`) rather than copying an axis constraint into a
   copy that contradicts it. Both failures used to look like a converged solve and a
   destroyed drawing.
+
+  Both also get a window of their own (`panels::sketch_operation_dialog`) rather than a
+  section at the bottom of the sketch palette. The controls an operation is driven by
+  have to be on screen for as long as it is running, and the palette is a scrolling panel
+  whose lower reaches are past the fold on an ordinary window — which made a pattern's
+  origin unsettable, because the button that arms picking it could not be reached.
+
+  Sketch mode has its own pick filter (`SketchPick`: all, curves, points, regions) beside
+  model mode's, over the kinds of thing a sketch has. It applies to the Select tool only:
+  drawing and snapping must still see every point whatever the user is choosing to
+  select.
+
+A dashed line carries the distance already travelled along its polyline
+(`SegmentInstance::start`), because the dash pattern is measured in pixels along a
+segment and a tessellated curve's segments are shorter than one dash — a pattern that
+restarted at each segment put every one inside a dash and drew the curve solid, so
+construction geometry was indistinguishable from ordinary geometry on anything small.
+The renderer accumulates that distance itself, starting a new run wherever a segment does
+not begin where the last one ended.
 
 The manipulator both kinds of move are dragged by lives in `editor::gizmo`: arrows for the
 directions a transform can travel along and rings for the axes it can turn about, chosen
