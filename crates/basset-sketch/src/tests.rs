@@ -979,6 +979,38 @@ fn crossing_curves_split_into_every_enclosed_region() {
 }
 
 #[test]
+fn geometry_drawn_on_top_of_itself_still_encloses_its_region() {
+    // A square whose outline is traced a second time. Every edge exists twice, which used
+    // to leave the face walk stepping between the copies and finding no region at all.
+    let mut s = Sketch::new();
+    shapes::rectangle_two_point(&mut s, v(0.0, 0.0), v(10.0, 10.0));
+    shapes::rectangle_two_point(&mut s, v(0.0, 0.0), v(10.0, 10.0));
+    let p = s.profiles(&tess());
+    assert_eq!(
+        p.len(),
+        1,
+        "the duplicate outline is one region, not two or none"
+    );
+    assert_relative_eq!(p[0].area(), 100.0, epsilon = 1e-9);
+    assert_eq!(p[0].outer.points.len(), 4, "and not a doubled boundary");
+}
+
+#[test]
+fn a_curve_overlapping_part_of_another_splits_both() {
+    // The long line runs the width of the square along its bottom edge and past it on both
+    // sides. Only the stretch they share is a duplicate; the overhangs are free ends that
+    // bound nothing, so the square is still exactly one region.
+    let mut s = Sketch::new();
+    shapes::rectangle_two_point(&mut s, v(0.0, 0.0), v(10.0, 10.0));
+    let a = s.add_point(v(-5.0, 0.0));
+    let b = s.add_point(v(15.0, 0.0));
+    s.add_line(a, b).unwrap();
+    let p = s.profiles(&tess());
+    assert_eq!(p.len(), 1);
+    assert_relative_eq!(p[0].area(), 100.0, epsilon = 1e-9);
+}
+
+#[test]
 fn a_chord_splits_a_circle_into_two_regions() {
     let mut s = Sketch::new();
     shapes::circle_center(&mut s, v(0.0, 0.0), 10.0);

@@ -2,32 +2,15 @@
 //! document exactly as the UI would, without a window or GPU.
 
 use basset_core::{BodyRef, FeatureKind, OriginPlane, PlaneRef, ProfileRef, RegionRef};
-use basset_math::{Ray, Vec2, Vec3};
+use basset_math::{Vec2, Vec3};
 use basset_sketch::Entity;
 
+use super::harness::{
+    block, click_at, click_with, dimension, draw_line, draw_rectangle, point_at, sketch, top_face,
+};
 use super::sketch_mode::{self, SketchTool};
 use super::tools::{self, ToolKind};
 use super::{Editor, Mode};
-
-/// A ray hitting the XY plane at `(x, y)` from above, as a click there would produce.
-fn click_at(x: f64, y: f64) -> Ray {
-    Ray::new(Vec3::new(x, y, 100.0), -Vec3::Z)
-}
-
-fn draw_rectangle(editor: &mut Editor, a: Vec2, b: Vec2) {
-    let camera = editor.camera;
-    let window = editor.window_px;
-    let Mode::Sketch(s) = &mut editor.mode else {
-        panic!("not sketching")
-    };
-    s.set_tool(SketchTool::Rectangle);
-    for p in [a, b] {
-        s.pointer_moved(&click_at(p.x, p.y), &camera, window, false);
-        s.pointer_up(&click_at(p.x, p.y), &camera, window, true, false);
-    }
-    assert!(s.take_dirty());
-    editor.commit_sketch();
-}
 
 #[test]
 fn sketch_mode_draws_and_finishes_a_profile() {
@@ -650,29 +633,6 @@ fn a_selected_region_is_drawn_filled() {
     );
 }
 
-/// Drives the dimension tool through two clicks and returns the constraint it made.
-fn dimension(
-    s: &mut sketch_mode::SketchEditor,
-    camera: &basset_viewport::Camera,
-    window: [u32; 2],
-    first: Vec2,
-    second: Vec2,
-) -> basset_sketch::Constraint {
-    s.set_tool(SketchTool::Dimension);
-    s.pointer_up(&click_at(first.x, first.y), camera, window, true, false);
-    s.pointer_up(&click_at(second.x, second.y), camera, window, true, false);
-    let (cid, _) = s.dim_edit.take().expect("dimension created");
-    s.sketch.constraint(cid).cloned().unwrap()
-}
-
-fn point_at(s: &sketch_mode::SketchEditor, p: Vec2) -> basset_sketch::EntityId {
-    s.sketch
-        .entities()
-        .find(|(_, e)| matches!(e.entity, Entity::Point { pos } if pos.distance(p) < 1e-6))
-        .map(|(id, _)| id)
-        .unwrap_or_else(|| panic!("no point at {p}"))
-}
-
 /// What the dimension tool measures follows from what was picked, as in Fusion: two
 /// parallel edges give their distance, a centre and an edge their distance, a circle
 /// alone its diameter, and two edges that are not parallel their angle.
@@ -698,7 +658,7 @@ fn dimension_tool_reads_the_picks_like_fusion() {
     let centre = point_at(s, Vec2::new(20.0, 5.0));
 
     // Bottom edge and top edge are parallel: distance between them.
-    let c = dimension(
+    let (_, c) = dimension(
         s,
         &camera,
         window,
@@ -715,7 +675,7 @@ fn dimension_tool_reads_the_picks_like_fusion() {
     assert!((value - 10.0).abs() < 1e-9, "{value}");
 
     // Circle centre and the bottom edge: distance from the point to the line.
-    let c = dimension(
+    let (_, c) = dimension(
         s,
         &camera,
         window,
@@ -729,7 +689,7 @@ fn dimension_tool_reads_the_picks_like_fusion() {
     assert!((value - 5.0).abs() < 1e-9, "{value}");
 
     // The circle's rim and the top edge: the circle stands in for its centre.
-    let c = dimension(
+    let (_, c) = dimension(
         s,
         &camera,
         window,
@@ -743,7 +703,7 @@ fn dimension_tool_reads_the_picks_like_fusion() {
     assert!((value - 5.0).abs() < 1e-9, "{value}");
 
     // Bottom edge and right edge are perpendicular: an angle.
-    let c = dimension(
+    let (_, c) = dimension(
         s,
         &camera,
         window,
@@ -794,7 +754,7 @@ fn angle_dimension_keeps_the_lines_where_they_are() {
     }
     s.finish_current();
     let tip = point_at(s, Vec2::new(10.0, -20.0));
-    let c = dimension(
+    let (_, c) = dimension(
         s,
         &camera,
         window,
@@ -963,35 +923,6 @@ fn slot_width_comes_from_a_third_click() {
         .collect();
     assert_eq!(radii.len(), 2);
     assert!(radii.iter().all(|r| (r - 2.0).abs() < 1e-9), "{radii:?}");
-}
-
-/// A base body for the tests below: a 10×10×2 block from a rectangle on XY.
-fn block(editor: &mut Editor) -> BodyRef {
-    sketch_mode::enter_new(editor, PlaneRef::Origin(OriginPlane::XY));
-    draw_rectangle(editor, Vec2::new(0.0, 0.0), Vec2::new(10.0, 10.0));
-    sketch_mode::finish(editor, true);
-    let sketch = editor.doc.timeline().features()[0].id;
-    let base = editor.doc.add_feature(FeatureKind::Extrude {
-        regions: vec![RegionRef::Profile(ProfileRef {
-            sketch,
-            sample: Vec2::new(5.0, 5.0),
-        })],
-        extent: basset_core::Extent::OneSide(2.0),
-        operation: basset_core::BodyOp::NewBody,
-        component: basset_core::ComponentId::ROOT,
-    });
-    editor.refresh_cache();
-    BodyRef(base)
-}
-
-fn top_face(body: BodyRef) -> basset_core::FaceRef {
-    basset_core::FaceRef {
-        body,
-        key: basset_core::FaceKey::new(
-            basset_kernel::OpId::new(body.0.0),
-            basset_core::FaceRole::EndCap,
-        ),
-    }
 }
 
 /// Create Sketch, then click a body's face: the sketch opens on that face, with its
@@ -1275,7 +1206,7 @@ fn dimensions_are_drawn_and_placed_by_their_label() {
         unreachable!()
     };
     s.snap_to_grid = false;
-    let c = dimension(
+    let (_, c) = dimension(
         s,
         &camera,
         window,
@@ -1311,41 +1242,6 @@ fn dimensions_are_drawn_and_placed_by_their_label() {
     let mut points = Vec::new();
     s.draw(&mut lines, &mut points);
     assert!(lines.iter().any(|l| l.segments.len() == 7));
-}
-
-/// Draws a line from `a` to `b` with the line tool and ends the chain.
-fn draw_line(editor: &mut Editor, a: Vec2, b: Vec2) {
-    let camera = editor.camera;
-    let window = editor.window_px;
-    let Mode::Sketch(s) = &mut editor.mode else {
-        panic!("not sketching")
-    };
-    s.set_tool(SketchTool::Line);
-    for p in [a, b] {
-        s.pointer_moved(&click_at(p.x, p.y), &camera, window, false);
-        s.pointer_up(&click_at(p.x, p.y), &camera, window, true, false);
-    }
-    s.finish_current();
-    editor.commit_sketch();
-}
-
-fn click_with(editor: &mut Editor, tool: SketchTool, at: Vec2) {
-    let camera = editor.camera;
-    let window = editor.window_px;
-    let Mode::Sketch(s) = &mut editor.mode else {
-        panic!("not sketching")
-    };
-    s.set_tool(tool);
-    s.pointer_moved(&click_at(at.x, at.y), &camera, window, false);
-    s.pointer_up(&click_at(at.x, at.y), &camera, window, true, false);
-    editor.commit_sketch();
-}
-
-fn sketch(editor: &mut Editor) -> &mut super::SketchEditor {
-    match &mut editor.mode {
-        Mode::Sketch(s) => s,
-        Mode::Model => panic!("not sketching"),
-    }
 }
 
 #[test]

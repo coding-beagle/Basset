@@ -2,18 +2,23 @@
 //!
 //! The algorithm is the classic planar face walk:
 //! 1. Flatten every line, arc and circle to a polyline.
-//! 2. Split those polylines wherever two of them cross, so the curves form a proper
-//!    planar subdivision and *every* enclosed region is a face, not just the ones the
-//!    user happened to draw with matching endpoints.
+//! 2. Split those polylines wherever two of them cross, and, where two run along each
+//!    other, at the ends of the stretch they share, so the curves form a proper planar
+//!    subdivision and *every* enclosed region is a face, not just the ones the user
+//!    happened to draw with matching endpoints.
 //! 3. Merge fragment endpoints within [`JOIN_TOL`] into graph nodes.
-//! 4. Every fragment becomes two opposite half-edges, each tagged with the tangent
+//! 4. Drop edges that repeat geometry another edge already carries. Geometry drawn twice
+//!    is common in a real drawing, and two edges of identical shape between the same two
+//!    nodes leave those nodes at the same angle, which the face walk in step 6 cannot
+//!    order: it steps between the copies and traces a sliver instead of the region.
+//! 5. Every fragment becomes two opposite half-edges, each tagged with the tangent
 //!    direction it leaves its node in (arcs use their true tangent, which is what makes
 //!    ordering correct where a line meets an arc).
-//! 5. Faces are traced by always taking the next outgoing edge in the smallest
+//! 6. Faces are traced by always taking the next outgoing edge in the smallest
 //!    clockwise turn from the reversed incoming edge. This walks every bounded face
 //!    counter-clockwise; the unbounded face comes out clockwise and is dropped.
-//! 6. Uncrossed circles and text glyph outlines are loops of their own.
-//! 7. Loops are nested by containment: every loop is a region in its own right, and any
+//! 7. Uncrossed circles and text glyph outlines are loops of their own.
+//! 8. Loops are nested by containment: every loop is a region in its own right, and any
 //!    loop directly inside it (from another connected component, with nothing between)
 //!    is punched out of it as a hole. A circle drawn inside a rectangle therefore yields
 //!    two regions — the rectangle-with-a-hole and the disc — which is what lets the user
@@ -117,6 +122,8 @@ pub(crate) fn profiles(sketch: &Sketch, tess: &Tessellation) -> Vec<Profile> {
             });
         }
     }
+
+    let edges = dedup(edges);
 
     // Outgoing half-edges per node, sorted counter-clockwise by departure angle.
     let mut outgoing: Vec<Vec<(f64, HalfEdge)>> = vec![Vec::new(); nodes.len()];
@@ -296,6 +303,23 @@ fn crossings(flats: &[Flat]) -> Vec<Vec<Split>> {
             }
             for (si, wa) in a.points.windows(2).enumerate() {
                 for (sj, wb) in b.points.windows(2).enumerate() {
+                    // Two curves lying on top of each other are cut at the ends of the
+                    // stretch they share, so the shared stretch is one fragment on each of
+                    // them rather than two fragments of unrelated extent; `dedup` then
+                    // keeps a single edge for it.
+                    if let Some(ends) = segment_overlap(wa[0], wa[1], wb[0], wb[1]) {
+                        for (ta, tb, point) in ends {
+                            splits[i].push(Split {
+                                at: si as f64 + ta,
+                                point,
+                            });
+                            splits[j].push(Split {
+                                at: sj as f64 + tb,
+                                point,
+                            });
+                        }
+                        continue;
+                    }
                     let Some((ta, tb)) = segment_crossing(wa[0], wa[1], wb[0], wb[1]) else {
                         continue;
                     };
@@ -334,8 +358,8 @@ fn crossings(flats: &[Flat]) -> Vec<Vec<Split>> {
 }
 
 /// Parameters `(ta, tb)` in `[0, 1]` where the two segments meet, or `None` if they are
-/// parallel or miss. Collinear overlaps report nothing: they add no region boundary, and
-/// the shared stretch would produce fragments of zero width.
+/// parallel or miss. Parallel segments are [`segment_overlap`]'s business: there is no
+/// single crossing point to report, only a shared stretch.
 fn segment_crossing(a0: Vec2, a1: Vec2, b0: Vec2, b1: Vec2) -> Option<(f64, f64)> {
     let r = a1 - a0;
     let s = b1 - b0;
@@ -349,6 +373,50 @@ fn segment_crossing(a0: Vec2, a1: Vec2, b0: Vec2, b1: Vec2) -> Option<(f64, f64)
     let ta = d.perp_dot(s) / denom;
     let tb = d.perp_dot(r) / denom;
     ((0.0..=1.0).contains(&ta) && (0.0..=1.0).contains(&tb)).then_some((ta, tb))
+}
+
+/// The two ends of the stretch two collinear segments share, as `(parameter on a,
+/// parameter on b, the point)`, or `None` when they are not collinear or share at most a
+/// point.
+///
+/// Overlapping geometry is ordinary in a real drawing: an edge traced a second time, a
+/// rectangle drawn over the outline of another. The graph has to cut both curves at the
+/// ends of the shared stretch, because only then is the overlap a fragment with the same
+/// endpoints on both curves — a duplicate that [`dedup`] can drop. Left uncut, the two
+/// curves contribute edges of different extent and the region they bound is never traced.
+///
+/// Each end is an endpoint of one of the two segments, and that exact point is reported
+/// rather than one reconstructed from a parameter, so both curves are cut at coordinates
+/// that merge into one node.
+fn segment_overlap(a0: Vec2, a1: Vec2, b0: Vec2, b1: Vec2) -> Option<[(f64, f64, Vec2); 2]> {
+    let r = a1 - a0;
+    let s = b1 - b0;
+    let (la, ls) = (r.length(), s.length());
+    if la <= JOIN_TOL || ls <= JOIN_TOL {
+        return None;
+    }
+    if r.perp_dot(s).abs() > 1e-12 * la * ls {
+        return None;
+    }
+    // Parallel is not enough: the segments must lie on the same line, within the tolerance
+    // the graph merges nodes at.
+    if (r / la).perp_dot(b0 - a0).abs() > JOIN_TOL {
+        return None;
+    }
+    // Both segments as intervals in a's parameter. The middle two of the four sorted ends
+    // bound the intersection of the intervals, and each of them is a real endpoint.
+    let param_a = |p: Vec2| (p - a0).dot(r) / (la * la);
+    let mut ends = [(0.0, a0), (1.0, a1), (param_a(b0), b0), (param_a(b1), b1)];
+    ends.sort_by(|x, y| x.0.total_cmp(&y.0));
+    let (lo, hi) = (ends[1], ends[2]);
+    if (hi.0 - lo.0) * la <= JOIN_TOL {
+        return None;
+    }
+    let param_b = |p: Vec2| ((p - b0).dot(s) / (ls * ls)).clamp(0.0, 1.0);
+    Some([
+        (lo.0.clamp(0.0, 1.0), param_b(lo.1), lo.1),
+        (hi.0.clamp(0.0, 1.0), param_b(hi.1), hi.1),
+    ])
 }
 
 /// Cuts a flattened curve at its crossings. Returns nothing when the curve is not cut into
@@ -449,6 +517,47 @@ fn closed_curve_loop(flat: &Flat, next_component: &mut usize) -> Loop {
         area,
         text: None,
     }
+}
+
+/// Drops edges that repeat geometry another edge already carries.
+///
+/// Two edges between the same nodes with the same shape leave their nodes at the same
+/// angle, so the walk cannot tell which of them continues a face and steps between the
+/// copies instead, tracing a zero-area sliver and marking the region's real half-edges
+/// visited on the way. Keeping one edge per distinct stretch of geometry is what makes a
+/// drawing whose outline was traced twice still enclose its regions. Which copy survives
+/// decides the curve the kernel names the resulting face after, and between identical
+/// curves that choice is arbitrary.
+fn dedup(edges: Vec<Edge>) -> Vec<Edge> {
+    let mut kept: Vec<(Vec2, Edge)> = Vec::with_capacity(edges.len());
+    for edge in edges {
+        let mid = polyline_midpoint(&edge.polyline);
+        let same = |(m, k): &(Vec2, Edge)| {
+            (k.nodes == edge.nodes || k.nodes == [edge.nodes[1], edge.nodes[0]])
+                && m.distance(mid) <= JOIN_TOL
+        };
+        if !kept.iter().any(same) {
+            kept.push((mid, edge));
+        }
+    }
+    kept.into_iter().map(|(_, e)| e).collect()
+}
+
+/// The point half way along a polyline by arc length. Together with the endpoints this
+/// identifies the stretch: it is what tells the two arcs that share a chord apart, which
+/// centre and radius alone do not.
+fn polyline_midpoint(points: &[Vec2]) -> Vec2 {
+    let half = points.windows(2).map(|w| w[0].distance(w[1])).sum::<f64>() / 2.0;
+    let mut walked = 0.0;
+    for w in points.windows(2) {
+        let d = w[0].distance(w[1]);
+        if walked + d >= half {
+            let t = if d > 0.0 { (half - walked) / d } else { 0.0 };
+            return w[0].lerp(w[1], t);
+        }
+        walked += d;
+    }
+    points[0]
 }
 
 fn node_of(nodes: &mut Vec<Vec2>, p: Vec2) -> usize {

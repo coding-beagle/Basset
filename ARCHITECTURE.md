@@ -87,7 +87,10 @@ the kernel can give the resulting side faces stable keys and correct surface kin
 Splitting happens on the tessellated curves and both sides are cut at the identical
 point, so the graph stays watertight and the boundary is as accurate as the tessellation
 the kernel consumes anyway. Two fragments of one curve bounding the same region share a
-curve tag, and so become one kernel face in two pieces rather than two faces.
+curve tag, and so become one kernel face in two pieces rather than two faces. Curves that
+run along each other are cut at the ends of the stretch they share and the duplicate is
+dropped, so an outline traced twice still encloses its regions; which copy survives, and
+therefore which curve names the face, is arbitrary between identical curves.
 
 Curves are trimmed and broken by cutting them at the analytic intersections with every
 other curve, which divides a curve into pieces named by parameter ranges: trim drops the
@@ -152,3 +155,18 @@ table of screen positions.
 
 Panels never hold `&mut Editor` while borrowing document state: they queue commands that
 run after the frame's UI closure returns.
+
+## Testing the application headlessly
+
+`basset-app`'s `editor::harness` drives the program with no window and no GPU. It feeds
+the editor real winit events (pointer moves, buttons, the wheel), runs the egui panels
+for a frame and reads back the text they laid out — so a test can click a toolbar button
+by its label — and builds the `Scene` the renderer would draw, which is how tests assert
+on what is on screen. Model-space helpers turn a point in millimetres into the pixel it
+occupies through the camera, so clicks exercise the same projection and pixel tolerances
+picking uses. Two things a window supplies cannot be forged, because winit keeps their
+fields private: `KeyEvent` and `Modifiers`. Keys go to `Editor::on_key` (what
+`handle_window_event` does with them) and modifier state is written where the event would
+have put it. `editor::tests` covers the interaction logic tool by tool; `editor::e2e`
+covers the seams above it — events in, panels and scene out, and a document round trip
+through a file.

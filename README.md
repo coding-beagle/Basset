@@ -27,7 +27,7 @@ honest list of kernel limitations.
 ```sh
 cargo build --release
 cargo run --release -p basset-app            # optionally: -- path/to/model.bass
-cargo test --workspace
+cargo test --workspace                       # includes headless tests of the app
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 

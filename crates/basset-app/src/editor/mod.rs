@@ -14,6 +14,10 @@ mod tools;
 mod viewcube;
 
 #[cfg(test)]
+mod e2e;
+#[cfg(test)]
+pub(crate) mod harness;
+#[cfg(test)]
 mod tests;
 
 use std::collections::{HashMap, HashSet};
