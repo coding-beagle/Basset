@@ -1,0 +1,14 @@
+[package]
+name = "basset-math"
+description = "Shared numeric foundations for Basset: vectors, frames, tolerances, and the triangle mesh interchange type."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+glam = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }

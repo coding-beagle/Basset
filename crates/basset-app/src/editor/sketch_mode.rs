@@ -1,0 +1,2604 @@
+//! Sketch mode: drawing and constraining 2D geometry on one plane.
+//!
+//! The editor works on a copy of the sketch and writes it back into the feature after
+//! every change, so the rest of the model (extrudes, fillets…) updates live while the
+//! user draws. Points are snapped to existing points within a screen-space tolerance
+//! and joined by sharing the point entity, which is how a closed loop of lines becomes
+//! a profile without the user thinking about coincidence constraints.
+//!
+//! Points that snap to nothing land on the grid instead. The increment follows the zoom
+//! like the drawn grid does, so the user is always snapping to something they can see,
+//! and can be pinned to a fixed value when a drawing calls for one.
+//!
+//! While a shape is being drawn its sizes can also be typed. A typed value pins that
+//! size while the pointer keeps choosing direction and side, and once the shape exists
+//! the value becomes a driving dimension, the way Fusion's entry boxes work: what the
+//! user stated stays true under later edits, what they merely pointed at stays free.
+
+use basset_core::{FeatureId, FeatureKind, PlaneRef, ProfileRef};
+use basset_math::{Frame, Ray, Vec2, Vec3};
+use basset_sketch::{
+    Constraint, ConstraintId, Entity, EntityId, Profile, Sketch, SketchError, SolveReport,
+    Tessellation, edit, pattern, shapes,
+};
+use basset_viewport::{Camera, LineBatch, PointBatch, grid};
+
+use super::Editor;
+
+/// Half-length of a crosshair arm, in pixels.
+const CURSOR_ARM_PX: f64 = 14.0;
+/// Pixels left clear around the centre, so the marker itself stays readable.
+const CURSOR_GAP_PX: f64 = 4.0;
+/// Lines whose directions differ by less than this are dimensioned by distance rather
+/// than by angle. It is far below anything drawn by hand, so only lines that are
+/// parallel by construction (grid, constraint) qualify, as in Fusion.
+const PARALLEL_TOL: f64 = 1e-6;
+/// Arrowhead length of a dimension line, in pixels.
+const ARROW_PX: f64 = 9.0;
+/// How far an unplaced dimension sits from what it measures, in pixels.
+const LABEL_GAP_PX: f64 = 28.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SketchTool {
+    Select,
+    Line,
+    Rectangle,
+    CenterRectangle,
+    Circle,
+    Circle2Point,
+    Circle3Point,
+    Arc3Point,
+    ArcCenter,
+    Polygon,
+    /// Centre to centre, then the width.
+    Slot,
+    /// End to end, then the width: the overall length is what was drawn.
+    SlotOverall,
+    /// Centre of the slot, one arc centre, then the width.
+    SlotCenterPoint,
+    Text,
+    Dimension,
+    /// Removes the piece of a curve between the crossings either side of the click.
+    Trim,
+    /// Cuts a curve at its crossings without removing anything.
+    Break,
+}
+
+/// A toolbar button. Variants of one shape (the three ways to draw a circle…) share a
+/// button, as they do in Fusion: the button shows the variant last used, and holding it
+/// or right-clicking lists the others.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolGroup {
+    Select,
+    Line,
+    Rectangle,
+    Circle,
+    Arc,
+    Polygon,
+    Slot,
+    Text,
+    Dimension,
+    Trim,
+}
+
+impl ToolGroup {
+    pub const ALL: [ToolGroup; 10] = [
+        ToolGroup::Select,
+        ToolGroup::Line,
+        ToolGroup::Rectangle,
+        ToolGroup::Circle,
+        ToolGroup::Arc,
+        ToolGroup::Polygon,
+        ToolGroup::Slot,
+        ToolGroup::Text,
+        ToolGroup::Dimension,
+        ToolGroup::Trim,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ToolGroup::Select => "Select",
+            ToolGroup::Line => "Line",
+            ToolGroup::Rectangle => "Rectangle",
+            ToolGroup::Circle => "Circle",
+            ToolGroup::Arc => "Arc",
+            ToolGroup::Polygon => "Polygon",
+            ToolGroup::Slot => "Slot",
+            ToolGroup::Text => "Text",
+            ToolGroup::Dimension => "Dimension",
+            ToolGroup::Trim => "Trim",
+        }
+    }
+
+    /// The tools folded under this button, the default first.
+    pub fn variants(self) -> &'static [SketchTool] {
+        match self {
+            ToolGroup::Select => &[SketchTool::Select],
+            ToolGroup::Line => &[SketchTool::Line],
+            ToolGroup::Rectangle => &[SketchTool::Rectangle, SketchTool::CenterRectangle],
+            ToolGroup::Circle => &[
+                SketchTool::Circle,
+                SketchTool::Circle2Point,
+                SketchTool::Circle3Point,
+            ],
+            ToolGroup::Arc => &[SketchTool::Arc3Point, SketchTool::ArcCenter],
+            ToolGroup::Polygon => &[SketchTool::Polygon],
+            ToolGroup::Slot => &[
+                SketchTool::Slot,
+                SketchTool::SlotOverall,
+                SketchTool::SlotCenterPoint,
+            ],
+            ToolGroup::Text => &[SketchTool::Text],
+            ToolGroup::Dimension => &[SketchTool::Dimension],
+            ToolGroup::Trim => &[SketchTool::Trim, SketchTool::Break],
+        }
+    }
+}
+
+impl SketchTool {
+    pub fn name(self) -> &'static str {
+        match self {
+            SketchTool::Select => "Select",
+            SketchTool::Line => "Line",
+            SketchTool::Rectangle => "Rectangle (2 pt)",
+            SketchTool::CenterRectangle => "Rectangle (centre)",
+            SketchTool::Circle => "Circle (centre)",
+            SketchTool::Circle2Point => "Circle (2 pt)",
+            SketchTool::Circle3Point => "Circle (3 pt)",
+            SketchTool::Arc3Point => "Arc (3 pt)",
+            SketchTool::ArcCenter => "Arc (centre)",
+            SketchTool::Polygon => "Polygon",
+            SketchTool::Slot => "Slot (centre to centre)",
+            SketchTool::SlotOverall => "Slot (overall)",
+            SketchTool::SlotCenterPoint => "Slot (centre point)",
+            SketchTool::Text => "Text",
+            SketchTool::Dimension => "Dimension",
+            SketchTool::Trim => "Trim",
+            SketchTool::Break => "Break",
+        }
+    }
+
+    pub fn group(self) -> ToolGroup {
+        match self {
+            SketchTool::Select => ToolGroup::Select,
+            SketchTool::Line => ToolGroup::Line,
+            SketchTool::Rectangle | SketchTool::CenterRectangle => ToolGroup::Rectangle,
+            SketchTool::Circle | SketchTool::Circle2Point | SketchTool::Circle3Point => {
+                ToolGroup::Circle
+            }
+            SketchTool::Arc3Point | SketchTool::ArcCenter => ToolGroup::Arc,
+            SketchTool::Polygon => ToolGroup::Polygon,
+            SketchTool::Slot | SketchTool::SlotOverall | SketchTool::SlotCenterPoint => {
+                ToolGroup::Slot
+            }
+            SketchTool::Text => ToolGroup::Text,
+            SketchTool::Dimension => ToolGroup::Dimension,
+            SketchTool::Trim | SketchTool::Break => ToolGroup::Trim,
+        }
+    }
+
+    /// Clicks needed before the shape exists.
+    fn clicks(self) -> usize {
+        match self {
+            SketchTool::Select
+            | SketchTool::Line
+            | SketchTool::Dimension
+            | SketchTool::Trim
+            | SketchTool::Break => 0,
+            SketchTool::Text => 1,
+            SketchTool::Circle3Point
+            | SketchTool::Arc3Point
+            | SketchTool::ArcCenter
+            | SketchTool::Slot
+            | SketchTool::SlotOverall
+            | SketchTool::SlotCenterPoint => 3,
+            _ => 2,
+        }
+    }
+
+    /// Sizes that can be typed while the shape is being drawn, in Tab order.
+    pub fn dims(self) -> &'static [Dim] {
+        match self {
+            SketchTool::Line => &[Dim::Length, Dim::Angle],
+            SketchTool::Rectangle | SketchTool::CenterRectangle => &[Dim::Width, Dim::Height],
+            SketchTool::Circle | SketchTool::Circle2Point => &[Dim::Diameter],
+            SketchTool::ArcCenter | SketchTool::Polygon => &[Dim::Radius],
+            SketchTool::Slot | SketchTool::SlotOverall | SketchTool::SlotCenterPoint => {
+                &[Dim::Length, Dim::Width]
+            }
+            _ => &[],
+        }
+    }
+}
+
+/// A size of the shape being drawn that the user may type instead of pointing at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dim {
+    Length,
+    Angle,
+    Width,
+    Height,
+    Diameter,
+    Radius,
+}
+
+impl Dim {
+    pub fn label(self) -> &'static str {
+        match self {
+            Dim::Length => "Length",
+            Dim::Angle => "Angle",
+            Dim::Width => "Width",
+            Dim::Height => "Height",
+            Dim::Diameter => "Diameter",
+            Dim::Radius => "Radius",
+        }
+    }
+
+    pub fn unit(self) -> &'static str {
+        match self {
+            Dim::Angle => "°",
+            _ => "mm",
+        }
+    }
+}
+
+/// One entry box for one [`Dim`] of the current tool. Until the user types into it the
+/// box mirrors the size the pointer is currently drawing, as Fusion's do; typing locks
+/// it, and a locked value is what the shape gets regardless of the pointer.
+#[derive(Clone, Debug)]
+pub struct Entry {
+    pub dim: Dim,
+    pub text: String,
+    pub locked: bool,
+}
+
+impl Entry {
+    /// The locked value in sketch units (mm, or radians for angles). Sizes are taken
+    /// unsigned because the pointer decides which way the shape grows; `None` while the
+    /// box is live, empty, unparsable or zero.
+    pub fn value(&self) -> Option<f64> {
+        if !self.locked {
+            return None;
+        }
+        let v: f64 = self.text.trim().parse().ok()?;
+        if !v.is_finite() {
+            return None;
+        }
+        match self.dim {
+            Dim::Angle => Some(v.to_radians()),
+            _ => (v != 0.0).then_some(v.abs()),
+        }
+    }
+}
+
+fn typed_value(entries: &[Entry], dim: Dim) -> Option<f64> {
+    entries.iter().find(|e| e.dim == dim).and_then(Entry::value)
+}
+
+/// Everything a shape needs besides its clicks: palette settings and typed sizes.
+#[derive(Clone, Debug)]
+struct ShapeParams {
+    sides: usize,
+    text: String,
+    text_height: f64,
+    typed: Vec<(Dim, f64)>,
+}
+
+impl ShapeParams {
+    fn typed(&self, dim: Dim) -> Option<f64> {
+        self.typed.iter().find(|(d, _)| *d == dim).map(|(_, v)| *v)
+    }
+}
+
+/// Where a click landed: the snapped position and, if it snapped, the point entity.
+#[derive(Clone, Copy)]
+struct Click {
+    pos: Vec2,
+    snapped: Option<EntityId>,
+}
+
+/// Geometry being dragged with the select tool: every point that moves, with where it
+/// started, and where the pointer went down. Each point is offered the same offset as a
+/// goal and the constraints decide how much of it survives.
+#[derive(Clone)]
+struct Drag {
+    points: Vec<(EntityId, Vec2)>,
+    press: Vec2,
+}
+
+/// A dimension drawn the way a mechanical drawing shows it: extension lines, a
+/// dimension line with arrowheads (or a leader), and the value at `label`.
+#[derive(Clone, Debug)]
+pub struct DimGraphic {
+    pub id: ConstraintId,
+    /// World position of the value text.
+    pub label: Vec3,
+    pub text: String,
+    pub segments: Vec<[Vec3; 2]>,
+}
+
+/// A keyboard-driven move of the selection. The numbers are typed rather than dragged,
+/// which is the whole point: a part goes exactly where the drawing says, and the
+/// constraints still decide how much of the offer they will take.
+#[derive(Clone, Debug)]
+pub struct MoveOp {
+    pub dx: f64,
+    pub dy: f64,
+    pub angle_deg: f64,
+    /// Every point that moves, at the position it held when the move began, so the
+    /// numbers always mean an offset from the start rather than from the last keystroke.
+    start: Vec<(EntityId, Vec2)>,
+    /// What the rotation turns about: the centre of what is being moved.
+    pivot: Vec2,
+}
+
+impl MoveOp {
+    /// Where a point should end up under the current numbers.
+    fn target(&self, from: Vec2) -> Vec2 {
+        let turned =
+            self.pivot + Vec2::from_angle(self.angle_deg.to_radians()).rotate(from - self.pivot);
+        turned + Vec2::new(self.dx, self.dy)
+    }
+}
+
+/// Settings of the pattern palette, kept between uses so repeating a pattern is one
+/// click rather than four numbers again.
+#[derive(Clone, Debug)]
+pub struct PatternParams {
+    pub circular: bool,
+    pub cols: usize,
+    pub rows: usize,
+    pub dx: f64,
+    pub dy: f64,
+    pub count: usize,
+    pub angle_deg: f64,
+    pub center: Vec2,
+}
+
+impl Default for PatternParams {
+    fn default() -> Self {
+        Self {
+            circular: false,
+            cols: 3,
+            rows: 1,
+            dx: 10.0,
+            dy: 10.0,
+            count: 6,
+            angle_deg: 360.0,
+            center: Vec2::ZERO,
+        }
+    }
+}
+
+/// Rubber-band selection in progress.
+#[derive(Clone, Copy)]
+struct Marquee {
+    start: Vec2,
+    current: Vec2,
+}
+
+impl Marquee {
+    /// Dragging leftwards means *crossing*: anything the rectangle touches is selected.
+    /// Dragging rightwards is a window: only what lies wholly inside. This is the CAD
+    /// convention every user of Fusion or AutoCAD already has in their fingers.
+    fn crossing(&self) -> bool {
+        self.current.x < self.start.x
+    }
+
+    fn corners(&self) -> [Vec2; 4] {
+        let (a, b) = (self.start, self.current);
+        [a, Vec2::new(b.x, a.y), b, Vec2::new(a.x, b.y)]
+    }
+}
+
+pub struct SketchEditor {
+    pub feature: FeatureId,
+    pub frame: Frame,
+    pub sketch: Sketch,
+    pub tool: SketchTool,
+    /// Which variant each folded toolbar button shows, so going back to Circle gives
+    /// the kind of circle used last.
+    pub last_variant: Vec<SketchTool>,
+    pub hover: Option<EntityId>,
+    /// Closed region under the pointer when nothing else is, as an index into
+    /// [`Self::profiles`]. Clicking it selects the curves around it.
+    pub hover_region: Option<usize>,
+    /// Where the next click will land, with typed sizes applied.
+    pub cursor: Option<Vec2>,
+    /// True when [`Self::cursor`] came from an existing point rather than the grid, so the
+    /// marker can tell the user their next click will join geometry instead of making a
+    /// new point.
+    pub cursor_snapped: bool,
+    /// World size of one pixel at the cursor, so the marker keeps its size on screen.
+    cursor_px: f64,
+    /// The snapped pointer position before typed sizes are applied, kept so the cursor
+    /// can be recomputed when an entry box changes without the pointer moving.
+    raw_cursor: Option<Vec2>,
+    pub selected: Vec<EntityId>,
+    pub polygon_sides: usize,
+    pub text: String,
+    pub text_height: f64,
+    /// Entry boxes for the current tool's sizes; empty for tools without any.
+    pub entries: Vec<Entry>,
+    /// Entry box that should take keyboard focus on the next frame, set when the user
+    /// starts typing a number with the pointer in the viewport.
+    pub entry_focus: Option<usize>,
+    pub dim_edit: Option<(ConstraintId, String)>,
+    pub report: Option<Result<SolveReport, String>>,
+    pub snap_to_grid: bool,
+    /// A step the user pinned, or `None` to follow the zoom.
+    pub fixed_grid_step: Option<f64>,
+    /// The step actually in use, for the palette to display. Updated as the pointer moves
+    /// because it depends on the zoom.
+    pub grid_step: f64,
+    clicks: Vec<Click>,
+    /// Last point of a line chain, so consecutive lines share their joint.
+    chain_end: Option<EntityId>,
+    drag: Option<Drag>,
+    marquee: Option<Marquee>,
+    /// Closed regions of the current geometry, recomputed after every change. The
+    /// select tool offers them as pickable things, the way a face is in model mode.
+    profiles: Vec<Profile>,
+    /// First pick of the dimension tool, waiting for the second pick or a placing click.
+    pub dim_first: Option<EntityId>,
+    /// Closed regions the user has picked, named by a point inside each of them so they
+    /// survive the re-solve that every edit causes. This is what `E` extrudes.
+    pub selected_regions: Vec<Vec2>,
+    /// The piece the trim tool would remove if clicked now, drawn as a warning.
+    trim_preview: Option<Vec<Vec2>>,
+    /// A keyboard-driven move of the selection, started with `M`.
+    pub move_op: Option<MoveOp>,
+    /// Settings of the pattern dialog, kept between uses.
+    pub pattern: PatternParams,
+    /// Editable text of the parameter panel: what the user is typing, which is not the
+    /// same as what the sketch has accepted.
+    pub param_drafts: Vec<(String, String)>,
+    pub new_param: (String, String),
+    pub param_error: Option<String>,
+    undo: Vec<Sketch>,
+    redo: Vec<Sketch>,
+    dirty: bool,
+    saved_camera: Camera,
+    /// Cursor to put back when an edit of an existing sketch ends.
+    restore_cursor: Option<usize>,
+    tess: Tessellation,
+}
+
+impl SketchEditor {
+    fn new(feature: FeatureId, frame: Frame, sketch: Sketch, saved_camera: Camera) -> Self {
+        let mut s = Self {
+            feature,
+            frame,
+            sketch,
+            tool: SketchTool::Line,
+            last_variant: ToolGroup::ALL.iter().map(|g| g.variants()[0]).collect(),
+            hover: None,
+            hover_region: None,
+            cursor: None,
+            cursor_snapped: false,
+            cursor_px: 1.0,
+            raw_cursor: None,
+            selected: Vec::new(),
+            polygon_sides: 6,
+            text: "Text".into(),
+            text_height: 10.0,
+            entries: Vec::new(),
+            entry_focus: None,
+            dim_edit: None,
+            report: None,
+            snap_to_grid: true,
+            fixed_grid_step: None,
+            grid_step: 1.0,
+            clicks: Vec::new(),
+            chain_end: None,
+            drag: None,
+            marquee: None,
+            profiles: Vec::new(),
+            dim_first: None,
+            selected_regions: Vec::new(),
+            trim_preview: None,
+            move_op: None,
+            pattern: PatternParams::default(),
+            param_drafts: Vec::new(),
+            new_param: (String::new(), String::new()),
+            param_error: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            dirty: false,
+            saved_camera,
+            restore_cursor: None,
+            tess: Tessellation::default(),
+        };
+        s.reset_entries();
+        s.solve();
+        s
+    }
+
+    pub fn take_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
+    }
+
+    pub fn has_pending(&self) -> bool {
+        !self.clicks.is_empty() || self.chain_end.is_some() || self.dim_first.is_some()
+    }
+
+    pub fn move_in_progress(&self) -> bool {
+        self.move_op.is_some()
+    }
+
+    pub fn select_tool(&mut self) {
+        self.set_tool(SketchTool::Select);
+    }
+
+    pub fn set_tool(&mut self, tool: SketchTool) {
+        self.cancel_current();
+        self.tool = tool;
+        let slot = ToolGroup::ALL
+            .iter()
+            .position(|g| *g == tool.group())
+            .unwrap_or(0);
+        self.last_variant[slot] = tool;
+        self.reset_entries();
+    }
+
+    /// The variant a toolbar button currently stands for.
+    pub fn variant_of(&self, group: ToolGroup) -> SketchTool {
+        ToolGroup::ALL
+            .iter()
+            .position(|g| *g == group)
+            .map(|i| self.last_variant[i])
+            .unwrap_or(group.variants()[0])
+    }
+
+    pub fn cancel_current(&mut self) {
+        self.finish_move(false);
+        self.trim_preview = None;
+        self.clicks.clear();
+        self.chain_end = None;
+        self.dim_first = None;
+        self.drag = None;
+        self.marquee = None;
+        self.reset_entries();
+    }
+
+    /// Ends a line chain (right click / Enter) without leaving the tool.
+    pub fn finish_current(&mut self) {
+        self.cancel_current();
+    }
+
+    /// Empties the entry boxes. Typed sizes belong to one shape; the next one starts
+    /// from what the pointer says, as it does in Fusion.
+    fn reset_entries(&mut self) {
+        self.entries = self
+            .tool
+            .dims()
+            .iter()
+            .map(|dim| Entry {
+                dim: *dim,
+                text: String::new(),
+                locked: false,
+            })
+            .collect();
+        self.entry_focus = None;
+        self.refresh_cursor();
+    }
+
+    fn checkpoint(&mut self) {
+        self.undo.push(self.sketch.clone());
+        if self.undo.len() > 100 {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    pub fn undo(&mut self) -> bool {
+        let Some(prev) = self.undo.pop() else {
+            return false;
+        };
+        self.redo.push(std::mem::replace(&mut self.sketch, prev));
+        self.after_change();
+        true
+    }
+
+    pub fn redo(&mut self) -> bool {
+        let Some(next) = self.redo.pop() else {
+            return false;
+        };
+        self.undo.push(std::mem::replace(&mut self.sketch, next));
+        self.after_change();
+        true
+    }
+
+    fn after_change(&mut self) {
+        self.solve();
+        self.selected.retain(|id| self.sketch.entity(*id).is_some());
+        // A region that the edit opened up is no longer selectable; one that merely
+        // changed shape still contains its sample point and stays picked.
+        let profiles = std::mem::take(&mut self.profiles);
+        self.selected_regions
+            .retain(|p| profiles.iter().any(|f| f.contains(*p)));
+        self.profiles = profiles;
+        self.dirty = true;
+    }
+
+    fn solve(&mut self) {
+        self.report = Some(self.sketch.solve().map_err(|e| e.to_string()));
+        self.profiles = self.sketch.profiles(&self.tess);
+        self.hover_region = None;
+    }
+
+    /// The smallest closed region around `pos`, if any.
+    fn region_at(&self, pos: Vec2) -> Option<usize> {
+        self.profiles
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.contains(pos))
+            .min_by(|(_, a), (_, b)| a.area().total_cmp(&b.area()))
+            .map(|(i, _)| i)
+    }
+
+    /// The curves bounding a region, outer loop and holes alike.
+    fn region_curves(&self, index: usize) -> Vec<EntityId> {
+        let mut out = Vec::new();
+        if let Some(p) = self.profiles.get(index) {
+            for c in std::iter::once(&p.outer).chain(p.holes.iter()) {
+                for seg in &c.segments {
+                    if !out.contains(&seg.curve) {
+                        out.push(seg.curve);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// True when everything selected is construction geometry, so the toolbar can show
+    /// the construction toggle as "on".
+    pub fn selection_is_construction(&self) -> bool {
+        !self.selected.is_empty()
+            && self
+                .selected
+                .iter()
+                .all(|id| self.sketch.entity(*id).is_some_and(|e| e.construction))
+    }
+
+    // --- Pointer -------------------------------------------------------------------
+
+    fn to_plane(&self, ray: &Ray) -> Option<Vec2> {
+        let t = self.frame.plane().intersect_ray(ray)?;
+        Some(self.frame.to_local(ray.at(t)))
+    }
+
+    fn tolerance(&self, pos: Vec2, camera: &Camera, window: [u32; 2]) -> f64 {
+        camera.pixel_size_at(self.frame.to_world(pos), window) * 8.0
+    }
+
+    /// The grid increment in force at this moment: the pinned one, or the finest that is
+    /// still comfortably far apart on screen at the current zoom.
+    fn step_for(&self, pos: Vec2, camera: &Camera, window: [u32; 2]) -> f64 {
+        match self.fixed_grid_step {
+            Some(step) if step.is_finite() && step > 0.0 => step,
+            _ => grid::snap_step_for(camera.pixel_size_at(self.frame.to_world(pos), window)),
+        }
+    }
+
+    /// Existing points win over the grid: joining geometry is what the user meant, and a
+    /// point already placed off-grid would otherwise be impossible to pick up again.
+    fn snap(&self, pos: Vec2, tol: f64) -> Click {
+        let point = self.sketch.hit_test(pos, tol).into_iter().find(|h| {
+            self.sketch
+                .entity(h.entity)
+                .is_some_and(|e| e.entity.is_point())
+        });
+        match point {
+            Some(h) => Click {
+                pos: self.sketch.point_pos(h.entity).unwrap_or(pos),
+                snapped: Some(h.entity),
+            },
+            None => Click {
+                pos: self.to_grid(pos),
+                snapped: None,
+            },
+        }
+    }
+
+    fn to_grid(&self, pos: Vec2) -> Vec2 {
+        if self.snap_to_grid {
+            grid::snap_to(pos, self.grid_step)
+        } else {
+            pos
+        }
+    }
+
+    /// Snaps, then applies typed sizes. A typed value beats the snap: the user has said
+    /// exactly what they want, and a snapped point almost never lies at that size.
+    fn aim(&self, pos: Vec2, tol: f64) -> Click {
+        let click = self.snap(pos, tol);
+        let pos = self.constrained_cursor(click.pos);
+        if pos == click.pos {
+            click
+        } else {
+            Click { pos, snapped: None }
+        }
+    }
+
+    fn typed(&self, dim: Dim) -> Option<f64> {
+        typed_value(&self.entries, dim)
+    }
+
+    /// Where the next click lands once typed sizes are applied. A typed size pins the
+    /// distance from the previous click while the pointer still chooses direction and
+    /// side, so the shape follows the mouse at exactly the size that was entered.
+    fn constrained_cursor(&self, raw: Vec2) -> Vec2 {
+        if self.entries.iter().all(|e| e.value().is_none()) {
+            return raw;
+        }
+        let first = self.clicks.first().map(|c| c.pos);
+        match self.tool {
+            SketchTool::Line => {
+                let Some(start) = self.chain_end.and_then(|id| self.sketch.point_pos(id)) else {
+                    return raw;
+                };
+                let delta = raw - start;
+                let angle = self.typed(Dim::Angle);
+                let dir = match angle {
+                    Some(a) => Vec2::from_angle(a),
+                    None => delta.normalize_or(Vec2::X),
+                };
+                // With only the angle typed, the line reaches as far along that
+                // direction as the pointer does.
+                let length = self.typed(Dim::Length).unwrap_or_else(|| {
+                    if angle.is_some() {
+                        delta.dot(dir).max(0.0)
+                    } else {
+                        delta.length()
+                    }
+                });
+                start + dir * length
+            }
+            SketchTool::Rectangle | SketchTool::CenterRectangle => {
+                let Some(first) = first else { return raw };
+                // A centre rectangle's second click is a corner, half the size away.
+                let scale = if self.tool == SketchTool::CenterRectangle {
+                    0.5
+                } else {
+                    1.0
+                };
+                let axis = |cur: f64, origin: f64, size: Option<f64>| match size {
+                    Some(s) => origin + s * scale * if cur < origin { -1.0 } else { 1.0 },
+                    None => cur,
+                };
+                Vec2::new(
+                    axis(raw.x, first.x, self.typed(Dim::Width)),
+                    axis(raw.y, first.y, self.typed(Dim::Height)),
+                )
+            }
+            SketchTool::Circle => {
+                at_distance(first, raw, self.typed(Dim::Diameter).map(|d| d * 0.5))
+            }
+            SketchTool::Circle2Point => at_distance(first, raw, self.typed(Dim::Diameter)),
+            SketchTool::Polygon => at_distance(first, raw, self.typed(Dim::Radius)),
+            // The arc's third click only picks the end direction; the radius is fixed by
+            // the second.
+            SketchTool::ArcCenter if self.clicks.len() == 1 => {
+                at_distance(first, raw, self.typed(Dim::Radius))
+            }
+            SketchTool::Slot | SketchTool::SlotOverall | SketchTool::SlotCenterPoint => {
+                match self.clicks[..] {
+                    // The second click's distance from the first is what the typed
+                    // length means for that variant: centre to centre, end to end, or
+                    // (from the middle) half of centre to centre.
+                    [_] => {
+                        let length = self.typed(Dim::Length).map(|l| {
+                            if self.tool == SketchTool::SlotCenterPoint {
+                                l * 0.5
+                            } else {
+                                l
+                            }
+                        });
+                        at_distance(first, raw, length)
+                    }
+                    [a, b] => match self.typed(Dim::Width) {
+                        Some(width) => {
+                            let axis = (b.pos - a.pos).normalize_or(Vec2::X);
+                            let side = if axis.perp_dot(raw - a.pos) < 0.0 {
+                                -1.0
+                            } else {
+                                1.0
+                            };
+                            let foot = a.pos + axis * axis.dot(raw - a.pos);
+                            foot + axis.perp() * (side * width * 0.5)
+                        }
+                        None => raw,
+                    },
+                    _ => raw,
+                }
+            }
+            _ => raw,
+        }
+    }
+
+    /// Re-derives the cursor from the last pointer position, for when a typed size
+    /// changes while the pointer stands still.
+    pub fn refresh_cursor(&mut self) {
+        if let Some(raw) = self.raw_cursor {
+            let constrained = self.constrained_cursor(raw);
+            if constrained != raw {
+                self.cursor_snapped = false;
+            }
+            self.cursor = Some(constrained);
+            let live = self.live_dims(constrained);
+            for entry in self.entries.iter_mut().filter(|e| !e.locked) {
+                if let Some((_, v)) = live.iter().find(|(d, _)| *d == entry.dim) {
+                    entry.text = match entry.dim {
+                        Dim::Angle => format!("{:.2}", v.to_degrees()),
+                        _ => format!("{v:.2}"),
+                    };
+                }
+            }
+        }
+    }
+
+    /// The sizes the pointer is drawing right now, for the live entry boxes.
+    fn live_dims(&self, cursor: Vec2) -> Vec<(Dim, f64)> {
+        let first = self.clicks.first().map(|c| c.pos);
+        match self.tool {
+            SketchTool::Line => {
+                let Some(start) = self.chain_end.and_then(|id| self.sketch.point_pos(id)) else {
+                    return Vec::new();
+                };
+                let d = cursor - start;
+                vec![(Dim::Length, d.length()), (Dim::Angle, d.to_angle())]
+            }
+            SketchTool::Rectangle | SketchTool::CenterRectangle => {
+                let Some(first) = first else {
+                    return Vec::new();
+                };
+                let scale = if self.tool == SketchTool::CenterRectangle {
+                    2.0
+                } else {
+                    1.0
+                };
+                let d = (cursor - first).abs() * scale;
+                vec![(Dim::Width, d.x), (Dim::Height, d.y)]
+            }
+            SketchTool::Circle => first
+                .map(|f| vec![(Dim::Diameter, 2.0 * f.distance(cursor))])
+                .unwrap_or_default(),
+            SketchTool::Circle2Point => first
+                .map(|f| vec![(Dim::Diameter, f.distance(cursor))])
+                .unwrap_or_default(),
+            SketchTool::Polygon | SketchTool::ArcCenter => first
+                .filter(|_| self.clicks.len() == 1)
+                .map(|f| vec![(Dim::Radius, f.distance(cursor))])
+                .unwrap_or_default(),
+            SketchTool::Slot | SketchTool::SlotOverall | SketchTool::SlotCenterPoint => {
+                let scale = if self.tool == SketchTool::SlotCenterPoint {
+                    2.0
+                } else {
+                    1.0
+                };
+                match self.clicks[..] {
+                    [a] => vec![(Dim::Length, a.pos.distance(cursor) * scale)],
+                    [a, b] => vec![
+                        (Dim::Length, a.pos.distance(b.pos) * scale),
+                        (Dim::Width, 2.0 * distance_to_line(cursor, a.pos, b.pos)),
+                    ],
+                    _ => Vec::new(),
+                }
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The user edited an entry box: from now on it drives the shape.
+    pub fn lock_entry(&mut self, index: usize) {
+        if let Some(e) = self.entries.get_mut(index) {
+            e.locked = true;
+        }
+        self.refresh_cursor();
+    }
+
+    /// Releases a locked box back to following the pointer.
+    pub fn unlock_entry(&mut self, index: usize) {
+        if let Some(e) = self.entries.get_mut(index) {
+            e.locked = false;
+        }
+        self.refresh_cursor();
+    }
+
+    /// Tab with the pointer in the viewport: focus the first box that is still following
+    /// the pointer, so the next keystrokes fill it. Inside the box egui's own Tab moves on.
+    pub fn focus_next_entry(&mut self) -> bool {
+        if self.entries.is_empty() || !self.has_pending() {
+            return false;
+        }
+        let index = self.entries.iter().position(|e| !e.locked).unwrap_or(0);
+        self.entry_focus = Some(index);
+        true
+    }
+
+    fn place_cursor(&mut self, click: Click) {
+        self.raw_cursor = Some(click.pos);
+        self.cursor_snapped = click.snapped.is_some();
+        self.cursor = Some(click.pos);
+        self.refresh_cursor();
+    }
+
+    pub fn pointer_moved(&mut self, ray: &Ray, camera: &Camera, window: [u32; 2], dragging: bool) {
+        let Some(pos) = self.to_plane(ray) else {
+            self.cursor = None;
+            self.raw_cursor = None;
+            return;
+        };
+        self.grid_step = self.step_for(pos, camera, window);
+        self.cursor_px = camera.pixel_size_at(self.frame.to_world(pos), window);
+        let tol = self.tolerance(pos, camera, window);
+        if self.tool == SketchTool::Select {
+            self.cursor = Some(pos);
+            self.raw_cursor = Some(pos);
+            self.cursor_snapped = false;
+        } else {
+            let click = self.snap(pos, tol);
+            self.place_cursor(click);
+        }
+        if dragging {
+            if let Some(m) = &mut self.marquee {
+                m.current = pos;
+                return;
+            }
+            if let Some(drag) = self.drag.clone() {
+                // The pointer's travel is snapped to the grid, so nudging a corner does
+                // not silently take the sketch off it and a moved shape stays on it.
+                let delta = self.to_grid(pos) - self.to_grid(drag.press);
+                let goals: Vec<(EntityId, Vec2)> = drag
+                    .points
+                    .iter()
+                    .map(|(id, start)| (*id, *start + delta))
+                    .collect();
+                if self.sketch.drag_points(&goals).is_ok() {
+                    self.dirty = true;
+                }
+                return;
+            }
+        }
+        self.hover = self.sketch.hit_test(pos, tol).first().map(|h| h.entity);
+        self.hover_region = match (self.tool, self.hover) {
+            (SketchTool::Select, None) => self.region_at(pos),
+            _ => None,
+        };
+        self.update_trim_preview(pos, tol);
+    }
+
+    /// The points that move when `id` is dragged: the whole selection if it is part of
+    /// it, otherwise just the entity under the pointer.
+    fn drag_set(&self, id: EntityId) -> Vec<(EntityId, Vec2)> {
+        let entities: Vec<EntityId> = if self.selected.contains(&id) {
+            self.selected.clone()
+        } else {
+            vec![id]
+        };
+        let mut points: Vec<(EntityId, Vec2)> = Vec::new();
+        for e in entities {
+            for p in self.sketch.entity_points(e) {
+                if !points.iter().any(|(q, _)| *q == p)
+                    && let Some(pos) = self.sketch.point_pos(p)
+                {
+                    points.push((p, pos));
+                }
+            }
+        }
+        points
+    }
+
+    pub fn pointer_down(&mut self, ray: &Ray, camera: &Camera, window: [u32; 2], _shift: bool) {
+        if self.tool != SketchTool::Select {
+            return;
+        }
+        let Some(pos) = self.to_plane(ray) else {
+            return;
+        };
+        self.grid_step = self.step_for(pos, camera, window);
+        let tol = self.tolerance(pos, camera, window);
+        let hit = self.sketch.hit_test(pos, tol).into_iter().next();
+        match hit {
+            // Anything can be dragged: a point alone, a curve by all its points, or the
+            // whole selection when the press lands on part of it.
+            Some(h) => {
+                self.checkpoint();
+                self.drag = Some(Drag {
+                    points: self.drag_set(h.entity),
+                    press: pos,
+                });
+            }
+            // Pressing on empty space starts a rubber band. It only becomes a selection if
+            // the pointer actually travels; a press and release in place is still a click.
+            None => {
+                self.marquee = Some(Marquee {
+                    start: pos,
+                    current: pos,
+                })
+            }
+        }
+    }
+
+    pub fn pointer_up(
+        &mut self,
+        ray: &Ray,
+        camera: &Camera,
+        window: [u32; 2],
+        clicked: bool,
+        shift: bool,
+    ) {
+        if let Some(drag) = self.drag.take() {
+            self.marquee = None;
+            if !clicked {
+                self.solve();
+                self.dirty = true;
+                return;
+            }
+            // A press and release without travel is a click, not a move: the
+            // checkpoint taken for the drag is not a change.
+            self.undo.pop();
+            let _ = drag;
+        }
+        if let Some(m) = self.marquee.take()
+            && !clicked
+        {
+            self.select_in(m, shift);
+            return;
+        }
+        if !clicked {
+            return;
+        }
+        let Some(pos) = self.to_plane(ray) else {
+            return;
+        };
+        self.grid_step = self.step_for(pos, camera, window);
+        let tol = self.tolerance(pos, camera, window);
+        match self.tool {
+            SketchTool::Select => {
+                let hit = self
+                    .sketch
+                    .hit_test(pos, tol)
+                    .into_iter()
+                    .next()
+                    .map(|h| h.entity);
+                match hit {
+                    Some(id) if shift => match self.selected.iter().position(|s| *s == id) {
+                        Some(i) => {
+                            self.selected.remove(i);
+                        }
+                        None => self.selected.push(id),
+                    },
+                    Some(id) => {
+                        self.clear_selection();
+                        self.selected.push(id);
+                    }
+                    // Empty space inside a closed region picks the region: the curves
+                    // around it, which is what moving, deleting or constraining it means.
+                    None => match self.region_at(pos) {
+                        Some(region) => {
+                            let curves = self.region_curves(region);
+                            let sample = self.region_sample(region);
+                            if !shift {
+                                self.clear_selection();
+                            }
+                            // Shift on a region already wholly selected takes it out.
+                            if shift && curves.iter().all(|c| self.selected.contains(c)) {
+                                self.selected.retain(|c| !curves.contains(c));
+                                self.selected_regions
+                                    .retain(|p| !self.profiles[region].contains(*p));
+                            } else {
+                                for c in curves {
+                                    if !self.selected.contains(&c) {
+                                        self.selected.push(c);
+                                    }
+                                }
+                                // The region itself is remembered as well as its curves:
+                                // the curves are what a constraint acts on, the region is
+                                // what an extrude does.
+                                if let Some(sample) = sample
+                                    && !self.selected_regions.contains(&sample)
+                                {
+                                    self.selected_regions.push(sample);
+                                }
+                            }
+                        }
+                        None => self.clear_selection(),
+                    },
+                }
+            }
+            SketchTool::Dimension => self.dimension_click(pos, tol),
+            SketchTool::Trim | SketchTool::Break => self.trim_click(pos, tol),
+            SketchTool::Line => self.line_click(self.aim(pos, tol)),
+            _ => self.shape_click(self.aim(pos, tol)),
+        }
+    }
+
+    /// Applies a finished rubber band. Shift adds to the selection the way shift-clicking
+    /// does; without it the band replaces what was selected.
+    fn select_in(&mut self, m: Marquee, shift: bool) {
+        let hits = self.sketch.hit_test_rect(m.start, m.current, m.crossing());
+        if !shift {
+            self.clear_selection();
+        }
+        for id in hits {
+            if !self.selected.contains(&id) {
+                self.selected.push(id);
+            }
+        }
+    }
+
+    // --- Regions ---------------------------------------------------------------------
+
+    /// A point inside a region, which is how a region is named in a feature reference.
+    fn region_sample(&self, index: usize) -> Option<Vec2> {
+        self.profiles.get(index)?.interior_point()
+    }
+
+    /// The regions a modelling tool would act on: the ones the user picked, or the one
+    /// under the pointer when they picked none. Pressing E with the pointer over a
+    /// region extrudes it without a click first, as Fusion's press-pull does.
+    pub fn region_samples(&self) -> Vec<Vec2> {
+        if !self.selected_regions.is_empty() {
+            return self.selected_regions.clone();
+        }
+        self.hover_region
+            .and_then(|r| self.region_sample(r))
+            .into_iter()
+            .collect()
+    }
+
+    pub fn has_region_selection(&self) -> bool {
+        !self.region_samples().is_empty()
+    }
+
+    fn clear_selection(&mut self) {
+        self.selected.clear();
+        self.selected_regions.clear();
+    }
+
+    // --- Trim and break --------------------------------------------------------------
+
+    fn curve_at(&self, pos: Vec2, tol: f64) -> Option<EntityId> {
+        self.sketch
+            .hit_test(pos, tol)
+            .into_iter()
+            .find(|h| {
+                self.sketch
+                    .entity(h.entity)
+                    .is_some_and(|d| d.entity.is_curve())
+            })
+            .map(|h| h.entity)
+    }
+
+    fn trim_click(&mut self, pos: Vec2, tol: f64) {
+        let Some(curve) = self.curve_at(pos, tol) else {
+            return;
+        };
+        self.checkpoint();
+        let result = match self.tool {
+            SketchTool::Break => edit::break_curve(&mut self.sketch, curve),
+            _ => edit::trim(&mut self.sketch, curve, pos),
+        };
+        match result {
+            Ok(_) => self.after_change(),
+            Err(e) => {
+                // Nothing partial is left behind: the sketch goes back to the copy the
+                // checkpoint took a moment ago.
+                log::warn!("{}: {e}", self.tool.name());
+                if let Some(prev) = self.undo.pop() {
+                    self.sketch = prev;
+                }
+            }
+        }
+        self.trim_preview = None;
+    }
+
+    /// Keeps the "this is what will go" highlight in step with the pointer.
+    fn update_trim_preview(&mut self, pos: Vec2, tol: f64) {
+        self.trim_preview = match self.tool {
+            SketchTool::Trim => self
+                .curve_at(pos, tol)
+                .and_then(|c| edit::trim_preview(&self.sketch, c, pos, &self.tess)),
+            _ => None,
+        };
+    }
+
+    // --- Move ------------------------------------------------------------------------
+
+    /// Starts a typed move of the selection. `false` when nothing is selected, so the
+    /// key press can fall through to whatever else `M` might mean.
+    pub fn begin_move(&mut self) -> bool {
+        if self.selected.is_empty() || self.move_op.is_some() {
+            return false;
+        }
+        let selected = self.selected.clone();
+        let mut start: Vec<(EntityId, Vec2)> = Vec::new();
+        for entity in selected {
+            for p in self.sketch.entity_points(entity) {
+                if !start.iter().any(|(q, _)| *q == p)
+                    && let Some(pos) = self.sketch.point_pos(p)
+                {
+                    start.push((p, pos));
+                }
+            }
+        }
+        if start.is_empty() {
+            return false;
+        }
+        let pivot =
+            start.iter().map(|(_, p)| *p).fold(Vec2::ZERO, |a, p| a + p) / start.len() as f64;
+        // The checkpoint makes the whole move one undo step, and cancelling is an undo.
+        self.checkpoint();
+        self.move_op = Some(MoveOp {
+            dx: 0.0,
+            dy: 0.0,
+            angle_deg: 0.0,
+            start,
+            pivot,
+        });
+        true
+    }
+
+    /// Re-applies the move from its starting positions, so editing a number never
+    /// accumulates with what was already applied.
+    pub fn update_move(&mut self) {
+        let Some(op) = self.move_op.clone() else {
+            return;
+        };
+        let goals: Vec<(EntityId, Vec2)> = op
+            .start
+            .iter()
+            .map(|(id, from)| (*id, op.target(*from)))
+            .collect();
+        if self.sketch.drag_points(&goals).is_ok() {
+            self.dirty = true;
+        }
+    }
+
+    /// Ends the move. Cancelling puts the geometry back through the checkpoint the move
+    /// took when it started.
+    pub fn finish_move(&mut self, keep: bool) {
+        if self.move_op.take().is_none() {
+            return;
+        }
+        if keep {
+            self.after_change();
+        } else if let Some(prev) = self.undo.pop() {
+            self.sketch = prev;
+            self.after_change();
+        }
+    }
+
+    // --- Pattern ---------------------------------------------------------------------
+
+    /// Repeats the selection. Returns how many entities were created, or the reason
+    /// nothing was.
+    pub fn apply_pattern(&mut self) -> Result<usize, String> {
+        if self.selected.is_empty() {
+            return Err("select the geometry to repeat first".into());
+        }
+        let seed = self.selected.clone();
+        let p = self.pattern.clone();
+        self.checkpoint();
+        let result = if p.circular {
+            pattern::circular(
+                &mut self.sketch,
+                &seed,
+                p.center,
+                p.count,
+                p.angle_deg.to_radians(),
+            )
+        } else {
+            pattern::rectangular(
+                &mut self.sketch,
+                &seed,
+                Vec2::new(p.dx, 0.0),
+                p.cols,
+                Vec2::new(0.0, p.dy),
+                p.rows,
+            )
+        };
+        match result {
+            Ok(created) => {
+                self.after_change();
+                Ok(created.len())
+            }
+            Err(e) => {
+                if let Some(prev) = self.undo.pop() {
+                    self.sketch = prev;
+                }
+                Err(e.to_string())
+            }
+        }
+    }
+
+    /// Centres a circular pattern on what is selected, which is almost always what the
+    /// user means by "around here".
+    pub fn pattern_center_from_selection(&mut self) {
+        let points: Vec<Vec2> = self
+            .selected
+            .iter()
+            .flat_map(|id| self.sketch.entity_points(*id))
+            .filter_map(|p| self.sketch.point_pos(p))
+            .collect();
+        if !points.is_empty() {
+            self.pattern.center =
+                points.iter().fold(Vec2::ZERO, |a, p| a + *p) / points.len() as f64;
+        }
+    }
+
+    // --- Parameters ------------------------------------------------------------------
+
+    /// Refreshes the panel's draft text from the sketch when the set of parameters has
+    /// changed underneath it (undo, a load, a rejected edit).
+    pub fn sync_param_drafts(&mut self) {
+        let live: Vec<(String, String)> = self
+            .sketch
+            .parameters()
+            .iter()
+            .map(|p| (p.name.clone(), p.expr.clone()))
+            .collect();
+        let names: Vec<&String> = live.iter().map(|(n, _)| n).collect();
+        if self.param_drafts.len() != live.len()
+            || !self.param_drafts.iter().all(|(n, _)| names.contains(&n))
+        {
+            self.param_drafts = live;
+        }
+    }
+
+    /// Adds or re-expresses a named constant, re-driving the dimensions that use it.
+    pub fn set_parameter(&mut self, name: &str, expression: &str) -> Result<(), String> {
+        self.checkpoint();
+        match self.sketch.set_parameter(name, expression) {
+            Ok(_) => {
+                self.after_change();
+                Ok(())
+            }
+            Err(e) => {
+                self.undo.pop();
+                Err(e.to_string())
+            }
+        }
+    }
+
+    pub fn remove_parameter(&mut self, name: &str) {
+        self.checkpoint();
+        if self.sketch.remove_parameter(name) {
+            self.after_change();
+        } else {
+            self.undo.pop();
+        }
+    }
+
+    /// Drives a dimension by an expression instead of a number.
+    pub fn bind_dimension(&mut self, id: ConstraintId, expression: &str) -> Result<(), String> {
+        self.checkpoint();
+        match self.sketch.bind_dimension(id, expression) {
+            Ok(_) => {
+                self.after_change();
+                Ok(())
+            }
+            Err(e) => {
+                self.undo.pop();
+                Err(e.to_string())
+            }
+        }
+    }
+
+    // --- Entry boxes -----------------------------------------------------------------
+
+    /// Routes a character typed with the pointer in the viewport into an entry box, so
+    /// the user can start typing a size without clicking the box first. Returns `false`
+    /// for anything that is not part of a number, leaving it to the key bindings.
+    pub fn type_into_entry(&mut self, text: &str) -> bool {
+        if self.entries.is_empty() || !self.has_pending() {
+            return false;
+        }
+        if text.is_empty()
+            || !text
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == '.' || c == '-')
+        {
+            return false;
+        }
+        // Typing continues in the box that is taking focus, otherwise starts in the
+        // first one still following the pointer, so "10 Tab 5" fills width then height.
+        // The first keystroke replaces the live value rather than appending to it.
+        let index = self
+            .entry_focus
+            .unwrap_or_else(|| self.entries.iter().position(|e| !e.locked).unwrap_or(0));
+        let entry = &mut self.entries[index];
+        if !entry.locked {
+            entry.text.clear();
+            entry.locked = true;
+        }
+        entry.text.push_str(text);
+        self.entry_focus = Some(index);
+        self.refresh_cursor();
+        true
+    }
+
+    /// Enter while drawing: finishes the shape from the locked sizes, taking whatever
+    /// the pointer still decides (direction, side, unlocked sizes) from where it is now.
+    pub fn submit_entry(&mut self) {
+        self.refresh_cursor();
+        let Some(cursor) = self.cursor else { return };
+        let click = Click {
+            pos: cursor,
+            snapped: None,
+        };
+        match self.tool {
+            SketchTool::Line if self.chain_end.is_some() => self.line_click(click),
+            tool if tool.clicks() > 0 && self.clicks.len() + 1 == tool.clicks() => {
+                self.shape_click(click)
+            }
+            _ => {}
+        }
+    }
+
+    fn params(&self) -> ShapeParams {
+        ShapeParams {
+            sides: self.polygon_sides.max(3),
+            text: self.text.clone(),
+            text_height: self.text_height,
+            typed: self
+                .entries
+                .iter()
+                .filter_map(|e| e.value().map(|v| (e.dim, v)))
+                .collect(),
+        }
+    }
+
+    // --- Drawing tools ---------------------------------------------------------------
+
+    fn line_click(&mut self, click: Click) {
+        let end = match click.snapped {
+            Some(id) => id,
+            None => {
+                self.checkpoint();
+                self.sketch.add_point(click.pos)
+            }
+        };
+        if let Some(start) = self.chain_end {
+            if start != end {
+                // A new point took its checkpoint above; a snapped one has not yet.
+                if click.snapped.is_some() {
+                    self.checkpoint();
+                }
+                match self.sketch.add_line(start, end) {
+                    Ok(line) => {
+                        for c in line_dims(line, start, end, &self.params()) {
+                            if let Err(e) = self.sketch.add_constraint(c) {
+                                log::warn!("line dimension: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => log::warn!("line: {e}"),
+                }
+                self.after_change();
+            }
+            // Snapping back onto an existing point closes the chain.
+            self.chain_end = if click.snapped.is_some() {
+                None
+            } else {
+                Some(end)
+            };
+        } else {
+            self.chain_end = Some(end);
+        }
+        self.reset_entries();
+    }
+
+    fn shape_click(&mut self, click: Click) {
+        self.clicks.push(click);
+        if self.clicks.len() < self.tool.clicks() {
+            return;
+        }
+        let clicks = std::mem::take(&mut self.clicks);
+        let params = self.params();
+        self.checkpoint();
+        match build_shape(&mut self.sketch, self.tool, &clicks, &params) {
+            Ok(()) => self.after_change(),
+            Err(e) => {
+                // A degenerate shape (collinear circle points…) leaves nothing behind,
+                // not even the partial entities the builder had already added.
+                log::warn!("{}: {e}", self.tool.name());
+                if let Some(prev) = self.undo.pop() {
+                    self.sketch = prev;
+                }
+            }
+        }
+        self.reset_entries();
+    }
+
+    // --- Dimension tool --------------------------------------------------------------
+
+    /// Fusion's dimension tool: the first click picks an entity, the second either picks
+    /// a partner or, on empty space, places a dimension of the first alone. What the
+    /// dimension measures follows from the pair, see [`Self::dimension_between`].
+    fn dimension_click(&mut self, pos: Vec2, tol: f64) {
+        let hit = self
+            .sketch
+            .hit_test(pos, tol)
+            .into_iter()
+            .next()
+            .map(|h| h.entity);
+        let constraint = match (self.dim_first.take(), hit) {
+            (None, Some(id)) => {
+                let dimensionable = self
+                    .sketch
+                    .entity(id)
+                    .is_some_and(|e| e.entity.is_point() || e.entity.is_curve());
+                if dimensionable {
+                    self.dim_first = Some(id);
+                }
+                None
+            }
+            (None, None) => None,
+            (Some(first), second) => self.dimension_between(first, second),
+        };
+        if let Some(c) = constraint {
+            self.checkpoint();
+            match self.sketch.add_constraint(c.clone()) {
+                Ok(id) => {
+                    self.dim_edit = Some((id, edit_text(&c)));
+                    self.after_change();
+                }
+                Err(e) => log::warn!("dimension: {e}"),
+            }
+        }
+    }
+
+    /// The dimension a pair of picks means, with its current value so adding it moves
+    /// nothing:
+    ///
+    /// - a line alone: its length; a circle alone: its diameter; an arc alone: its radius
+    /// - two parallel lines: the distance between them; two other lines: their angle
+    /// - a line and a point: their distance; circles and arcs stand in for their centres
+    /// - two points (or centres): their distance
+    fn dimension_between(&self, first: EntityId, second: Option<EntityId>) -> Option<Constraint> {
+        let kind = |id: EntityId| self.sketch.entity(id).map(|e| e.entity.clone());
+        let a = kind(first)?;
+        let Some(second) = second else {
+            return match a {
+                Entity::Line { start, end } => Some(Constraint::Distance {
+                    a: start,
+                    b: end,
+                    value: self.distance(start, end),
+                }),
+                Entity::Circle { radius, .. } => Some(Constraint::Diameter {
+                    curve: first,
+                    value: radius * 2.0,
+                }),
+                Entity::Arc { center, start, .. } => Some(Constraint::Radius {
+                    curve: first,
+                    value: self.distance(center, start),
+                }),
+                _ => None,
+            };
+        };
+        if second == first {
+            return None;
+        }
+        let b = kind(second)?;
+        // In a distance, a circle or arc means its centre, as it does in Fusion.
+        let as_point = |id: EntityId, e: &Entity| match *e {
+            Entity::Point { .. } => Some(id),
+            Entity::Circle { center, .. } | Entity::Arc { center, .. } => Some(center),
+            _ => None,
+        };
+        let point_line = |p: EntityId, line: EntityId| Constraint::Distance {
+            a: p,
+            b: line,
+            value: self.point_line(p, line),
+        };
+        match (&a, &b) {
+            (Entity::Line { start, .. }, Entity::Line { .. }) => {
+                if self.parallel(first, second) {
+                    Some(point_line(*start, second))
+                } else {
+                    Some(Constraint::Angle {
+                        a: first,
+                        b: second,
+                        value: self.angle_between(first, second),
+                    })
+                }
+            }
+            (Entity::Line { .. }, other) => as_point(second, other).map(|p| point_line(p, first)),
+            (other, Entity::Line { .. }) => as_point(first, other).map(|p| point_line(p, second)),
+            (pa, pb) => match (as_point(first, pa), as_point(second, pb)) {
+                (Some(p), Some(q)) if p != q => Some(Constraint::Distance {
+                    a: p,
+                    b: q,
+                    value: self.distance(p, q),
+                }),
+                _ => None,
+            },
+        }
+    }
+
+    fn distance(&self, a: EntityId, b: EntityId) -> f64 {
+        match (self.sketch.point_pos(a), self.sketch.point_pos(b)) {
+            (Some(a), Some(b)) => a.distance(b),
+            _ => 0.0,
+        }
+    }
+
+    fn point_line(&self, p: EntityId, line: EntityId) -> f64 {
+        match (self.sketch.point_pos(p), self.sketch.curve_endpoints(line)) {
+            (Some(p), Some((a, b))) => distance_to_line(p, a, b),
+            _ => 0.0,
+        }
+    }
+
+    fn parallel(&self, a: EntityId, b: EntityId) -> bool {
+        let (Some((a0, a1)), Some((b0, b1))) = (
+            self.sketch.curve_endpoints(a),
+            self.sketch.curve_endpoints(b),
+        ) else {
+            return false;
+        };
+        let (u, v) = (
+            (a1 - a0).normalize_or(Vec2::X),
+            (b1 - b0).normalize_or(Vec2::X),
+        );
+        u.perp_dot(v).abs() <= PARALLEL_TOL
+    }
+
+    /// Signed angle from the first line's direction to the second's, matching the
+    /// solver's convention. Keeping the sign is what stops a fresh angle dimension from
+    /// swinging the second line to the mirror-image position.
+    fn angle_between(&self, a: EntityId, b: EntityId) -> f64 {
+        let (Some((a0, a1)), Some((b0, b1))) = (
+            self.sketch.curve_endpoints(a),
+            self.sketch.curve_endpoints(b),
+        ) else {
+            return 0.0;
+        };
+        (a1 - a0).angle_to(b1 - b0)
+    }
+
+    // --- Commands --------------------------------------------------------------------
+
+    pub fn delete_selected(&mut self) {
+        if self.selected.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for id in std::mem::take(&mut self.selected) {
+            self.sketch.remove_entity(id);
+        }
+        self.after_change();
+    }
+
+    pub fn toggle_construction(&mut self) {
+        if self.selected.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for id in self.selected.clone() {
+            let is = self
+                .sketch
+                .entity(id)
+                .map(|e| e.construction)
+                .unwrap_or(false);
+            let _ = self.sketch.set_construction(id, !is);
+        }
+        self.after_change();
+    }
+
+    pub fn add_constraint(&mut self, c: Constraint) -> Result<(), String> {
+        self.checkpoint();
+        let r = self
+            .sketch
+            .add_constraint(c)
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        if r.is_err() {
+            self.undo.pop();
+        } else {
+            self.after_change();
+        }
+        r
+    }
+
+    pub fn set_dimension(&mut self, id: ConstraintId, value: f64) {
+        self.checkpoint();
+        if self.sketch.set_dimension_value(id, value).is_ok() {
+            self.after_change();
+        }
+    }
+
+    pub fn remove_constraint(&mut self, id: ConstraintId) {
+        self.checkpoint();
+        self.sketch.remove_constraint(id);
+        self.after_change();
+    }
+
+    /// Constraints the palette can apply to the current selection, by kind of selection.
+    pub fn applicable_constraints(&self) -> Vec<(&'static str, Constraint)> {
+        let sel = &self.selected;
+        let kind = |i: usize| self.sketch.entity(sel[i]).map(|e| &e.entity);
+        let mut out = Vec::new();
+        match sel.len() {
+            1 => match kind(0) {
+                Some(Entity::Line { .. }) => {
+                    out.push(("Horizontal", Constraint::Horizontal(sel[0])));
+                    out.push(("Vertical", Constraint::Vertical(sel[0])));
+                }
+                Some(Entity::Point { .. }) => out.push(("Fix", Constraint::Fix(sel[0]))),
+                _ => {}
+            },
+            2 => match (kind(0), kind(1)) {
+                (Some(Entity::Line { .. }), Some(Entity::Line { .. })) => {
+                    out.push(("Parallel", Constraint::Parallel(sel[0], sel[1])));
+                    out.push(("Perpendicular", Constraint::Perpendicular(sel[0], sel[1])));
+                    out.push(("Equal", Constraint::Equal(sel[0], sel[1])));
+                }
+                (Some(Entity::Point { .. }), Some(Entity::Point { .. })) => {
+                    out.push((
+                        "Coincident",
+                        Constraint::Coincident {
+                            point: sel[0],
+                            target: sel[1],
+                        },
+                    ));
+                    out.push((
+                        "Horizontal",
+                        Constraint::HorizontalDistance {
+                            a: sel[0],
+                            b: sel[1],
+                            value: 0.0,
+                        },
+                    ));
+                    out.push((
+                        "Vertical",
+                        Constraint::VerticalDistance {
+                            a: sel[0],
+                            b: sel[1],
+                            value: 0.0,
+                        },
+                    ));
+                }
+                (Some(Entity::Point { .. }), Some(Entity::Line { .. })) => {
+                    out.push((
+                        "Coincident",
+                        Constraint::Coincident {
+                            point: sel[0],
+                            target: sel[1],
+                        },
+                    ));
+                    out.push((
+                        "Midpoint",
+                        Constraint::Midpoint {
+                            point: sel[0],
+                            line: sel[1],
+                        },
+                    ));
+                }
+                (Some(Entity::Point { .. }), Some(Entity::Circle { .. } | Entity::Arc { .. })) => {
+                    out.push((
+                        "Coincident",
+                        Constraint::Coincident {
+                            point: sel[0],
+                            target: sel[1],
+                        },
+                    ));
+                }
+                (Some(Entity::Line { .. }), Some(Entity::Circle { .. } | Entity::Arc { .. }))
+                | (Some(Entity::Circle { .. } | Entity::Arc { .. }), Some(Entity::Line { .. })) => {
+                    out.push(("Tangent", Constraint::Tangent(sel[0], sel[1])));
+                }
+                (
+                    Some(Entity::Circle { .. } | Entity::Arc { .. }),
+                    Some(Entity::Circle { .. } | Entity::Arc { .. }),
+                ) => {
+                    out.push(("Tangent", Constraint::Tangent(sel[0], sel[1])));
+                    out.push(("Equal", Constraint::Equal(sel[0], sel[1])));
+                    out.push(("Concentric", Constraint::Concentric(sel[0], sel[1])));
+                }
+                _ => {}
+            },
+            3 => {
+                if let (
+                    Some(Entity::Point { .. }),
+                    Some(Entity::Point { .. }),
+                    Some(Entity::Line { .. }),
+                ) = (kind(0), kind(1), kind(2))
+                {
+                    out.push((
+                        "Symmetric",
+                        Constraint::Symmetric {
+                            a: sel[0],
+                            b: sel[1],
+                            axis: sel[2],
+                        },
+                    ));
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
+    // --- Drawing ----------------------------------------------------------------------
+
+    /// Plane position the entry boxes hang off: the last click, or the open end of a
+    /// line chain. `None` when nothing is being drawn.
+    pub fn entry_anchor(&self) -> Option<Vec3> {
+        let pos = match self.tool {
+            SketchTool::Line => self.chain_end.and_then(|id| self.sketch.point_pos(id)),
+            _ => self.clicks.last().map(|c| c.pos),
+        }?;
+        Some(self.frame.to_world(pos))
+    }
+
+    /// Line and point batches for the sketch overlay.
+    pub fn draw(&self, lines: &mut Vec<LineBatch>, points: &mut Vec<PointBatch>) {
+        let to3 = |p: Vec2| self.frame.to_world(p);
+        let mut normal = LineBatch::new([0.92, 0.92, 0.95, 1.0]);
+        normal.depth_test = false;
+        let mut construction = LineBatch::new([0.75, 0.75, 0.55, 1.0]);
+        construction.dashed = true;
+        construction.depth_test = false;
+        let mut selected = LineBatch::new([0.25, 0.6, 1.0, 1.0]);
+        selected.width_px = 3.0;
+        selected.depth_test = false;
+        let mut hovered = LineBatch::new([1.0, 0.85, 0.3, 1.0]);
+        hovered.width_px = 2.5;
+        hovered.depth_test = false;
+        let mut pts = PointBatch::new([0.9, 0.9, 0.9, 1.0]);
+        let mut sel_pts = PointBatch::new([0.25, 0.6, 1.0, 1.0]);
+        sel_pts.size_px = 8.0;
+
+        let region_curves = self
+            .hover_region
+            .map(|r| self.region_curves(r))
+            .unwrap_or_default();
+        for (id, data) in self.sketch.entities() {
+            let is_selected = self.selected.contains(&id);
+            let is_hovered =
+                self.hover == Some(id) || self.dim_first == Some(id) || region_curves.contains(&id);
+            if let Entity::Point { pos } = data.entity {
+                if is_selected || is_hovered {
+                    sel_pts.points.push(to3(pos));
+                } else {
+                    pts.points.push(to3(pos));
+                }
+                continue;
+            }
+            let Some(polyline) = outline(&self.sketch, id, &self.tess) else {
+                continue;
+            };
+            let batch = if is_selected {
+                &mut selected
+            } else if is_hovered {
+                &mut hovered
+            } else if data.construction {
+                &mut construction
+            } else {
+                &mut normal
+            };
+            for w in polyline.windows(2) {
+                batch.segments.push([to3(w[0]), to3(w[1])]);
+            }
+            // Text outlines when a font is available.
+            if let Entity::Text {
+                anchor,
+                text,
+                height,
+                angle,
+            } = &data.entity
+                && let Some(font) = self.sketch.font()
+                && let Some(origin) = self.sketch.point_pos(*anchor)
+            {
+                for outline in font.text_outlines(text, *height, *angle, origin, &self.tess) {
+                    for i in 0..outline.len() {
+                        batch
+                            .segments
+                            .push([to3(outline[i]), to3(outline[(i + 1) % outline.len()])]);
+                    }
+                }
+            }
+        }
+        if let Some(piece) = &self.trim_preview {
+            // Red, wide and on top: the user is about to lose this, and seeing which
+            // piece before clicking is most of what makes trim usable.
+            let mut doomed = LineBatch::new([1.0, 0.35, 0.3, 1.0]);
+            doomed.width_px = 4.0;
+            doomed.depth_test = false;
+            for w in piece.windows(2) {
+                doomed.segments.push([to3(w[0]), to3(w[1])]);
+            }
+            lines.push(doomed);
+        }
+        if let Some(m) = self.marquee {
+            let mut band = LineBatch::new([0.55, 0.8, 1.0, 0.9]);
+            band.depth_test = false;
+            // Crossing bands are dashed, the way the drawing conventions of every CAD tool
+            // distinguish "touches" from "encloses".
+            band.dashed = m.crossing();
+            let corners = m.corners();
+            for i in 0..4 {
+                band.segments
+                    .push([to3(corners[i]), to3(corners[(i + 1) % 4])]);
+            }
+            lines.push(band);
+        }
+        if let Some(cursor) = self.cursor {
+            let mut preview = LineBatch::new([0.6, 0.9, 1.0, 0.9]);
+            preview.depth_test = false;
+            if let Some(start) = self.chain_end.and_then(|id| self.sketch.point_pos(id)) {
+                preview.segments.push([to3(start), to3(cursor)]);
+            }
+            self.shape_preview(cursor, &mut preview);
+            if !preview.segments.is_empty() {
+                lines.push(preview);
+            }
+        }
+        let mut dims = LineBatch::new([0.55, 0.75, 0.95, 0.9]);
+        dims.depth_test = false;
+        for g in self.dimension_graphics() {
+            dims.segments.extend(g.segments);
+        }
+        lines.extend([normal, construction, hovered, selected, dims]);
+        points.extend([pts, sel_pts]);
+        // Crosshair on the snapped position, so the user aims at where the point will
+        // actually land rather than at the pointer, which the grid snap can pull away
+        // from by half a step. Amber when it will reuse an existing point.
+        if let Some(cursor) = self.cursor
+            && self.tool != SketchTool::Select
+        {
+            let color = if self.cursor_snapped {
+                [1.0, 0.85, 0.3, 1.0]
+            } else {
+                [0.6, 0.9, 1.0, 0.9]
+            };
+            let mut cross = LineBatch::new(color);
+            cross.depth_test = false;
+            let arm = self.cursor_px * CURSOR_ARM_PX;
+            let gap = self.cursor_px * CURSOR_GAP_PX;
+            for axis in [Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0)] {
+                for dir in [1.0, -1.0] {
+                    let d = axis * dir;
+                    cross
+                        .segments
+                        .push([to3(cursor + d * gap), to3(cursor + d * arm)]);
+                }
+            }
+            lines.push(cross);
+            let mut marker = PointBatch::new(color);
+            marker.size_px = if self.cursor_snapped { 9.0 } else { 5.0 };
+            marker.points.push(to3(cursor));
+            points.push(marker);
+        }
+    }
+
+    /// Rubber band of the shape the next click would make. It is built for real in a
+    /// scratch copy of the sketch, so every tool previews exactly what it will create,
+    /// typed sizes included. Tools still short of their last click show a line from the
+    /// first click instead.
+    fn shape_preview(&self, cursor: Vec2, preview: &mut LineBatch) {
+        let to3 = |p: Vec2| self.frame.to_world(p);
+        let needed = self.tool.clicks();
+        if needed == 0 {
+            return;
+        }
+        if self.clicks.len() + 1 < needed {
+            if let Some(first) = self.clicks.first().map(|c| c.pos) {
+                preview.segments.push([to3(first), to3(cursor)]);
+            }
+            return;
+        }
+        let mut clicks = self.clicks.clone();
+        clicks.push(Click {
+            pos: cursor,
+            snapped: None,
+        });
+        let mut scratch = self.sketch.clone();
+        if build_shape(&mut scratch, self.tool, &clicks, &self.params()).is_err() {
+            return;
+        }
+        for (id, _) in scratch.entities() {
+            if self.sketch.entity(id).is_some() {
+                continue;
+            }
+            if let Some(polyline) = outline(&scratch, id, &self.tess) {
+                for w in polyline.windows(2) {
+                    preview.segments.push([to3(w[0]), to3(w[1])]);
+                }
+            }
+        }
+    }
+
+    /// Moves a dimension's value text to where the pointer is on the sketch plane. The
+    /// lines are re-derived from the text position, so dragging the text is how the
+    /// user places the whole dimension.
+    pub fn move_label(&mut self, id: ConstraintId, ray: &Ray) {
+        if let Some(pos) = self.to_plane(ray) {
+            let _ = self.sketch.set_dimension_label(id, pos);
+            self.dirty = true;
+        }
+    }
+
+    /// Every dimension as drawn: value text position, text, and the lines around it.
+    pub fn dimension_graphics(&self) -> Vec<DimGraphic> {
+        let px = self.cursor_px;
+        let mut out = Vec::new();
+        for (cid, c) in self.sketch.constraints() {
+            if let Some(g) = self.dimension_graphic(cid, c, px) {
+                out.push(g);
+            }
+        }
+        out
+    }
+
+    fn dimension_graphic(&self, cid: ConstraintId, c: &Constraint, px: f64) -> Option<DimGraphic> {
+        let pos = |id: EntityId| self.sketch.point_pos(id);
+        let placed = self.sketch.dimension_label(cid);
+        let gap = LABEL_GAP_PX * px;
+        let arrow = ARROW_PX * px;
+        let to3 = |p: Vec2| self.frame.to_world(p);
+        let mut segments: Vec<[Vec2; 2]> = Vec::new();
+        let label = match c {
+            Constraint::Distance { a, b, .. } => {
+                match (pos(*a), pos(*b)) {
+                    // Point to point: extension lines out to the dimension line, which
+                    // runs parallel to the pair at the label's offset.
+                    (Some(pa), Some(pb)) => {
+                        let dir = (pb - pa).normalize_or(Vec2::X);
+                        let n = dir.perp();
+                        let label = placed.unwrap_or((pa + pb) * 0.5 + n * gap);
+                        let off = (label - pa).dot(n);
+                        distance_lines(&mut segments, pa, pb, n, off, arrow);
+                        label
+                    }
+                    // Point to line: the dimension line is perpendicular to the line,
+                    // from the point to its foot, slid along the line to the label.
+                    (Some(p), None) | (None, Some(p)) => {
+                        let line = if pos(*a).is_some() { *b } else { *a };
+                        let (la, lb) = self.sketch.curve_endpoints(line)?;
+                        let dir = (lb - la).normalize_or(Vec2::X);
+                        let foot = la + dir * dir.dot(p - la);
+                        let label = placed.unwrap_or((p + foot) * 0.5 + dir * gap);
+                        let slide = (label - p).dot(dir);
+                        distance_lines(&mut segments, p, foot, dir, slide, arrow);
+                        label
+                    }
+                    _ => return None,
+                }
+            }
+            Constraint::HorizontalDistance { a, b, .. }
+            | Constraint::VerticalDistance { a, b, .. } => {
+                let (pa, pb) = (pos(*a)?, pos(*b)?);
+                let horizontal = matches!(c, Constraint::HorizontalDistance { .. });
+                // The dimension line runs along the measured axis; the extension lines
+                // along the other one.
+                let n = if horizontal { Vec2::Y } else { Vec2::X };
+                let label = placed.unwrap_or((pa + pb) * 0.5 + n * gap);
+                let off = (label - pa).dot(n);
+                let (qa, qb) = (pa + n * off, pb + n * off);
+                segments.push([pa, qa]);
+                segments.push([pb, qb]);
+                segments.push([qa, qb]);
+                arrowheads(&mut segments, qa, qb, arrow);
+                label
+            }
+            Constraint::Radius { curve, .. } | Constraint::Diameter { curve, .. } => {
+                let (center, radius) = match self.sketch.entity(*curve).map(|e| &e.entity)? {
+                    Entity::Circle { center, radius } => (pos(*center)?, *radius),
+                    Entity::Arc { center, start, .. } => {
+                        let c = pos(*center)?;
+                        (c, c.distance(pos(*start)?))
+                    }
+                    _ => return None,
+                };
+                let default_dir = Vec2::from_angle(std::f64::consts::FRAC_PI_4);
+                let label = placed.unwrap_or(center + default_dir * (radius + gap));
+                let dir = (label - center).normalize_or(default_dir);
+                let rim = center + dir * radius;
+                // A leader from the rim to the text, and for a diameter the line right
+                // across the circle with an arrowhead at each end.
+                if matches!(c, Constraint::Diameter { .. }) {
+                    let far = center - dir * radius;
+                    segments.push([far, rim]);
+                    arrowheads(&mut segments, far, rim, arrow);
+                } else {
+                    segments.push([center, rim]);
+                    arrowhead(&mut segments, rim, dir, arrow);
+                }
+                segments.push([rim, label]);
+                label
+            }
+            Constraint::Angle { a, b, .. } => {
+                let (a0, a1) = self.sketch.curve_endpoints(*a)?;
+                let (b0, b1) = self.sketch.curve_endpoints(*b)?;
+                let apex = line_intersection(a0, a1, b0, b1)?;
+                // Each line is measured along whichever of its directions leaves the
+                // apex toward the line itself, so the arc spans the angle the user sees
+                // between the drawn stretches.
+                let da = ((a0 + a1) * 0.5 - apex).normalize_or(a1 - a0);
+                let db = ((b0 + b1) * 0.5 - apex).normalize_or(b1 - b0);
+                let bisector = (da + db).normalize_or(da.perp());
+                let label = placed.unwrap_or(apex + bisector * gap * 1.5);
+                let r = label.distance(apex).max(px);
+                let sweep = da.angle_to(db);
+                let steps = ((sweep.abs() / 0.15).ceil() as usize).max(2);
+                let start = da.to_angle();
+                let mut prev = apex + da * r;
+                for i in 1..=steps {
+                    let next = apex + Vec2::from_angle(start + sweep * i as f64 / steps as f64) * r;
+                    segments.push([prev, next]);
+                    prev = next;
+                }
+                // Extension lines reach out to the arc when it lies beyond the lines.
+                for (p0, p1, d) in [(a0, a1, da), (b0, b1, db)] {
+                    let reach = (p0 - apex).dot(d).max((p1 - apex).dot(d));
+                    if reach < r {
+                        segments.push([apex + d * reach, apex + d * r]);
+                    }
+                }
+                label
+            }
+            _ => return None,
+        };
+        Some(DimGraphic {
+            id: cid,
+            label: to3(label),
+            // A driven dimension is marked the way a spreadsheet marks a formula cell:
+            // the number is still what matters, but the user must be able to see that
+            // retyping it will replace an expression.
+            text: match self.sketch.dimension_expr(cid) {
+                Some(_) => format!("ƒ {}", format_value(c)),
+                None => format_value(c),
+            },
+            segments: segments.iter().map(|[a, b]| [to3(*a), to3(*b)]).collect(),
+        })
+    }
+
+    pub fn saved_camera(&self) -> &Camera {
+        &self.saved_camera
+    }
+}
+
+// --- Shape building -----------------------------------------------------------------------
+
+/// Creates the tool's shape from its clicks, ties it to any points the clicks snapped
+/// to, and turns typed sizes into driving dimensions. Errors are degenerate input
+/// (collinear circle points…) and may leave partial entities behind, so the caller
+/// restores its checkpoint.
+fn build_shape(
+    s: &mut Sketch,
+    tool: SketchTool,
+    c: &[Click],
+    params: &ShapeParams,
+) -> Result<(), SketchError> {
+    let p = |i: usize| c[i].pos;
+    // Points a builder creates on top of a snapped click get tied to the existing
+    // point, so shapes join the rest of the sketch just like lines do.
+    let mut tie: Vec<(EntityId, usize)> = Vec::new();
+    // A typed value is a decision the user made, so it becomes a dimension the way it
+    // does in Fusion; a size picked with the pointer stays free to be dragged.
+    let mut dims: Vec<Constraint> = Vec::new();
+    match tool {
+        SketchTool::Rectangle | SketchTool::CenterRectangle => {
+            let r = if tool == SketchTool::Rectangle {
+                let r = shapes::rectangle_two_point(s, p(0), p(1));
+                tie.push((r.corners[0], 0));
+                tie.push((r.corners[2], 1));
+                r
+            } else {
+                let r = shapes::rectangle_center(s, p(0), p(1));
+                if let Some(center) = r.center {
+                    tie.push((center, 0));
+                }
+                r
+            };
+            // Corners run counter-clockwise from the minimum corner, so the first edge
+            // is the bottom (width) and the second the right side (height).
+            if let Some(width) = params.typed(Dim::Width) {
+                dims.push(Constraint::Distance {
+                    a: r.corners[0],
+                    b: r.corners[1],
+                    value: width,
+                });
+            }
+            if let Some(height) = params.typed(Dim::Height) {
+                dims.push(Constraint::Distance {
+                    a: r.corners[1],
+                    b: r.corners[2],
+                    value: height,
+                });
+            }
+        }
+        SketchTool::Circle | SketchTool::Circle2Point => {
+            let circle = if tool == SketchTool::Circle {
+                let r = (p(1) - p(0)).length().max(1e-3);
+                let circle = shapes::circle_center(s, p(0), r);
+                tie.push((circle.center, 0));
+                circle
+            } else {
+                shapes::circle_two_point(s, p(0), p(1))
+            };
+            if let Some(diameter) = params.typed(Dim::Diameter) {
+                dims.push(Constraint::Diameter {
+                    curve: circle.circle,
+                    value: diameter,
+                });
+            }
+        }
+        SketchTool::Circle3Point => {
+            shapes::circle_three_point(s, p(0), p(1), p(2))?;
+        }
+        SketchTool::Arc3Point => {
+            let a = shapes::arc_three_point(s, p(0), p(1), p(2))?;
+            tie.push((a.start, 0));
+            tie.push((a.end, 2));
+        }
+        SketchTool::ArcCenter => {
+            let a = shapes::arc_center(s, p(0), p(1), p(2));
+            tie.push((a.center, 0));
+            tie.push((a.start, 1));
+            if let Some(radius) = params.typed(Dim::Radius) {
+                dims.push(Constraint::Radius {
+                    curve: a.arc,
+                    value: radius,
+                });
+            }
+        }
+        SketchTool::Polygon => {
+            let poly = shapes::polygon_center(s, p(0), p(1), params.sides)?;
+            tie.push((poly.center, 0));
+            // The construction circle is the polygon's circumcircle, so its radius is
+            // exactly the size the user typed.
+            if let Some(radius) = params.typed(Dim::Radius) {
+                dims.push(Constraint::Radius {
+                    curve: poly.circle,
+                    value: radius,
+                });
+            }
+        }
+        SketchTool::Slot | SketchTool::SlotOverall | SketchTool::SlotCenterPoint => {
+            // Every slot is the same stadium; the variants differ in which two points
+            // the first clicks give and a third click always sets the width, as in
+            // Fusion.
+            let width = (2.0 * distance_to_line(p(2), p(0), p(1))).max(1e-3);
+            let axis = (p(1) - p(0)).normalize_or(Vec2::X);
+            let (a, b) = match tool {
+                SketchTool::SlotOverall => {
+                    // The clicks are the slot's ends; the arc centres sit half a width
+                    // inside them. A slot shorter than its width has no straight part.
+                    let inset = (width * 0.5).min(p(0).distance(p(1)) * 0.5 - 1e-3);
+                    (p(0) + axis * inset, p(1) - axis * inset)
+                }
+                SketchTool::SlotCenterPoint => (p(0) * 2.0 - p(1), p(1)),
+                _ => (p(0), p(1)),
+            };
+            let slot = shapes::slot_center_to_center(s, a, b, width);
+            match tool {
+                SketchTool::Slot => {
+                    tie.push((slot.centers[0], 0));
+                    tie.push((slot.centers[1], 1));
+                }
+                SketchTool::SlotCenterPoint => {
+                    tie.push((slot.centers[1], 1));
+                    // The middle is a construction point on the centre line, so the
+                    // slot stays centred on what was clicked.
+                    let middle = s.add_point(p(0));
+                    s.set_construction(middle, true)?;
+                    s.add_constraint(Constraint::Midpoint {
+                        point: middle,
+                        line: slot.center_line,
+                    })?;
+                    tie.push((middle, 0));
+                }
+                _ => {}
+            }
+            if let Some(length) = params.typed(Dim::Length) {
+                // Typed lengths are between the arc centres for every variant but
+                // overall, where the ends are a width apart from them.
+                let value = if tool == SketchTool::SlotOverall {
+                    (length - width).max(1e-3)
+                } else {
+                    length
+                };
+                dims.push(Constraint::Distance {
+                    a: slot.centers[0],
+                    b: slot.centers[1],
+                    value,
+                });
+            }
+            // Both arcs are equal, so one diameter fixes the whole width.
+            if let Some(width) = params.typed(Dim::Width) {
+                dims.push(Constraint::Diameter {
+                    curve: slot.arcs[0],
+                    value: width,
+                });
+            }
+        }
+        SketchTool::Text => {
+            let anchor = s.add_point(p(0));
+            tie.push((anchor, 0));
+            s.add_text(anchor, params.text.clone(), params.text_height, 0.0)?;
+        }
+        // Tools that draw nothing: the chain tools place their own geometry, and the
+        // editing tools never reach the builder at all.
+        SketchTool::Select
+        | SketchTool::Line
+        | SketchTool::Dimension
+        | SketchTool::Trim
+        | SketchTool::Break => {}
+    }
+    for (created, click) in tie {
+        if let Some(target) = c[click].snapped
+            && target != created
+        {
+            s.add_constraint(Constraint::Coincident {
+                point: created,
+                target,
+            })?;
+        }
+    }
+    for d in dims {
+        s.add_constraint(d)?;
+    }
+    Ok(())
+}
+
+/// Dimensions for a line the user typed sizes for. A typed angle only becomes a
+/// constraint when it is horizontal or vertical: there is no axis entity to measure a
+/// general angle against, so other angles position the line and leave it free.
+fn line_dims(
+    line: EntityId,
+    start: EntityId,
+    end: EntityId,
+    params: &ShapeParams,
+) -> Vec<Constraint> {
+    let mut dims = Vec::new();
+    if let Some(length) = params.typed(Dim::Length) {
+        dims.push(Constraint::Distance {
+            a: start,
+            b: end,
+            value: length,
+        });
+    }
+    if let Some(angle) = params.typed(Dim::Angle) {
+        let quarter_turns = angle / std::f64::consts::FRAC_PI_2;
+        if (quarter_turns - quarter_turns.round()).abs() < 1e-9 {
+            let flat = quarter_turns.round().rem_euclid(2.0) == 0.0;
+            dims.push(if flat {
+                Constraint::Horizontal(line)
+            } else {
+                Constraint::Vertical(line)
+            });
+        }
+    }
+    dims
+}
+
+/// Closed polyline of a curve or text box, for drawing.
+fn outline(sketch: &Sketch, id: EntityId, tess: &Tessellation) -> Option<Vec<Vec2>> {
+    match sketch.entity(id).map(|d| &d.entity)? {
+        Entity::Text { .. } => sketch.text_box(id).map(|b| {
+            let mut v = b.to_vec();
+            v.push(b[0]);
+            v
+        }),
+        _ => sketch.curve_polyline(id, tess),
+    }
+}
+
+/// `toward` moved to exactly `distance` from `from` along the same direction, or left
+/// alone when there is no typed distance or no origin yet.
+fn at_distance(from: Option<Vec2>, toward: Vec2, distance: Option<f64>) -> Vec2 {
+    match (from, distance) {
+        (Some(from), Some(d)) => from + (toward - from).normalize_or(Vec2::X) * d,
+        _ => toward,
+    }
+}
+
+/// Extension lines from `a` and `b` along `n` by `off`, the dimension line joining
+/// their ends, and arrowheads at both ends. Extension lines stop a little short of the
+/// geometry, as drawing convention has it.
+fn distance_lines(segments: &mut Vec<[Vec2; 2]>, a: Vec2, b: Vec2, n: Vec2, off: f64, arrow: f64) {
+    let (qa, qb) = (a + n * off, b + n * off);
+    let clear = n * (arrow * 0.3).copysign(off);
+    segments.push([a + clear, qa]);
+    segments.push([b + clear, qb]);
+    segments.push([qa, qb]);
+    arrowheads(segments, qa, qb, arrow);
+}
+
+/// Arrowheads pointing outward at both ends of the line `a`–`b`, or inward when the
+/// line is too short to hold them.
+fn arrowheads(segments: &mut Vec<[Vec2; 2]>, a: Vec2, b: Vec2, size: f64) {
+    let dir = (b - a).normalize_or(Vec2::X);
+    let flip = if a.distance(b) < size * 3.0 {
+        -1.0
+    } else {
+        1.0
+    };
+    arrowhead(segments, a, -dir * flip, size);
+    arrowhead(segments, b, dir * flip, size);
+}
+
+/// An arrowhead at `tip` pointing along `dir`.
+fn arrowhead(segments: &mut Vec<[Vec2; 2]>, tip: Vec2, dir: Vec2, size: f64) {
+    let dir = dir.normalize_or(Vec2::X);
+    let back = tip - dir * size;
+    let side = dir.perp() * (size * 0.35);
+    segments.push([tip, back + side]);
+    segments.push([tip, back - side]);
+}
+
+/// Where two infinite lines cross, or `None` when parallel.
+fn line_intersection(a0: Vec2, a1: Vec2, b0: Vec2, b1: Vec2) -> Option<Vec2> {
+    let (da, db) = (a1 - a0, b1 - b0);
+    let denom = da.perp_dot(db);
+    if denom.abs() < 1e-12 {
+        return None;
+    }
+    let t = (b0 - a0).perp_dot(db) / denom;
+    Some(a0 + da * t)
+}
+
+fn distance_to_line(p: Vec2, a: Vec2, b: Vec2) -> f64 {
+    let d = b - a;
+    if d.length_squared() < 1e-18 {
+        return p.distance(a);
+    }
+    (d.perp_dot(p - a) / d.length()).abs()
+}
+
+// --- Dimension text -----------------------------------------------------------------------
+
+/// Angles are stored signed for the solver but shown unsigned, as Fusion shows them.
+fn format_value(c: &Constraint) -> String {
+    match c {
+        Constraint::Angle { value, .. } => format!("{:.2}°", value.to_degrees().abs()),
+        Constraint::Diameter { value, .. } => format!("⌀{value:.3}"),
+        Constraint::Radius { value, .. } => format!("R{value:.3}"),
+        other => other
+            .dimension_value()
+            .map(|v| format!("{v:.3}"))
+            .unwrap_or_default(),
+    }
+}
+
+/// The bare number to prefill a dimension's edit box with.
+pub fn edit_text(c: &Constraint) -> String {
+    match c {
+        Constraint::Angle { value, .. } => format!("{:.2}", value.to_degrees().abs()),
+        other => other
+            .dimension_value()
+            .map(|v| format!("{v:.3}"))
+            .unwrap_or_default(),
+    }
+}
+
+/// Parses what the user typed in a dimension box: degrees for angles, mm otherwise. An
+/// angle keeps the sign of the dimension it replaces, so retyping a value never flips
+/// the geometry to the other side.
+pub fn parse_value(c: &Constraint, text: &str) -> Option<f64> {
+    let cleaned: String = text
+        .chars()
+        .filter(|ch| ch.is_ascii_digit() || matches!(ch, '.' | '-' | 'e' | 'E'))
+        .collect();
+    let v: f64 = cleaned.parse().ok()?;
+    Some(match c {
+        Constraint::Angle { value, .. } => v.abs().to_radians().copysign(*value),
+        _ => v,
+    })
+}
+
+// --- Entering and leaving ---------------------------------------------------------------
+
+/// Points the camera squarely at the sketch plane, keeping the current distance.
+fn look_at_plane(camera: &mut Camera, frame: &Frame) {
+    camera.look_from_direction(frame.z);
+    camera.target = frame.origin;
+}
+
+pub fn enter_new(editor: &mut Editor, plane: PlaneRef) {
+    let Some(frame) = editor.plane_frame(&plane) else {
+        editor.report_error("that plane cannot be sketched on (it is not planar)");
+        return;
+    };
+    editor.doc.begin_transaction();
+    let component = editor.active_component;
+    let id = editor.doc.add_feature(FeatureKind::Sketch {
+        plane,
+        component,
+        sketch: Sketch::new(),
+    });
+    start(editor, id, frame, Sketch::new(), None);
+}
+
+pub fn enter_existing(editor: &mut Editor, id: FeatureId, previous_cursor: usize) {
+    let Some(FeatureKind::Sketch { plane, sketch, .. }) =
+        editor.doc.timeline().get(id).map(|f| f.kind.clone())
+    else {
+        return;
+    };
+    editor.refresh_cache();
+    let Some(frame) = editor.plane_frame(&plane) else {
+        editor.report_error("the sketch plane no longer exists");
+        return;
+    };
+    editor.doc.begin_transaction();
+    start(editor, id, frame, sketch, Some(previous_cursor));
+}
+
+fn start(
+    editor: &mut Editor,
+    id: FeatureId,
+    frame: Frame,
+    mut sketch: Sketch,
+    restore_cursor: Option<usize>,
+) {
+    sketch.set_font(editor.font.clone());
+    let saved = editor.camera;
+    look_at_plane(&mut editor.camera, &frame);
+    editor.selection.clear();
+    editor.tool = None;
+    let mut sketch_editor = SketchEditor::new(id, frame, sketch, saved);
+    sketch_editor.restore_cursor = restore_cursor;
+    editor.mode = super::Mode::Sketch(Box::new(sketch_editor));
+    editor.set_status(
+        "Sketching: type a size and Enter to place it, M moves the selection, E extrudes \
+         the region under the pointer, right-click or Esc to end a chain",
+    );
+    editor.request_repaint();
+}
+
+/// Fusion's most-used gesture: point at a closed region inside a sketch, press E, and
+/// the extrude tool opens with that region already chosen. The sketch is finished and
+/// kept first — the extrude is a separate timeline feature and has to be able to see the
+/// sketch it consumes.
+pub fn extrude_region(editor: &mut Editor) {
+    let super::Mode::Sketch(s) = &editor.mode else {
+        return;
+    };
+    let samples = s.region_samples();
+    let sketch = s.feature;
+    if samples.is_empty() {
+        editor.set_status("Point at a closed region, or click inside one, then press E");
+        editor.request_repaint();
+        return;
+    }
+    finish(editor, true);
+    editor.selection.clear();
+    editor.selection.profiles = samples
+        .into_iter()
+        .map(|sample| ProfileRef { sketch, sample })
+        .collect();
+    super::tools::start_tool(editor, super::tools::ToolKind::Extrude);
+}
+
+pub fn finish(editor: &mut Editor, keep: bool) {
+    let super::Mode::Sketch(s) = std::mem::replace(&mut editor.mode, super::Mode::Model) else {
+        return;
+    };
+    editor.camera = *s.saved_camera();
+    // Cursor first: it must be inside the transaction so undo restores it as well.
+    if let Some(c) = s.restore_cursor {
+        editor.doc.set_cursor(c);
+    }
+    if keep {
+        let sketch = s.sketch.clone();
+        let _ = editor.doc.edit_feature_kind(s.feature, |k| {
+            if let FeatureKind::Sketch { sketch: target, .. } = k {
+                *target = sketch;
+            }
+        });
+        editor.doc.commit_transaction();
+        editor.set_status("Sketch finished");
+    } else {
+        editor.doc.rollback_transaction();
+        editor.set_status("Sketch cancelled");
+    }
+    editor.request_repaint();
+}

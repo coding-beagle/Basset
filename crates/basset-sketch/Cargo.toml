@@ -1,0 +1,19 @@
+[package]
+name = "basset-sketch"
+description = "2D sketch entities, constraints, Levenberg–Marquardt solver, shape builders, text outlines and profile extraction for Basset."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+basset-math = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+slotmap = { workspace = true }
+ttf-parser = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }
+serde_json = { workspace = true }

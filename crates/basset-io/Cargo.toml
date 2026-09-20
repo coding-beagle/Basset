@@ -1,0 +1,16 @@
+[package]
+name = "basset-io"
+description = "Mesh export and import for Basset: binary/ASCII STL and 3MF packages."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+basset-math = { workspace = true }
+thiserror = { workspace = true }
+zip = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }

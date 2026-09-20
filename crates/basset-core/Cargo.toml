@@ -1,0 +1,20 @@
+[package]
+name = "basset-core"
+description = "Document model, timeline, and regeneration engine for Basset."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+basset-math = { workspace = true }
+basset-sketch = { workspace = true }
+basset-kernel = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+slotmap = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }

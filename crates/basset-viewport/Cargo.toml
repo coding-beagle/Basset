@@ -1,0 +1,18 @@
+[package]
+name = "basset-viewport"
+description = "Windowing-agnostic wgpu renderer for Basset: orbit camera, shaded meshes, pixel-width lines and points, ground grid, selection highlight."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+basset-math = { workspace = true }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }
+pollster = { workspace = true }

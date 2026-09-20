@@ -1,0 +1,17 @@
+[package]
+name = "basset-kernel"
+description = "Solid modelling kernel for Basset: polygonal boundary representation with analytic provenance, CSG, extrude/revolve/sweep/loft, fillet/chamfer, tessellation, picking."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+basset-math = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+earcutr = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }

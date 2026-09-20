@@ -1,0 +1,29 @@
+[package]
+name = "basset-app"
+description = "Basset desktop application: winit + wgpu + egui shell around the parametric modelling core."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "basset"
+path = "src/main.rs"
+
+[dependencies]
+basset-math = { workspace = true }
+basset-sketch = { workspace = true }
+basset-kernel = { workspace = true }
+basset-core = { workspace = true }
+basset-io = { workspace = true }
+basset-viewport = { workspace = true }
+wgpu = { workspace = true }
+winit = { workspace = true }
+egui = { workspace = true }
+egui-wgpu = { workspace = true }
+egui-winit = { workspace = true }
+pollster = { workspace = true }
+rfd = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+anyhow = { workspace = true }

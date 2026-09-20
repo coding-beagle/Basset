@@ -1,0 +1,4 @@
+/target
+**/*.rs.bk
+*.bass.bak
+.DS_Store
