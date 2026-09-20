@@ -18,7 +18,7 @@
 use basset_core::{FeatureId, FeatureKind, PlaneRef, ProfileRef};
 use basset_math::{Frame, Ray, Vec2, Vec3};
 use basset_sketch::{
-    Constraint, ConstraintId, Entity, EntityId, Profile, Sketch, SketchError, SolveReport,
+    Constraint, ConstraintId, Entity, EntityId, Hit, Profile, Sketch, SketchError, SolveReport,
     Tessellation, edit, pattern, shapes,
 };
 use basset_viewport::{Camera, LineBatch, PointBatch, grid};
@@ -37,6 +37,13 @@ const PARALLEL_TOL: f64 = 1e-6;
 const ARROW_PX: f64 = 9.0;
 /// How far an unplaced dimension sits from what it measures, in pixels.
 const LABEL_GAP_PX: f64 = 28.0;
+/// Geometry the constraints do not pin down, drawn in Fusion's convention of blue for
+/// under-constrained and white for solved.
+const LOOSE_COLOR: [f32; 4] = [0.55, 0.72, 1.0, 1.0];
+/// Half-extent of a constraint badge.
+const GLYPH_PX: f64 = 5.0;
+/// Clearance between the geometry and the first badge on it.
+const GLYPH_GAP_PX: f64 = 13.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SketchTool {
@@ -290,11 +297,16 @@ impl ShapeParams {
     }
 }
 
-/// Where a click landed: the snapped position and, if it snapped, the point entity.
-#[derive(Clone, Copy)]
+/// Where a click landed: the snapped position, and what it landed on.
+#[derive(Clone, Copy, Default)]
 struct Click {
     pos: Vec2,
+    /// An existing point the click landed on. New geometry shares the entity outright,
+    /// which is what joins a loop without the user asking for a constraint.
     snapped: Option<EntityId>,
+    /// A curve the click landed on, when it landed on no point. Sharing an entity is not
+    /// possible here, so the new point gets a `Coincident` onto the curve instead.
+    on_curve: Option<EntityId>,
 }
 
 /// Geometry being dragged with the select tool: every point that moves, with where it
@@ -314,6 +326,23 @@ pub struct DimGraphic {
     /// World position of the value text.
     pub label: Vec3,
     pub text: String,
+    pub segments: Vec<[Vec3; 2]>,
+}
+
+/// A geometric constraint drawn on the geometry it acts on: a small badge of strokes
+/// beside the entity, at a constant size on screen the way the dimension arrows are.
+///
+/// Dimensions draw their own value and leader; these are the ones that have no number,
+/// and without them a sketch gives the user no way to see what is holding it together.
+pub struct ConstraintGlyph {
+    pub id: ConstraintId,
+    /// Which of the constraint's entities this badge sits on. A constraint between two
+    /// curves draws one badge on each, so the id alone does not identify a badge, and the
+    /// interactive area over it needs something stable that the geometry moving does not
+    /// change.
+    pub target: usize,
+    /// World centre of the badge, for placing an interactive area over it.
+    pub center: Vec3,
     pub segments: Vec<[Vec3; 2]>,
 }
 
@@ -400,6 +429,10 @@ pub struct SketchEditor {
     /// the kind of circle used last.
     pub last_variant: Vec<SketchTool>,
     pub hover: Option<EntityId>,
+    /// Geometry the palette wants lit up — the entities of the constraint row under the
+    /// pointer. It is set from the panel each frame and drawn like a hover, which is how
+    /// a row in the list points at the geometry it belongs to.
+    pub highlighted: Vec<EntityId>,
     /// Closed region under the pointer when nothing else is, as an index into
     /// [`Self::profiles`]. Clicking it selects the curves around it.
     pub hover_region: Option<usize>,
@@ -473,6 +506,7 @@ impl SketchEditor {
             tool: SketchTool::Line,
             last_variant: ToolGroup::ALL.iter().map(|g| g.variants()[0]).collect(),
             hover: None,
+            highlighted: Vec::new(),
             hover_region: None,
             cursor: None,
             cursor_snapped: false,
@@ -685,20 +719,37 @@ impl SketchEditor {
     /// Existing points win over the grid: joining geometry is what the user meant, and a
     /// point already placed off-grid would otherwise be impossible to pick up again.
     fn snap(&self, pos: Vec2, tol: f64) -> Click {
-        let point = self.sketch.hit_test(pos, tol).into_iter().find(|h| {
+        let hits = self.sketch.hit_test(pos, tol);
+        let is_point = |h: &&Hit| {
             self.sketch
                 .entity(h.entity)
                 .is_some_and(|e| e.entity.is_point())
-        });
-        match point {
-            Some(h) => Click {
+        };
+        if let Some(h) = hits.iter().find(is_point) {
+            return Click {
                 pos: self.sketch.point_pos(h.entity).unwrap_or(pos),
                 snapped: Some(h.entity),
-            },
-            None => Click {
-                pos: self.to_grid(pos),
-                snapped: None,
-            },
+                on_curve: None,
+            };
+        }
+        // Landing on a curve drops the click onto it and records the curve, so the point
+        // is held there by a constraint rather than by where the grid happened to put it.
+        // Without this a divider drawn to an edge only *looks* attached: it is a free
+        // point that the next re-solve is free to move off, which silently opens the
+        // regions either side of it.
+        for h in &hits {
+            if let Some(on) = self.sketch.closest_point_on(h.entity, pos) {
+                return Click {
+                    pos: on,
+                    snapped: None,
+                    on_curve: Some(h.entity),
+                };
+            }
+        }
+        Click {
+            pos: self.to_grid(pos),
+            snapped: None,
+            on_curve: None,
         }
     }
 
@@ -718,7 +769,11 @@ impl SketchEditor {
         if pos == click.pos {
             click
         } else {
-            Click { pos, snapped: None }
+            Click {
+                pos,
+                snapped: None,
+                on_curve: None,
+            }
         }
     }
 
@@ -1159,6 +1214,15 @@ impl SketchEditor {
         self.selected_regions.clear();
     }
 
+    /// Replaces the selection with exactly these entities, as picking them one by one
+    /// would. Used by the constraint list, where clicking a row means "show me what this
+    /// holds"; the regions go because a set of curves and a filled region are different
+    /// kinds of selection and keeping both would leave the palette offering nonsense.
+    pub fn select_only(&mut self, entities: Vec<EntityId>) {
+        self.clear_selection();
+        self.selected = entities;
+    }
+
     // --- Trim and break --------------------------------------------------------------
 
     fn curve_at(&self, pos: Vec2, tol: f64) -> Option<EntityId> {
@@ -1429,6 +1493,7 @@ impl SketchEditor {
         let click = Click {
             pos: cursor,
             snapped: None,
+            on_curve: None,
         };
         match self.tool {
             SketchTool::Line if self.chain_end.is_some() => self.line_click(click),
@@ -1459,7 +1524,15 @@ impl SketchEditor {
             Some(id) => id,
             None => {
                 self.checkpoint();
-                self.sketch.add_point(click.pos)
+                let point = self.sketch.add_point(click.pos);
+                if let Some(target) = click.on_curve
+                    && let Err(e) = self
+                        .sketch
+                        .add_constraint(Constraint::Coincident { point, target })
+                {
+                    log::warn!("point on curve: {e}");
+                }
+                point
             }
         };
         if let Some(start) = self.chain_end {
@@ -1718,7 +1791,24 @@ impl SketchEditor {
         self.after_change();
     }
 
-    /// Constraints the palette can apply to the current selection, by kind of selection.
+    /// Every constraint the toolbar can offer, in a fixed order. The toolbar shows the
+    /// whole set so the user can see what exists, greying out the ones the current
+    /// selection does not support, rather than having buttons appear and vanish.
+    pub const CONSTRAINT_NAMES: [&'static str; 11] = [
+        "Coincident",
+        "Horizontal",
+        "Vertical",
+        "Parallel",
+        "Perpendicular",
+        "Tangent",
+        "Equal",
+        "Concentric",
+        "Midpoint",
+        "Symmetric",
+        "Fix",
+    ];
+
+    /// Constraints that can be applied to the current selection, by kind of selection.
     pub fn applicable_constraints(&self) -> Vec<(&'static str, Constraint)> {
         let sel = &self.selected;
         let kind = |i: usize| self.sketch.entity(sel[i]).map(|e| &e.entity);
@@ -1836,6 +1926,36 @@ impl SketchEditor {
         Some(self.frame.to_world(pos))
     }
 
+    /// Everything the constraints leave free to move, curves included.
+    ///
+    /// The solver names the points and circles that own a loose parameter; a curve is
+    /// loose when a point that defines it is, and the curve is what the user sees and
+    /// clicks. Drawing these differently is the whole early warning: a sketch that is
+    /// still free to move looks identical to a finished one until a dimension change
+    /// drags it somewhere unintended.
+    pub fn under_constrained(&self) -> std::collections::HashSet<EntityId> {
+        let Some(Ok(report)) = &self.report else {
+            return std::collections::HashSet::new();
+        };
+        let mut out: std::collections::HashSet<EntityId> =
+            report.under_constrained.iter().copied().collect();
+        let curves: Vec<EntityId> = self
+            .sketch
+            .entities()
+            .filter(|(id, _)| {
+                !out.contains(id)
+                    && self
+                        .sketch
+                        .entity_points(*id)
+                        .iter()
+                        .any(|p| out.contains(p))
+            })
+            .map(|(id, _)| id)
+            .collect();
+        out.extend(curves);
+        out
+    }
+
     /// Line and point batches for the sketch overlay.
     pub fn draw(&self, lines: &mut Vec<LineBatch>, points: &mut Vec<PointBatch>) {
         let to3 = |p: Vec2| self.frame.to_world(p);
@@ -1844,6 +1964,13 @@ impl SketchEditor {
         let mut construction = LineBatch::new([0.75, 0.75, 0.55, 1.0]);
         construction.dashed = true;
         construction.depth_test = false;
+        // Periwinkle for anything still free to move, after Fusion's blue: not the
+        // saturated blue of the selection, which is also drawn three pixels wide.
+        let mut loose = LineBatch::new(LOOSE_COLOR);
+        loose.depth_test = false;
+        let mut loose_construction = LineBatch::new(LOOSE_COLOR);
+        loose_construction.dashed = true;
+        loose_construction.depth_test = false;
         let mut selected = LineBatch::new([0.25, 0.6, 1.0, 1.0]);
         selected.width_px = 3.0;
         selected.depth_test = false;
@@ -1851,8 +1978,10 @@ impl SketchEditor {
         hovered.width_px = 2.5;
         hovered.depth_test = false;
         let mut pts = PointBatch::new([0.9, 0.9, 0.9, 1.0]);
+        let mut loose_pts = PointBatch::new(LOOSE_COLOR);
         let mut sel_pts = PointBatch::new([0.25, 0.6, 1.0, 1.0]);
         sel_pts.size_px = 8.0;
+        let free = self.under_constrained();
 
         let region_curves = self
             .hover_region
@@ -1860,11 +1989,15 @@ impl SketchEditor {
             .unwrap_or_default();
         for (id, data) in self.sketch.entities() {
             let is_selected = self.selected.contains(&id);
-            let is_hovered =
-                self.hover == Some(id) || self.dim_first == Some(id) || region_curves.contains(&id);
+            let is_hovered = self.hover == Some(id)
+                || self.dim_first == Some(id)
+                || region_curves.contains(&id)
+                || self.highlighted.contains(&id);
             if let Entity::Point { pos } = data.entity {
                 if is_selected || is_hovered {
                     sel_pts.points.push(to3(pos));
+                } else if free.contains(&id) {
+                    loose_pts.points.push(to3(pos));
                 } else {
                     pts.points.push(to3(pos));
                 }
@@ -1873,14 +2006,18 @@ impl SketchEditor {
             let Some(polyline) = outline(&self.sketch, id, &self.tess) else {
                 continue;
             };
-            let batch = if is_selected {
-                &mut selected
-            } else if is_hovered {
-                &mut hovered
-            } else if data.construction {
-                &mut construction
-            } else {
-                &mut normal
+            let batch = match (
+                is_selected,
+                is_hovered,
+                data.construction,
+                free.contains(&id),
+            ) {
+                (true, ..) => &mut selected,
+                (_, true, ..) => &mut hovered,
+                (.., true, true) => &mut loose_construction,
+                (.., true, false) => &mut construction,
+                (.., false, true) => &mut loose,
+                _ => &mut normal,
             };
             for w in polyline.windows(2) {
                 batch.segments.push([to3(w[0]), to3(w[1])]);
@@ -1944,8 +2081,23 @@ impl SketchEditor {
         for g in self.dimension_graphics() {
             dims.segments.extend(g.segments);
         }
-        lines.extend([normal, construction, hovered, selected, dims]);
-        points.extend([pts, sel_pts]);
+        // Amber, so a constraint mark is never mistaken for a dimension or for geometry.
+        let mut glyphs = LineBatch::new([0.95, 0.72, 0.30, 0.95]);
+        glyphs.depth_test = false;
+        for g in self.constraint_glyphs() {
+            glyphs.segments.extend(g.segments);
+        }
+        lines.extend([
+            normal,
+            construction,
+            loose,
+            loose_construction,
+            hovered,
+            selected,
+            dims,
+            glyphs,
+        ]);
+        points.extend([pts, loose_pts, sel_pts]);
         // Crosshair on the snapped position, so the user aims at where the point will
         // actually land rather than at the pointer, which the grid snap can pull away
         // from by half a step. Amber when it will reuse an existing point.
@@ -1997,6 +2149,7 @@ impl SketchEditor {
         clicks.push(Click {
             pos: cursor,
             snapped: None,
+            on_curve: None,
         });
         let mut scratch = self.sketch.clone();
         if build_shape(&mut scratch, self.tool, &clicks, &self.params()).is_err() {
@@ -2159,12 +2312,183 @@ impl SketchEditor {
         })
     }
 
+    /// A badge for every geometric constraint, placed beside the geometry it holds.
+    ///
+    /// Several constraints on one entity stack outwards from it so they stay legible,
+    /// which is what a real drawing does with its constraint marks.
+    pub fn constraint_glyphs(&self) -> Vec<ConstraintGlyph> {
+        let size = self.cursor_px * GLYPH_PX;
+        let gap = self.cursor_px * GLYPH_GAP_PX;
+        let to3 = |p: Vec2| self.frame.to_world(p);
+        let mut stacked: Vec<(EntityId, f64)> = Vec::new();
+        let mut out = Vec::new();
+        for (cid, c) in self.sketch.constraints() {
+            let strokes = glyph_strokes(c);
+            if strokes.is_empty() {
+                continue;
+            }
+            // Horizontal and Vertical are statements about the axes, so their marks keep
+            // the axes' orientation; every other badge lines up with its entity.
+            let axis_aligned = matches!(c, Constraint::Horizontal(_) | Constraint::Vertical(_));
+            for (target, id) in glyph_targets(c).into_iter().enumerate() {
+                let Some((base, outward, along)) = self.glyph_anchor(id) else {
+                    continue;
+                };
+                let slot = match stacked.iter_mut().find(|(e, _)| *e == id) {
+                    Some((_, used)) => used,
+                    None => {
+                        stacked.push((id, 0.0));
+                        &mut stacked.last_mut().expect("just pushed").1
+                    }
+                };
+                let center = base + outward * (gap + *slot);
+                *slot += size * 2.6;
+                let (u, v) = if axis_aligned {
+                    (Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0))
+                } else {
+                    (along, outward)
+                };
+                let place = |p: Vec2| center + u * (p.x * size) + v * (p.y * size);
+                out.push(ConstraintGlyph {
+                    id: cid,
+                    target,
+                    center: to3(center),
+                    segments: strokes
+                        .iter()
+                        .map(|[a, b]| [to3(place(*a)), to3(place(*b))])
+                        .collect(),
+                });
+            }
+        }
+        out
+    }
+
+    /// Where a badge for a constraint on `id` sits: a point on the entity, the direction
+    /// away from it, and the direction along it.
+    fn glyph_anchor(&self, id: EntityId) -> Option<(Vec2, Vec2, Vec2)> {
+        let x = Vec2::new(1.0, 0.0);
+        match self.sketch.entity(id)?.entity {
+            Entity::Point { pos } => {
+                // Up and to the right, clear of the crosshair and of the point itself.
+                let diagonal = std::f64::consts::FRAC_1_SQRT_2;
+                Some((pos, Vec2::new(diagonal, diagonal), x))
+            }
+            Entity::Line { start, end } => {
+                let (a, b) = (self.sketch.point_pos(start)?, self.sketch.point_pos(end)?);
+                let along = (b - a).try_normalize()?;
+                Some(((a + b) * 0.5, along.perp(), along))
+            }
+            Entity::Circle { center, radius } => {
+                let c = self.sketch.point_pos(center)?;
+                let radial = Vec2::new(0.0, 1.0);
+                Some((c + radial * radius, radial, x))
+            }
+            Entity::Arc { center, start, end } => {
+                let c = self.sketch.point_pos(center)?;
+                let (a, b) = (self.sketch.point_pos(start)?, self.sketch.point_pos(end)?);
+                let a0 = (a - c).to_angle();
+                let sweep = ((b - c).to_angle() - a0).rem_euclid(std::f64::consts::TAU);
+                let radial = Vec2::from_angle(a0 + sweep * 0.5);
+                Some((c + radial * a.distance(c), radial, radial.perp()))
+            }
+            _ => None,
+        }
+    }
+
     pub fn saved_camera(&self) -> &Camera {
         &self.saved_camera
     }
 }
 
 // --- Shape building -----------------------------------------------------------------------
+
+/// The entities a constraint puts a badge on. A constraint between two curves marks
+/// both, as a drawing does, so it is clear which pair it ties together.
+fn glyph_targets(c: &Constraint) -> Vec<EntityId> {
+    match c {
+        Constraint::Horizontal(a) | Constraint::Vertical(a) | Constraint::Fix(a) => vec![*a],
+        Constraint::Parallel(a, b)
+        | Constraint::Perpendicular(a, b)
+        | Constraint::Equal(a, b)
+        | Constraint::Tangent(a, b)
+        | Constraint::Concentric(a, b) => vec![*a, *b],
+        Constraint::Coincident { point, .. } | Constraint::Midpoint { point, .. } => vec![*point],
+        Constraint::Symmetric { a, b, .. } => vec![*a, *b],
+        // Dimensions draw their own value, extension lines and arrowheads.
+        _ => Vec::new(),
+    }
+}
+
+/// A closed ring of `r`, for the badges drawn as circles.
+fn glyph_ring(r: f64) -> Vec<[Vec2; 2]> {
+    const STEPS: usize = 10;
+    (0..STEPS)
+        .map(|i| {
+            let angle = |k: usize| std::f64::consts::TAU * k as f64 / STEPS as f64;
+            [
+                Vec2::from_angle(angle(i)) * r,
+                Vec2::from_angle(angle(i + 1)) * r,
+            ]
+        })
+        .collect()
+}
+
+/// The badge for a constraint, in a local frame spanning roughly -1..1 on each axis.
+/// Returns nothing for the dimensions, which draw themselves.
+fn glyph_strokes(c: &Constraint) -> Vec<[Vec2; 2]> {
+    let v = Vec2::new;
+    match c {
+        Constraint::Horizontal(_) => vec![[v(-1.0, 0.0), v(1.0, 0.0)]],
+        Constraint::Vertical(_) => vec![[v(0.0, -1.0), v(0.0, 1.0)]],
+        // Two slanted strokes, the drawing convention for parallel.
+        Constraint::Parallel(..) => {
+            vec![[v(-0.8, -1.0), v(-0.2, 1.0)], [v(0.2, -1.0), v(0.8, 1.0)]]
+        }
+        Constraint::Perpendicular(..) => {
+            vec![[v(-1.0, 1.0), v(-1.0, -1.0)], [v(-1.0, -1.0), v(1.0, -1.0)]]
+        }
+        Constraint::Equal(..) => vec![
+            [v(-1.0, 0.45), v(1.0, 0.45)],
+            [v(-1.0, -0.45), v(1.0, -0.45)],
+        ],
+        // A curve resting on its tangent line.
+        Constraint::Tangent(..) => {
+            let mut out = vec![[v(-1.0, -0.75), v(1.0, -0.75)]];
+            out.extend(
+                glyph_ring(0.75)
+                    .into_iter()
+                    .filter(|[a, b]| a.y >= -0.01 && b.y >= -0.01),
+            );
+            out
+        }
+        Constraint::Concentric(..) => {
+            let mut out = glyph_ring(1.0);
+            out.extend(glyph_ring(0.45));
+            out
+        }
+        Constraint::Coincident { .. } => glyph_ring(0.8),
+        Constraint::Midpoint { .. } => vec![
+            [v(0.0, 1.0), v(-0.9, -0.7)],
+            [v(-0.9, -0.7), v(0.9, -0.7)],
+            [v(0.9, -0.7), v(0.0, 1.0)],
+        ],
+        Constraint::Symmetric { .. } => vec![
+            [v(0.0, -1.0), v(0.0, 1.0)],
+            [v(-1.0, 0.7), v(-0.35, 0.0)],
+            [v(-1.0, -0.7), v(-0.35, 0.0)],
+            [v(1.0, 0.7), v(0.35, 0.0)],
+            [v(1.0, -0.7), v(0.35, 0.0)],
+        ],
+        // A pinned point: a box around it.
+        Constraint::Fix(_) => vec![
+            [v(-0.8, -0.8), v(0.8, -0.8)],
+            [v(0.8, -0.8), v(0.8, 0.8)],
+            [v(0.8, 0.8), v(-0.8, 0.8)],
+            [v(-0.8, 0.8), v(-0.8, -0.8)],
+        ],
+        _ => Vec::new(),
+    }
+}
 
 /// Creates the tool's shape from its clicks, ties it to any points the clicks snapped
 /// to, and turns typed sizes into driving dimensions. Errors are degenerate input
@@ -2333,7 +2657,9 @@ fn build_shape(
         | SketchTool::Break => {}
     }
     for (created, click) in tie {
-        if let Some(target) = c[click].snapped
+        // A click on a curve ties the same way a click on a point does; the solver takes
+        // `Coincident` against a line or circle as "on it", not "at its centre".
+        if let Some(target) = c[click].snapped.or(c[click].on_curve)
             && target != created
         {
             s.add_constraint(Constraint::Coincident {

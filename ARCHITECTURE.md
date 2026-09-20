@@ -79,6 +79,13 @@ solver flattens all free parameters into one vector and solves constraints as a
 least-squares system with Levenberg–Marquardt, using forward-mode dual numbers for exact
 Jacobians. Constraint residuals are written once, generically over the scalar type.
 
+The solve reports not only how many degrees of freedom remain — free parameters minus the
+rank of the hard Jacobian — but which entities own them, by walking the Jacobian's null
+space one free column at a time. The editor draws those entities in blue, and a sketch
+that still has freedom left warns from the timeline through `FeatureStatus::Warned`: an
+under-constrained sketch is a model-level fault, because it is an edit *elsewhere* that
+moves the loose geometry and quietly changes what the profiles enclose.
+
 Profiles (closed regions usable by extrude etc.) are found by planar face tracing.
 Curves are tessellated into polylines at extraction time and split wherever two of them
 cross, so every region the drawing encloses is a profile, not only the ones the user drew
@@ -86,7 +93,11 @@ with matching endpoints. Each polyline segment is tagged with its source curve i
 the kernel can give the resulting side faces stable keys and correct surface kinds.
 Splitting happens on the tessellated curves and both sides are cut at the identical
 point, so the graph stays watertight and the boundary is as accurate as the tessellation
-the kernel consumes anyway. Two fragments of one curve bounding the same region share a
+the kernel consumes anyway. A curve is also split where another curve's *endpoint* lands
+within the join tolerance of its interior without touching it — the 2D counterpart of
+`Solid::heal` — because solver output lands a few 1e-7 off exact coordinates routinely,
+and an unhealed near miss merges the regions either side of it into one self-overlapping
+loop that extrudes without complaining. Two fragments of one curve bounding the same region share a
 curve tag, and so become one kernel face in two pieces rather than two faces. Curves that
 run along each other are cut at the ends of the stretch they share and the duplicate is
 dropped, so an outline traced twice still encloses its regions; which copy survives, and

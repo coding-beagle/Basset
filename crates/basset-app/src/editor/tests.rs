@@ -3,7 +3,7 @@
 
 use basset_core::{BodyRef, FeatureKind, OriginPlane, PlaneRef, ProfileRef, RegionRef};
 use basset_math::{Vec2, Vec3};
-use basset_sketch::Entity;
+use basset_sketch::{Constraint, Entity, EntityId};
 
 use super::harness::{
     block, click_at, click_with, dimension, draw_line, draw_rectangle, point_at, sketch, top_face,
@@ -1486,4 +1486,165 @@ fn a_named_parameter_drives_a_dimension_through_the_editor() {
     assert_eq!(s.param_drafts, vec![("width".into(), "30".into())]);
     assert!(s.set_parameter("width", "nope * 2").is_err());
     assert_eq!(s.sketch.parameter_value("width").unwrap(), 30.0);
+}
+
+/// Clicking a curve while drawing attaches the point to it, rather than leaving a free
+/// point wherever the grid put it.
+///
+/// A divider drawn to an edge used to only *look* attached: `snap` considered existing
+/// points and nothing else, so the endpoint was a grid-snapped free point that happened
+/// to sit on the edge. Re-solving after any dimension change moved it off, which opened
+/// the regions either side of it and silently changed what the extrudes built.
+#[test]
+fn drawing_onto_a_curve_constrains_the_point_to_it() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+    // Both ends land on an edge, away from any corner.
+    draw_line(&mut editor, Vec2::new(10.0, 0.0), Vec2::new(10.0, 10.0));
+    let s = sketch(&mut editor);
+
+    let onto_curves = s
+        .sketch
+        .constraints()
+        .filter(|(_, c)| match c {
+            Constraint::Coincident { target, .. } => s
+                .sketch
+                .entity(*target)
+                .is_some_and(|e| e.entity.is_curve()),
+            _ => false,
+        })
+        .count();
+    assert_eq!(onto_curves, 2, "both ends are held onto the edge they meet");
+    assert_eq!(s.sketch.profiles(&Default::default()).len(), 2);
+
+    // Moving the top edge away is what used to break it: the divider must follow.
+    let top: Vec<EntityId> = s
+        .sketch
+        .entities()
+        .filter(|(id, d)| d.entity.is_point() && s.sketch.point_pos(*id).is_some_and(|p| p.y > 5.0))
+        .map(|(id, _)| id)
+        .collect();
+    let goals: Vec<(EntityId, Vec2)> = top
+        .iter()
+        .map(|id| (*id, s.sketch.point_pos(*id).unwrap() + Vec2::new(0.0, 10.0)))
+        .collect();
+    s.sketch.drag_points(&goals).expect("drag");
+
+    let profiles = s.sketch.profiles(&Default::default());
+    assert_eq!(profiles.len(), 2, "the divider still splits the rectangle");
+    for p in &profiles {
+        assert!(
+            p.area() > 50.0,
+            "each half grew with the rectangle: {}",
+            p.area()
+        );
+    }
+}
+
+/// Geometric constraints are drawn on the geometry, not left invisible.
+///
+/// Only the six dimension kinds used to produce a graphic; Horizontal, Vertical,
+/// Coincident, Parallel and the rest returned nothing, so a sketch showed no sign of
+/// what was holding it together and a constraint could never be picked to remove.
+#[test]
+fn geometric_constraints_are_drawn_on_the_geometry() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+    let s = sketch(&mut editor);
+
+    // A rectangle is built with horizontal and vertical constraints on its four sides.
+    let glyphs = s.constraint_glyphs();
+    assert_eq!(glyphs.len(), 4, "one badge per constraint");
+    for g in &glyphs {
+        assert!(!g.segments.is_empty(), "a badge has strokes to draw");
+        assert!(
+            s.sketch.constraint(g.id).is_some(),
+            "each badge names a live constraint"
+        );
+    }
+
+    // Every badge sits off the geometry rather than on top of it, and within reach of it.
+    let bounds = 40.0;
+    for g in &glyphs {
+        let p = s.frame.to_local(g.center);
+        assert!(
+            p.x.abs() < bounds && p.y.abs() < bounds,
+            "badge is beside its entity, not flung off: {p:?}"
+        );
+    }
+}
+
+/// Dimensions keep drawing their own value and leader; they must not gain a second badge.
+#[test]
+fn dimensions_are_not_given_constraint_badges() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_line(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0));
+    let before = sketch(&mut editor).constraint_glyphs().len();
+    let camera = editor.camera;
+    let window = editor.window_px;
+    dimension(
+        sketch(&mut editor),
+        &camera,
+        window,
+        Vec2::new(5.0, 0.0),
+        Vec2::new(5.0, -6.0),
+    );
+    let s = sketch(&mut editor);
+    assert!(
+        s.sketch
+            .constraints()
+            .any(|(_, c)| matches!(c, Constraint::Distance { .. })),
+        "the dimension was made"
+    );
+    assert_eq!(
+        s.constraint_glyphs().len(),
+        before,
+        "the dimension draws itself and gets no badge"
+    );
+}
+
+/// The viewport colours what the solver leaves free, and a curve counts as free when a
+/// point defining it does — otherwise a rectangle with one loose corner would look
+/// finished except for a single dot.
+#[test]
+fn under_constrained_geometry_includes_the_curves_its_points_hold() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+    let Mode::Sketch(s) = &mut editor.mode else {
+        unreachable!()
+    };
+    let free = s.under_constrained();
+    let curves: Vec<EntityId> = s
+        .sketch
+        .entities()
+        .filter(|(_, e)| !e.entity.is_point())
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(curves.len(), 4);
+    for id in &curves {
+        assert!(
+            free.contains(id),
+            "every line of a loose rectangle is loose"
+        );
+    }
+
+    // Pin it down completely: nothing is drawn blue any more.
+    let corners: Vec<EntityId> = s
+        .sketch
+        .entities()
+        .filter(|(_, e)| e.entity.is_point())
+        .map(|(id, _)| id)
+        .collect();
+    for id in corners {
+        s.add_constraint(Constraint::Fix(id)).unwrap();
+    }
+    assert!(s.under_constrained().is_empty());
 }

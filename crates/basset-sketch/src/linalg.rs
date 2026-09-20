@@ -2,6 +2,18 @@
 //! crate has no numeric dependency. Sketch systems are a few hundred unknowns at most,
 //! so dense O(n³) routines are the simplest correct choice.
 
+/// How far a column must move, per unit of motion of the free column that drives it, to
+/// count as free in [`Mat::freedom`].
+///
+/// The null-space vector is built with the driving column set to exactly one, so this
+/// thresholds a ratio: "millimetres this unknown moves per millimetre of that one". A
+/// component below it is elimination noise rather than a direction the geometry can
+/// really take. It is not invariant to column scaling, so a sketch mixing features whose
+/// sizes differ by more than ~1e3 — which shows up in the Jacobian through residuals
+/// normalised by length, such as `Angle` — can under-report a genuinely free unknown
+/// whose motion is that much smaller than its neighbour's.
+const FREE_TOL: f64 = 1e-6;
+
 /// Dense row-major matrix.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Mat {
@@ -63,12 +75,52 @@ impl Mat {
         out
     }
 
-    /// Numerical rank by Gaussian elimination with full pivoting. `rel_tol` is relative to
-    /// the largest pivot, so the answer does not depend on the units of the rows.
-    pub fn rank(&self, rel_tol: f64) -> usize {
+    /// The rank, and which columns some solution of `A x = 0` moves — the unknowns the
+    /// rows leave free.
+    ///
+    /// Rank is by Gaussian elimination with full pivoting; `rel_tol` is relative to the
+    /// largest pivot, so the answer does not depend on the units of the rows.
+    ///
+    /// The rank alone says *how many* degrees of freedom remain; the columns say *where*
+    /// they are, which is what lets the editor point at the geometry that is still loose
+    /// instead of only counting it. A column with no pivot is free by construction, and
+    /// so is every pivot column that a free one drags along, because moving the free
+    /// unknown forces the pivot ones to follow. Both answers come out of one elimination
+    /// because this runs on every solve, and a solve runs on every frame of a drag.
+    pub fn freedom(&self, rel_tol: f64) -> (usize, Vec<bool>) {
+        let e = self.eliminate(rel_tol);
+        let mut pivot_col = vec![false; self.cols];
+        for &(_, c) in &e.pivots {
+            pivot_col[c] = true;
+        }
+        let mut free = vec![false; self.cols];
+        for f in (0..self.cols).filter(|c| !pivot_col[*c]) {
+            // One null-space vector per free column: move that unknown by exactly one and
+            // back-substitute what the pivot unknowns must do to keep every row at zero.
+            // The pivots were chosen in order, so no pivot row has an entry in an earlier
+            // pivot column and the substitution runs straight back up them.
+            let mut x = vec![0.0; self.cols];
+            x[f] = 1.0;
+            for (i, &(r, c)) in e.pivots.iter().enumerate().rev() {
+                let mut sum = e.m.at(r, f);
+                for &(_, later) in &e.pivots[i + 1..] {
+                    sum += e.m.at(r, later) * x[later];
+                }
+                x[c] = -sum / e.m.at(r, c);
+            }
+            for (c, v) in x.iter().enumerate() {
+                free[c] |= v.abs() > FREE_TOL;
+            }
+        }
+        (e.pivots.len(), free)
+    }
+
+    /// Gaussian elimination with full pivoting: the reduced matrix and the
+    /// `(row, column)` of each pivot, in the order they were taken.
+    fn eliminate(&self, rel_tol: f64) -> Elimination {
         let mut m = self.clone();
         let (rows, cols) = (m.rows, m.cols);
-        let mut rank = 0;
+        let mut pivots = Vec::new();
         let mut first_pivot = None;
         let mut row_used = vec![false; rows];
         let mut col_used = vec![false; cols];
@@ -87,7 +139,7 @@ impl Mat {
                 break;
             }
             first_pivot.get_or_insert(pivot);
-            rank += 1;
+            pivots.push((pr, pc));
             row_used[pr] = true;
             col_used[pc] = true;
             let pv = m.at(pr, pc);
@@ -102,8 +154,15 @@ impl Mat {
                 }
             }
         }
-        rank
+        Elimination { m, pivots }
     }
+}
+
+/// The result of [`Mat::eliminate`], kept together because the pivot positions are
+/// meaningless without the reduced matrix they index.
+struct Elimination {
+    m: Mat,
+    pivots: Vec<(usize, usize)>,
 }
 
 /// Solves `A x = b` for symmetric positive-definite `A` by Cholesky decomposition.
@@ -182,15 +241,15 @@ mod tests {
             cols: 3,
             data: vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
         };
-        assert_eq!(full.rank(1e-9), 2);
+        assert_eq!(full.freedom(1e-9).0, 2);
         let dep = Mat {
             rows: 3,
             cols: 2,
             data: vec![1.0, 2.0, 2.0, 4.0, 0.0, 1.0],
         };
-        assert_eq!(dep.rank(1e-9), 2);
+        assert_eq!(dep.freedom(1e-9).0, 2);
         let zero = Mat::zeros(2, 2);
-        assert_eq!(zero.rank(1e-9), 0);
+        assert_eq!(zero.freedom(1e-9).0, 0);
     }
 
     #[test]
@@ -203,5 +262,42 @@ mod tests {
         let g = a.gram();
         assert_eq!(g.data, vec![10.0, 14.0, 14.0, 20.0]);
         assert_eq!(a.transpose_mul_vec(&[1.0, 1.0]), vec![4.0, 6.0]);
+    }
+    #[test]
+    fn free_columns_are_the_ones_the_rows_do_not_pin() {
+        // x0 + x1 = 0 holds neither down: either can move if the other follows.
+        let coupled = Mat {
+            rows: 1,
+            cols: 2,
+            data: vec![1.0, 1.0],
+        };
+        assert_eq!(coupled.freedom(1e-9), (1, vec![true, true]));
+
+        // Two rows pinning two of three unknowns: only the third is free, and it drags
+        // nothing with it.
+        let partly = Mat {
+            rows: 2,
+            cols: 3,
+            data: vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        };
+        assert_eq!(partly.freedom(1e-9), (2, vec![false, false, true]));
+
+        // A pivot column a free one drags along counts as free: x0 is pinned only
+        // relative to x2.
+        let dragged = Mat {
+            rows: 2,
+            cols: 3,
+            data: vec![1.0, 0.0, -1.0, 0.0, 1.0, 0.0],
+        };
+        assert_eq!(dragged.freedom(1e-9), (2, vec![true, false, true]));
+
+        // Nothing constrained at all, and nothing left free.
+        assert_eq!(Mat::zeros(2, 2).freedom(1e-9), (0, vec![true, true]));
+        let identity = Mat {
+            rows: 2,
+            cols: 2,
+            data: vec![1.0, 0.0, 0.0, 1.0],
+        };
+        assert_eq!(identity.freedom(1e-9), (2, vec![false, false]));
     }
 }

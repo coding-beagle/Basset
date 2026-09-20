@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use basset_kernel::{Profile, Solid};
 use basset_math::Frame;
-use basset_sketch::Sketch;
+use basset_sketch::{Sketch, SolveReport};
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{ComponentId, FeatureId};
@@ -19,6 +19,10 @@ use crate::refs::BodyRef;
 pub enum FeatureStatus {
     Ok,
     Suppressed,
+    /// The feature built, but something about the result deserves the user's attention —
+    /// an under-constrained sketch, say, whose geometry the next edit is free to move.
+    /// Replay carries on exactly as for `Ok`; only the UI treats it differently.
+    Warned(String),
     /// Replay continued past this feature; its outputs are missing and dependants will
     /// usually fail too. The message is what the UI shows in the timeline tooltip.
     Failed(String),
@@ -47,6 +51,10 @@ pub struct SolvedSketch {
     pub sketch: Sketch,
     /// Closed regions in kernel form (frame attached), ready for extrude/revolve/loft.
     pub profiles: Vec<Profile>,
+    /// What the solver made of it. Kept because an under-constrained sketch is a problem
+    /// the *model* has, not just the sketch editor: the warning has to survive into
+    /// regeneration, where a dimension change is what moves the loose geometry.
+    pub report: SolveReport,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -78,6 +86,13 @@ impl ModelState {
 
     pub fn status(&self, id: FeatureId) -> Option<&FeatureStatus> {
         self.statuses.get(&id)
+    }
+
+    pub fn warned_features(&self) -> impl Iterator<Item = (FeatureId, &str)> {
+        self.statuses.iter().filter_map(|(id, s)| match s {
+            FeatureStatus::Warned(msg) => Some((*id, msg.as_str())),
+            _ => None,
+        })
     }
 
     pub fn failed_features(&self) -> impl Iterator<Item = (FeatureId, &str)> {

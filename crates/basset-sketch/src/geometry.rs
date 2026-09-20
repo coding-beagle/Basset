@@ -34,6 +34,39 @@ pub fn point_arc_distance(p: Vec2, center: Vec2, start: Vec2, end: Vec2) -> f64 
     }
 }
 
+/// Nearest point of the segment `ab` to `p`.
+pub fn closest_point_on_segment(p: Vec2, a: Vec2, b: Vec2) -> Vec2 {
+    let d = b - a;
+    let len2 = d.length_squared();
+    if len2 == 0.0 {
+        return a;
+    }
+    a + d * ((p - a).dot(d) / len2).clamp(0.0, 1.0)
+}
+
+/// Nearest point of the circle — the curve, not the disc — to `p`.
+pub fn closest_point_on_circle(p: Vec2, center: Vec2, radius: f64) -> Vec2 {
+    match (p - center).try_normalize() {
+        Some(radial) => center + radial * radius,
+        // Dead centre: every point of the circle is equally near, so any will do.
+        None => center + Vec2::X * radius,
+    }
+}
+
+/// Nearest point of the CCW arc from `start` to `end` about `center` to `p`. Mirrors
+/// [`point_arc_distance`]: radial inside the sweep, the nearer endpoint outside it.
+pub fn closest_point_on_arc(p: Vec2, center: Vec2, start: Vec2, end: Vec2) -> Vec2 {
+    let a0 = (start - center).to_angle();
+    let sweep = ccw_sweep(a0, (end - center).to_angle());
+    if angle_within((p - center).to_angle(), a0, sweep) {
+        closest_point_on_circle(p, center, start.distance(center))
+    } else if p.distance(start) <= p.distance(end) {
+        start
+    } else {
+        end
+    }
+}
+
 /// Axis-aligned bounds of a CCW arc: its endpoints plus any axis-extreme point it crosses.
 pub fn arc_bounds(center: Vec2, start: Vec2, end: Vec2) -> (Vec2, Vec2) {
     let radius = start.distance(center);

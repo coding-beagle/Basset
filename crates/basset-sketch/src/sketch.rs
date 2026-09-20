@@ -9,7 +9,8 @@ use slotmap::{SecondaryMap, SlotMap};
 
 use crate::contour::{Contour, Segment, SegmentKind};
 use crate::geometry::{
-    arc_bounds, point_arc_distance, point_circle_distance, point_in_rect, point_segment_distance,
+    arc_bounds, closest_point_on_arc, closest_point_on_circle, closest_point_on_segment,
+    point_arc_distance, point_circle_distance, point_in_rect, point_segment_distance,
     polyline_intersects_rect,
 };
 use crate::tessellation::{Tessellation, arc_polyline, circle_polyline};
@@ -397,6 +398,30 @@ impl Sketch {
                     .fold(Vec2::splat(f64::NEG_INFINITY), |m, p| m.max(*p));
                 Some((min, max))
             }
+        }
+    }
+
+    /// The point of `id` nearest `pos`, for dropping a click onto a curve it landed on.
+    /// `None` for entities a point cannot be made [`Constraint::Coincident`] with.
+    pub fn closest_point_on(&self, id: EntityId, pos: Vec2) -> Option<Vec2> {
+        match self.entities.get(id)?.entity {
+            Entity::Line { start, end } => Some(closest_point_on_segment(
+                pos,
+                self.point_pos(start)?,
+                self.point_pos(end)?,
+            )),
+            Entity::Circle { center, radius } => Some(closest_point_on_circle(
+                pos,
+                self.point_pos(center)?,
+                radius,
+            )),
+            Entity::Arc { center, start, end } => Some(closest_point_on_arc(
+                pos,
+                self.point_pos(center)?,
+                self.point_pos(start)?,
+                self.point_pos(end)?,
+            )),
+            _ => None,
         }
     }
 
