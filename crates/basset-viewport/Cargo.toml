@@ -14,5 +14,8 @@ log = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+# The silhouette is tested against the meshes it is actually handed — a tessellated
+# cylinder, a loft, a filleted box — rather than against triangles written out by hand.
+basset-kernel = { workspace = true }
 approx = { workspace = true }
 pollster = { workspace = true }
