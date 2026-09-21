@@ -710,3 +710,42 @@ fn transactions_group_edits_into_one_undo_step() {
     assert!(doc.timeline().get(extra).is_none());
     assert!(!doc.in_transaction());
 }
+
+/// While a radius is being dragged the fillet is drawn with a coarse arc, because the
+/// blend's facet count is what the boolean's cost turns on and a drag replays the
+/// feature every frame. The moment the drag ends it is replayed properly: the coarse
+/// shell must not be what gets saved, exported or measured.
+#[test]
+fn a_previewed_fillet_is_coarse_and_is_redrawn_at_full_quality_after() {
+    let (mut doc, _, ex, fi, _) = block_with_fillet();
+    let key = FaceKey::new(OpId::new(fi.0), FaceRole::Fillet(0));
+    let facets = |doc: &mut Document| {
+        doc.state()
+            .body(BodyRef(ex))
+            .unwrap()
+            .solid
+            .face(key)
+            .map(|f| f.polygons.len())
+            .expect("the fillet is there")
+    };
+    let full = facets(&mut doc);
+
+    doc.set_preview(true);
+    // The preview only applies to what is replayed, so the cached full-quality shell has
+    // to go first: a drag does that by writing the new radius.
+    doc.edit_feature_kind(fi, |k| {
+        if let FeatureKind::Fillet { radius, .. } = k {
+            *radius = 1.0;
+        }
+    })
+    .unwrap();
+    let preview = facets(&mut doc);
+    assert!(preview < full, "{preview} facets against {full}");
+
+    doc.set_preview(false);
+    assert_eq!(
+        facets(&mut doc),
+        full,
+        "the drag's coarse arc did not survive it"
+    );
+}

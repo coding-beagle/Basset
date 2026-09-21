@@ -592,6 +592,9 @@ pub fn sync_tool(editor: &mut Editor) {
 }
 
 pub fn confirm_tool(editor: &mut Editor) {
+    // Whatever was drawn coarse for the drag is the model from here on, so it is drawn
+    // again properly; the dialog is about to stop running and cannot do it later.
+    editor.doc.set_preview(false);
     let Some(tool) = editor.tool.take() else {
         return;
     };
@@ -619,6 +622,7 @@ pub fn confirm_tool(editor: &mut Editor) {
 }
 
 pub fn cancel_tool(editor: &mut Editor) {
+    editor.doc.set_preview(false);
     let Some(tool) = editor.tool.take() else {
         return;
     };
@@ -770,6 +774,14 @@ pub fn dialog(editor: &mut Editor, ctx: &egui::Context) {
         t.op_chosen = true;
     }
     changed |= handle_drag(editor, ctx);
+    // A blend is drawn coarsely for as long as the pointer is down, and at full quality
+    // the moment it comes up. The radius box and the viewport arrow both report a change
+    // every frame the pointer moves, and each one replays the feature; what the user is
+    // reading off the screen meanwhile is how far the rounding reaches, which the arc's
+    // facet count does not change, while it is exactly what the boolean's cost turns on.
+    editor
+        .doc
+        .set_preview(kind == ToolKind::Fillet && ctx.input(|i| i.pointer.any_down()));
     if changed {
         sync_tool(editor);
     }
