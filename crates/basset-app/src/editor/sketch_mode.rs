@@ -1406,6 +1406,31 @@ impl SketchEditor {
         }
     }
 
+    /// Where a single dragged point is being asked to go. The same inference the
+    /// drawing tools use, minus the joining: a drag moves a point that already exists
+    /// and sharing it with another one is a different operation than this gesture.
+    fn drag_goal(&mut self, dragged: EntityId, pos: Vec2, tol: f64) -> Vec2 {
+        // The point being dragged is its own nearest snap, and the curves hanging off
+        // it follow it about, so neither is any guide to where it should land: they are
+        // named here so the inference passes over them.
+        let cont = snap::Continuation {
+            moving: Some(dragged),
+            ..Default::default()
+        };
+        let joins_only = self.free_snap || !self.snap_to_grid;
+        let grid = self
+            .snap_rule()
+            .is_on()
+            .then(|| self.snap_rule().point(pos));
+        match self
+            .inference
+            .resolve(&self.sketch, cont, pos, tol, joins_only, grid)
+        {
+            Some(found) => found.at,
+            None => self.to_grid(pos),
+        }
+    }
+
     /// What the point being placed is continuing from, which is what makes tangent and
     /// perpendicular mean anything. A line chain continues from its open end; every
     /// other tool continues from its last click.
@@ -1417,7 +1442,11 @@ impl SketchEditor {
             ),
             _ => (self.clicks.last().map(|c| c.pos), None),
         };
-        snap::Continuation { from, curve }
+        snap::Continuation {
+            from,
+            curve,
+            moving: None,
+        }
     }
 
     /// The curve the open end of the chain belongs to — the one just drawn, when there
@@ -1751,7 +1780,19 @@ impl SketchEditor {
             if let Some(drag) = self.drag.clone() {
                 // The pointer's travel is snapped to the grid, so nudging a corner does
                 // not silently take the sketch off it and a moved shape stays on it.
-                let delta = self.to_grid(pos) - self.to_grid(drag.press);
+                //
+                // One point on its own is aimed rather than nudged: it goes where the
+                // pointer says, and so it is offered the drawing's own places too — the
+                // middle of that line, level with that corner. Several points are a
+                // shape being moved, and a shape has no one position to infer for, so
+                // those keep the grid.
+                let delta = match drag.points[..] {
+                    [(id, _)] => {
+                        let goal = self.drag_goal(id, pos, tol);
+                        goal - self.sketch.point_pos(id).unwrap_or(goal)
+                    }
+                    _ => self.to_grid(pos) - self.to_grid(drag.press),
+                };
                 let goals: Vec<(EntityId, Vec2)> = drag
                     .points
                     .iter()

@@ -490,6 +490,10 @@ impl Candidate {
 pub struct Continuation {
     pub from: Option<Vec2>,
     pub curve: Option<EntityId>,
+    /// A point being dragged, and so not a place to snap to: it is under the pointer by
+    /// definition, and the curves hanging off it follow it about, so neither says
+    /// anything about where it should land.
+    pub moving: Option<EntityId>,
 }
 
 /// The ranking and the hold, and the short memory of points the pointer has touched
@@ -631,7 +635,19 @@ pub fn gather(
     let reach = |kind: SnapKind| kind.pick_radius(tol) * HOLD_FACTOR;
     let mut out: Vec<Candidate> = Vec::new();
     let roles = point_roles(sketch);
+    let follows_the_pointer = |id: EntityId| match cont.moving {
+        Some(moving) => {
+            id == moving
+                || sketch
+                    .entity(id)
+                    .is_some_and(|e| e.entity.references().contains(&moving))
+        }
+        None => false,
+    };
     for (id, data) in sketch.entities() {
+        if follows_the_pointer(id) {
+            continue;
+        }
         if let Entity::Point { pos } = data.entity {
             let kind = roles.get(&id).copied().unwrap_or(SnapKind::Point);
             if pos.distance(pointer) > reach(kind) {
@@ -650,7 +666,8 @@ pub fn gather(
         out.push(Candidate::new(SnapKind::Origin, Vec2::ZERO));
     }
 
-    let near = near_curves(sketch, pointer, reach(SnapKind::OnCurve));
+    let mut near = near_curves(sketch, pointer, reach(SnapKind::OnCurve));
+    near.retain(|(id, _)| !follows_the_pointer(*id));
     for &(id, geom) in &near {
         if let Some(on) = sketch.closest_point_on(id, pointer)
             && on.distance(pointer) <= reach(SnapKind::OnCurve)
@@ -1297,6 +1314,7 @@ mod tests {
         let cont = Continuation {
             from: Some(Vec2::new(10.0, 0.0)),
             curve: Some(line),
+            moving: None,
         };
         let along = gather(&sketch, &[], cont, Vec2::new(16.0, 0.05), 1.0, false);
         assert!(
@@ -1433,5 +1451,32 @@ mod tests {
             dashes.last().map(|d| d[1].x) > Some(10.0),
             "and carried past the point, because it is a line that goes on"
         );
+    }
+
+    /// A point being dragged must not snap to itself, nor to the curves that follow it
+    /// about: both are under the pointer by construction, and a drag that sticks to
+    /// them cannot be moved at all.
+    #[test]
+    fn a_dragged_point_does_not_snap_to_itself_or_to_what_hangs_off_it() {
+        let mut sketch = Sketch::new();
+        let a = sketch.add_point(Vec2::new(0.0, 0.0));
+        let b = sketch.add_point(Vec2::new(20.0, 0.0));
+        sketch.add_line(a, b).expect("line");
+        let cont = Continuation {
+            moving: Some(b),
+            ..Default::default()
+        };
+        let found = gather(&sketch, &[], cont, Vec2::new(20.05, 0.05), 1.0, false);
+        assert!(
+            found
+                .iter()
+                .all(|c| c.point != Some(b) && c.curve.is_none()),
+            "{:?}",
+            kinds(&found)
+        );
+        // The other end of that line is still a place to land, which is how a drag
+        // closes a loop.
+        let onto = gather(&sketch, &[], cont, Vec2::new(0.05, 0.05), 1.0, false);
+        assert!(onto.iter().any(|c| c.point == Some(a)));
     }
 }
