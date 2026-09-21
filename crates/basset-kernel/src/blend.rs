@@ -164,12 +164,9 @@ fn tools_for(
         chains.extend(edge.chains().into_iter().map(|c| (i as u32, *key, c)));
     }
     // Whether there is material for it at all, checked after the edges are known to exist
-    // so a stale reference is still reported as the stale reference it is. The comparison
-    // carries a few ulps of slack because the limit arrives through a normalise, a dot
-    // product and a division, and a blend that fits its material exactly — the 2 mm round
-    // on the rim of a 2 mm plate — must not be turned away over the last bits of that.
+    // so a stale reference is still reported as the stale reference it is.
     if let Some(limit) = size_limit(solid, &all_edges, keys, blend.kind())
-        && size > limit * (1.0 + 1e-9)
+        && size > limit
     {
         return Err(KernelError::BlendTooLarge { size, limit });
     }
@@ -247,6 +244,13 @@ const OWN_BOUNDARY: f64 = 8.0 * MERGE_TOL;
 /// never smaller than the truth.
 const CROSSES: f64 = 1e-6;
 
+/// Relative slack on the limit. It arrives through a normalise, a dot product and a
+/// division, so a blend that fits its material exactly — the 2 mm round on the rim of a
+/// 2 mm plate — lands a few ulps either side of it, and neither the check nor the editor
+/// showing the number may turn such a blend away over the last bits of that. Carried by
+/// the limit itself rather than by each comparison, so every reader agrees on where it is.
+const LIMIT_SLACK: f64 = 1e-9;
+
 /// The largest blend of `kind` the edges `keys` can carry together, or `None` when none
 /// of them is an edge of this solid.
 ///
@@ -320,7 +324,9 @@ fn size_limit(solid: &Solid, all_edges: &[Edge], keys: &[EdgeKey], kind: BlendKi
             }
         }
     }
-    limit.is_finite().then_some(limit.max(0.0))
+    limit
+        .is_finite()
+        .then_some(limit.max(0.0) * (1.0 + LIMIT_SLACK))
 }
 
 /// How far a point `from` on the boundary of a face travels across it along `into` before
@@ -1299,7 +1305,7 @@ mod tests {
             12,
             "two shells, neither one healed away"
         );
-        assert_relative_eq!(merged[0].0.volume(), 16.0, epsilon = 1e-9);
+        assert_relative_eq!(merged[0].0.volume(), 16.0, epsilon = 1e-6);
         assert!(merged[0].0.is_closed());
     }
 
@@ -1311,7 +1317,7 @@ mod tests {
         ];
         let merged = merge_tools(tools.clone(), 10_000);
         assert_eq!(merged.len(), 1);
-        assert_relative_eq!(merged[0].0.volume(), 8.0 + 8.0 - 1.0, epsilon = 1e-9);
+        assert_relative_eq!(merged[0].0.volume(), 8.0 + 8.0 - 1.0, epsilon = 1e-6);
         assert!(merged[0].0.is_closed());
         // The same pair against a body smaller than they are stays apart, because the
         // boolean saved would cost more than the boolean spent.
@@ -1369,11 +1375,11 @@ mod tests {
         let c = cube();
         let key = edge_between(FaceRole::EndCap, FaceRole::Side(0));
         let limit = max_fillet_radius(&c, &[key]).unwrap();
-        assert_relative_eq!(limit, 10.0, epsilon = 1e-9);
+        assert_relative_eq!(limit, 10.0, epsilon = 1e-6);
         let err = fillet(OpId::new(2), &c, &[key], 12.0, &fine()).unwrap_err();
         assert!(
             matches!(err, KernelError::BlendTooLarge { size, limit }
-                     if size == 12.0 && (limit - 10.0).abs() < 1e-9),
+                     if size == 12.0 && (limit - 10.0).abs() < 1e-6),
             "{err:?}"
         );
     }
@@ -1405,7 +1411,7 @@ mod tests {
     fn a_fillet_that_would_overflow_a_pocket_is_refused() {
         let (l, key) = l_block();
         let limit = max_fillet_radius(&l, &[key]).unwrap();
-        assert_relative_eq!(limit, 5.0, epsilon = 1e-9);
+        assert_relative_eq!(limit, 5.0, epsilon = 1e-6);
         assert!(matches!(
             fillet(OpId::new(3), &l, &[key], 6.0, &fine()).unwrap_err(),
             KernelError::BlendTooLarge { .. }
@@ -1421,7 +1427,7 @@ mod tests {
         let keys: Vec<EdgeKey> = (0..4)
             .map(|i| edge_between(FaceRole::EndCap, FaceRole::Side(i)))
             .collect();
-        assert_relative_eq!(max_fillet_radius(&c, &keys).unwrap(), 5.0, epsilon = 1e-9);
+        assert_relative_eq!(max_fillet_radius(&c, &keys).unwrap(), 5.0, epsilon = 1e-6);
         assert!(matches!(
             fillet(OpId::new(2), &c, &keys, 6.0, &fine()).unwrap_err(),
             KernelError::BlendTooLarge { .. }
@@ -1437,7 +1443,7 @@ mod tests {
         assert_relative_eq!(
             max_chamfer_distance(&c, &[key]).unwrap(),
             10.0,
-            epsilon = 1e-9
+            epsilon = 1e-6
         );
         assert!(matches!(
             chamfer(OpId::new(2), &c, &[key], 11.0).unwrap_err(),
@@ -1524,7 +1530,7 @@ mod tests {
         assert_relative_eq!(
             max_fillet_radius(&plate, &[key]).unwrap(),
             2.0,
-            epsilon = 1e-9
+            epsilon = 1e-6
         );
     }
 }

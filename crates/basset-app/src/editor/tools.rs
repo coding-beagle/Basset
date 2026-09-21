@@ -6,8 +6,8 @@
 //! the whole interaction a single undo step, and Cancel is a rollback.
 
 use basset_core::{
-    AxisRef, BodyOp, BodyRef, CombineOp, Extent, FeatureId, FeatureKind, FeatureStatus, OriginAxis,
-    PathRef, PlaneRef, RegionRef,
+    AxisRef, BodyOp, BodyRef, CombineOp, EdgeRef, Extent, FeatureId, FeatureKind, FeatureStatus,
+    OriginAxis, PathRef, PlaneRef, RegionRef,
 };
 use basset_math::{Aabb, Affine3, Quat, Vec3};
 
@@ -134,6 +134,11 @@ pub struct Tool {
     /// The user picked the operation themselves. Until they do, an extrude follows
     /// Fusion's rule: it joins whatever body it lands on and is a new body otherwise.
     pub op_chosen: bool,
+    /// Fillet and Chamfer: the largest size the selected edges can take, and the
+    /// selection it was worked out for. Asking the kernel costs a pass over the body's
+    /// edges, which is nothing beside a boolean but too much to spend on every frame of
+    /// a drag, so it is kept until the selection itself moves on.
+    limit: (Vec<EdgeRef>, Option<f64>),
 }
 
 impl Tool {
@@ -165,6 +170,13 @@ impl Tool {
     /// only as shorthand for every edge around one.
     pub fn prefers_edges(&self) -> bool {
         matches!(self.kind, ToolKind::Fillet | ToolKind::Chamfer)
+    }
+
+    /// The largest radius or distance this blend may be given, as last worked out for
+    /// the selection it is running on. `None` for a tool that is not a blend, and while
+    /// nothing is selected to measure.
+    pub fn blend_limit(&self) -> Option<f64> {
+        self.limit.1
     }
 
     pub fn selection_changed(&mut self, selection: &Selection) {
@@ -328,6 +340,7 @@ pub fn start_tool(editor: &mut Editor, kind: ToolKind) {
         params: params.clone(),
         restore_cursor: None,
         op_chosen: false,
+        limit: (Vec::new(), None),
     }
     .filter();
     let mut sel = Selection::default();
@@ -364,6 +377,7 @@ pub fn start_tool(editor: &mut Editor, kind: ToolKind) {
         params,
         restore_cursor: None,
         op_chosen: false,
+        limit: (Vec::new(), None),
     });
     if kind == ToolKind::Component {
         editor.doc.begin_transaction();
@@ -491,6 +505,7 @@ pub fn edit_existing(editor: &mut Editor, id: FeatureId, previous_cursor: usize)
         restore_cursor,
         // An existing feature's operation was decided when it was made.
         op_chosen: true,
+        limit: (Vec::new(), None),
     });
     editor.set_status(format!("Editing {}", feature.name));
 }
@@ -570,6 +585,7 @@ pub fn sync_tool(editor: &mut Editor) {
             t.params.target = target;
         }
     }
+    refresh_blend_limit(editor);
     let tool = editor.tool.as_ref().unwrap();
     let Some(kind) = tool.build_kind(editor) else {
         return;
@@ -589,6 +605,49 @@ pub fn sync_tool(editor: &mut Editor) {
         }
     }
     editor.request_repaint();
+}
+
+/// Works out how large the running blend may be, if the selection has moved since the
+/// last time it was asked.
+///
+/// The bodies picking runs against are the model *before* the previewed feature, which
+/// is the same body the fillet is applied to, so the number is the one the kernel will
+/// hold the radius against. Several bodies blended at once take the smallest of theirs:
+/// one feature carries one radius, and it has to fit everywhere it lands.
+fn refresh_blend_limit(editor: &mut Editor) {
+    let Some(tool) = editor.tool.as_ref() else {
+        return;
+    };
+    if !matches!(tool.kind, ToolKind::Fillet | ToolKind::Chamfer)
+        || tool.limit.0 == editor.selection.edges
+    {
+        return;
+    }
+    let kind = tool.kind;
+    let edges = editor.selection.edges.clone();
+    let mut by_body: Vec<(BodyRef, Vec<basset_kernel::EdgeKey>)> = Vec::new();
+    for e in &edges {
+        match by_body.iter_mut().find(|(b, _)| *b == e.body) {
+            Some((_, keys)) => keys.push(e.key),
+            None => by_body.push((e.body, vec![e.key])),
+        }
+    }
+    let mut limit: Option<f64> = None;
+    for (body, keys) in by_body {
+        let Some(solid) = editor.pick_body(body).map(|p| p.solid.clone()) else {
+            continue;
+        };
+        let found = match kind {
+            ToolKind::Chamfer => basset_kernel::blend::max_chamfer_distance(&solid, &keys),
+            _ => basset_kernel::blend::max_fillet_radius(&solid, &keys),
+        };
+        if let Some(found) = found {
+            limit = Some(limit.map_or(found, |l: f64| l.min(found)));
+        }
+    }
+    if let Some(tool) = editor.tool.as_mut() {
+        tool.limit = (edges, limit);
+    }
 }
 
 pub fn confirm_tool(editor: &mut Editor) {
@@ -642,6 +701,7 @@ pub fn dialog(editor: &mut Editor, ctx: &egui::Context) {
     let status = tool
         .feature
         .and_then(|id| editor.cached_statuses.get(&id).cloned());
+    let blend_limit = tool.blend_limit();
     let bodies: Vec<(BodyRef, String)> = editor.cached_bodies.clone();
     let selection_text = editor.selection.summary();
     let edge_count = editor.selection.edges.len();
@@ -703,6 +763,23 @@ pub fn dialog(editor: &mut Editor, ctx: &egui::Context) {
                         _ => ("Distance", 0.1),
                     };
                     changed |= drag(ui, label, &mut p.radius, speed, "mm");
+                    // What the material allows. The handle in the viewport stops there of
+                    // its own accord, so this is for the box, which does not: a number
+                    // typed past it is still sent to the kernel and still refused, and
+                    // the user should be able to see why before that happens.
+                    if let Some(max) = blend_limit {
+                        let over = p.radius > max;
+                        let text = egui::RichText::new(format!(
+                            "{} {max:.2} mm fits between these edges and the faces they \
+                             sit on",
+                            if over { "only" } else { "up to" }
+                        ));
+                        ui.label(if over {
+                            text.color(egui::Color32::from_rgb(235, 190, 90))
+                        } else {
+                            text.weak()
+                        });
+                    }
                 }
                 ToolKind::Combine => {
                     ui.horizontal(|ui| {
@@ -907,6 +984,7 @@ fn handle_drag(editor: &mut Editor, ctx: &egui::Context) -> bool {
     let Some(tool) = editor.tool.as_mut() else {
         return false;
     };
+    let limit = tool.blend_limit();
     let p = &mut tool.params;
     let value = match tool.kind {
         ToolKind::Extrude => {
@@ -922,7 +1000,12 @@ fn handle_drag(editor: &mut Editor, ctx: &egui::Context) -> bool {
             p.distance
         }
         ToolKind::Fillet | ToolKind::Chamfer => {
-            p.radius = snap.value(p.radius + world).max(0.01);
+            // Stopped at what the material allows rather than let past it and refused:
+            // a blend dragged out of range would take the shell off the screen and
+            // leave the user pulling back through a preview that is not there. The
+            // handle simply stops, which is the same thing the geometry does.
+            let ceiling = limit.unwrap_or(f64::INFINITY).max(0.01);
+            p.radius = snap.value(p.radius + world).clamp(0.01, ceiling);
             p.radius
         }
         ToolKind::OffsetPlane => {
@@ -1286,5 +1369,60 @@ mod tests {
         let inside = |v: f64| (0.0..=10.0).contains(&v);
         assert!(inside(h.tip.x) && inside(h.tip.y), "{:?}", h.tip);
         assert!(matches!(editor.mode, Mode::Model));
+    }
+
+    /// The block is 10 mm across and 2 mm thick, so a fillet round the rim of its top
+    /// face is bounded by the thickness: past 2 mm the round has eaten the whole side
+    /// and is taking material from under it. The dialog says so before the kernel has
+    /// to, and a radius typed past it anyway comes back as a refusal rather than as a
+    /// body that quietly stops changing.
+    #[test]
+    fn a_fillet_is_bounded_by_the_material_and_the_dialog_says_by_how_much() {
+        let mut h = Harness::new();
+        let body = h.block();
+        h.start_tool(ToolKind::Fillet);
+        h.editor
+            .apply_pick(Some(Pick::Face(top_face(body), 0.0)), false);
+        let limit = h
+            .editor
+            .tool
+            .as_ref()
+            .unwrap()
+            .blend_limit()
+            .expect("a limit for the top rim");
+        let thickness = h.editor.pick_body(body).unwrap().solid.aabb().extent().z;
+        assert!(
+            (limit - thickness).abs() < 1e-6,
+            "the rim of a {thickness} mm wall took {limit}"
+        );
+        h.frame();
+        assert!(
+            h.frame().has_text(&format!("up to {limit:.2} mm fits")),
+            "{:?}",
+            h.frame().text()
+        );
+
+        h.editor.tool.as_mut().unwrap().params.radius = limit * 2.0;
+        sync_tool(&mut h.editor);
+        let feature = h.editor.tool.as_ref().unwrap().feature.unwrap();
+        assert!(
+            matches!(
+                h.editor.doc.state().status(feature),
+                Some(FeatureStatus::Failed(_))
+            ),
+            "twice the limit went through"
+        );
+        h.frame();
+        assert!(
+            h.frame()
+                .has_text("runs past the material it has to work with"),
+            "{:?}",
+            h.frame().text()
+        );
+        assert!(
+            h.frame().has_text(&format!("only {limit:.2} mm fits")),
+            "{:?}",
+            h.frame().text()
+        );
     }
 }
