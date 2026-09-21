@@ -33,10 +33,30 @@ use crate::ids::{EdgeKey, FaceKey};
 /// resolve, so nothing real is welded away by being generous here.
 pub const MERGE_TOL: f64 = 1e-5;
 
-/// Surfaces meeting at a sharper angle than this are separated by a visible crease.
-/// [`smooth_normals`] shades to the same cut-off, so an edge that reads as sharp is also
-/// drawn as one.
+/// Facets of one surface meeting at a sharper angle than this are shaded as a crease
+/// rather than smoothed together, and a fold that sharp inside a face is drawn as a line
+/// so that what reads as sharp is also outlined as sharp. Shading and the within-surface
+/// fold are one question, which is why they share one number.
 const DISPLAY_CREASE_COS: f64 = 0.7; // ≈ 45.6°
+
+/// The drawn-edge cut-off where two *different* surfaces meet: below this they fold and a
+/// line is drawn, above it they are tangent and nothing is.
+///
+/// It is a separate number from [`DISPLAY_CREASE_COS`] because the two answer different
+/// questions. 45° is where a fold stops being shading and starts being a corner — the
+/// right place to cut a crease *within* one surface. A fillet running out into the face it
+/// blends into is not a corner at all: the surfaces are tangent there, the shading already
+/// carries across it, and a line drawn along it says "fold" about something that is smooth.
+/// Before this constant existed that boundary was always drawn, because the two faces'
+/// surfaces differ, and every fillet came out ringed like a chamfer.
+///
+/// The only reason it is not 1.0 is that the blend is faceted: the first facet of an arc
+/// is tilted about half a facet angle off the neighbouring face, so the test has to absorb
+/// half of the coarsest arc the blend tool will draw. [`Tessellation`](crate::Tessellation)
+/// defaults to 10° facets, and a blend coarsened against the tool's polygon budget can
+/// reach 45°/facet; 20° covers everything down to a 40°-facet arc while staying far below
+/// a fold anyone would call an edge.
+const TANGENT_EDGE_COS: f64 = 0.94; // ≈ 20°
 
 /// One polygon's use of an edge: (face index, directed a→b, polygon normal).
 type EdgeUser = (usize, bool, Vec3);
@@ -321,10 +341,12 @@ pub struct EdgeSegment {
 pub struct Edge {
     pub key: EdgeKey,
     pub segments: Vec<EdgeSegment>,
-    /// The two faces continue into each other here: one surface, split only because two
-    /// features happened to name the halves. A sketch line cut in two makes a wall like
-    /// this. Nothing is drawn along such an edge and nothing can be picked on it, because
-    /// to the user there is no edge there.
+    /// The two faces run into each other here with nothing to see: one surface split only
+    /// because two features happened to name the halves (a sketch line cut in two makes a
+    /// wall like this), or two surfaces meeting tangentially, as a fillet meets the face it
+    /// blends into. Nothing is drawn along such an edge and nothing can be picked on it,
+    /// because to the user there is no edge there — and there is no dihedral to fillet,
+    /// which is what [`blend`](crate::blend) refuses as a tangent edge.
     pub smooth: bool,
 }
 
@@ -553,8 +575,8 @@ impl Solid {
     /// one flat top as two or three faces. That is not a naming subtlety they can see:
     /// they cannot select the top, sketch on the whole of it, or read its area, and an
     /// exporter writes it as several patches. Faces that share an edge and continue
-    /// across it — the same test [`Solid::display_edges`] uses to draw nothing there —
-    /// are therefore collapsed into one.
+    /// across it — [`Solid::continuous`], the strict test, not the looser one drawing
+    /// asks — are therefore collapsed into one.
     ///
     /// The survivor is the group's lowest [`FaceKey`], so the patch is named by the
     /// earliest operation that made part of it and keeps that name as later features add
@@ -747,8 +769,12 @@ impl Solid {
         (index, shared)
     }
 
-    /// Whether two polygons meeting along an edge join without anything to see: they
+    /// Whether two polygons meeting along an edge are the same piece of surface: they
     /// belong to one face, or to two faces of the same surface, and they do not fold.
+    ///
+    /// This is the topological question — may these two faces be merged into one? — and
+    /// [`Solid::merge_continuous_faces`] is what asks it. What a *viewer* should see along
+    /// the edge is the looser [`Solid::flush`].
     fn continuous(&self, a: (usize, Vec3), b: (usize, Vec3)) -> bool {
         if a.1.dot(b.1) < DISPLAY_CREASE_COS {
             return false;
@@ -756,8 +782,23 @@ impl Solid {
         a.0 == b.0 || self.faces[a.0].surface.continues(&self.faces[b.0].surface)
     }
 
-    /// The straight pieces a viewer should see as the body's outline: every fold or change
-    /// of surface, whether or not the topology calls it a face boundary.
+    /// Whether two polygons meeting along an edge leave nothing to see there: either they
+    /// are the same surface and do not fold, or they are different surfaces meeting
+    /// tangentially, as a fillet meets the face it blends into.
+    ///
+    /// Distinct from [`Solid::continuous`]: a fillet is genuinely a different face from the
+    /// plane it runs out into — it has its own key, its own radius, and a user can select
+    /// it — but there is no line to draw between them, and no corner there to fillet
+    /// either, which is why [`Edge::smooth`] is decided by this test.
+    fn flush(&self, a: (usize, Vec3), b: (usize, Vec3)) -> bool {
+        self.continuous(a, b) || a.1.dot(b.1) >= TANGENT_EDGE_COS
+    }
+
+    /// The straight pieces a viewer should see as the body's outline: every fold, and
+    /// every change of surface that is not tangent, whether or not the topology calls it a
+    /// face boundary. A fillet's two boundaries are tangent, so they are not in here; what
+    /// bounds a blend against the background is its silhouette, which is view-dependent and
+    /// so the viewport's business rather than the kernel's.
     ///
     /// These are segments, not polylines: one visual line comes back cut wherever a
     /// neighbouring face happens to end against it. That suits a line batch, and nothing
@@ -783,7 +824,7 @@ impl Solid {
                 users.iter().enumerate().any(|(i, (fa, _, na))| {
                     users[i + 1..]
                         .iter()
-                        .any(|(fb, _, nb)| !self.continuous((*fa, *na), (*fb, *nb)))
+                        .any(|(fb, _, nb)| !self.flush((*fa, *na), (*fb, *nb)))
                 })
             })
             .map(|((a, b), _)| ((a, b), [index.points[a as usize], index.points[b as usize]]))
@@ -829,7 +870,7 @@ impl Solid {
                     normal_a: na,
                     normal_b: nb,
                 },
-                self.continuous((fa, na), (fb, nb)),
+                self.flush((fa, na), (fb, nb)),
             ));
         }
         // Hash-map order would make the chain start point (and so blend tool geometry)
@@ -1390,6 +1431,74 @@ mod tests {
             before,
             "outline changed under a nudge inside MERGE_TOL"
         );
+    }
+
+    /// A cylinder's curved wall is one face of many facets: the facet seams are shading,
+    /// not geometry, and drawing them would paint the mesh onto the body. Only the two
+    /// rims are drawn, and against the background the wall is bounded by its silhouette
+    /// instead, which the viewport recomputes per camera.
+    #[test]
+    fn a_cylinders_only_drawn_edges_are_its_two_rims() {
+        let tess = crate::geometry::Tessellation::default();
+        let c = crate::primitives::cylinder(OpId::new(1), Vec3::ZERO, Vec3::Z, 5.0, 10.0, &tess);
+        let wall = c
+            .face(FaceKey::new(OpId::new(1), FaceRole::Side(0)))
+            .expect("the curved wall is Side(0)");
+        let facets = wall.polygons.len();
+        assert!(facets >= 12, "a 5 mm cylinder at the default tessellation");
+        let drawn = c.display_edges();
+        assert_eq!(
+            drawn.len(),
+            2 * facets,
+            "one drawn segment per facet per rim"
+        );
+        assert!(
+            drawn.iter().all(|[a, b]| (a.z - b.z).abs() < 1e-9),
+            "a facet seam runs up the wall, and none of those may be drawn"
+        );
+        // And the rims themselves stay pickable: they are folds, not tangencies.
+        assert_eq!(c.edges().iter().filter(|e| !e.smooth).count(), 2);
+    }
+
+    /// The tangent half of the problem: a fillet meets the faces it blends into with no
+    /// corner between them, so neither boundary is drawn and neither can be picked to
+    /// fillet again. Before the drawn-edge cut-off was split from the shading one, both
+    /// were drawn — the fillet came out ringed, exactly like the chamfer it is not.
+    #[test]
+    fn a_fillets_tangent_boundaries_are_neither_drawn_nor_picked() {
+        let op = OpId::new(1);
+        let cube = crate::primitives::cuboid(op, Vec3::ZERO, Vec3::splat(10.0));
+        let key = EdgeKey::new(
+            FaceKey::new(op, FaceRole::EndCap),
+            FaceKey::new(op, FaceRole::Side(0)),
+        );
+        let tess = crate::geometry::Tessellation::default();
+        let r = crate::blend::fillet(OpId::new(2), &cube, &[key], 2.0, &tess)
+            .expect("filleting one top edge of a cube");
+        let blend = FaceKey::new(OpId::new(2), FaceRole::Fillet(0));
+        let edges = r.edges();
+        let touching: Vec<&Edge> = edges.iter().filter(|e| e.key.touches(blend)).collect();
+        assert_eq!(touching.len(), 4, "the blend is bounded by four edges");
+        assert_eq!(
+            touching.iter().filter(|e| e.smooth).count(),
+            2,
+            "the two long boundaries are tangent; the two ends fold against the side faces"
+        );
+        // The blend is a quarter cylinder of radius 2 rounding the edge at y = 0, z = 10,
+        // so it runs out along y = 0, z = 8 and along y = 2, z = 10.
+        let on_a_tangent_line = |p: &Vec3| {
+            (p.y.abs() < 1e-6 && (p.z - 8.0).abs() < 1e-6)
+                || ((p.y - 2.0).abs() < 1e-6 && (p.z - 10.0).abs() < 1e-6)
+        };
+        assert!(
+            r.display_edges()
+                .iter()
+                .all(|[a, b]| !(on_a_tangent_line(a) && on_a_tangent_line(b))),
+            "a line was drawn where the fillet runs tangentially into its neighbour"
+        );
+        // Every other edge of the cube survives as a drawn one: twelve, less the filleted
+        // one, plus the two short ends the blend adds at the faces it dies into.
+        assert_eq!(edges.iter().filter(|e| !e.smooth).count(), 11 + 2);
     }
 
     /// The cube with its +x face split in two and the T-junctions that leaves healed:
