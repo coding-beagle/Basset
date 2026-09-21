@@ -56,50 +56,6 @@ pub struct Regenerator {
     font: Option<Arc<Font>>,
     tessellation: Tessellation,
     kernel_tessellation: kernel::Tessellation,
-    /// A tool is being dragged, so blends are drawn at [`PREVIEW_SEGMENT_ANGLE`].
-    preview: bool,
-    /// Earliest feature whose cached state was computed under `preview`, and so has to
-    /// be replayed once the drag is over.
-    previewed_from: Option<usize>,
-}
-
-/// Arc a fillet is drawn with while its radius is being dragged: thirty degrees a facet,
-/// and no chord rule, so the count does not climb with the radius.
-///
-/// A blend tool carries one facet per arc step per edge segment, and the boolean that
-/// applies it costs the square of that (see `basset_kernel::csg`), so the arc is what
-/// decides whether a radius drag keeps up with the pointer. Measured on both rims of a
-/// cylinder: 21 ms a frame against 6 at the default tessellation, and 228 ms against 37
-/// on a body tessellated at 2°. What the user is judging mid-drag is how far the
-/// rounding reaches, which is the same either way, and the moment they let go the
-/// feature is replayed at the quality the model is stored at.
-const PREVIEW_ARC: kernel::Tessellation = kernel::Tessellation {
-    chord_tolerance: f64::INFINITY,
-    max_segment_angle: std::f64::consts::PI / 6.0,
-};
-
-impl Regenerator {
-    /// Turns the coarse preview on for the duration of a drag, or off and back to the
-    /// quality the model is actually stored at. Switching it off replays every feature
-    /// that was drawn coarse; switching it on replays nothing, because what is already
-    /// cached was computed at full quality and is no worse for being kept.
-    pub fn set_preview(&mut self, on: bool) {
-        if self.preview == on {
-            return;
-        }
-        self.preview = on;
-        if !on && let Some(from) = self.previewed_from.take() {
-            self.invalidate_from(from);
-        }
-    }
-
-    /// Tessellation for a blend: coarse while a tool is being dragged.
-    fn blend_tessellation(&self) -> kernel::Tessellation {
-        match self.preview {
-            false => self.kernel_tessellation,
-            true => PREVIEW_ARC,
-        }
-    }
 }
 
 impl Regenerator {
@@ -131,11 +87,6 @@ impl Regenerator {
                 _ => self.snapshots[index - 1].clone(),
             };
             let next = self.apply(base, &active[index]);
-            // Only a blend reads the preview setting, so only a blend has to be replayed
-            // when the drag ends.
-            if self.preview && matches!(active[index].kind, FeatureKind::Fillet { .. }) {
-                self.previewed_from = Some(self.previewed_from.map_or(index, |i| i.min(index)));
-            }
             self.snapshots.push(next);
         }
         // Nothing before the first feature: hand out the shared empty state.
@@ -295,7 +246,7 @@ impl Regenerator {
                         &body.solid,
                         &keys,
                         *radius,
-                        &self.blend_tessellation(),
+                        &self.kernel_tessellation,
                     )?;
                     body.solid = Arc::new(solid);
                 }

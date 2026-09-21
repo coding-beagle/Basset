@@ -95,12 +95,6 @@ impl Editor {
     /// Exports the selected bodies, or every visible body when nothing is selected, so
     /// "export the whole component" is the zero-click default.
     fn export(&mut self, ext: &str) {
-        // A blend dragged with the pointer down is drawn at a coarse arc, and the drag
-        // ends when the pointer comes up — which a keyboard-driven export need not wait
-        // for. Exported geometry leaves the program, so it is replayed at the quality the
-        // model is stored at before anything is read out of it, rather than relying on
-        // the drag having finished.
-        self.doc.set_preview(false);
         let items = self.export_items();
         if items.is_empty() {
             self.report_error("nothing to export: create or show a body first");

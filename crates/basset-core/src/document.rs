@@ -122,12 +122,6 @@ impl Document {
         self.regen.invalidate_from(0);
     }
 
-    /// Draws blends coarsely until it is turned off again, for the length of a drag.
-    /// See [`Regenerator::set_preview`].
-    pub fn set_preview(&mut self, on: bool) {
-        self.regen.set_preview(on);
-    }
-
     /// Evaluates the timeline up to the cursor, reusing cached results where inputs are
     /// unchanged.
     pub fn state(&mut self) -> &ModelState {
