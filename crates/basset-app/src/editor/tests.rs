@@ -3969,6 +3969,21 @@ mod shortcuts {
         assert!(!h.editor.show_shortcuts);
     }
 
+    /// Escape takes the overlay away and leaves what is underneath alone, rather than
+    /// cancelling a tool the user only wanted to read the keys for.
+    #[test]
+    fn escape_closes_the_overlay_before_it_cancels_anything() {
+        let mut h = Harness::new();
+        h.type_key("e");
+        assert!(h.editor.tool.is_some());
+        h.key(NamedKey::F1);
+        h.key(NamedKey::Escape);
+        assert!(!h.editor.show_shortcuts);
+        assert!(h.editor.tool.is_some(), "Extrude was left running");
+        h.key(NamedKey::Escape);
+        assert!(h.editor.tool.is_none());
+    }
+
     /// The palette searches the same table, so what it finds is what the key would have
     /// done — including for commands that have no key at all.
     #[test]

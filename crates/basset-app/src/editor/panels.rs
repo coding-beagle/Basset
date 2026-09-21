@@ -103,7 +103,15 @@ pub(super) fn run(editor: &mut Editor, c: Command) {
         Command::ToggleProjection => editor.toggle_projection(),
         Command::Display(m) => editor.set_display_mode(m),
         Command::CycleDisplay => editor.cycle_display_mode(),
-        Command::Cancel => editor.cancel(),
+        // Escape dismisses the topmost thing first. The overlay is drawn over
+        // everything, and putting it away should not also put down the tool under it.
+        Command::Cancel => {
+            if editor.show_shortcuts {
+                editor.show_shortcuts = false;
+            } else {
+                editor.cancel();
+            }
+        }
         Command::Confirm => editor.confirm(),
         Command::DeleteSelected => editor.delete_selected(),
         Command::FocusNextEntry => {
@@ -2922,9 +2930,6 @@ fn shortcut_overlay(editor: &mut Editor, ctx: &egui::Context) {
             open = false;
         }
     });
-    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-        open = false;
-    }
     editor.show_shortcuts = open;
 }
 
