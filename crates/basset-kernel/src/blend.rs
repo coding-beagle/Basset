@@ -15,6 +15,10 @@
 //! both rims of a 536-facet cylinder measured 165 ms for the first tool and 1 318 ms for
 //! the second, identical one. The other half is the budget, which decides how many
 //! facets the tools may carry at all; see [`MAX_FEATURE_POLYGONS`].
+//!
+//! How *large* a blend may be is decided here as well, and for the same reason: nothing
+//! below this module notices that a tool has outgrown the material it was meant to work
+//! in. See [`size_limit`].
 
 use basset_math::{Aabb, Vec3};
 
@@ -301,9 +305,16 @@ fn size_limit(solid: &Solid, all_edges: &[Edge], keys: &[EdgeKey], kind: BlendKi
             let boundary: Vec<(&EdgeSegment, bool)> = all_edges
                 .iter()
                 .filter(|e| e.key.touches(face_key))
-                .flat_map(|e| e.segments.iter().map(|s| (s, keys.contains(&e.key))))
+                .flat_map(|e| {
+                    let blended = keys.contains(&e.key);
+                    e.segments.iter().map(move |s| (s, blended))
+                })
                 .collect();
-            let extent = Aabb::from_points(face.polygons.iter().flat_map(|p| p.vertices.clone()));
+            let extent = Aabb::from_points(
+                face.polygons
+                    .iter()
+                    .flat_map(|p| p.vertices.iter().copied()),
+            );
             for seg in &edge.segments {
                 let (_, da, db, phi) = dihedral(seg);
                 let here = kind.setback_per_size(phi);
