@@ -307,6 +307,7 @@ name = "basset-viewport"
 version = "0.1.0"
 dependencies = [
  "approx",
+ "basset-kernel",
  "basset-math",
  "bytemuck",
  "log",

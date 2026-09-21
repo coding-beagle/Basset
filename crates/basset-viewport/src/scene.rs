@@ -45,6 +45,17 @@ impl MeshStyle {
         matches!(self, Self::ShadedWithEdges | Self::Wireframe | Self::XRay)
     }
 
+    /// Whether the body's silhouette — the view-dependent line where its surface turns
+    /// away from the eye — is drawn along with its feature edges.
+    ///
+    /// Only the styles that draw faces *and* edges: the silhouette exists to bound a
+    /// shaded face against what is behind it. A wireframe has no faces to bound, and its
+    /// far side is already drawn, so the silhouette would be one more line in a picture
+    /// made of lines, jumping about as the camera moves.
+    pub fn draws_silhouette(self) -> bool {
+        self.draws_faces() && self.draws_edges()
+    }
+
     /// Styles that blend rather than replace and leave the depth buffer alone. They are
     /// drawn after the opaque ones so there is something for them to blend over.
     pub fn is_translucent(self) -> bool {
@@ -199,6 +210,17 @@ mod tests {
         assert!(!MeshStyle::Wireframe.draws_faces() && MeshStyle::Wireframe.draws_edges());
         assert!(MeshStyle::XRay.draws_faces() && MeshStyle::XRay.draws_edges());
         assert!(MeshStyle::Ghost.draws_faces() && !MeshStyle::Ghost.draws_edges());
+    }
+
+    #[test]
+    fn only_the_shaded_styles_with_edges_outline_themselves() {
+        for style in [MeshStyle::ShadedWithEdges, MeshStyle::XRay] {
+            assert!(style.draws_silhouette(), "{style:?}");
+        }
+        // Wireframe draws edges but no faces; Shaded and Ghost draw faces but no edges.
+        for style in [MeshStyle::Wireframe, MeshStyle::Shaded, MeshStyle::Ghost] {
+            assert!(!style.draws_silhouette(), "{style:?}");
+        }
     }
 
     #[test]

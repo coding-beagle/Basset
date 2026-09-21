@@ -16,7 +16,7 @@ rewritten when the next tool arrives.
 | Construction | offset plane, plane at an angle, sketch on a planar face |
 | Timeline | insert at cursor, edit, suppress, reorder, delete, roll back / forward; edits replay forward with per-feature caching; per-feature failure reporting |
 | Files | `.bass` documents (versioned JSON); STL and 3MF export of bodies and components |
-| Viewport | wgpu renderer with orbit camera, MSAA, pixel-width lines, a grid on any plane, face highlighting, translucent region fills, ray picking |
+| Viewport | wgpu renderer with orbit camera, MSAA, pixel-width lines, view-dependent silhouettes so a curved body is bounded against the background, a grid on any plane, face highlighting, translucent region fills, ray picking |
 | App | winit + egui desktop shell: browser, timeline with rollback marker and context menu, live-preview tool dialogs, viewport transform manipulator (arrows and rotation rings) for sketch and body moves, navigation cube, sketch mode with shape tools, constraint tools and click-to-edit dimensions, native open/save/export dialogs; one declared table of keyboard commands, a shortcut overlay and a fuzzy command palette over it |
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the crate layout, identity strategy and the

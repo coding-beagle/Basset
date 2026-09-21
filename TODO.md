@@ -74,10 +74,30 @@ Sketch:
 
 Extrude tool:
 
-- Still open there: a silhouette is not drawn, so a cylinder standing against the
-  background is bounded only by its shading; and `DISPLAY_CREASE_COS` (45°) is shared with
-  the shading cut-off, which is right for a fold but arbitrary for a tangent edge, where
-  a fillet meets the face it blends into
+- Silhouettes are drawn: `basset-viewport`'s `silhouette` module takes an edge to be on the
+  outline when one of the two facets sharing it faces the camera and the other does not,
+  which is view-dependent and so recomputed per camera change rather than baked at
+  tessellation time. Adjacency is welded and listed once per mesh upload; per frame only
+  one dot product per facet and one sign comparison per edge run, and the result is cached
+  per drawn instance against the view that produced it. Perspective judges each facet
+  against the direction from the eye to that facet, orthographic against the one view
+  direction — an orthographic camera stood in for by an eye a long way off puts the outline
+  of a large body visibly off its edge. Measured on a ball of 57 600 facets / 86 160
+  adjacency records: 77 ms to build the adjacency, 82 µs per frame while the camera moves,
+  0.4 µs while it is still; a body at the default tessellation (2 876 facets) costs 6 µs
+  per moving frame
+- The drawn-edge cut-off is now `TANGENT_EDGE_COS` (20°), separate from the shading crease
+  `DISPLAY_CREASE_COS` (45°): two different surfaces meeting closer to tangent than that
+  get no line, so a fillet no longer comes out ringed like a chamfer. `Edge::smooth`
+  follows the same test, so a tangent boundary is not offered as a fillet target either
+- Still open there: the adjacency is rebuilt on every upload of a body, which is a second
+  weld of a mesh the kernel has already welded in `display_edges` — the 77 ms above lands
+  on every regeneration of a dense body and would be better shared. The 20° is a fixed
+  number, so a blend coarsened to the tool budget's two facets per arc (45° per facet) is
+  still drawn as if it folded; the honest test compares the fold across the boundary with
+  the folds *inside* the adjacent face, which is adaptive and needs no constant. And a
+  silhouette edge that is also a drawn feature edge is drawn twice, over the same pixels:
+  harmless, one wasted instance per such edge on a cube-shaped body
 
 Fillet tool:
 
