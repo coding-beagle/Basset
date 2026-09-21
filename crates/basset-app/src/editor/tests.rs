@@ -3713,3 +3713,98 @@ mod measure {
         unchanged(&mut h, features);
     }
 }
+
+/// Inference, through the editor rather than the ranking: the middle of a line is a
+/// place a click can land, the marker on the crosshair says which place it was, and the
+/// point clicked a moment ago is what the next one lines up with. This is the whole of
+/// what "it reads my mind" means in a sketcher, and none of it is reachable by the grid.
+#[test]
+fn drawing_lands_on_the_places_the_drawing_names() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(100.0, 60.0));
+    let camera = editor.camera;
+    let window = editor.window_px;
+    let s = sketch(&mut editor);
+    s.set_tool(SketchTool::Line);
+
+    // Just above the middle of the bottom edge. The curve is nearer the pointer than
+    // its midpoint is, and the midpoint still wins: it is the stronger kind.
+    s.pointer_moved(&click_at(50.5, 1.0), &camera, window, false);
+    assert_eq!(s.cursor, Some(Vec2::new(50.0, 0.0)), "the midpoint");
+    let marks = |s: &mut super::SketchEditor| {
+        let mut lines = Vec::new();
+        s.draw(&mut lines, &mut Vec::new(), &mut Vec::new());
+        let count = |color| {
+            lines
+                .iter()
+                .filter(|l| l.color == color)
+                .map(|l| l.segments.len())
+                .sum::<usize>()
+        };
+        (
+            count(sketch_mode::SNAP_MARKER_COLOR),
+            count(sketch_mode::SNAP_GUIDE_COLOR),
+        )
+    };
+    let (glyph, guides) = marks(s);
+    assert!(glyph > 0, "a glyph says what caught the pointer");
+    assert_eq!(guides, 0, "and nothing was inferred from a guide");
+
+    // Place it, then aim well above: the click is remembered and the point above it
+    // lines up with it, with the dashed guide drawn back to where it comes from.
+    s.pointer_up(&click_at(50.5, 1.0), &camera, window, true, false);
+    s.pointer_moved(&click_at(50.3, 31.7), &camera, window, false);
+    let cursor = s.cursor.expect("aiming");
+    assert!(
+        (cursor.x - 50.0).abs() < 1e-9 && (cursor.y - 31.7).abs() < 1e-9,
+        "directly above the point just placed: {cursor:?}"
+    );
+    let (glyph, guides) = marks(s);
+    assert!(glyph > 0 && guides > 0, "the guide is drawn, dashed");
+
+    // Shift lets go of the inference, exactly as it lets go of the grid.
+    s.set_free_snap(true);
+    s.pointer_moved(&click_at(50.3, 31.7), &camera, window, false);
+    assert_eq!(s.cursor, Some(Vec2::new(50.3, 31.7)), "free of the guide");
+    // But not of the joins: an existing corner is still picked up, because that is how
+    // geometry gets attached rather than drawn to look attached.
+    s.pointer_moved(&click_at(99.5, 59.5), &camera, window, false);
+    assert_eq!(s.cursor, Some(Vec2::new(100.0, 60.0)), "the corner");
+    assert!(s.cursor_snapped, "and the click will share its point");
+}
+
+/// The hold, through the editor: a snap acquired keeps the crosshair still while the
+/// pointer jitters around it, instead of the preview flicking between two answers.
+#[test]
+fn an_acquired_snap_does_not_flicker_as_the_pointer_jitters() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(100.0, 60.0));
+    let camera = editor.camera;
+    let window = editor.window_px;
+    let s = sketch(&mut editor);
+    s.set_tool(SketchTool::Line);
+    s.pointer_moved(&click_at(99.6, 59.6), &camera, window, false);
+    assert_eq!(s.cursor, Some(Vec2::new(100.0, 60.0)), "the corner");
+    // A hand resting on the mouse: a pixel here and there around where it landed.
+    for jitter in [
+        Vec2::new(0.4, -0.3),
+        Vec2::new(-0.5, 0.4),
+        Vec2::new(0.6, 0.5),
+        Vec2::new(-0.2, -0.6),
+    ] {
+        let p = Vec2::new(99.6, 59.6) + jitter;
+        s.pointer_moved(&click_at(p.x, p.y), &camera, window, false);
+        assert_eq!(
+            s.cursor,
+            Some(Vec2::new(100.0, 60.0)),
+            "still the corner at {p:?}"
+        );
+    }
+    // Walking away from it does let go.
+    s.pointer_moved(&click_at(85.0, 45.0), &camera, window, false);
+    assert_ne!(s.cursor, Some(Vec2::new(100.0, 60.0)));
+}

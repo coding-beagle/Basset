@@ -449,6 +449,7 @@ pub type SnapKey = (
     Option<EntityId>,
     Option<EntityId>,
     [Option<(SnapKind, i64, i64, i64, i64)>; 2],
+    Option<(i64, i64)>,
 );
 
 impl Candidate {
@@ -463,6 +464,11 @@ impl Candidate {
     }
 
     pub fn key(&self) -> SnapKey {
+        // A crossing of two curves is named by nothing but where it is — it belongs to
+        // no entity and no guide — so its position joins the key. Everything else is
+        // identified by what it is *of*, which is what lets a held snap survive the
+        // geometry under it shifting by a hair as the sketch re-solves.
+        let anonymous = self.point.is_none() && self.curve.is_none() && self.guides[0].is_none();
         (
             self.kind,
             self.point,
@@ -471,6 +477,7 @@ impl Candidate {
                 self.guides[0].map(Guide::key),
                 self.guides[1].map(Guide::key),
             ],
+            anonymous.then(|| (quantise(self.at.x), quantise(self.at.y))),
         )
     }
 }
@@ -1022,5 +1029,409 @@ mod tests {
             .at(5.0),
         );
         assert!(!freed.on_grid && freed.text.contains("free"), "{freed:?}");
+    }
+
+    // --- Inference ------------------------------------------------------------------
+
+    /// A sketch with a 20 mm line along the bottom, a 10 mm vertical line meeting it at
+    /// the origin and a circle of radius 5 about (30, 0).
+    fn drawing() -> Sketch {
+        let mut sketch = Sketch::new();
+        let a = sketch.add_point(Vec2::new(0.0, 0.0));
+        let b = sketch.add_point(Vec2::new(20.0, 0.0));
+        let c = sketch.add_point(Vec2::new(0.0, 10.0));
+        let centre = sketch.add_point(Vec2::new(30.0, 0.0));
+        sketch.add_line(a, b).expect("bottom");
+        sketch.add_line(a, c).expect("side");
+        sketch.add_circle(centre, 5.0).expect("hole");
+        sketch
+    }
+
+    fn kinds(candidates: &[Candidate]) -> Vec<SnapKind> {
+        let mut k: Vec<SnapKind> = candidates.iter().map(|c| c.kind).collect();
+        k.dedup();
+        k
+    }
+
+    fn at(kind: SnapKind, at: Vec2) -> Candidate {
+        Candidate::new(kind, at)
+    }
+
+    /// The whole ranking in one go: with the pointer in range of all of them, the
+    /// endpoint wins, then the midpoint, then the curve, then the guide - and with none
+    /// of them in range nothing is chosen, which is the caller's cue to use the grid.
+    #[test]
+    fn a_point_beats_a_curve_beats_a_guide() {
+        let p = Vec2::new(10.0, 10.0);
+        let guide = Guide {
+            kind: SnapKind::Horizontal,
+            anchor: Vec2::new(0.0, 10.2),
+            dir: Vec2::new(1.0, 0.0),
+        };
+        let mut aligned = at(SnapKind::Horizontal, Vec2::new(10.0, 10.2));
+        aligned.guides[0] = Some(guide);
+        let all = vec![
+            aligned,
+            at(SnapKind::OnCurve, Vec2::new(10.0, 10.3)),
+            at(SnapKind::Midpoint, Vec2::new(10.0, 10.4)),
+            at(SnapKind::Endpoint, Vec2::new(10.0, 10.5)),
+        ];
+        let pick = |list: &[Candidate]| choose(list, None, p, 1.0, None).map(|i| list[i].kind);
+        assert_eq!(pick(&all), Some(SnapKind::Endpoint), "a point first");
+        assert_eq!(
+            pick(&all[..3]),
+            Some(SnapKind::Midpoint),
+            "then what it implies"
+        );
+        assert_eq!(pick(&all[..2]), Some(SnapKind::OnCurve), "then the curve");
+        assert_eq!(
+            pick(&all[..1]),
+            Some(SnapKind::Horizontal),
+            "then the guide"
+        );
+        assert_eq!(
+            choose(&all, None, Vec2::new(10.0, 40.0), 1.0, None),
+            None,
+            "nothing in range means the grid, which is not a candidate"
+        );
+    }
+
+    /// Within one tier the nearer one wins, and nothing outside the pick radius is
+    /// acquired however strong its kind.
+    #[test]
+    fn within_a_tier_the_nearer_one_wins_and_the_radius_is_a_radius() {
+        let p = Vec2::ZERO;
+        let near = at(SnapKind::Endpoint, Vec2::new(0.3, 0.0));
+        let far = at(SnapKind::Endpoint, Vec2::new(0.6, 0.0));
+        let list = vec![far, near];
+        assert_eq!(choose(&list, None, p, 1.0, None), Some(1));
+        let list = vec![at(SnapKind::Endpoint, Vec2::new(2.0, 0.0))];
+        assert_eq!(choose(&list, None, p, 1.0, None), None, "out of reach");
+    }
+
+    /// The hold: an acquired snap survives the pointer wandering out past the pick
+    /// radius, and lets go once it is properly gone. Without it the preview argues with
+    /// itself every time the hand shakes.
+    #[test]
+    fn an_acquired_snap_is_held_past_the_pick_radius_and_then_let_go() {
+        let end = at(SnapKind::Endpoint, Vec2::ZERO);
+        let list = vec![end];
+        let held = Some(end.key());
+        let tol = 1.0;
+        assert_eq!(choose(&list, None, Vec2::new(0.9, 0.0), tol, None), Some(0));
+        assert_eq!(
+            choose(&list, held, Vec2::new(1.5, 0.0), tol, None),
+            Some(0),
+            "held out past the radius it was acquired in"
+        );
+        assert_eq!(
+            choose(&list, held, Vec2::new(1.9, 0.0), tol, None),
+            None,
+            "and let go once the pointer has really left it"
+        );
+        assert_eq!(
+            choose(&list, None, Vec2::new(1.5, 0.0), tol, None),
+            None,
+            "a snap never acquired is not held"
+        );
+    }
+
+    /// Two candidates of one tier a hair apart must not trade the snap back and forth:
+    /// the challenger has to be clearly nearer, not merely nearer.
+    #[test]
+    fn a_rival_in_the_same_tier_has_to_beat_the_held_snap_by_a_margin() {
+        let held_at = at(SnapKind::Endpoint, Vec2::ZERO);
+        let rival = at(SnapKind::Endpoint, Vec2::new(1.0, 0.0));
+        let list = vec![held_at, rival];
+        let held = Some(held_at.key());
+        // Just past halfway, so the rival is nearer - but not by the margin.
+        let pointer = Vec2::new(0.55, 0.0);
+        assert_eq!(choose(&list, held, pointer, 1.0, None), Some(0), "held");
+        assert_eq!(
+            choose(&list, None, pointer, 1.0, None),
+            Some(1),
+            "with nothing held the nearer one simply wins"
+        );
+        // Well over to the rival's side, and it takes over.
+        assert_eq!(choose(&list, held, Vec2::new(0.9, 0.0), 1.0, None), Some(1));
+    }
+
+    /// A stronger tier does not have to beat the margin - a point appearing under the
+    /// pointer while a guide is held is exactly the moment to change the answer.
+    #[test]
+    fn a_stronger_tier_takes_a_held_snap_over_on_acquisition_alone() {
+        let guide = at(SnapKind::Horizontal, Vec2::ZERO);
+        let point = at(SnapKind::Endpoint, Vec2::new(0.4, 0.0));
+        let list = vec![guide, point];
+        let held = Some(guide.key());
+        assert_eq!(choose(&list, held, Vec2::new(0.2, 0.0), 1.0, None), Some(1));
+    }
+
+    /// A guide is worth taking only when it is nearer than the grid line it displaces.
+    /// Without this the axes of the drawing catch every click near them and a sketch
+    /// made by eye stops coming out in round numbers.
+    #[test]
+    fn a_guide_further_off_than_the_grid_is_not_help() {
+        let pointer = Vec2::new(0.2, 0.9);
+        let guide = at(SnapKind::Horizontal, Vec2::new(0.2, 0.0));
+        let list = vec![guide];
+        assert_eq!(choose(&list, None, pointer, 5.0, None), Some(0), "no grid");
+        assert_eq!(
+            choose(&list, None, pointer, 5.0, Some(Vec2::new(0.0, 1.0))),
+            None,
+            "the grid line is nearer, so the grid is the better answer"
+        );
+        // Geometry is not a suggestion: the grid does not overrule a real place.
+        let mid = vec![at(SnapKind::Midpoint, Vec2::new(0.2, 0.0))];
+        assert_eq!(
+            choose(&mid, None, pointer, 5.0, Some(Vec2::new(0.0, 1.0))),
+            Some(0)
+        );
+    }
+
+    /// The places the drawing names, found where they are.
+    #[test]
+    fn the_drawing_names_endpoints_midpoints_centres_and_curves() {
+        let sketch = drawing();
+        let found = |p: Vec2| {
+            kinds(&gather(
+                &sketch,
+                &[],
+                Continuation::default(),
+                p,
+                0.5,
+                false,
+            ))
+        };
+        assert!(found(Vec2::new(20.0, 0.1)).contains(&SnapKind::Endpoint));
+        assert!(found(Vec2::new(10.0, 0.1)).contains(&SnapKind::Midpoint));
+        assert!(found(Vec2::new(30.0, 0.1)).contains(&SnapKind::Center));
+        assert!(found(Vec2::new(13.0, 0.05)).contains(&SnapKind::OnCurve));
+        assert!(found(Vec2::new(0.05, 0.05)).contains(&SnapKind::Endpoint));
+    }
+
+    /// A crossing is a place whether or not anything is drawn there: two curves that
+    /// pass through each other are offered at the point they pass.
+    #[test]
+    fn two_curves_crossing_are_offered_where_they_cross() {
+        let mut sketch = Sketch::new();
+        let a = sketch.add_point(Vec2::new(-10.0, 5.0));
+        let b = sketch.add_point(Vec2::new(10.0, 5.0));
+        let c = sketch.add_point(Vec2::new(0.0, -10.0));
+        let d = sketch.add_point(Vec2::new(0.0, 10.0));
+        sketch.add_line(a, b).expect("across");
+        sketch.add_line(c, d).expect("up");
+        let found = gather(
+            &sketch,
+            &[],
+            Continuation::default(),
+            Vec2::new(0.1, 5.1),
+            0.5,
+            false,
+        );
+        let crossing = found
+            .iter()
+            .find(|c| c.kind == SnapKind::Intersection)
+            .expect("the crossing");
+        assert!(crossing.at.distance(Vec2::new(0.0, 5.0)) < 1e-9);
+    }
+
+    /// Alignment with a point the user has touched, and the continuation of the line it
+    /// belongs to. Both carry the geometry they came from, so the dashed line can be
+    /// drawn back to it.
+    #[test]
+    fn touched_points_and_drawn_lines_grow_guides() {
+        let sketch = drawing();
+        let recent = [Vec2::new(20.0, 0.0)];
+        let found = |p: Vec2| gather(&sketch, &recent, Continuation::default(), p, 1.0, false);
+        let vertical = found(Vec2::new(20.05, 8.0));
+        let caught = vertical
+            .iter()
+            .find(|c| c.kind == SnapKind::Vertical)
+            .expect("above the point it was touched at");
+        assert!((caught.at.x - 20.0).abs() < 1e-9 && (caught.at.y - 8.0).abs() < 1e-9);
+        assert_eq!(
+            caught.guides[0].map(|g| g.anchor),
+            Some(Vec2::new(20.0, 0.0)),
+            "the guide names the point it comes from"
+        );
+        // Out along the bottom line, past its end: the extension.
+        let out = found(Vec2::new(28.0, 0.05));
+        assert!(
+            kinds(&out).contains(&SnapKind::Extension),
+            "{:?}",
+            kinds(&out)
+        );
+    }
+
+    /// Where two guides agree, the place they agree on is offered as a point - the one
+    /// inference that names a position in both axes.
+    #[test]
+    fn two_guides_that_agree_are_offered_as_a_point() {
+        let sketch = Sketch::new();
+        let recent = [Vec2::new(10.0, 0.0), Vec2::new(0.0, 7.0)];
+        let found = gather(
+            &sketch,
+            &recent,
+            Continuation::default(),
+            Vec2::new(10.05, 7.05),
+            1.0,
+            false,
+        );
+        let cross = found
+            .iter()
+            .find(|c| c.kind == SnapKind::GuideCross)
+            .expect("level with one and above the other");
+        assert!(cross.at.distance(Vec2::new(10.0, 7.0)) < 1e-9);
+        assert!(cross.guides[1].is_some(), "both guides are drawn");
+    }
+
+    /// Continuing from a curve offers its tangent and its normal, which is how a chain
+    /// carries on smoothly without reaching for a constraint afterwards.
+    #[test]
+    fn continuing_from_a_curve_offers_its_tangent_and_its_normal() {
+        let mut sketch = Sketch::new();
+        let a = sketch.add_point(Vec2::new(0.0, 0.0));
+        let b = sketch.add_point(Vec2::new(10.0, 0.0));
+        let line = sketch.add_line(a, b).expect("line");
+        let cont = Continuation {
+            from: Some(Vec2::new(10.0, 0.0)),
+            curve: Some(line),
+        };
+        let along = gather(&sketch, &[], cont, Vec2::new(16.0, 0.05), 1.0, false);
+        assert!(
+            kinds(&along).contains(&SnapKind::Tangent),
+            "{:?}",
+            kinds(&along)
+        );
+        let across = gather(&sketch, &[], cont, Vec2::new(10.05, 6.0), 1.0, false);
+        assert!(
+            kinds(&across).contains(&SnapKind::Perpendicular),
+            "{:?}",
+            kinds(&across)
+        );
+    }
+
+    /// Shift, and the palette's switch, leave the joins and nothing else: the point to
+    /// share and the curve to be held onto survive, every computed place goes.
+    #[test]
+    fn shift_lets_go_of_everything_but_the_joins() {
+        let sketch = drawing();
+        let recent = [Vec2::new(20.0, 0.0)];
+        let cont = Continuation::default();
+        let free = |p: Vec2| kinds(&gather(&sketch, &recent, cont, p, 1.0, true));
+        assert!(
+            free(Vec2::new(20.0, 0.2)).contains(&SnapKind::Endpoint),
+            "an existing point is never given up: it is how geometry is joined"
+        );
+        assert_eq!(
+            free(Vec2::new(13.0, 0.1)),
+            vec![SnapKind::OnCurve],
+            "nor is a curve, which the new point is held onto by a constraint"
+        );
+        let middle = free(Vec2::new(10.0, 0.1));
+        assert!(
+            middle.contains(&SnapKind::OnCurve) && !middle.contains(&SnapKind::Midpoint),
+            "but the midpoint of that same line is computed, and goes"
+        );
+        assert!(free(Vec2::new(0.1, 0.1)).iter().all(|k| k.joins()));
+    }
+
+    /// The memory the guides grow from: newest first, no duplicates, and bounded, so
+    /// the screen never fills with dashes the user cannot account for.
+    #[test]
+    fn touched_points_are_remembered_newest_first_and_bounded() {
+        let mut inference = Inference::default();
+        for i in 0..6 {
+            inference.touch(Vec2::new(f64::from(i), 0.0));
+        }
+        assert_eq!(
+            inference.recent,
+            vec![
+                Vec2::new(5.0, 0.0),
+                Vec2::new(4.0, 0.0),
+                Vec2::new(3.0, 0.0)
+            ]
+        );
+        inference.touch(Vec2::new(4.0, 0.0));
+        assert_eq!(inference.recent[0], Vec2::new(4.0, 0.0));
+        assert_eq!(
+            inference.recent.len(),
+            3,
+            "touching one again does not add it"
+        );
+    }
+
+    /// End to end through the state: the pointer acquires the endpoint, keeps it while
+    /// it wanders, and hovering it is what makes that corner an anchor for the guides
+    /// the next point will line up with.
+    #[test]
+    fn resolving_holds_the_snap_and_remembers_what_was_hovered() {
+        let sketch = drawing();
+        let mut inference = Inference::default();
+        let cont = Continuation::default();
+        let found = inference
+            .resolve(&sketch, cont, Vec2::new(19.8, 0.1), 1.0, false, None)
+            .expect("the endpoint");
+        assert_eq!(found.kind, SnapKind::Endpoint);
+        assert!(
+            found.point.is_some(),
+            "and it hands back the entity to share"
+        );
+        assert_eq!(inference.recent.first(), Some(&Vec2::new(20.0, 0.0)));
+        let held = inference
+            .resolve(&sketch, cont, Vec2::new(18.6, 0.1), 1.0, false, None)
+            .expect("still held");
+        assert_eq!(held.kind, SnapKind::Endpoint);
+        assert!(inference.current().is_some(), "and the overlay can draw it");
+        inference.release();
+        assert!(inference.current().is_none());
+    }
+
+    /// The feedback is geometry the overlay can draw: a glyph on the point, different
+    /// per kind, and a dashed line back to whatever caught it.
+    #[test]
+    fn every_kind_has_a_marker_and_a_guide_is_drawn_dashed() {
+        for kind in [
+            SnapKind::Point,
+            SnapKind::Endpoint,
+            SnapKind::Center,
+            SnapKind::Origin,
+            SnapKind::Midpoint,
+            SnapKind::Intersection,
+            SnapKind::GuideCross,
+            SnapKind::OnCurve,
+            SnapKind::Horizontal,
+            SnapKind::Vertical,
+            SnapKind::Extension,
+            SnapKind::Tangent,
+            SnapKind::Perpendicular,
+        ] {
+            let glyph = marker(kind, Vec2::new(3.0, 4.0), 0.1);
+            assert!(!glyph.is_empty(), "{kind:?} has nothing to draw");
+            for seg in &glyph {
+                assert!(
+                    seg[0].distance(Vec2::new(3.0, 4.0)) < 2.0,
+                    "{kind:?} strays"
+                );
+            }
+        }
+        let guide = Guide {
+            kind: SnapKind::Horizontal,
+            anchor: Vec2::ZERO,
+            dir: Vec2::new(1.0, 0.0),
+        };
+        let dashes = guide_dashes(guide, Vec2::new(10.0, 0.0), 0.1);
+        assert!(dashes.len() > 3, "a dashed line, not a solid one");
+        assert!(
+            dashes
+                .iter()
+                .all(|d| d[0].y.abs() < 1e-9 && d[1].y.abs() < 1e-9),
+            "drawn along the guide"
+        );
+        assert!(
+            dashes.last().map(|d| d[1].x) > Some(10.0),
+            "and carried past the point, because it is a line that goes on"
+        );
     }
 }

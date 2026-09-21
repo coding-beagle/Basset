@@ -60,10 +60,10 @@ const MIN_FILLET_RADIUS: f64 = 0.01;
 const GLYPH_PX: f64 = 5.0;
 /// The snap marker, in the same amber the crosshair turns when a click will join
 /// geometry: one colour means "the drawing caught this" wherever it appears.
-const SNAP_MARKER_COLOR: [f32; 4] = [1.0, 0.85, 0.3, 1.0];
+pub(crate) const SNAP_MARKER_COLOR: [f32; 4] = [1.0, 0.85, 0.3, 1.0];
 /// The guide lines, dimmer than the marker because they are scaffolding rather than a
 /// place — the eye should land on the point, not on the line that found it.
-const SNAP_GUIDE_COLOR: [f32; 4] = [1.0, 0.85, 0.3, 0.45];
+pub(crate) const SNAP_GUIDE_COLOR: [f32; 4] = [1.0, 0.85, 0.3, 0.45];
 /// Clearance between the geometry and the first badge on it. Measured from the anchor,
 /// so it is wide enough that the first slot's box clears the curve it is written on.
 const GLYPH_GAP_PX: f64 = 15.0;
