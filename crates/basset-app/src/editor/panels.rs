@@ -756,28 +756,32 @@ fn sketch_toolbar(s: &super::SketchEditor, ui: &mut egui::Ui, commands: &mut Vec
         } else {
             s.construction
         };
+        // The keys live in the tooltips rather than in the names, here and along the
+        // rest of this row. The row already wraps on an ordinary window, and every line
+        // it gains is a line taken off the palette beside it — which is where the
+        // degrees of freedom and the redundant constraints are reported, and they are
+        // worth more than a key printed twice: the overlay and the palette have it.
         if ui
-            .add(
-                egui::Button::new(format!(
-                    "Construction{}",
-                    commands::hint("sketch.construction")
-                ))
-                .selected(lit),
-            )
-            .on_hover_text(if selection {
-                "Make the selection construction geometry, or ordinary geometry again"
-            } else {
-                "Draw the next shape as construction (reference) geometry"
-            })
+            .add(egui::Button::new("Construction").selected(lit))
+            .on_hover_text(format!(
+                "{}{}",
+                if selection {
+                    "Make the selection construction geometry, or ordinary geometry again"
+                } else {
+                    "Draw the next shape as construction (reference) geometry"
+                },
+                commands::hint("sketch.construction")
+            ))
             .clicked()
         {
             commands.push(Command::SketchConstruction);
         }
         if ui
-            .add_enabled(
-                !s.selected.is_empty(),
-                egui::Button::new(format!("Delete{}", commands::hint("edit.delete"))),
-            )
+            .add_enabled(!s.selected.is_empty(), egui::Button::new("Delete"))
+            .on_hover_text(format!(
+                "Delete the selection{}",
+                commands::hint("edit.delete")
+            ))
             .clicked()
         {
             commands.push(Command::SketchDelete);
@@ -787,9 +791,12 @@ fn sketch_toolbar(s: &super::SketchEditor, ui: &mut egui::Ui, commands: &mut Vec
         if ui
             .add_enabled(
                 !s.selected.is_empty() && !s.modal(),
-                egui::Button::new(format!("Move{}", commands::hint("sketch.move"))),
+                egui::Button::new("Move"),
             )
-            .on_hover_text("Move the selection: drag the arrows and ring, or type offsets")
+            .on_hover_text(format!(
+                "Move the selection: drag the arrows and ring, or type offsets{}",
+                commands::hint("sketch.move")
+            ))
             .on_disabled_hover_text("Select the geometry to move first")
             .clicked()
         {
@@ -814,9 +821,12 @@ fn sketch_toolbar(s: &super::SketchEditor, ui: &mut egui::Ui, commands: &mut Vec
         if ui
             .add_enabled(
                 !s.selected.is_empty() && !s.modal(),
-                egui::Button::new(format!("Offset{}", commands::hint("sketch.offset"))),
+                egui::Button::new("Offset"),
             )
-            .on_hover_text("Draw a chain of curves alongside the selection at a fixed distance")
+            .on_hover_text(format!(
+                "Draw a chain of curves alongside the selection at a fixed distance{}",
+                commands::hint("sketch.offset")
+            ))
             .on_disabled_hover_text("Select the path or loop to offset first")
             .clicked()
         {

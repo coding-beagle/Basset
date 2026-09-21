@@ -142,6 +142,12 @@ What is left here:
 - The palette matches on the label and the id with a subsequence score. It has no memory
   of what was picked last, so the common command does not rise to the top of a query that
   matches several
+- Keys are printed in the sketch toolbar's tooltips rather than in its button names,
+  because that row already wraps to three lines on an 800 px window and a fourth came
+  off the sketch palette beside it — far enough to push the redundant-constraint section
+  below the fold. The palette scrolls, so nothing was unreachable, but a report nobody
+  scrolls to is a report nobody reads. The real fix is for the palette's warnings not to
+  sit at the bottom of a long scroll in the first place
 - `enabled` is shown, by dimming, but not enforced on a keystroke: a key whose command
   cannot act runs it anyway and the command says why. That is deliberate — the messages
   that say what to select first are worth more than a dead key — but it means the overlay

@@ -4116,6 +4116,26 @@ mod shortcuts {
         assert!(h.editor.tool.is_none());
     }
 
+    /// The sketch toolbar wraps, and every row it gains is a row taken off the palette
+    /// beside it — which is where the degrees of freedom, the redundant constraints and
+    /// the conflicting ones are reported. Printing a key inside a button's name rather
+    /// than in its tooltip cost exactly one row, and pushed the redundant-constraint
+    /// section under the fold. Three rows is what it fits in on the harness window.
+    #[test]
+    fn the_sketch_toolbar_does_not_grow_a_row_to_print_a_key() {
+        let mut h = sketching();
+        h.rectangle(Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+        h.frame();
+        let frame = h.frame();
+        let last = frame
+            .rect_of("\u{2714} Finish Sketch")
+            .unwrap_or_else(|| panic!("the toolbar's last button: {:?}", frame.text()));
+        assert!(
+            last.max.y < 120.0,
+            "the toolbar wrapped onto a fourth row: {last:?}"
+        );
+    }
+
     /// The menus and buttons print their key rather than carrying one in the label, so
     /// a re-binding shows up everywhere at once.
     #[test]
