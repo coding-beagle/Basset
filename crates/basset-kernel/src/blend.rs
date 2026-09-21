@@ -7,8 +7,16 @@
 //! consecutive pieces meet on the bisecting plane. Corners where several filleted edges
 //! meet are simply the intersection of their tools, which is a crease rather than the
 //! spherical patch a full-featured kernel would make — an accepted MVP limitation.
+//!
+//! What a blend costs is decided here rather than in the boolean. The tools of one
+//! feature are folded into as few solids as they can be before any of them meets the
+//! body ([`merge_tools`]), because a boolean is superlinear in the body it is given and
+//! every tool applied on its own hands the next one a body it has fragmented: filleting
+//! both rims of a 536-facet cylinder measured 165 ms for the first tool and 1 318 ms for
+//! the second, identical one. The other half is the budget, which decides how many
+//! facets the tools may carry at all; see [`MAX_FEATURE_POLYGONS`].
 
-use basset_math::Vec3;
+use basset_math::{Aabb, Vec3};
 
 use crate::csg::{BoolOp, boolean};
 use crate::error::KernelError;
@@ -112,6 +120,22 @@ fn apply(
     blend: Blend,
     tess: &Tessellation,
 ) -> Result<Solid, KernelError> {
+    let tools = tools_for(op, solid, keys, blend, tess)?;
+    let mut result = solid.clone();
+    for (tool, bool_op) in merge_tools(tools, solid.polygon_count()) {
+        result = boolean(&result, &tool, bool_op)?;
+    }
+    Ok(result)
+}
+
+/// One tool per chain of every selected edge, with the operation that applies it.
+fn tools_for(
+    op: OpId,
+    solid: &Solid,
+    keys: &[EdgeKey],
+    blend: Blend,
+    tess: &Tessellation,
+) -> Result<Vec<(Solid, BoolOp)>, KernelError> {
     let size = match blend {
         Blend::Fillet { radius } => radius,
         Blend::Chamfer { distance } => distance,
@@ -155,11 +179,102 @@ fn apply(
             (tool_polygons(ring_count(chain), MIN_ARC_SEGMENTS) + slack).min(MAX_TOOL_POLYGONS);
         tools.push(tool_for_chain(op, *i, *key, chain, blend, tess, budget)?);
     }
-    let mut result = solid.clone();
-    for (tool, bool_op) in tools {
-        result = boolean(&result, &tool, bool_op)?;
+    Ok(tools)
+}
+
+/// Folds the tools into as few as possible, so the body goes through one boolean rather
+/// than one per edge.
+///
+/// This is where a multi-edge blend is won or lost. Every boolean runs against the
+/// *accumulating* result, so the second one meets a body the first has fragmented, and
+/// the boolean is superlinear in that count: filleting both rims of a 536-facet cylinder
+/// measured 165 ms for the first tool against the bare body and 1 318 ms for the second,
+/// identical tool against the 2 702 facets the first left behind. Subtracting a set of
+/// tools is subtracting their union whichever order it is done in, and the same for
+/// adding, so the tools can be folded together first — and a tool is small where the
+/// body is large, which is why folding them is nearly free.
+///
+/// Tools that do not reach each other are folded by concatenating their faces: two
+/// closed shells that share no point are one closed shell of two components, which the
+/// BSP handles without ever being asked about the gap between them. Only tools that do
+/// meet — the corner where two filleted edges of a box run together — cost a real
+/// boolean, and that one is tool against tool rather than tool against body.
+///
+/// Folding may only reorder tools that share an operation: a subtraction and a union
+/// that overlap are not interchangeable, so the tools are folded within runs of one
+/// operation and the runs keep their order.
+fn merge_tools(tools: Vec<(Solid, BoolOp)>, body: usize) -> Vec<(Solid, BoolOp)> {
+    let mut out: Vec<(Solid, BoolOp)> = Vec::new();
+    // A group is one tool being built up, with the boxes of the tools already in it kept
+    // apart rather than as one box round the lot: a third tool clear of both of two
+    // grouped tools is still clear of them where their common box, which spans the gap
+    // between them, says otherwise.
+    let mut groups: Vec<(Solid, Vec<Aabb>)> = Vec::new();
+    let mut run: Option<BoolOp> = None;
+    for (tool, op) in tools {
+        if run != Some(op) {
+            out.extend(groups.drain(..).map(|(t, _)| (t, run.unwrap())));
+            run = Some(op);
+        }
+        let box_of = tool.aabb();
+        // Into the first group it stays clear of, which is free; failing that a boolean,
+        // which is worth its cost only while tool against tool is the smaller problem
+        // than tool against body — the usual one, since a tool is a band across a body.
+        // Four fillets meeting at the corners of a box are four 87-facet tools, and
+        // folding those against each other cost 11 ms where applying each to the
+        // eight-facet box cost 2 ms.
+        match groups
+            .iter_mut()
+            .find(|(_, boxes)| boxes.iter().all(|b| clear_of(b, &box_of)))
+        {
+            Some((acc, boxes)) => {
+                absorb(acc, tool);
+                boxes.push(box_of);
+            }
+            None => {
+                let fold = groups
+                    .first()
+                    .is_some_and(|(acc, _)| acc.polygon_count() + tool.polygon_count() < body);
+                match fold.then(|| boolean(&groups[0].0, &tool, BoolOp::Union)) {
+                    Some(Ok(merged)) => {
+                        groups[0].0 = merged;
+                        groups[0].1.push(box_of);
+                    }
+                    Some(Err(e)) => {
+                        // The tools stay separate and cost a boolean each against the
+                        // body, which is what they cost before any of this.
+                        log::warn!("blend: tools left unfolded, their union failed: {e:?}");
+                        groups.push((tool, vec![box_of]));
+                    }
+                    None => groups.push((tool, vec![box_of])),
+                }
+            }
+        }
     }
-    Ok(result)
+    out.extend(groups.into_iter().map(|(t, _)| (t, run.unwrap())));
+    out
+}
+
+/// Concatenates one tool's faces into another's. Two closed shells that share no point
+/// are one closed shell of two components, which the BSP handles without ever being
+/// asked about the gap between them. Faces are joined by key rather than appended
+/// blindly, because the two chains of one selected edge carry the same blend key.
+fn absorb(acc: &mut Solid, tool: Solid) {
+    for face in tool.faces {
+        match acc.faces.iter_mut().find(|f| f.key == face.key) {
+            Some(existing) => existing.polygons.extend(face.polygons),
+            None => acc.faces.push(face),
+        }
+    }
+}
+
+/// Whether two boxes are far enough apart that no point of one is a point of the other,
+/// with the boolean's own coplanarity tolerance to spare. Anything closer is folded by a
+/// boolean instead, because concatenating shells that touch would hand the BSP a
+/// non-manifold edge.
+fn clear_of(a: &Aabb, b: &Aabb) -> bool {
+    let gap = 8.0 * MERGE_TOL;
+    (0..3).any(|i| a.max[i] + gap < b.min[i] || b.max[i] + gap < a.min[i])
 }
 
 /// Cross-section of the tool in the plane perpendicular to the edge at a point `c`.
@@ -835,6 +950,169 @@ mod tests {
         assert_eq!(
             chamfer(OpId::new(2), &c, &[], 0.0),
             Err(KernelError::NonPositiveBlend)
+        );
+    }
+
+    /// Every case below turns on the same claim: folding the tools together leaves
+    /// exactly what applying them one at a time left. Volume is the sharp end of it —
+    /// a fold that lost a cut or made one twice moves it — and closure is the other,
+    /// because the shell a broken fold leaves is one the healer cannot pair up.
+    ///
+    /// Here, a chain that wraps a closed rim, and two of them: the fold by
+    /// concatenation, two closed shells with a gap between them handed to the BSP as one.
+    #[test]
+    fn folding_two_rims_leaves_what_two_features_would_have_left() {
+        let cyl = rimmed_cylinder(10.0);
+        let tess = Tessellation::default();
+        let folded = fillet(
+            OpId::new(2),
+            &cyl,
+            &[rim(FaceRole::EndCap), rim(FaceRole::StartCap)],
+            1.0,
+            &tess,
+        )
+        .unwrap();
+        let one = fillet(OpId::new(2), &cyl, &[rim(FaceRole::EndCap)], 1.0, &tess).unwrap();
+        let two = fillet(OpId::new(3), &one, &[rim(FaceRole::StartCap)], 1.0, &tess).unwrap();
+        assert!(folded.is_closed(), "{:?}", folded.validate());
+        assert!(folded.validate().is_ok(), "{:?}", folded.validate());
+        assert_relative_eq!(folded.volume(), two.volume(), epsilon = 1e-6);
+        assert!(
+            folded
+                .face(FaceKey::new(OpId::new(2), FaceRole::Fillet(0)))
+                .is_some()
+                && folded
+                    .face(FaceKey::new(OpId::new(2), FaceRole::Fillet(1)))
+                    .is_some(),
+            "both blends are named, and separately"
+        );
+    }
+
+    /// Tools that do meet — four fillets running into each other at the corners of a
+    /// box, each tool's box straddling the top face, a side and both ends — and whose
+    /// fold is therefore a boolean, or nothing at all.
+    #[test]
+    fn folding_tools_that_meet_at_a_corner_leaves_what_applying_them_in_turn_left() {
+        let c = cube();
+        let keys: Vec<EdgeKey> = (0..4)
+            .map(|i| edge_between(FaceRole::EndCap, FaceRole::Side(i)))
+            .collect();
+        let folded = fillet(OpId::new(2), &c, &keys, 2.0, &fine()).unwrap();
+        // The same tools, applied one at a time as they were before the fold. Not four
+        // separate fillet features: those would each be built against the edges the last
+        // one left, which is a different shape and not what the fold has to reproduce.
+        let mut one_at_a_time = c.clone();
+        for (tool, op) in tools_for(
+            OpId::new(2),
+            &c,
+            &keys,
+            Blend::Fillet { radius: 2.0 },
+            &fine(),
+        )
+        .unwrap()
+        {
+            one_at_a_time = boolean(&one_at_a_time, &tool, op).unwrap();
+        }
+        assert!(folded.is_closed(), "{:?}", folded.validate());
+        assert!(folded.validate().is_ok(), "{:?}", folded.validate());
+        assert_relative_eq!(folded.volume(), one_at_a_time.volume(), epsilon = 1e-6);
+    }
+
+    /// The material-adding path, folded: two concave edges on opposite sides of a boss,
+    /// far enough apart to be concatenated, whose tools are unions rather than
+    /// subtractions.
+    #[test]
+    fn folding_two_concave_edges_adds_what_two_features_would_have_added() {
+        let base = cuboid(OpId::new(1), Vec3::ZERO, Vec3::splat(10.0));
+        let boss = cuboid(
+            OpId::new(2),
+            Vec3::new(3.0, 3.0, 10.0),
+            Vec3::new(7.0, 7.0, 14.0),
+        );
+        let body = boolean(&base, &boss, BoolOp::Union).unwrap();
+        let top = FaceKey::new(OpId::new(1), FaceRole::EndCap);
+        let keys: Vec<EdgeKey> = [0u32, 2]
+            .iter()
+            .map(|i| {
+                let side = FaceKey::new(OpId::new(2), FaceRole::Side(*i));
+                body.edges()
+                    .into_iter()
+                    .map(|e| e.key)
+                    .find(|k| k.touches(top) && k.touches(side))
+                    .expect("the boss meets the top face along each of its sides")
+            })
+            .collect();
+        let folded = fillet(OpId::new(3), &body, &keys, 1.0, &fine()).unwrap();
+        let one = fillet(OpId::new(3), &body, &keys[..1], 1.0, &fine()).unwrap();
+        let two = fillet(OpId::new(4), &one, &keys[1..], 1.0, &fine()).unwrap();
+        assert!(folded.is_closed(), "{:?}", folded.validate());
+        assert!(folded.validate().is_ok(), "{:?}", folded.validate());
+        assert_relative_eq!(folded.volume(), two.volume(), epsilon = 1e-6);
+        // Each fillet fills a quarter-circle gusset four long: (1 − π/4) · 4 apiece.
+        let added = 2.0 * (1.0 - PI / 4.0) * 4.0;
+        assert_relative_eq!(folded.volume(), body.volume() + added, epsilon = 0.05);
+    }
+
+    fn brick(op: u64, min: Vec3) -> Solid {
+        cuboid(OpId::new(op), min, min + Vec3::splat(2.0))
+    }
+
+    #[test]
+    fn tools_that_cannot_reach_each_other_are_folded_without_a_boolean() {
+        let tools = vec![
+            (brick(1, Vec3::ZERO), BoolOp::Subtract),
+            (brick(2, Vec3::new(5.0, 0.0, 0.0)), BoolOp::Subtract),
+        ];
+        // A body of one polygon, so the size guard rules out any boolean fold: what
+        // comes back can only have been concatenated.
+        let merged = merge_tools(tools, 1);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].1, BoolOp::Subtract);
+        assert_eq!(
+            merged[0].0.faces.len(),
+            12,
+            "two shells, neither one healed away"
+        );
+        assert_relative_eq!(merged[0].0.volume(), 16.0, epsilon = 1e-9);
+        assert!(merged[0].0.is_closed());
+    }
+
+    #[test]
+    fn tools_that_overlap_are_folded_into_their_union_when_the_body_is_the_bigger_problem() {
+        let tools = vec![
+            (brick(1, Vec3::ZERO), BoolOp::Subtract),
+            (brick(2, Vec3::splat(1.0)), BoolOp::Subtract),
+        ];
+        let merged = merge_tools(tools.clone(), 10_000);
+        assert_eq!(merged.len(), 1);
+        assert_relative_eq!(merged[0].0.volume(), 8.0 + 8.0 - 1.0, epsilon = 1e-9);
+        assert!(merged[0].0.is_closed());
+        // The same pair against a body smaller than they are stays apart, because the
+        // boolean saved would cost more than the boolean spent.
+        assert_eq!(merge_tools(tools, 8).len(), 2);
+    }
+
+    /// Subtracting and adding do not commute, so the fold may reorder tools only within
+    /// a run of one operation.
+    #[test]
+    fn a_subtraction_and_a_union_keep_their_order_through_the_fold() {
+        let tools = vec![
+            (brick(1, Vec3::ZERO), BoolOp::Subtract),
+            (brick(2, Vec3::new(5.0, 0.0, 0.0)), BoolOp::Union),
+            (brick(3, Vec3::new(10.0, 0.0, 0.0)), BoolOp::Subtract),
+            (brick(4, Vec3::new(15.0, 0.0, 0.0)), BoolOp::Subtract),
+        ];
+        let merged = merge_tools(tools, 1);
+        let ops: Vec<BoolOp> = merged.iter().map(|(_, o)| *o).collect();
+        assert_eq!(
+            ops,
+            vec![BoolOp::Subtract, BoolOp::Union, BoolOp::Subtract],
+            "the two subtractions either side of the union are not brought together"
+        );
+        assert_eq!(
+            merged[2].0.faces.len(),
+            12,
+            "the trailing run is folded, though"
         );
     }
 }
