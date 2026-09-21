@@ -1108,10 +1108,41 @@ pub(crate) fn binding(id: &str) -> Option<&'static Binding> {
 /// The key printed after a menu item or a tooltip, as ` (Ctrl+S)`, or nothing when the
 /// command has no key. Callers append it to their own label.
 pub(crate) fn hint(id: &str) -> String {
-    match binding(id).and_then(|b| b.shortcut_label()) {
+    suffix(binding(id))
+}
+
+fn suffix(binding: Option<&'static Binding>) -> String {
+    match binding.and_then(|b| b.shortcut_label()) {
         Some(k) => format!(" ({k})"),
         None => String::new(),
     }
+}
+
+/// The binding whose command is this one, found by asking each one what it makes. The
+/// toolbar knows the tool it is drawing a button for, not the command id, and looking
+/// the key up by what the button does is what keeps the two from drifting apart.
+fn made_by(predicate: impl Fn(&Command) -> bool) -> Option<&'static Binding> {
+    BINDINGS.iter().find(|b| predicate(&(b.make)()))
+}
+
+/// The key beside a modelling tool's button or menu item.
+pub(crate) fn tool_hint(kind: ToolKind) -> String {
+    suffix(made_by(|c| matches!(c, Command::Tool(k) if *k == kind)))
+}
+
+/// The key beside a sketch toolbar button: its group's key, or the tool's own where the
+/// tool is bound directly (Trim, Break, the corner fillet).
+pub(crate) fn sketch_tool_hint(group: ToolGroup, tool: SketchTool) -> String {
+    let found = made_by(|c| matches!(c, Command::SketchTool(t) if *t == tool))
+        .or_else(|| made_by(|c| matches!(c, Command::SketchGroup(g) if *g == group)));
+    suffix(found)
+}
+
+/// The key beside a constraint button.
+pub(crate) fn constraint_hint(kind: ConstraintKind) -> String {
+    suffix(made_by(
+        |c| matches!(c, Command::SketchTool(SketchTool::Constrain(k)) if *k == kind),
+    ))
 }
 
 /// Score a command against what has been typed in the palette: the letters have to
