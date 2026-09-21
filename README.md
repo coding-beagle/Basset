@@ -11,7 +11,7 @@ rewritten when the next tool arrives.
 | Area | What exists |
 | --- | --- |
 | Object model | Document, Components, origin & construction Planes/Axes, Sketches, Bodies |
-| Sketching | points, lines, arcs, circles, construction geometry, text; rectangles (2-point, centre), circles (centre, 2-point, 3-point), polygons, slots, arcs; geometric constraints and driving dimensions; Levenberg–Marquardt solver that names both the loose geometry and, when a sketch will not solve, the constraints that disagree; selection / hit testing including box select; grid snapping; closed-region detection with curves split at their crossings; trim and break; rectangular and circular patterns with a live preview; offset with rounded or squared corners; named parameters driving dimensions |
+| Sketching | points, lines, arcs, circles, construction geometry, text; rectangles (2-point, centre), circles (centre, 2-point, 3-point), polygons, slots, arcs; geometric constraints and driving dimensions; Levenberg–Marquardt solver that names both the loose geometry and, when a sketch will not solve, the constraints that disagree; selection / hit testing including box select; snapping to the grid and to what the drawing names — endpoints, midpoints, centres, crossings, the nearest point on a curve, the origin, alignment with a touched point, a line's own extension, tangent and perpendicular — ranked, held steady and marked on screen; closed-region detection with curves split at their crossings; trim and break; rectangular and circular patterns with a live preview; offset with rounded or squared corners; named parameters driving dimensions |
 | Solids | extrude (one side / symmetric / two sides), revolve, sweep, loft, from a sketch region or a planar face; join / cut / intersect; fillet, chamfer, combine, move |
 | Construction | offset plane, plane at an angle, sketch on a planar face |
 | Timeline | insert at cursor, edit, suppress, reorder, delete, roll back / forward; edits replay forward with per-feature caching; per-feature failure reporting |
@@ -42,13 +42,31 @@ cargo clippy --workspace --all-targets -- -D warnings
   shape with several ways to draw it (rectangle, circle, arc, slot) has one button that
   shows the kind used last, and holding it or right-clicking lists the others. Click
   points; clicks snap to existing points, which is how loops close. Right-click or Esc
-  ends a line chain. Points that snap to nothing land on the grid, which is drawn on the
+  ends a line chain. Clicks also land on the places the drawing already names: the middle
+  of a line, the centre of a hole, where two curves cross, the nearest point on a curve,
+  the origin, level with or straight above a point you have just touched, out along a
+  line's own direction past its end, and tangent or square to the curve a chain is
+  continuing from. A glyph on the crosshair says which of those caught it — a square for
+  an end, a triangle for a middle, a circle for a centre, a cross for a crossing — and an
+  alignment draws a dashed line back to the point it comes from, so a guide is never
+  mysterious. When several are in range at once one ranking decides: a point of the
+  drawing, then a place it implies, then two guides agreeing, then a curve, then a single
+  guide, then the grid, and the nearer of two of a kind. Once one is taken it is held
+  until the pointer clearly leaves it, so the preview does not flicker between two answers
+  under a resting hand, and a guide is only taken when it is nearer than the grid line it
+  would displace — a sketch drawn by eye still comes out in round numbers. Points that
+  land on none of it land on the grid, which is drawn on the
   sketch plane; the palette turns snapping off or pins the increment, and **holding shift
   lets go of the grid** for as long as it is down — for the one point that has to land
   between the lines, which is far commoner than wanting no grid at all. Shift frees the
-  manipulators too, not just the drawing. Snapping to an existing *point* is never given
-  up: it is how geometry gets joined, and shift is for escaping the grid rather than for
-  drawing something that only looks attached. After a shape's
+  manipulators too, not just the drawing, and it lets go of the inference with the grid,
+  since both are things standing between the pointer and a position of its own; the
+  palette's switch, off, says the same for good. What neither gives up is a *join*: an
+  existing point, which is how geometry gets tied together, or a curve, which the new
+  point is held onto with a constraint. Shift is for escaping the grid rather than for
+  drawing something that only looks attached. Dragging a single point aims it the same
+  way, so a corner can be put on the middle of the line beside it and not merely back on
+  the grid. After a shape's
   first click, type its sizes (length, width and height, diameter…) in the entry boxes
   that appear, Tab between them and press Enter to place it; a typed size pins the
   preview while the pointer picks the direction, and becomes a driving dimension. With
