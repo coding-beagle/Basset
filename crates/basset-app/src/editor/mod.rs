@@ -5,6 +5,7 @@
 //! that draws on one plane. Both build the 3D scene from the document's regenerated
 //! state every frame, so there is never a second copy of geometry to keep in sync.
 
+pub(crate) mod commands;
 mod files;
 mod gizmo;
 mod measure;
@@ -35,7 +36,7 @@ use basset_math::{Aabb, Frame, Vec3};
 use basset_sketch::Font;
 use basset_viewport::{Camera, MeshHandle, MeshStyle, Projection, ViewPreset};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::Key;
 
 pub use measure::Measure;
 pub use selection::{Pick, SelectMode, Selection};
@@ -189,6 +190,10 @@ pub struct Editor {
     pub status: String,
     pub error: Option<String>,
     pub font: Option<Arc<Font>>,
+    /// Whether the keyboard shortcut overlay is up.
+    pub show_shortcuts: bool,
+    /// The command palette, while it is open. See [`commands::Palette`].
+    pub(crate) palette: Option<commands::Palette>,
     rename: Option<(FeatureId, String)>,
     meshes: HashMap<BodyRef, BodyMesh>,
     /// Bodies as picking sees them, see [`PickBody`]. Refreshed with the cache.
@@ -238,6 +243,8 @@ impl Editor {
             status: "Ready".into(),
             error: None,
             font,
+            show_shortcuts: false,
+            palette: None,
             rename: None,
             meshes: HashMap::new(),
             pick_bodies: HashMap::new(),
@@ -600,84 +607,25 @@ impl Editor {
         }
     }
 
+    /// One lookup into [`commands::BINDINGS`], and then the same command the toolbar
+    /// would have queued. Nothing is decided here that the table does not say, so the
+    /// help overlay and the palette cannot fall out of step with what the keys do.
     fn on_key(&mut self, key: &Key) {
         let ctrl = self.pointer.ctrl;
         let shift = self.pointer.shift;
-        match key {
-            Key::Named(NamedKey::Escape) => self.cancel(),
-            Key::Named(NamedKey::Delete) | Key::Named(NamedKey::Backspace) => {
-                self.delete_selected()
-            }
-            Key::Named(NamedKey::Enter) => self.confirm(),
-            Key::Named(NamedKey::Tab) => {
-                if let Mode::Sketch(s) = &mut self.mode {
-                    s.focus_next_entry();
-                }
-            }
-            // A number typed while drawing goes into the size entry box, so the user
-            // never has to click the box first.
-            Key::Character(c) if !ctrl && self.type_into_entry(c) => {}
-            Key::Character(c) => match (c.to_ascii_lowercase().as_str(), ctrl, shift) {
-                ("z", true, false) => self.undo(),
-                ("z", true, true) | ("y", true, _) => self.redo(),
-                ("s", true, _) => self.save(shift),
-                ("o", true, _) => self.open(),
-                ("n", true, _) => self.new_document(),
-                ("f", false, _) => self.zoom_to_fit(),
-                // D walks the display modes, as it does in the View menu. It is free in
-                // sketch mode too: a sketch is drawn over whatever the bodies show.
-                ("d", false, _) => self.cycle_display_mode(),
-                // 1-5 switch the selection filter, as in the toolbar. A sketch has its
-                // own filter over its own kinds of thing, on the same keys.
-                (d @ ("1" | "2" | "3" | "4"), false, _) if matches!(self.mode, Mode::Sketch(_)) => {
-                    let i = d.parse::<usize>().unwrap_or(1) - 1;
-                    if let Mode::Sketch(s) = &mut self.mode {
-                        s.set_pick(sketch_mode::SketchPick::ALL[i]);
-                    }
-                }
-                (d @ ("1" | "2" | "3" | "4" | "5"), false, _) if !self.is_sketching() => {
-                    let i = d.parse::<usize>().unwrap_or(1) - 1;
-                    self.set_select_mode(SelectMode::ALL[i]);
-                }
-                ("x", false, _) => {
-                    if let Mode::Sketch(s) = &mut self.mode {
-                        s.toggle_construction();
-                    }
-                }
-                // M moves the selection by typed offsets, E pushes the region under the
-                // pointer into a solid: the two things a sketch is usually finished with.
-                ("m", false, _) => {
-                    if let Mode::Sketch(s) = &mut self.mode
-                        && !s.begin_move()
-                    {
-                        let why = busy(s).unwrap_or(
-                            "Select sketch geometry first, then press M to move it".into(),
-                        );
-                        self.set_status(why);
-                    }
-                }
-                // O offsets it, after Fusion. Ctrl-O is Open and is matched above.
-                ("o", false, _) => {
-                    if let Mode::Sketch(s) = &mut self.mode {
-                        if s.begin_offset() {
-                            // The preview is real geometry in the feature by now, so it
-                            // has to reach the document for anything downstream to see.
-                            self.commit_sketch();
-                        } else {
-                            let why = busy(s).unwrap_or(
-                                "Select the path or loop first, then press O to offset it".into(),
-                            );
-                            self.set_status(why);
-                        }
-                    }
-                }
-                ("e", false, _) => match &self.mode {
-                    Mode::Sketch(_) => sketch_mode::extrude_region(self),
-                    Mode::Model => {}
-                },
-                _ => {}
-            },
-            _ => {}
+        // A number typed while drawing goes into the size entry box, so the user never
+        // has to click the box first. It comes before the table because the entry is
+        // modal over the keyboard in a way a binding cannot express: `2` is a width,
+        // not a selection filter, for as long as a box is waiting for it.
+        if !ctrl
+            && let Key::Character(c) = key
+            && self.type_into_entry(c)
+        {
+            self.repaint = true;
+            return;
+        }
+        if let Some(binding) = commands::lookup(key, ctrl, shift, self.is_sketching()) {
+            panels::run(self, (binding.make)());
         }
         self.repaint = true;
     }
@@ -1064,7 +1012,7 @@ impl Editor {
 /// Why a tool refused to start, when the reason is that something else is already
 /// running. A message about selecting geometry first, said to someone who has selected
 /// it and is halfway through a move, tells them nothing about what to do next.
-fn busy(s: &sketch_mode::SketchEditor) -> Option<String> {
+pub(crate) fn busy(s: &sketch_mode::SketchEditor) -> Option<String> {
     let what = s.modal_name()?;
     Some(format!(
         "{what} is still up — finish it or cancel it first (Enter or Esc)"

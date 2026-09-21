@@ -3775,3 +3775,359 @@ mod measure {
         unchanged(&mut h, features);
     }
 }
+
+/// The keyboard, the overlay that lists it and the palette that searches it. All three
+/// read one table, and these tests are mostly about that: what a key does is what the
+/// button does, and what is listed is what is bound.
+mod shortcuts {
+    use basset_core::{OriginPlane, PlaneRef};
+    use basset_math::Vec2;
+    use winit::keyboard::NamedKey;
+
+    use crate::editor::Mode;
+    use crate::editor::commands;
+    use crate::editor::harness::{Harness, click_at};
+    use crate::editor::sketch_mode::{ConstraintKind, SketchTool};
+    use crate::editor::tools::ToolKind;
+
+    /// A keystroke with shift held, released afterwards. winit reports the shifted
+    /// letter in upper case, which is what a real window would deliver.
+    fn shift_key(h: &mut Harness, text: &str) {
+        h.set_modifiers(true, false);
+        h.type_key(&text.to_ascii_uppercase());
+        h.set_modifiers(false, false);
+    }
+
+    fn sketching() -> Harness {
+        let mut h = Harness::new();
+        h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+        h
+    }
+
+    fn tool(h: &Harness) -> SketchTool {
+        match &h.editor.mode {
+            Mode::Sketch(s) => s.tool,
+            Mode::Model => panic!("not sketching"),
+        }
+    }
+
+    /// Two commands live in the same mode cannot want the same chord: whichever the
+    /// table listed first would silently swallow the other.
+    #[test]
+    fn no_chord_is_claimed_twice_in_one_mode() {
+        for sketching in [false, true] {
+            let live: Vec<_> = commands::BINDINGS
+                .iter()
+                .filter(|b| b.live.covers(sketching))
+                .collect();
+            for (i, a) in live.iter().enumerate() {
+                for b in &live[i + 1..] {
+                    for chord in a.chords {
+                        assert!(
+                            !b.chords.contains(chord),
+                            "{} and {} both want {} (sketching: {sketching})",
+                            a.id,
+                            b.id,
+                            chord.label()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_command_has_its_own_id_and_says_what_it_is() {
+        for (i, a) in commands::BINDINGS.iter().enumerate() {
+            assert!(!a.label.is_empty(), "{} has no label", a.id);
+            for b in &commands::BINDINGS[i + 1..] {
+                assert_ne!(a.id, b.id, "two commands called {}", a.id);
+            }
+        }
+    }
+
+    /// The bindings that existed before the table did, still doing what they did.
+    #[test]
+    fn the_keys_that_worked_before_still_work() {
+        let mut h = Harness::new();
+        h.type_key("d");
+        assert_eq!(h.editor.display, crate::editor::DisplayMode::ALL[1]);
+        h.type_key("3");
+        assert_eq!(h.editor.select_mode, crate::editor::SelectMode::ALL[2]);
+
+        let mut h = sketching();
+        h.type_key("2");
+        let Mode::Sketch(s) = &h.editor.mode else {
+            unreachable!()
+        };
+        assert_eq!(s.pick, crate::editor::sketch_mode::SketchPick::ALL[1]);
+        h.type_key("x");
+        let Mode::Sketch(s) = &h.editor.mode else {
+            unreachable!()
+        };
+        assert!(s.construction, "X armed construction mode");
+    }
+
+    /// A shape key arms the tool its toolbar button would, which is the whole point of
+    /// routing the key through the same command.
+    #[test]
+    fn a_shape_key_arms_the_tool_its_button_would() {
+        let mut h = sketching();
+        for (key, expected) in [
+            ("l", SketchTool::Line),
+            ("r", SketchTool::Rectangle),
+            ("c", SketchTool::Circle),
+            ("a", SketchTool::Arc3Point),
+            ("p", SketchTool::Polygon),
+            ("s", SketchTool::Slot),
+            ("t", SketchTool::Trim),
+            ("b", SketchTool::Break),
+        ] {
+            h.type_key(key);
+            assert_eq!(tool(&h), expected, "{key} armed the wrong tool");
+        }
+        shift_key(&mut h, "d");
+        assert_eq!(tool(&h), SketchTool::Dimension);
+    }
+
+    /// A folded button shows the variant used last, and its key opens that same variant
+    /// rather than resetting to the group's first.
+    #[test]
+    fn a_shape_key_follows_the_variant_the_button_is_showing() {
+        let mut h = sketching();
+        let Mode::Sketch(s) = &mut h.editor.mode else {
+            unreachable!()
+        };
+        s.set_tool(SketchTool::CenterRectangle);
+        h.type_key("l");
+        h.type_key("r");
+        assert_eq!(tool(&h), SketchTool::CenterRectangle);
+    }
+
+    #[test]
+    fn shift_and_a_letter_arms_a_constraint() {
+        let mut h = sketching();
+        for (key, expected) in [
+            ("p", ConstraintKind::Parallel),
+            ("r", ConstraintKind::Perpendicular),
+            ("t", ConstraintKind::Tangent),
+            ("e", ConstraintKind::Equal),
+            ("n", ConstraintKind::Concentric),
+        ] {
+            shift_key(&mut h, key);
+            let Mode::Sketch(s) = &h.editor.mode else {
+                unreachable!()
+            };
+            assert_eq!(
+                s.armed_constraint(),
+                Some(expected),
+                "Shift+{key} armed the wrong constraint"
+            );
+        }
+        h.type_key("h");
+        let Mode::Sketch(s) = &h.editor.mode else {
+            unreachable!()
+        };
+        assert_eq!(s.armed_constraint(), Some(ConstraintKind::Horizontal));
+    }
+
+    /// The same letter is a rectangle in a sketch and a revolve outside one. The mode is
+    /// part of the binding, so both are true at once without either knowing about the
+    /// other.
+    #[test]
+    fn a_letter_means_different_things_in_the_two_modes() {
+        let mut h = Harness::new();
+        h.type_key("r");
+        assert_eq!(
+            h.editor.tool.as_ref().map(|t| t.kind),
+            Some(ToolKind::Revolve)
+        );
+        h.key(NamedKey::Escape);
+
+        h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+        h.type_key("r");
+        assert_eq!(tool(&h), SketchTool::Rectangle);
+    }
+
+    #[test]
+    fn the_modelling_tools_have_keys() {
+        for (key, shift, expected) in [
+            ("s", false, ToolKind::Sketch),
+            ("e", false, ToolKind::Extrude),
+            ("w", false, ToolKind::Sweep),
+            ("l", false, ToolKind::Loft),
+            ("f", true, ToolKind::Fillet),
+            ("c", true, ToolKind::Chamfer),
+            ("b", false, ToolKind::Combine),
+            ("m", false, ToolKind::Move),
+            ("p", false, ToolKind::OffsetPlane),
+        ] {
+            let mut h = Harness::new();
+            if shift {
+                shift_key(&mut h, key);
+            } else {
+                h.type_key(key);
+            }
+            assert_eq!(
+                h.editor.tool.as_ref().map(|t| t.kind),
+                Some(expected),
+                "{key} did not open {expected:?}"
+            );
+        }
+    }
+
+    /// A digit typed into a size entry box is a size, not a selection filter. The entry
+    /// is modal over the keyboard in a way a binding cannot express, so it is the one
+    /// thing that comes before the table.
+    #[test]
+    fn a_number_typed_while_drawing_still_goes_into_the_entry_box() {
+        let mut h = sketching();
+        h.type_key("r");
+        let (camera, window) = (h.editor.camera, h.editor.window_px);
+        let Mode::Sketch(s) = &mut h.editor.mode else {
+            unreachable!()
+        };
+        let at = Vec2::new(0.0, 0.0);
+        s.pointer_moved(&click_at(at.x, at.y), &camera, window, false);
+        s.pointer_up(&click_at(at.x, at.y), &camera, window, true, false);
+        h.type_key("2");
+        let Mode::Sketch(s) = &h.editor.mode else {
+            unreachable!()
+        };
+        assert_eq!(s.pick, crate::editor::sketch_mode::SketchPick::ALL[0]);
+        assert!(
+            s.entries.iter().any(|e| e.text.contains('2')),
+            "the 2 landed in an entry box"
+        );
+    }
+
+    /// `?` lists what is live here. In a sketch that is the sketch tools; outside one it
+    /// is the modelling tools, and neither list mentions the other's keys.
+    #[test]
+    fn the_overlay_lists_what_this_mode_can_do() {
+        let mut h = Harness::new();
+        shift_key(&mut h, "?");
+        assert!(h.editor.show_shortcuts);
+        h.frame();
+        let frame = h.frame();
+        assert!(frame.has_text("Extrude"), "{:?}", frame.text());
+        assert!(!frame.has_text("Concentric"), "{:?}", frame.text());
+
+        h.editor.show_shortcuts = false;
+        h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+        h.key(NamedKey::F1);
+        h.frame();
+        let frame = h.frame();
+        assert!(frame.has_text("Concentric"), "{:?}", frame.text());
+        assert!(!frame.has_text("Plane at Angle"), "{:?}", frame.text());
+    }
+
+    #[test]
+    fn the_overlay_closes_on_the_key_that_opened_it() {
+        let mut h = Harness::new();
+        h.key(NamedKey::F1);
+        assert!(h.editor.show_shortcuts);
+        h.key(NamedKey::F1);
+        assert!(!h.editor.show_shortcuts);
+    }
+
+    /// Escape takes the overlay away and leaves what is underneath alone, rather than
+    /// cancelling a tool the user only wanted to read the keys for.
+    #[test]
+    fn escape_closes_the_overlay_before_it_cancels_anything() {
+        let mut h = Harness::new();
+        h.type_key("e");
+        assert!(h.editor.tool.is_some());
+        h.key(NamedKey::F1);
+        h.key(NamedKey::Escape);
+        assert!(!h.editor.show_shortcuts);
+        assert!(h.editor.tool.is_some(), "Extrude was left running");
+        h.key(NamedKey::Escape);
+        assert!(h.editor.tool.is_none());
+    }
+
+    /// The palette searches the same table, so what it finds is what the key would have
+    /// done — including for commands that have no key at all.
+    #[test]
+    fn the_palette_finds_a_command_by_what_it_is_called() {
+        let h = Harness::new();
+        let hits = commands::search(&h.editor, "extr");
+        assert_eq!(hits.first().map(|b| b.id), Some("create.extrude"));
+
+        let hits = commands::search(&h.editor, "3mf");
+        assert_eq!(hits.first().map(|b| b.id), Some("file.export_3mf"));
+    }
+
+    #[test]
+    fn the_palette_only_offers_what_this_mode_can_do() {
+        let mut h = Harness::new();
+        assert!(
+            commands::search(&h.editor, "concentric").is_empty(),
+            "a sketch constraint is not a modelling command"
+        );
+        h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+        assert_eq!(
+            commands::search(&h.editor, "concentric")
+                .first()
+                .map(|b| b.id),
+            Some("constrain.concentric")
+        );
+    }
+
+    /// Ctrl+P opens it, typing narrows it and Enter runs what is highlighted.
+    #[test]
+    fn the_palette_runs_the_command_it_is_pointed_at() {
+        let mut h = Harness::new();
+        h.ctrl_key("p");
+        assert!(h.editor.palette.is_some(), "Ctrl+P opened the palette");
+        h.frame();
+        if let Some(p) = h.editor.palette.as_mut() {
+            p.query = "revolve".into();
+        }
+        h.frame();
+        h.frame_with(vec![egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        }]);
+        assert!(h.editor.palette.is_none(), "it closed on the choice");
+        assert_eq!(
+            h.editor.tool.as_ref().map(|t| t.kind),
+            Some(ToolKind::Revolve)
+        );
+    }
+
+    /// Escape puts the palette down without running anything.
+    #[test]
+    fn escape_closes_the_palette() {
+        let mut h = Harness::new();
+        h.ctrl_key("p");
+        h.frame();
+        h.frame_with(vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        }]);
+        assert!(h.editor.palette.is_none());
+        assert!(h.editor.tool.is_none());
+    }
+
+    /// The menus and buttons print their key rather than carrying one in the label, so
+    /// a re-binding shows up everywhere at once.
+    #[test]
+    fn the_buttons_say_which_key_runs_them() {
+        assert_eq!(commands::hint("file.save"), " (Ctrl+S)");
+        assert_eq!(commands::hint("view.fit"), " (F)");
+        assert_eq!(commands::tool_hint(ToolKind::Fillet), " (Shift+F)");
+        assert_eq!(
+            commands::constraint_hint(ConstraintKind::Tangent),
+            " (Shift+T)"
+        );
+        // A command with no key prints nothing rather than an empty pair of brackets.
+        assert_eq!(commands::hint("sketch.finish"), "");
+    }
+}
