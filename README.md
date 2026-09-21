@@ -17,7 +17,7 @@ rewritten when the next tool arrives.
 | Timeline | insert at cursor, edit, suppress, reorder, delete, roll back / forward; edits replay forward with per-feature caching; per-feature failure reporting |
 | Files | `.bass` documents (versioned JSON); STL and 3MF export of bodies and components |
 | Viewport | wgpu renderer with orbit camera, MSAA, pixel-width lines, a grid on any plane, face highlighting, translucent region fills, ray picking |
-| App | winit + egui desktop shell: browser, timeline with rollback marker and context menu, live-preview tool dialogs, viewport transform manipulator (arrows and rotation rings) for sketch and body moves, navigation cube, sketch mode with shape tools, constraint tools and click-to-edit dimensions, native open/save/export dialogs |
+| App | winit + egui desktop shell: browser, timeline with rollback marker and context menu, live-preview tool dialogs, viewport transform manipulator (arrows and rotation rings) for sketch and body moves, navigation cube, sketch mode with shape tools, constraint tools and click-to-edit dimensions, native open/save/export dialogs; one declared table of keyboard commands, a shortcut overlay and a fuzzy command palette over it |
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the crate layout, identity strategy and the
 honest list of kernel limitations.
@@ -140,6 +140,59 @@ cargo clippy --workspace --all-targets -- -D warnings
   features are inserted at the marker.
 * **Files**: `.bass` documents through the File menu or `Ctrl+S` / `Ctrl+O`; Export STL /
   3MF writes the selected bodies, or every visible body when nothing is selected.
+
+## Keyboard
+
+Every command — its name, its keys, the mode it is live in and whether it can run right
+now — is declared in one table, `crates/basset-app/src/editor/commands.rs`. The key
+handler is a lookup into that table and runs the same command the button would, so a key
+and its button cannot come to mean different things; the menus and tooltips print their
+key from it rather than carrying one in the label; and `?` or `F1` lists it, filtered to
+the mode you are in. `Ctrl+P` opens a command palette over the same table — a fuzzy
+search that reaches everything, including the commands that have no key at all.
+
+The letters follow Fusion where Fusion has one and it is free here. Two do not, and both
+are keys Basset already had: `F` fits the view and `D` walks the display modes, so Fillet
+takes `Shift+F` and Dimension — Fusion's `D` — takes `Shift+D`. Constraints take shift
+and a letter of their own name.
+
+| Anywhere | |
+| --- | --- |
+| `Esc` | Cancel, or put the tool down |
+| `Enter` | Confirm |
+| `Del` | Delete the selection |
+| `F` / `D` | Fit the view / next display mode |
+| `Ctrl+N` `Ctrl+O` `Ctrl+S` `Ctrl+Shift+S` | New, open, save, save as |
+| `Ctrl+Z` / `Ctrl+Shift+Z`, `Ctrl+Y` | Undo / redo |
+| `?` or `F1` | Keyboard shortcuts |
+| `Ctrl+P` | Command palette |
+
+| Model mode | |
+| --- | --- |
+| `1`–`5` | What a click may take: anything, faces, edges, vertices, sketch geometry |
+| `S` `E` `R` `W` `L` | Sketch, Extrude, Revolve, Sweep, Loft |
+| `Shift+F` `Shift+C` `B` `M` | Fillet, Chamfer, Combine, Move |
+| `P` / `Shift+P` | Offset Plane / Plane at Angle |
+| `Shift+N` | New Component |
+| `I` | Measure |
+
+| Sketch mode | |
+| --- | --- |
+| `1`–`4` | What a click may take: anything, curves, points, regions |
+| `L` `R` `C` `A` `P` `S` | Line, Rectangle, Circle, Arc, Polygon, Slot |
+| `T` `B` `Shift+G` | Trim, Break, fillet a corner |
+| `Shift+D` | Dimension |
+| `X` `M` `O` `E` | Construction, Move, Offset, Extrude the region under the pointer |
+| `H` `V` | Horizontal, Vertical |
+| `Shift+C` `Shift+P` `Shift+R` `Shift+T` | Coincident, Parallel, Perpendicular, Tangent |
+| `Shift+E` `Shift+N` `Shift+M` `Shift+S` `Shift+F` | Equal, Concentric, Midpoint, Symmetric, Fix |
+
+A shape's key opens whichever variant its toolbar button is showing — the one you drew
+with last — because the key and the button are the same button. Trim, Break and the
+corner fillet share a button but have a key each: a `T` that sometimes broke instead of
+trimming would be worse than no key. A digit typed while a shape's size boxes are open is
+a size, not a selection filter. Pattern, Text and Finish Sketch have no key yet; they are
+in the palette and on the toolbar.
 
 Requires a Vulkan-capable GPU driver (Mesa is fine) for the application; the library
 crates and their tests have no GPU requirement, and the renderer tests skip themselves

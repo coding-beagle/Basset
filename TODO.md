@@ -93,3 +93,29 @@ Fillet tool:
   MemoryMax=12G`) while this stands
 - Where several blended edges meet, the result is the intersection of their tools rather
   than a corner patch, and a radius larger than the neighbouring face is not detected
+
+Keyboard:
+
+Commands are declared once, in `crates/basset-app/src/editor/commands.rs`: an id, a
+label, the chords that run it, the mode it is live in and a test for whether it would do
+anything now. `on_key` is a lookup into that table and runs the same `Command` a toolbar
+button queues, the menus and tooltips print their key from it, `?` / `F1` lists it
+filtered to the current mode, and `Ctrl+P` is a fuzzy search over it.
+
+What is left here:
+
+- Bindings are not user-configurable: the table is `const`, so re-binding means editing
+  it and rebuilding. A keymap file read at startup, overlaid on the table, is the shape
+  of the fix; the conflict check that the tests do over the table would have to move to
+  runtime and say which of the two it dropped
+- Pattern, Text and Finish Sketch have no key. The plain letters they would want are
+  taken by shapes, and a second letter of the same word is worse than the palette
+- Chords are one key with modifiers. Fusion's two-key sequences (`G` then a letter) have
+  no home in `Chord`, which would need a pending-prefix state in the editor
+- The palette matches on the label and the id with a subsequence score. It has no memory
+  of what was picked last, so the common command does not rise to the top of a query that
+  matches several
+- `enabled` is shown, by dimming, but not enforced on a keystroke: a key whose command
+  cannot act runs it anyway and the command says why. That is deliberate — the messages
+  that say what to select first are worth more than a dead key — but it means the overlay
+  can dim a row whose key still does something visible (a status line)
