@@ -212,9 +212,8 @@ fn merge_tools(tools: Vec<(Solid, BoolOp)>, body: usize) -> Vec<(Solid, BoolOp)>
     let mut groups: Vec<(Solid, Vec<Aabb>)> = Vec::new();
     let mut run: Option<BoolOp> = None;
     for (tool, op) in tools {
-        if run != Some(op) {
-            out.extend(groups.drain(..).map(|(t, _)| (t, run.unwrap())));
-            run = Some(op);
+        if let Some(previous) = run.replace(op).filter(|p| *p != op) {
+            out.extend(groups.drain(..).map(|(t, _)| (t, previous)));
         }
         let box_of = tool.aabb();
         // Into the first group it stays clear of, which is free; failing that a boolean,
@@ -251,14 +250,15 @@ fn merge_tools(tools: Vec<(Solid, BoolOp)>, body: usize) -> Vec<(Solid, BoolOp)>
             }
         }
     }
-    out.extend(groups.into_iter().map(|(t, _)| (t, run.unwrap())));
+    if let Some(op) = run {
+        out.extend(groups.into_iter().map(|(t, _)| (t, op)));
+    }
     out
 }
 
-/// Concatenates one tool's faces into another's. Two closed shells that share no point
-/// are one closed shell of two components, which the BSP handles without ever being
-/// asked about the gap between them. Faces are joined by key rather than appended
-/// blindly, because the two chains of one selected edge carry the same blend key.
+/// Concatenates one tool's faces into another's, joining them by key rather than
+/// appending blindly: the two chains of one selected edge carry the same blend key, and
+/// a solid with that key twice would name one surface two different faces.
 fn absorb(acc: &mut Solid, tool: Solid) {
     for face in tool.faces {
         match acc.faces.iter_mut().find(|f| f.key == face.key) {
