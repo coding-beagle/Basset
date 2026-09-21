@@ -494,6 +494,87 @@ fn the_palette_lists_the_constraints_and_lights_up_what_they_hold() {
     assert_eq!(highlighted.len(), 2, "the two points the distance spans");
 }
 
+/// A redundant constraint gets a section of its own in the palette, counted in a line,
+/// with each one offered for deletion and lighting up what it holds when hovered — the
+/// same treatment a conflicting one gets, one step less severe.
+#[test]
+fn the_palette_lists_redundant_constraints_and_offers_to_delete_them() {
+    let mut h = Harness::new();
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    h.rectangle(Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+    assert!(
+        !h.frame().has_text("redundant constraint"),
+        "a rectangle's own constraints are all doing something"
+    );
+    let bottom = {
+        let s = h.sketch();
+        s.sketch
+            .entities()
+            .find(|(id, d)| {
+                matches!(d.entity, basset_sketch::Entity::Line { .. })
+                    && s.sketch
+                        .entity_bounds(*id)
+                        .is_some_and(|(min, max)| min.y == 0.0 && max.y == 0.0)
+            })
+            .map(|(id, _)| id)
+            .expect("bottom edge")
+    };
+    h.sketch()
+        .add_constraint(basset_sketch::Constraint::Horizontal(bottom))
+        .expect("consistent, so it is taken");
+    let before = h.sketch().sketch.constraints().count();
+
+    // The count is a line of its own, and the row sits under it. The toolbar has a
+    // Horizontal button too, so the row is the "Horizontal" below the count.
+    let (count, row) = {
+        let frame = h.frame();
+        let count = frame
+            .rect_of("1 redundant constraint")
+            .unwrap_or_else(|| panic!("the palette counts them: {:?}", frame.text()));
+        let row = frame
+            .texts
+            .iter()
+            .find(|(r, t)| t.trim() == "Horizontal" && r.min.y > count.min.y)
+            .map(|(r, _)| *r)
+            .unwrap_or_else(|| panic!("the row names the constraint: {:?}", frame.text()));
+        (count, row)
+    };
+    assert!(row.min.y > count.min.y, "the row is in the section");
+    h.frame_with(vec![egui::Event::PointerMoved(row.center())]);
+    assert_eq!(
+        h.sketch().highlighted,
+        vec![bottom],
+        "hovering the row lights up the line it holds"
+    );
+
+    // The delete button sits at the start of the row, so click just left of the name.
+    let cross = {
+        let frame = h.frame();
+        frame
+            .texts
+            .iter()
+            .find(|(r, t)| t.trim() == "\u{2715}" && (r.center().y - row.center().y).abs() < 4.0)
+            .map(|(r, _)| *r)
+            .unwrap_or_else(|| panic!("a delete on the row: {:?}", frame.text()))
+    };
+    h.click_at_ui(cross.center());
+    h.frame();
+    assert_eq!(
+        h.sketch().sketch.constraints().count(),
+        before - 1,
+        "the delete removed the constraint"
+    );
+    assert!(
+        h.sketch().redundant().is_empty(),
+        "and nothing is redundant any more"
+    );
+    assert!(
+        !h.frame().has_text("redundant constraint"),
+        "so the section is gone: {:?}",
+        h.frame().text()
+    );
+}
+
 /// The controls a running operation is driven by have to be in front of the user.
 ///
 /// Move and Pattern used to sit at the bottom of the sketch palette, below the tool

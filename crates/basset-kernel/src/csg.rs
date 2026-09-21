@@ -9,19 +9,31 @@
 //! Known limits, inherited from the algorithm: overlapping *coplanar* faces with the same
 //! orientation are both kept, and the tree is only as shallow as the shape allows. A
 //! splitting plane is taken from one of the polygons, so on a convex body — a cylinder,
-//! or a fillet tool swept round a rim — every candidate leaves the whole remainder in
-//! front of it, the tree degenerates into a list of depth `n`, and both the build and the
-//! clip cost `O(n²)`. Measured on one rim of a cylinder: 450 tool facets take 10 ms,
-//! 1700 take 175 ms, 8.8k take 5.3 s, 14k take 7.9 s, and 30k overflows the stack.
-//! [`blend`](crate::blend) budgets its tools against those numbers; a general fix means
-//! splitting on planes that are not face planes, which this scheme cannot express.
+//! or a fillet tool swept round a rim — every candidate has the whole remainder behind
+//! it, the tree degenerates into a list of depth `n`, and both the build and the clip
+//! cost `O(n²)`. That is not a poor choice of plane but the shape: a convex solid *is*
+//! the intersection of its face half-spaces, so a tree of face planes over it is a list
+//! whichever order they are taken in. Measured filleting both rims of a cylinder, body
+//! and tools together: 2.6k facets take 0.18 s, 4.5k take 0.5 s, 9k take 3.7 s and 27k
+//! take 105 s, at 106 MB peak. [`blend`](crate::blend) budgets its tools against those
+//! numbers. The walks are iterative, so depth costs heap rather than stack, and a
+//! polygon clear of the other solid's bounding box never enters its tree at all.
+//!
+//! The general fix is a plane that is not a face plane: an axis-aligned cut through the
+//! middle of a convex sweep halves it, and the tree is `O(log n)` deep. The scheme can
+//! carry such a node — it stores no polygons and only routes — but tried plainly it
+//! costs more than it saves, because every polygon of *either* solid that crosses a cut
+//! is fragmented along it whether or not the boolean touches it there: the rim fillet
+//! above came out with three and a half times the polygons and a handful of slivers the
+//! healer could not close. Making it pay wants the fragments of an untouched polygon
+//! put back together on the way out, which is where that work stopped.
 //!
 //! Keeping every fragment under its own key is right for naming and wrong for what the
 //! user sees, because two bodies joined flush leave the one flat face they now share as
 //! two. [`Solid::merge_continuous_faces`] is the other half of the assembly: it puts the
 //! faces different operations have grown into one patch of surface back together.
 
-use basset_math::Vec3;
+use basset_math::{Aabb, Vec3};
 
 use crate::error::KernelError;
 use crate::solid::{Face, MERGE_TOL, Polygon, Solid, SurfaceKind};
@@ -41,7 +53,6 @@ pub enum BoolOp {
 /// That near-duplicate is what a later split drags further out of place, and it is what
 /// leaves the shell with slivers and holes no amount of healing can pair up.
 const EPSILON: f64 = MERGE_TOL;
-
 pub fn boolean(a: &Solid, b: &Solid, op: BoolOp) -> Result<Solid, KernelError> {
     let sources = [a, b];
     let mut na = Node::new(polygons_of(a, 0));
@@ -177,35 +188,40 @@ impl SplitPlane {
     }
 
     /// Sorts `polygon` into the four bins, splitting it when it straddles the plane.
+    ///
+    /// Takes the polygon by value so the three whole-polygon outcomes move it rather than
+    /// copy its vertex list. A polygon is sorted once per level of the tree it passes
+    /// through, and on a list-shaped tree (see the module header) that is every level, so
+    /// the copies were one heap allocation per polygon per polygon: they, not the
+    /// classification, were most of the boolean's time.
     fn split(
         &self,
-        polygon: &CsgPolygon,
+        polygon: CsgPolygon,
         coplanar_front: &mut Vec<CsgPolygon>,
         coplanar_back: &mut Vec<CsgPolygon>,
         front: &mut Vec<CsgPolygon>,
         back: &mut Vec<CsgPolygon>,
     ) {
+        // The whole-polygon verdict first, and the per-vertex verdicts only for the one
+        // outcome that needs them: nearly every polygon at nearly every node lands whole
+        // on one side, and keeping a vector of verdicts for those was one heap
+        // allocation per polygon per node.
         let mut polygon_type = 0u8;
-        let types: Vec<u8> = polygon
-            .vertices
-            .iter()
-            .map(|v| {
-                let t = self.classify(*v);
-                polygon_type |= t;
-                t
-            })
-            .collect();
+        for v in &polygon.vertices {
+            polygon_type |= self.classify(*v);
+        }
         match polygon_type {
             COPLANAR => {
                 if self.normal.dot(polygon.normal) > 0.0 {
-                    coplanar_front.push(polygon.clone());
+                    coplanar_front.push(polygon);
                 } else {
-                    coplanar_back.push(polygon.clone());
+                    coplanar_back.push(polygon);
                 }
             }
-            FRONT => front.push(polygon.clone()),
-            BACK => back.push(polygon.clone()),
+            FRONT => front.push(polygon),
+            BACK => back.push(polygon),
             _ => {
+                let types: Vec<u8> = polygon.vertices.iter().map(|v| self.classify(*v)).collect();
                 let n = polygon.vertices.len();
                 let mut f = Vec::with_capacity(n + 1);
                 let mut b = Vec::with_capacity(n + 1);
@@ -226,10 +242,10 @@ impl SplitPlane {
                         b.push(v);
                     }
                 }
-                if let Some(p) = fragment(polygon, f) {
+                if let Some(p) = fragment(&polygon, f) {
                     front.push(p);
                 }
-                if let Some(p) = fragment(polygon, b) {
+                if let Some(p) = fragment(&polygon, b) {
                     back.push(p);
                 }
             }
@@ -257,8 +273,64 @@ struct Node {
     front: Option<Box<Node>>,
     back: Option<Box<Node>>,
     polygons: Vec<CsgPolygon>,
+    /// Box round every polygon this tree was built from, kept at the root only.
+    ///
+    /// The tree partitions space by its planes, and the planes are infinite, so a
+    /// polygon nowhere near the solid still walks the whole tree to learn that it is
+    /// outside — on a list-shaped tree, every node. The box answers that without the
+    /// walk: outside the box is outside the solid, or, once the tree has been inverted,
+    /// inside it. Only the root is ever clipped against, so only the root carries it.
+    bounds: Aabb,
+    /// Odd number of inversions: the tree now describes the complement of the solid,
+    /// and the box bounds what is *not* in it.
+    inverted: bool,
 }
 
+/// Slack round the bounds, so a polygon the box says is clear of the solid is also
+/// clear of the splitter's own coplanarity tolerance at every face.
+const BOUNDS_PAD: f64 = 2.0 * EPSILON;
+
+fn outside(bounds: &Aabb, polygon: &CsgPolygon) -> bool {
+    let (mut lo, mut hi) = (Vec3::splat(f64::INFINITY), Vec3::splat(f64::NEG_INFINITY));
+    for v in &polygon.vertices {
+        lo = lo.min(*v);
+        hi = hi.max(*v);
+    }
+    (0..3).any(|i| hi[i] < bounds.min[i] - BOUNDS_PAD || lo[i] > bounds.max[i] + BOUNDS_PAD)
+}
+
+/// Every polygon of `polygons` sorted against `plane`, as `(coplanar_front,
+/// coplanar_back, front, back)`.
+fn partition(
+    plane: &SplitPlane,
+    polygons: Vec<CsgPolygon>,
+) -> (
+    Vec<CsgPolygon>,
+    Vec<CsgPolygon>,
+    Vec<CsgPolygon>,
+    Vec<CsgPolygon>,
+) {
+    let mut front = Vec::new();
+    let mut back = Vec::new();
+    let (mut coplanar_front, mut coplanar_back) = (Vec::new(), Vec::new());
+    for p in polygons {
+        plane.split(
+            p,
+            &mut coplanar_front,
+            &mut coplanar_back,
+            &mut front,
+            &mut back,
+        );
+    }
+    (coplanar_front, coplanar_back, front, back)
+}
+
+// None of the tree walks recurse. A tree built from a convex sweep is a list one node
+// deep per facet (see the module header), and a recursive walk of it is one stack frame
+// per facet: on a 2 MiB thread stack that was an abort somewhere between 4.5k and 4.8k
+// polygons, and it was the hard ceiling the blend budgets were set under. Each walk
+// carries its own work list on the heap instead, so depth costs memory it would have
+// cost anyway and nothing else.
 impl Node {
     fn empty() -> Box<Node> {
         Box::new(Node {
@@ -266,6 +338,8 @@ impl Node {
             front: None,
             back: None,
             polygons: Vec::new(),
+            bounds: Aabb::empty(),
+            inverted: false,
         })
     }
 
@@ -276,130 +350,126 @@ impl Node {
     }
 
     fn invert(&mut self) {
-        for p in &mut self.polygons {
-            p.flip();
+        self.inverted = !self.inverted;
+        let mut stack: Vec<&mut Node> = vec![self];
+        while let Some(node) = stack.pop() {
+            for p in &mut node.polygons {
+                p.flip();
+            }
+            if let Some(p) = &mut node.plane {
+                p.flip();
+            }
+            std::mem::swap(&mut node.front, &mut node.back);
+            stack.extend(node.front.as_deref_mut());
+            stack.extend(node.back.as_deref_mut());
         }
-        if let Some(p) = &mut self.plane {
-            p.flip();
-        }
-        if let Some(f) = &mut self.front {
-            f.invert();
-        }
-        if let Some(b) = &mut self.back {
-            b.invert();
-        }
-        std::mem::swap(&mut self.front, &mut self.back);
     }
 
     /// Removes the parts of `polygons` inside this tree.
     fn clip_polygons(&self, polygons: Vec<CsgPolygon>) -> Vec<CsgPolygon> {
-        let Some(plane) = self.plane else {
-            return polygons;
-        };
-        let mut front = Vec::new();
-        let mut back = Vec::new();
-        let (mut coplanar_front, mut coplanar_back) = (Vec::new(), Vec::new());
-        for p in &polygons {
-            plane.split(
-                p,
-                &mut coplanar_front,
-                &mut coplanar_back,
-                &mut front,
-                &mut back,
-            );
+        let mut out = Vec::new();
+        // Settle everything the bounds can settle before the walk; see `bounds`. Kept
+        // whole rather than walked, which is also fewer fragments in the result.
+        let mut near = Vec::with_capacity(polygons.len());
+        for p in polygons {
+            match (outside(&self.bounds, &p), self.inverted) {
+                (true, false) => out.push(p),
+                (true, true) => {}
+                (false, _) => near.push(p),
+            }
         }
-        // Coplanar polygons go with the side their normal agrees with.
-        front.extend(coplanar_front);
-        back.extend(coplanar_back);
-        let mut front = match &self.front {
-            Some(f) => f.clip_polygons(front),
-            None => front,
-        };
-        let back = match &self.back {
-            Some(b) => b.clip_polygons(back),
-            None => Vec::new(),
-        };
-        front.extend(back);
-        front
+        let mut stack: Vec<(&Node, Vec<CsgPolygon>)> = vec![(self, near)];
+        while let Some((node, polygons)) = stack.pop() {
+            let Some(plane) = node.plane else {
+                out.extend(polygons);
+                continue;
+            };
+            let (coplanar_front, coplanar_back, mut front, mut back) = partition(&plane, polygons);
+            // Coplanar polygons go with the side their normal agrees with.
+            front.extend(coplanar_front);
+            back.extend(coplanar_back);
+            match &node.front {
+                Some(f) => stack.push((f, front)),
+                None => out.extend(front),
+            }
+            // Behind a face with nothing behind it is inside the solid.
+            if let Some(b) = &node.back {
+                stack.push((b, back));
+            }
+        }
+        out
     }
 
     fn clip_to(&mut self, other: &Node) {
-        self.polygons = other.clip_polygons(std::mem::take(&mut self.polygons));
-        if let Some(f) = &mut self.front {
-            f.clip_to(other);
-        }
-        if let Some(b) = &mut self.back {
-            b.clip_to(other);
+        let mut stack: Vec<&mut Node> = vec![self];
+        while let Some(node) = stack.pop() {
+            node.polygons = other.clip_polygons(std::mem::take(&mut node.polygons));
+            stack.extend(node.front.as_deref_mut());
+            stack.extend(node.back.as_deref_mut());
         }
     }
 
     fn all_polygons(&self) -> Vec<CsgPolygon> {
-        let mut out = self.polygons.clone();
-        if let Some(f) = &self.front {
-            out.extend(f.all_polygons());
-        }
-        if let Some(b) = &self.back {
-            out.extend(b.all_polygons());
+        let mut out = Vec::new();
+        let mut stack: Vec<&Node> = vec![self];
+        while let Some(node) = stack.pop() {
+            out.extend(node.polygons.iter().cloned());
+            stack.extend(node.front.as_deref());
+            stack.extend(node.back.as_deref());
         }
         out
     }
 
     fn build(&mut self, polygons: Vec<CsgPolygon>) {
-        if polygons.is_empty() {
-            return;
+        // Whichever solid the polygons describe, the tree now bounds it too — and if the
+        // tree is inverted, the complement of it, which the box means then.
+        for v in polygons.iter().flat_map(|p| p.vertices.iter()) {
+            self.bounds.include(*v);
         }
-        // Whether the plane comes from this very set of polygons, which is what the
-        // progress check below relies on; a node that already had a plane got it from a
-        // different set and a one-sided split there is ordinary.
-        let mut chosen_here = false;
-        let plane = *self.plane.get_or_insert_with(|| {
-            chosen_here = true;
-            choose_plane(&polygons)
-        });
-        let mut front = Vec::new();
-        let mut back = Vec::new();
-        let (mut coplanar_front, mut coplanar_back) = (Vec::new(), Vec::new());
-        for p in &polygons {
-            plane.split(
-                p,
-                &mut coplanar_front,
-                &mut coplanar_back,
-                &mut front,
-                &mut back,
-            );
-        }
-        // The recursion shrinks only because a plane taken from these polygons consumes
-        // at least the polygon it came from. A polygon whose vertices stray further from
-        // its own plane than EPSILON — healing inserts a T-junction vertex within
-        // MERGE_TOL of an edge without projecting it onto the face, and `Polygon::new`
-        // then centres the plane on a centroid that the stray vertex has pulled off it —
-        // fails that test against its own plane and lands whole on one side. The child
-        // would get an identical set, deterministically choose the same plane, and
-        // recurse until the stack ran out. Keep the set here instead: it is within a
-        // hair of the plane, so coplanar is also the right answer geometrically.
-        let made_progress = !coplanar_front.is_empty()
-            || !coplanar_back.is_empty()
-            || (!front.is_empty() && !back.is_empty());
-        if chosen_here && !made_progress {
-            self.polygons.extend(polygons);
-            return;
-        }
-        // `front` and `back` already hold a copy of everything that is still wanted, so
-        // the input set is dead here — but it is a local, and a local lives until the end
-        // of the function, i.e. across both recursive calls. A tree that degenerates into
-        // a list (which is what a tool swept round a curved edge produces: every facet
-        // plane leaves the rest of the tool in front of it) then keeps one nearly-full
-        // set alive per level, and the peak is quadratic in the polygon count rather than
-        // linear. Measured on one rim of a cylinder: 1700 tool facets peaked at 252 MB
-        // before this line and 19 MB after it.
-        drop(polygons);
-        self.polygons.extend(coplanar_front);
-        self.polygons.extend(coplanar_back);
-        if !front.is_empty() {
-            self.front.get_or_insert_with(Node::empty).build(front);
-        }
-        if !back.is_empty() {
-            self.back.get_or_insert_with(Node::empty).build(back);
+        let mut stack: Vec<(&mut Node, Vec<CsgPolygon>)> = vec![(self, polygons)];
+        while let Some((node, polygons)) = stack.pop() {
+            if polygons.is_empty() {
+                continue;
+            }
+            // Whether the plane comes from this very set of polygons, which is what the
+            // progress check below relies on; a node that already had a plane got it from
+            // a different set and a one-sided split there is ordinary.
+            let mut chosen_here = false;
+            let plane = *node.plane.get_or_insert_with(|| {
+                chosen_here = true;
+                choose_plane(&polygons)
+            });
+            let (coplanar_front, coplanar_back, front, back) = partition(&plane, polygons);
+            // The recursion shrinks only because a plane taken from these polygons
+            // consumes at least the polygon it came from. A polygon whose vertices stray
+            // further from its own plane than EPSILON — healing inserts a T-junction
+            // vertex within MERGE_TOL of an edge without projecting it onto the face, and
+            // `Polygon::new` then centres the plane on a centroid that the stray vertex
+            // has pulled off it — fails that test against its own plane and lands whole
+            // on one side. The child would get an identical set, deterministically choose
+            // the same plane, and recurse until the stack ran out. Keep the set here
+            // instead: it is within a hair of the plane, so coplanar is also the right
+            // answer geometrically.
+            let made_progress = !coplanar_front.is_empty()
+                || !coplanar_back.is_empty()
+                || (!front.is_empty() && !back.is_empty());
+            if chosen_here && !made_progress {
+                node.polygons.extend(front);
+                node.polygons.extend(back);
+                continue;
+            }
+            node.polygons.extend(coplanar_front);
+            node.polygons.extend(coplanar_back);
+            // The input set was consumed by `partition`, so nothing but `front` and
+            // `back` is alive while the children wait on the work list. Measured on one
+            // rim of a cylinder, 1700 tool facets peaked at 252 MB when the recursive
+            // walk kept one nearly-full set alive per level, and 19 MB once it did not.
+            if !front.is_empty() {
+                stack.push((node.front.get_or_insert_with(Node::empty), front));
+            }
+            if !back.is_empty() {
+                stack.push((node.back.get_or_insert_with(Node::empty), back));
+            }
         }
     }
 }
@@ -481,7 +551,7 @@ mod tests {
             w: 0.0,
         };
         let (mut cf, mut cb, mut front, mut back) = (vec![], vec![], vec![], vec![]);
-        plane.split(&poly, &mut cf, &mut cb, &mut front, &mut back);
+        plane.split(poly.clone(), &mut cf, &mut cb, &mut front, &mut back);
         assert_eq!(back.len(), 0, "no sliver behind the plane");
         assert_eq!(front.len(), 1);
         assert_eq!(

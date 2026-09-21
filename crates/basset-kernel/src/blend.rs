@@ -29,30 +29,49 @@ const CLEARANCE: f64 = 1e-4;
 /// allocate tens of gigabytes before the OOM killer ended the session.
 ///
 /// The BSP boolean degenerates on exactly this shape — a convex sweep gives every
-/// candidate splitting plane the whole remainder in front of it, so the tree is a list
-/// (see [`csg`](crate::csg)). Time is quadratic in the facet count, and the recursion is
-/// one frame deep per facet, which is the hard limit: measured on a 2 MiB thread stack,
-/// 4 563 polygons come through and 4 803 abort. The budget leaves room for the booleans
-/// that follow and is spent by coarsening the arc first, because a faceted fillet is a
-/// better answer than a refusal.
-const MAX_TOOL_POLYGONS: usize = 2_000;
+/// candidate splitting plane the whole remainder behind it, so the tree is a list (see
+/// [`csg`](crate::csg)) and time is quadratic in the facet count. Nothing else bounds it
+/// any more: the walks no longer recurse, so depth costs no stack, and the peak memory
+/// measured on two rims at 27k facets was 106 MB. The budgets are therefore a choice of
+/// how long a preview may take. Measured on one core, both rims of a cylinder cost
+/// 0.18 s at 2.6k facets in, 0.5 s at 4.5k and 3.7 s at 9k, and the per-feature
+/// budget below sits at about a second. It is spent by coarsening the arc first, because
+/// a faceted fillet is a better answer than a refusal.
+const MAX_TOOL_POLYGONS: usize = 4_000;
 
 /// Facets one blend feature may put through its booleans, tools and body together.
 ///
 /// Each tool is applied against the accumulating result, so the last boolean of an
-/// n-edge blend builds a tree over everything the earlier ones fragmented, and it is that
-/// tree that has to stay inside the stack. Bounding the tools alone would not bound it.
-const MAX_FEATURE_POLYGONS: usize = 4_500;
+/// n-edge blend runs over everything the earlier ones fragmented, and it is that pass
+/// whose time has to stay reasonable. Bounding the tools alone would not bound it. The
+/// body's share is fixed, so what is left is shared out between the tools, and each
+/// coarsens its arc to fit its share the way it does for [`MAX_TOOL_POLYGONS`].
+const MAX_FEATURE_POLYGONS: usize = 7_000;
 
 /// Coarsest arc a fillet is willing to draw, and the `.max(2)` the rings need: a ring has
 /// to carry both tangent points and at least one point between them.
 const MIN_ARC_SEGMENTS: usize = 2;
 
 /// Facets of the swept tool: one ring of section vertices per chain segment. A section
-/// carries the arc's points, its two tangent points and three scaffolding corners, and an
-/// open chain's two end caps add a handful more that the budget can absorb.
-fn tool_polygons(chain_len: usize, arc_segments: usize) -> usize {
-    chain_len * (arc_segments + 4)
+/// carries the arc's points, its two tangent points and three scaffolding corners. An
+/// open chain's end caps are fans over one ring each, so they are counted as two more.
+fn tool_polygons(rings: usize, arc_segments: usize) -> usize {
+    rings * (arc_segments + 4)
+}
+
+/// Whether a chain closes on itself: its end caps are then unnecessary and not built.
+fn is_closed(chain: &[EdgeSegment]) -> bool {
+    chain.len() > 1
+        && chain[0].start.distance_squared(chain.last().unwrap().end) < MERGE_TOL * MERGE_TOL
+}
+
+/// Rings a chain's tool is built from, caps included.
+fn ring_count(chain: &[EdgeSegment]) -> usize {
+    if is_closed(chain) {
+        chain.len()
+    } else {
+        chain.len() + 2
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -103,25 +122,38 @@ fn apply(
     // Tools are built from the original edges, before any of them is blended away, so
     // the result does not depend on the order edges were selected in.
     let all_edges = solid.edges();
-    let mut tools = Vec::new();
+    let mut chains = Vec::new();
     for (i, key) in keys.iter().enumerate() {
         let edge = all_edges
             .iter()
             .find(|e| e.key == *key)
             .ok_or(KernelError::MissingEdge(*key))?;
-        for chain in edge.chains() {
-            tools.push(tool_for_chain(op, i as u32, *key, &chain, blend, tess)?);
-        }
+        chains.extend(edge.chains().into_iter().map(|c| (i as u32, *key, c)));
     }
-    // Checked before any boolean runs, so an over-ambitious blend costs the user a
-    // message rather than the minutes it would take to fail part-way through.
-    let needed =
-        solid.polygon_count() + tools.iter().map(|(t, _)| t.polygon_count()).sum::<usize>();
-    if needed > MAX_FEATURE_POLYGONS {
+    // The feature's budget less the body, shared equally between the tools: decided
+    // before any tool is built, so an over-ambitious blend costs the user a coarser arc
+    // or a message rather than the minutes it would take to fail part-way through. A
+    // body that alone leaves the tools less than their coarsest form is refused here,
+    // with the whole feature's count, because no arc can be coarsened out of that.
+    let body = solid.polygon_count();
+    let coarsest: usize = chains
+        .iter()
+        .map(|(_, _, c)| tool_polygons(ring_count(c), MIN_ARC_SEGMENTS))
+        .sum();
+    if body + coarsest > MAX_FEATURE_POLYGONS {
         return Err(KernelError::BlendTooDense {
-            needed,
+            needed: body + coarsest,
             budget: MAX_FEATURE_POLYGONS,
         });
+    }
+    // Each chain gets its coarsest form and an equal share of the slack over that, so a
+    // long chain beside a short one is not starved by an even split of the whole.
+    let slack = (MAX_FEATURE_POLYGONS - body - coarsest) / chains.len().max(1);
+    let mut tools = Vec::with_capacity(chains.len());
+    for (i, key, chain) in &chains {
+        let budget =
+            (tool_polygons(ring_count(chain), MIN_ARC_SEGMENTS) + slack).min(MAX_TOOL_POLYGONS);
+        tools.push(tool_for_chain(op, *i, *key, chain, blend, tess, budget)?);
     }
     let mut result = solid.clone();
     for (tool, bool_op) in tools {
@@ -220,6 +252,7 @@ fn tool_for_chain(
     chain: &[EdgeSegment],
     blend: Blend,
     tess: &Tessellation,
+    budget: usize,
 ) -> Result<(Solid, BoolOp), KernelError> {
     let first = &chain[0];
     let (t0, _, db, _) = dihedral(first);
@@ -236,13 +269,15 @@ fn tool_for_chain(
     } else {
         BoolOp::Union
     };
-    let affordable = (MAX_TOOL_POLYGONS / chain.len()).saturating_sub(4);
+    let closed = is_closed(chain);
+    let rings = ring_count(chain);
+    let affordable = (budget / rings).saturating_sub(4);
     let arc_segments = match blend {
         Blend::Fillet { radius } => {
             if affordable < MIN_ARC_SEGMENTS {
                 return Err(KernelError::BlendTooDense {
-                    needed: tool_polygons(chain.len(), MIN_ARC_SEGMENTS),
-                    budget: MAX_TOOL_POLYGONS,
+                    needed: tool_polygons(rings, MIN_ARC_SEGMENTS),
+                    budget,
                 });
             }
             let wanted = chain
@@ -254,26 +289,23 @@ fn tool_for_chain(
             if wanted > affordable {
                 log::warn!(
                     "blend on {key:?}: arc coarsened from {wanted} to {affordable} facets \
-                     to keep the tool for its {} edge segments inside {MAX_TOOL_POLYGONS} \
-                     polygons",
+                     to keep the tool for its {} edge segments inside {budget} polygons",
                     chain.len()
                 );
             }
             wanted.min(affordable)
         }
         Blend::Chamfer { .. } => {
-            if tool_polygons(chain.len(), 0) > MAX_TOOL_POLYGONS {
+            if tool_polygons(rings, 0) > budget {
                 return Err(KernelError::BlendTooDense {
-                    needed: tool_polygons(chain.len(), 0),
-                    budget: MAX_TOOL_POLYGONS,
+                    needed: tool_polygons(rings, 0),
+                    budget,
                 });
             }
             0
         }
     };
 
-    let closed = chain.len() > 1
-        && chain[0].start.distance_squared(chain.last().unwrap().end) < MERGE_TOL * MERGE_TOL;
     // One ring of section points per joint. Interior joints take the section of the
     // incoming segment projected onto the bisecting plane; chain ends extend slightly.
     let mut rings: Vec<Vec<Vec3>> = Vec::with_capacity(chain.len() + 1);
@@ -653,17 +685,139 @@ mod tests {
     }
 
     /// Past the point where even the coarsest arc fits, there is nothing left to give up
-    /// and the feature has to say so rather than spend the session's memory finding out.
+    /// and the feature has to say so rather than spend the session's time finding out.
     #[test]
     fn a_blend_that_cannot_be_coarsened_far_enough_is_refused() {
         let cyl = rimmed_cylinder(0.2);
         let err = fillet(OpId::new(2), &cyl, &[rim(FaceRole::EndCap)], 1.0, &fine()).unwrap_err();
+        // The body alone is most of the feature's budget here, so it is the feature that
+        // refuses, and the count it quotes is the whole feature at its coarsest.
         assert!(
             matches!(
                 err,
-                KernelError::BlendTooDense { budget, .. } if budget == MAX_TOOL_POLYGONS
+                KernelError::BlendTooDense { needed, budget }
+                    if budget == MAX_FEATURE_POLYGONS && needed > cyl.polygon_count()
             ),
             "{err:?}"
+        );
+    }
+
+    /// The budget is decided from an estimate of the tool's facet count, made before the
+    /// tool is built; a tool bigger than its estimate would put the feature over what it
+    /// was told it could afford. Checked on an open chain, whose end caps are the part
+    /// the estimate has to allow for, and on a closed one, which has none.
+    #[test]
+    fn a_tool_fits_the_budget_it_was_given() {
+        let c = cube();
+        let cube_edges = c.edges();
+        let open = cube_edges
+            .iter()
+            .find(|e| e.key == edge_between(FaceRole::EndCap, FaceRole::Side(0)))
+            .unwrap()
+            .chains()
+            .remove(0);
+        let cyl = rimmed_cylinder(3.0);
+        let cyl_edges = cyl.edges();
+        let closed = cyl_edges
+            .iter()
+            .find(|e| e.key == rim(FaceRole::EndCap))
+            .unwrap()
+            .chains()
+            .remove(0);
+        assert!(!is_closed(&open) && is_closed(&closed), "the fixtures");
+        for (chain, key) in [
+            (&open, edge_between(FaceRole::EndCap, FaceRole::Side(0))),
+            (&closed, rim(FaceRole::EndCap)),
+        ] {
+            for budget in [
+                tool_polygons(ring_count(chain), MIN_ARC_SEGMENTS),
+                tool_polygons(ring_count(chain), 7),
+                MAX_TOOL_POLYGONS,
+            ] {
+                let (tool, _) = tool_for_chain(
+                    OpId::new(2),
+                    0,
+                    key,
+                    chain,
+                    Blend::Fillet { radius: 1.0 },
+                    &fine(),
+                    budget,
+                )
+                .unwrap();
+                assert!(
+                    tool.polygon_count() <= budget,
+                    "{} facets for a budget of {budget} on a chain of {} ({})",
+                    tool.polygon_count(),
+                    chain.len(),
+                    if is_closed(chain) { "closed" } else { "open" }
+                );
+            }
+        }
+    }
+
+    /// Two rims on a body that leaves room for both only at a coarser arc than either
+    /// tool's own budget would allow: the feature shares what is left rather than
+    /// building each tool to its own limit and then refusing the pair.
+    #[test]
+    fn the_feature_budget_is_shared_between_the_tools() {
+        let cyl = rimmed_cylinder(1.0);
+        let rim_segments = cyl
+            .edges()
+            .iter()
+            .find(|e| e.key == rim(FaceRole::EndCap))
+            .unwrap()
+            .segments
+            .len();
+        // The premise: each tool at the limit of its own budget would fit, but two of
+        // them beside the body would not.
+        let own_limit = MAX_TOOL_POLYGONS / rim_segments - 4;
+        assert!(
+            own_limit > MIN_ARC_SEGMENTS,
+            "the fixture has nothing to share"
+        );
+        assert!(
+            cyl.polygon_count() + 2 * tool_polygons(rim_segments, own_limit) > MAX_FEATURE_POLYGONS,
+            "the fixture stopped exercising the feature budget"
+        );
+        let r = fillet(
+            OpId::new(2),
+            &cyl,
+            &[rim(FaceRole::EndCap), rim(FaceRole::StartCap)],
+            1.0,
+            &fine(),
+        )
+        .unwrap();
+        assert!(r.is_closed(), "{:?}", r.validate());
+        for n in 0..2 {
+            let blend = r
+                .face(FaceKey::new(OpId::new(2), FaceRole::Fillet(n)))
+                .unwrap();
+            // The boolean fragments the facets, so count facets by their normals: one
+            // per arc step per rim segment, and a fragment shares its parent's.
+            let facets = blend
+                .polygons
+                .iter()
+                .map(|p| {
+                    let n = p.plane.normal * 1e6;
+                    (n.x.round() as i64, n.y.round() as i64, n.z.round() as i64)
+                })
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            assert!(
+                facets < rim_segments * own_limit,
+                "rim {n} was built to its own limit, not its share: {facets} facets"
+            );
+            assert!(facets >= rim_segments * MIN_ARC_SEGMENTS, "{facets} facets");
+        }
+        // Both rims are gone: two corner rings swept round, as in the single-rim test.
+        // A coarse arc is chords inside the true one, so the tool takes a little more
+        // than the exact ring, and the result sits below the figure, not around it.
+        let ring = (1.0 - PI / 4.0) * 2.0 * PI * (5.0 - 0.777);
+        let exact = cyl.volume() - 2.0 * ring;
+        assert!(
+            r.volume() < exact && r.volume() > exact - 4.0,
+            "{} against {exact}",
+            r.volume()
         );
     }
 

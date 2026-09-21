@@ -1695,6 +1695,68 @@ fn a_conflicting_sketch_names_and_marks_the_constraints_at_fault() {
     assert!(!red.segments.is_empty(), "the marks are actually drawn");
 }
 
+/// A constraint that repeats what the sketch already says is named, and its badge is
+/// drawn in the redundant colour rather than the ordinary amber — a second Horizontal on
+/// an edge the rectangle already holds horizontal changes nothing, and the drawing has
+/// to say which of the two alike it is.
+#[test]
+fn a_redundant_constraint_is_named_and_marked_on_the_drawing() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+    let s = sketch(&mut editor);
+    assert!(
+        s.redundant().is_empty(),
+        "a rectangle's own constraints all drive something"
+    );
+    let bottom = s
+        .sketch
+        .entities()
+        .find(|(id, d)| {
+            matches!(d.entity, Entity::Line { .. })
+                && s.sketch
+                    .entity_bounds(*id)
+                    .is_some_and(|(min, max)| min.y == 0.0 && max.y == 0.0)
+        })
+        .map(|(id, _)| id)
+        .expect("bottom edge");
+    s.add_constraint(Constraint::Horizontal(bottom))
+        .expect("consistent, so it is taken");
+
+    let named = s.redundant().to_vec();
+    assert_eq!(named.len(), 1, "the repeat, and nothing else: {named:?}");
+    let c = s.sketch.constraint(named[0]).expect("a live constraint");
+    assert_eq!(
+        *c,
+        Constraint::Horizontal(bottom),
+        "the later of the two alike"
+    );
+    assert!(
+        s.conflicting().is_empty(),
+        "redundant is not conflicting: the sketch still solves"
+    );
+
+    let mut lines = Vec::new();
+    let mut points = Vec::new();
+    s.draw(&mut lines, &mut points, &mut Vec::new());
+    let orange = lines
+        .iter()
+        .find(|b| b.color == sketch_mode::REDUNDANT_COLOR)
+        .expect("a batch for what is redundant");
+    assert!(!orange.segments.is_empty(), "the mark is actually drawn");
+    let red = lines
+        .iter()
+        .find(|b| b.color == sketch_mode::CONFLICT_COLOR)
+        .expect("the conflict batch is always there");
+    assert!(red.segments.is_empty(), "nothing is drawn as a conflict");
+
+    // Deleting what was named clears the mark, so it cannot be left pointing at a
+    // constraint the palette just removed.
+    s.remove_constraint(named[0]);
+    assert!(s.redundant().is_empty());
+}
+
 /// Dimensions keep drawing their own value and leader; they must not gain a second badge.
 #[test]
 fn dimensions_are_not_given_constraint_badges() {

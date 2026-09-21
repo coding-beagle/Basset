@@ -69,6 +69,13 @@ Details worth knowing:
   concave ones. Where several blended edges meet the result is the intersection of their
   tools (a crease), not a spherical corner patch. Rolling over a face onto a neighbour
   (a radius larger than the adjacent face) is not detected.
+* A BSP tree over a convex body is a list — the solid is the intersection of its face
+  half-spaces, so every face plane has the rest behind it — and a boolean is quadratic
+  in the facets of such a body. A fillet tool swept round a rim is one, and so is the
+  cylinder it is cut from. The tree walks are iterative so depth costs no stack, and a
+  blend feature budgets the facets it puts through its booleans (`MAX_FEATURE_POLYGONS`),
+  coarsening its arcs to fit before it refuses, because the alternative was a radius box
+  that could take the machine down.
 * Overlapping coplanar faces with the same orientation survive a union twice; the
   volume is right but the face is doubled. Coplanar opposite faces (extruding from a
   face, cutting from a face) are handled.
@@ -108,6 +115,14 @@ space one free column at a time. The editor draws those entities in blue, and a 
 that still has freedom left warns from the timeline through `FeatureStatus::Warned`: an
 under-constrained sketch is a model-level fault, because it is an edit *elsewhere* that
 moves the loose geometry and quietly changes what the profiles enclose.
+
+Over-constraint is reported two ways, because it is two faults. A solve that fails names
+the constraints that disagree (`SolveError::DidNotConverge::conflicting`, worst first);
+a solve that succeeds names the constraints whose equations were all implied by the
+ones ahead of them (`SolveReport::redundant`). The editor draws the first red and the
+second orange — badges, leader lines and dimension value boxes alike — and the sketch
+palette lists each set in a section of its own with hover-to-highlight and a delete, so
+the answer to "which one?" is on the drawing and the fix is one click away.
 
 Profiles (closed regions usable by extrude etc.) are found by planar face tracing.
 Curves are tessellated into polylines at extraction time and split wherever two of them

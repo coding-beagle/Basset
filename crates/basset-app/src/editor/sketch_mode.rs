@@ -46,6 +46,12 @@ const LOOSE_COLOR: [f32; 4] = [0.55, 0.72, 1.0, 1.0];
 /// drawn at all: the palette names them, but the answer to "which one is fighting?"
 /// belongs on the drawing.
 pub const CONFLICT_COLOR: [f32; 4] = [0.95, 0.35, 0.3, 1.0];
+/// Constraints the solver found redundant — satisfied, but saying nothing the rest of
+/// the sketch does not already say. Orange: a warning rather than an error, and one step
+/// short of the red a conflict gets, because deleting one costs nothing while leaving it
+/// makes the next edit's conflict harder to read. Distinct from the amber of an ordinary
+/// badge by being drawn wider, the way a conflict is.
+pub const REDUNDANT_COLOR: [f32; 4] = [1.0, 0.55, 0.12, 1.0];
 /// A closed region the pointer is inside, filled so the user can see the area itself
 /// rather than infer it from the curves around it. Matches the model-mode profile
 /// highlight, because it is the same thing being pointed at.
@@ -3450,6 +3456,15 @@ impl SketchEditor {
         }
     }
 
+    /// The constraints the last solve found redundant: every equation of each one is
+    /// implied by the constraints ahead of it. Empty unless the sketch solved.
+    pub fn redundant(&self) -> &[ConstraintId] {
+        match &self.report {
+            Some(Ok(report)) => &report.redundant,
+            _ => &[],
+        }
+    }
+
     /// Everything the constraints leave free to move, curves included.
     ///
     /// The solver names the points and circles that own a loose parameter; a curve is
@@ -3676,9 +3691,17 @@ impl SketchEditor {
         conflicting.width_px = 2.0;
         conflicting.depth_test = false;
         let in_conflict = self.conflicting().to_vec();
+        // Orange for the ones that hold nothing: the palette offers each for deletion,
+        // but the user has to find it on the drawing to know which of two alike it is.
+        let mut redundant = LineBatch::new(REDUNDANT_COLOR);
+        redundant.width_px = 2.0;
+        redundant.depth_test = false;
+        let is_redundant = self.redundant().to_vec();
         for g in self.dimension_graphics() {
             let batch = if in_conflict.contains(&g.id) {
                 &mut conflicting
+            } else if is_redundant.contains(&g.id) {
+                &mut redundant
             } else {
                 &mut dims
             };
@@ -3701,10 +3724,16 @@ impl SketchEditor {
                         || self.selected.contains(&id)
                         || self.highlighted.contains(&id)
                 });
-            let batch = match (in_conflict.contains(&g.id), lit) {
-                (true, _) => &mut conflicting,
-                (_, true) => &mut lit_glyphs,
-                _ => &mut glyphs,
+            // A conflict or a redundancy keeps its colour even when lit, because the
+            // fault is the thing worth reading about a badge the pointer is on.
+            let batch = if in_conflict.contains(&g.id) {
+                &mut conflicting
+            } else if is_redundant.contains(&g.id) {
+                &mut redundant
+            } else if lit {
+                &mut lit_glyphs
+            } else {
+                &mut glyphs
             };
             batch.segments.extend(g.segments);
             batch.segments.extend(g.leader);
@@ -3720,6 +3749,7 @@ impl SketchEditor {
             dims,
             glyphs,
             lit_glyphs,
+            redundant,
             conflicting,
         ]);
         points.extend([pts, loose_pts, sel_pts]);
@@ -4044,9 +4074,10 @@ impl SketchEditor {
                 .map(|p| (p.x.to_bits(), p.y.to_bits()))
                 .hash(&mut h);
         }
-        // The solve report only changes the colours, but a conflicting badge is drawn
-        // wider and the palette may have just deleted what it blamed.
+        // The solve report only changes the colours, but a conflicting or redundant badge
+        // is drawn wider and the palette may have just deleted what it blamed.
         self.conflicting().hash(&mut h);
+        self.redundant().hash(&mut h);
         h.finish()
     }
 

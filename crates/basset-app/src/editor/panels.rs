@@ -16,6 +16,9 @@ use super::{DisplayMode, Editor, Mode, SelectMode};
 const LOOSE_LABEL: egui::Color32 = egui::Color32::from_rgb(140, 184, 255);
 /// Amber for a feature that built but warns about its result, matching the timeline chip.
 const WARNING_LABEL: egui::Color32 = egui::Color32::from_rgb(235, 190, 90);
+/// The orange the viewport draws a redundant constraint's badge in, so the row that
+/// names it matches the mark on the drawing.
+const REDUNDANT_LABEL: egui::Color32 = egui::Color32::from_rgb(255, 160, 80);
 
 /// Deferred commands, so panel code never needs `&mut Editor` while it borrows state.
 enum Command {
@@ -1860,6 +1863,7 @@ fn sketch_palette_body(editor: &mut Editor, ui: &mut egui::Ui, commands: &mut Ve
             egui::RichText::new("Constraints are in the toolbar; select 1–3 entities first").weak(),
         );
         ui.separator();
+        let mut highlight = Vec::new();
         match &s.report {
             Some(Ok(r)) => {
                 let dof = r.degrees_of_freedom;
@@ -1877,13 +1881,14 @@ fn sketch_palette_body(editor: &mut Editor, ui: &mut egui::Ui, commands: &mut Ve
                         .weak(),
                     );
                 }
+                highlight = redundant_report(s, &r.redundant, ui, commands);
             }
             Some(Err(e)) => conflict_report(s, e, ui, commands),
             None => {}
         }
         // Directly under the degrees-of-freedom readout, because that is the line that
         // prompts the question the list answers: what *is* holding this sketch?
-        constraint_list(s, ui, commands);
+        constraint_list(s, ui, commands, highlight);
         ui.separator();
         egui::CollapsingHeader::new("Parameters")
             .default_open(false)
@@ -2322,6 +2327,60 @@ fn conflict_report(
     }
 }
 
+/// What a successful solve has to say about constraints that earn nothing. A redundant
+/// constraint is not wrong today, but it is the one that turns into a conflict the day a
+/// dimension changes, and a sketch with two of something is a sketch whose author has
+/// lost track of it. Hovering a row lights up what the constraint holds, as the main
+/// list does, and the highlight is handed back so the two lists share one.
+fn redundant_report(
+    s: &super::SketchEditor,
+    redundant: &[basset_sketch::ConstraintId],
+    ui: &mut egui::Ui,
+    commands: &mut Vec<Command>,
+) -> Vec<basset_sketch::EntityId> {
+    let mut highlight = Vec::new();
+    if redundant.is_empty() {
+        return highlight;
+    }
+    let count = match redundant.len() {
+        1 => "1 redundant constraint".to_string(),
+        n => format!("{n} redundant constraints"),
+    };
+    ui.colored_label(REDUNDANT_LABEL, count);
+    ui.label(
+        egui::RichText::new(
+            "Orange constraints repeat what the rest of the sketch already says; deleting \
+             one changes nothing:",
+        )
+        .weak(),
+    );
+    for id in redundant {
+        let Some(c) = s.sketch.constraint(*id) else {
+            continue;
+        };
+        ui.horizontal(|ui| {
+            if ui
+                .add(egui::Button::new("\u{2715}").frame(false))
+                .on_hover_text("Delete")
+                .clicked()
+            {
+                commands.push(Command::SketchRemoveConstraint(*id));
+            }
+            let response = ui.add(
+                egui::Label::new(egui::RichText::new(constraint_label(c)).color(REDUNDANT_LABEL))
+                    .sense(egui::Sense::click()),
+            );
+            if response.contains_pointer() {
+                highlight = c.references();
+            }
+            if response.clicked() {
+                commands.push(Command::SketchSelect(c.references()));
+            }
+        });
+    }
+    highlight
+}
+
 /// A constraint as the user reads it: its name, and its value when it has one.
 fn constraint_label(c: &basset_sketch::Constraint) -> String {
     match c.dimension_value() {
@@ -2334,7 +2393,16 @@ fn constraint_label(c: &basset_sketch::Constraint) -> String {
     }
 }
 
-fn constraint_list(s: &mut super::SketchEditor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
+/// Every constraint the sketch holds, collapsed by default.
+///
+/// `highlight` is what the redundant list above already lit up this frame, so the
+/// geometry stays lit while the pointer is on that row rather than on one of these.
+fn constraint_list(
+    s: &mut super::SketchEditor,
+    ui: &mut egui::Ui,
+    commands: &mut Vec<Command>,
+    mut highlight: Vec<basset_sketch::EntityId>,
+) {
     let rows: Vec<(
         basset_sketch::ConstraintId,
         String,
@@ -2344,7 +2412,6 @@ fn constraint_list(s: &mut super::SketchEditor, ui: &mut egui::Ui, commands: &mu
         .constraints()
         .map(|(id, c)| (id, constraint_label(c), c.references()))
         .collect();
-    let mut highlight = Vec::new();
     egui::CollapsingHeader::new(format!("Constraints ({})", rows.len()))
         .default_open(false)
         .show(ui, |ui| {
@@ -2627,6 +2694,7 @@ fn dimension_overlay(editor: &mut Editor, ctx: &egui::Context, commands: &mut Ve
     };
     let graphics = s.dimension_graphics();
     let conflicting = s.conflicting().to_vec();
+    let redundant = s.redundant().to_vec();
     let mut open_edit: Option<basset_sketch::ConstraintId> = None;
     let mut dragged: Option<basset_sketch::ConstraintId> = None;
     for g in &graphics {
@@ -2639,12 +2707,18 @@ fn dimension_overlay(editor: &mut Editor, ctx: &egui::Context, commands: &mut Ve
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 // A dimension the solver could not satisfy reads red here as well as on
-                // its leader lines, so the number the user must change is the one lit up.
+                // its leader lines, so the number the user must change is the one lit up;
+                // one it did not need reads orange for the same reason.
                 let text = egui::RichText::new(&g.text).small();
                 let (text, fill) = if conflicting.contains(&g.id) {
                     (
                         text.color(egui::Color32::from_rgb(255, 180, 170)),
                         egui::Color32::from_rgba_unmultiplied(90, 25, 25, 220),
+                    )
+                } else if redundant.contains(&g.id) {
+                    (
+                        text.color(egui::Color32::from_rgb(255, 205, 150)),
+                        egui::Color32::from_rgba_unmultiplied(90, 50, 15, 220),
                     )
                 } else {
                     (text, egui::Color32::from_rgba_unmultiplied(20, 40, 70, 200))

@@ -31,9 +31,11 @@ What is left here:
   them while the system is satisfied — deleting one changes neither the geometry nor the
   degrees of freedom. Distinct from conflicting, which is inconsistency rather than
   dependence and so only ever appears on a failed solve. The later of two interchangeable
-  constraints is the one named, because implied equations go into the basis first.
-  **No UI yet: nothing draws or lists them.** Also populated on every drag frame, and the
-  grouped Gram–Schmidt behind it is O(rows²·cols), worth revisiting before sketches grow
+  constraints is the one named, because implied equations go into the basis first. The
+  editor draws them orange (badge, leader, value box) and the palette counts them and
+  lists each with hover-to-highlight and a delete, the way it does conflicts. Also
+  populated on every drag frame, and the grouped Gram–Schmidt behind it is
+  O(rows²·cols), worth revisiting before sketches grow
 - The degrees-of-freedom estimate is instantaneous (first order), so a point pinned only
   at second order — a zero-length distance, or two distance dimensions with the point
   exactly between them — is drawn blue although it cannot move. The fix is not a better
@@ -79,17 +81,22 @@ Extrude tool:
 
 Fillet tool:
 
-- Still needs optimisation fixes
-- Slow for some geometries, needs optimisation. Worse than slow on a finely tessellated
-  one: filleting both rims of a cylinder built at `chord_tolerance` 1e-4 and a 2° segment
-  angle allocated ~25 GB before the OOM killer took the whole session with it, so the
-  growth in the BSP boolean is superlinear in the tool's polygon count rather than merely
-  steep. The fillet is applied as one boolean per edge chain against the accumulating
-  result, so each rim's tool is split against every fragment the previous one made. Wants
-  measuring — polygon count per boolean, against tessellation density — before it is
-  optimised, and a guard that refuses or coarsens a blend whose tool would exceed some
-  polygon budget, because a modeller must not be able to exhaust the machine from a
-  radius box. Run `cargo test` under a memory cap (`systemd-run --user --scope -p
-  MemoryMax=12G`) while this stands
+- The boolean's cost is measured, and bounded by time rather than by the machine. The
+  BSP tree over a convex sweep (a rim tool, or the cylinder it sits on) is a list, which
+  is the shape and not a poor choice of plane, so each boolean is quadratic in its facet
+  count. The walks no longer recurse (the stack used to be the hard ceiling, at ~4.6k
+  facets), polygons move through the tree rather than being copied at every level, and a
+  polygon clear of the other solid's bounding box skips its tree; both rims of a
+  cylinder now run 0.18 s at 2.6k facets, 0.5 s at 4.5k, 3.7 s at 9k and 105 s at 27k,
+  at 106 MB peak where 25 GB used to be. `MAX_FEATURE_POLYGONS` is the choice of how
+  long a preview may take (about a second), shared between the tools, and spent by
+  coarsening the arcs before anything is refused. Still open: the asymptotic fix is a
+  splitting plane that is not a face plane (see the `csg` module header for why the
+  plain version costs more than it saves), and the whole feature is one thread, so a
+  refused radius is instant but an accepted one still blocks the frame
+- At a half-degree segment angle and finer the result leaks — 8 unmatched edges at
+  0.5°, 4221 at 0.25° — on the old splitter as much as the new, so it is the healer's
+  tolerance against facets tens of microns wide rather than the tree. Out of reach of the
+  budget today, but a body tessellated that finely elsewhere would hit it
 - Where several blended edges meet, the result is the intersection of their tools rather
   than a corner patch, and a radius larger than the neighbouring face is not detected
