@@ -22,7 +22,7 @@ use crate::csg::{BoolOp, boolean};
 use crate::error::KernelError;
 use crate::geometry::Tessellation;
 use crate::ids::{EdgeKey, FaceKey, FaceRole, OpId};
-use crate::solid::{EdgeSegment, MERGE_TOL, Solid, SolidBuilder, SurfaceKind, newell_normal};
+use crate::solid::{Edge, EdgeSegment, MERGE_TOL, Solid, SolidBuilder, SurfaceKind, newell_normal};
 
 /// How far the tool reaches beyond the faces it trims. Keeps the tool's planes off the
 /// solid's planes so the boolean never has to resolve coincident faces, and closes the
@@ -86,6 +86,15 @@ fn ring_count(chain: &[EdgeSegment]) -> usize {
 enum Blend {
     Fillet { radius: f64 },
     Chamfer { distance: f64 },
+}
+
+impl Blend {
+    fn kind(self) -> BlendKind {
+        match self {
+            Blend::Fillet { .. } => BlendKind::Fillet,
+            Blend::Chamfer { .. } => BlendKind::Chamfer,
+        }
+    }
 }
 
 pub fn fillet(
@@ -154,6 +163,16 @@ fn tools_for(
             .ok_or(KernelError::MissingEdge(*key))?;
         chains.extend(edge.chains().into_iter().map(|c| (i as u32, *key, c)));
     }
+    // Whether there is material for it at all, checked after the edges are known to exist
+    // so a stale reference is still reported as the stale reference it is. The comparison
+    // carries a few ulps of slack because the limit arrives through a normalise, a dot
+    // product and a division, and a blend that fits its material exactly — the 2 mm round
+    // on the rim of a 2 mm plate — must not be turned away over the last bits of that.
+    if let Some(limit) = size_limit(solid, &all_edges, keys, blend.kind())
+        && size > limit * (1.0 + 1e-9)
+    {
+        return Err(KernelError::BlendTooLarge { size, limit });
+    }
     // The feature's budget less the body, shared equally between the tools: decided
     // before any tool is built, so an over-ambitious blend costs the user a coarser arc
     // or a message rather than the minutes it would take to fail part-way through. A
@@ -180,6 +199,213 @@ fn tools_for(
         tools.push(tool_for_chain(op, *i, *key, chain, blend, tess, budget)?);
     }
     Ok(tools)
+}
+
+// --- How large a blend may be ---------------------------------------------------------
+//
+// Nothing below this point notices when a blend has run out of material. The tool is
+// built from the edge and the size alone and the boolean applies it either way, so past
+// the point where the tool is wider than what it has to work in the answer is a shell
+// that is closed and wrong: a face swallowed whole, a neighbouring feature cut away, or —
+// round a closed rim — a swept prism turned inside out. The bound is derived here, before
+// a tool exists, from the one quantity every case turns on: the *setback*, how far from
+// the edge the blend lands on each of the two faces it joins.
+
+/// A blend's kind without its size. How much room an edge has does not depend on the size
+/// being asked for, only on how a size of a given kind becomes a setback, so the limit is
+/// derived once and the size held up against it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlendKind {
+    Fillet,
+    Chamfer,
+}
+
+impl BlendKind {
+    /// Setback per unit of size, across a face whose dihedral angle at the edge is `phi`.
+    ///
+    /// A fillet of radius r rolls in the corner with its centre on the bisector and
+    /// touches each face where the perpendicular from that centre meets it, which is
+    /// r/tan(phi/2) from the edge: the far leg of the right triangle whose near leg is r
+    /// and whose angle at the edge is phi/2. It is the same `d` [`section`] lays its
+    /// cross-section out with. A chamfer's setback is its distance, by definition.
+    fn setback_per_size(self, phi: f64) -> f64 {
+        match self {
+            BlendKind::Fillet => 1.0 / (phi / 2.0).tan(),
+            BlendKind::Chamfer => 1.0,
+        }
+    }
+}
+
+/// Distance along a ray below which a crossing is the boundary the ray started from
+/// rather than one ahead of it: the segment being measured is part of the boundary the
+/// ray is cast into, and the ray leaves from a point on it.
+const OWN_BOUNDARY: f64 = 8.0 * MERGE_TOL;
+
+/// How close a ray and a boundary segment come before they count as crossing. Inside a
+/// planar face the two are coplanar and the crossing is exact, so this only absorbs
+/// rounding; a ray that finds nothing falls back to the face's bounding box, which is
+/// never smaller than the truth.
+const CROSSES: f64 = 1e-6;
+
+/// The largest blend of `kind` the edges `keys` can carry together, or `None` when none
+/// of them is an edge of this solid.
+///
+/// Every bound is the same statement seen from a different side: *the strip of face a
+/// blend consumes has to be there to consume*. The blend lands a setback from the edge on
+/// each adjacent face, and everything between the edge and that landing is either gone
+/// (convex, the tool is subtracted) or buried (concave, the tool is added). So each
+/// segment's setback is held against how far its face actually reaches from that segment
+/// in the direction the blend travels — [`reach_in_face`] — and the size at which the two
+/// are equal is the limit.
+///
+/// * A cube's edge is stopped by the far side of each face it borders. A 10 mm face takes
+///   a 10 mm setback and no more; past that the tool's tangent plane lies beyond the far
+///   edge and the subtraction takes the material behind it as well.
+/// * A cylinder's rim is stopped by itself. The ray across the top disc from one rim
+///   segment leaves through the rim 2R away, and that far side is being blended by the
+///   same feature and is coming this way, so the two setbacks share the 2R between them
+///   and r < R. That is also exactly where the tool's centre circle, of radius R − r,
+///   collapses to a point and the sweep turns inside out.
+/// * A concave edge is the same bound with the material's sign reversed: the fillet's
+///   landing on the floor of the pocket has to be on floor that exists, or the union
+///   raises a wall where the far side of the pocket used to open out.
+/// * Two edges of one face blended together are the rim case without the closure. Each
+///   one's ray lands on the other, both are in `keys`, and the room between them is
+///   divided between their two setbacks.
+///
+/// Where the blocking boundary is itself being blended its setback is taken off the room
+/// rather than half of it being assumed, because two edges of different dihedral angles
+/// do not eat into the gap at the same rate. Both setbacks are proportional to the one
+/// size the feature applies, so the largest size that fits is `reach / (here + there)`.
+fn size_limit(solid: &Solid, all_edges: &[Edge], keys: &[EdgeKey], kind: BlendKind) -> Option<f64> {
+    let selected: Vec<&Edge> = keys
+        .iter()
+        .filter_map(|k| all_edges.iter().find(|e| e.key == *k))
+        .collect();
+    if selected.is_empty() {
+        return None;
+    }
+    let mut limit = f64::INFINITY;
+    for edge in &selected {
+        for face_key in [edge.key.a, edge.key.b] {
+            let Some(face) = solid.face(face_key) else {
+                continue;
+            };
+            // The face's own boundary, each segment flagged with whether this feature is
+            // blending it too, which is what decides whether the room ahead of a segment
+            // is this blend's alone or shared with the one coming the other way.
+            let boundary: Vec<(&EdgeSegment, bool)> = all_edges
+                .iter()
+                .filter(|e| e.key.touches(face_key))
+                .flat_map(|e| e.segments.iter().map(|s| (s, keys.contains(&e.key))))
+                .collect();
+            let extent = Aabb::from_points(face.polygons.iter().flat_map(|p| p.vertices.clone()));
+            for seg in &edge.segments {
+                let (_, da, db, phi) = dihedral(seg);
+                let here = kind.setback_per_size(phi);
+                // Smooth or degenerate: there is no corner here and so no setback, and a
+                // zero would let every size through. `tool_for_chain` refuses such an
+                // edge by name, which is the message the user should get.
+                if !here.is_finite() || here <= 0.0 {
+                    continue;
+                }
+                let into = if face_key == edge.key.a { da } else { db };
+                let from = (seg.start + seg.end) * 0.5;
+                let (reach, blocker) = reach_in_face(from, into, &boundary, &extent);
+                let there = blocker
+                    .map(|p| kind.setback_per_size(p))
+                    .filter(|s| s.is_finite() && *s > 0.0)
+                    .unwrap_or(0.0);
+                limit = limit.min(reach / (here + there));
+            }
+        }
+    }
+    limit.is_finite().then_some(limit.max(0.0))
+}
+
+/// How far a point `from` on the boundary of a face travels across it along `into` before
+/// leaving it, together with the dihedral angle of the boundary it leaves through when
+/// that boundary is itself being blended.
+///
+/// The ray is cast against the face's own boundary segments. That is exact for a planar
+/// face, where ray and boundary are coplanar and the crossing is a real intersection, and
+/// for the ruled curved faces a blend actually meets, where `into` runs along the ruling
+/// and the ray stays on the surface — the side of a cylinder measured down from one rim
+/// to the other. On a curved face where it does neither, the ray leaves the surface and
+/// finds nothing; the answer is then the face's bounding box measured along `into`, which
+/// the face cannot reach past and which is an honest ceiling, if a loose one.
+fn reach_in_face(
+    from: Vec3,
+    into: Vec3,
+    boundary: &[(&EdgeSegment, bool)],
+    extent: &Aabb,
+) -> (f64, Option<f64>) {
+    let cap: f64 = (0..3)
+        .map(|i| (into[i] * (extent.min[i] - from[i])).max(into[i] * (extent.max[i] - from[i])))
+        .sum();
+    let mut best = f64::INFINITY;
+    let mut blocker = None;
+    for (seg, blended) in boundary {
+        let along = seg.end - seg.start;
+        // Nowhere near the ray's line: no point of the segment reaches within half its
+        // own length of the line its midpoint sits that far off. Most of a rim is ruled
+        // out here, before the crossing is solved for, which is what keeps the check
+        // per-edge rather than something the user waits on.
+        let mid = (seg.start + seg.end) * 0.5 - from;
+        let reach = along.length() * 0.5 + CROSSES;
+        if (mid - into * mid.dot(into)).length_squared() > reach * reach {
+            continue;
+        }
+        let (near, far) = {
+            let (a, b) = ((seg.start - from).dot(into), (seg.end - from).dot(into));
+            (a.min(b), a.max(b))
+        };
+        // Behind the ray, or no nearer than what has been found already: the crossing
+        // lies on the segment, so it is at least as far along as the nearer endpoint.
+        if far <= OWN_BOUNDARY || near > best {
+            continue;
+        }
+        let (a, b, c) = (into.dot(into), into.dot(along), along.dot(along));
+        let denom = a * c - b * b;
+        // Parallel to the ray: a boundary running beside it never stops it.
+        if denom.abs() < 1e-12 {
+            continue;
+        }
+        let w = from - seg.start;
+        // The closest approach of the two lines, pinned to the segment so that a ray
+        // leaving exactly through a vertex — an odd-sided rim crossed through its centre
+        // — is the hit it is rather than a miss either neighbour disowns.
+        let u = ((a * along.dot(w) - b * into.dot(w)) / denom).clamp(0.0, 1.0);
+        let q = seg.start + along * u;
+        let t = (q - from).dot(into);
+        if t <= OWN_BOUNDARY || t >= best || (q - from - into * t).length() > CROSSES {
+            continue;
+        }
+        best = t;
+        blocker = blended.then(|| dihedral(seg).3);
+    }
+    if best <= cap {
+        (best, blocker)
+    } else {
+        (cap, None)
+    }
+}
+
+/// The largest fillet radius the edges `keys` of `solid` can take together, or `None`
+/// when none of them is an edge of it.
+///
+/// The editor clamps a dragged radius to this so a blend cannot be driven past the
+/// material in the first place; [`fillet`] refuses anything over it with
+/// [`KernelError::BlendTooLarge`], which is the same number arrived at the same way.
+pub fn max_fillet_radius(solid: &Solid, keys: &[EdgeKey]) -> Option<f64> {
+    size_limit(solid, &solid.edges(), keys, BlendKind::Fillet)
+}
+
+/// The largest chamfer distance the edges `keys` of `solid` can take together. See
+/// [`max_fillet_radius`]; a chamfer's setback is its distance, so the limit is the room
+/// itself rather than the room turned back through the dihedral angle.
+pub fn max_chamfer_distance(solid: &Solid, keys: &[EdgeKey]) -> Option<f64> {
+    size_limit(solid, &solid.edges(), keys, BlendKind::Chamfer)
 }
 
 /// Folds the tools into as few as possible, so the body goes through one boolean rather
@@ -1113,6 +1339,192 @@ mod tests {
             merged[2].0.faces.len(),
             12,
             "the trailing run is folded, though"
+        );
+    }
+
+    // --- Range ------------------------------------------------------------------------
+
+    /// The L-block of [`fillet_concave_edge_adds_material`], and the concave edge between
+    /// the pocket's floor and its far wall. The floor reaches 5 mm from that edge to the
+    /// front of the block and the wall reaches 5 mm up it to the top.
+    fn l_block() -> (Solid, EdgeKey) {
+        let notch = cuboid(
+            OpId::new(9),
+            Vec3::new(-1.0, -1.0, 5.0),
+            Vec3::new(11.0, 5.0, 11.0),
+        );
+        let key = EdgeKey::new(
+            FaceKey::new(OpId::new(9), FaceRole::StartCap),
+            FaceKey::new(OpId::new(9), FaceRole::Side(2)),
+        );
+        (boolean(&cube(), &notch, BoolOp::Subtract).unwrap(), key)
+    }
+
+    /// A fillet whose setback runs past the far side of a face has eaten the face, and
+    /// what the boolean then takes away is whatever lay behind it. On a 10 mm cube both
+    /// faces of a top edge are 10 mm across and the dihedral is a right angle, so the
+    /// setback is the radius and the limit is 10 mm exactly.
+    #[test]
+    fn a_fillet_wider_than_the_faces_it_sits_between_is_refused() {
+        let c = cube();
+        let key = edge_between(FaceRole::EndCap, FaceRole::Side(0));
+        let limit = max_fillet_radius(&c, &[key]).unwrap();
+        assert_relative_eq!(limit, 10.0, epsilon = 1e-9);
+        let err = fillet(OpId::new(2), &c, &[key], 12.0, &fine()).unwrap_err();
+        assert!(
+            matches!(err, KernelError::BlendTooLarge { size, limit }
+                     if size == 12.0 && (limit - 10.0).abs() < 1e-9),
+            "{err:?}"
+        );
+    }
+
+    /// Round a closed rim the blend meets itself: the ray across the cap from one rim
+    /// segment leaves through the rim on the far side, and that far side is coming this
+    /// way at the same rate, so the radius is bounded by the cylinder's own radius —
+    /// which is also where the tool's centre circle, of radius R − r, collapses.
+    #[test]
+    fn a_fillet_that_would_close_a_rim_on_itself_is_refused() {
+        let cyl = rimmed_cylinder(10.0);
+        let key = rim(FaceRole::EndCap);
+        let limit = max_fillet_radius(&cyl, &[key]).unwrap();
+        assert!(limit < 5.0, "a rim of radius 5 cannot take {limit}");
+        assert!(
+            limit > 4.9,
+            "and the faceted rim is barely inside it, not {limit}"
+        );
+        assert!(matches!(
+            fillet(OpId::new(2), &cyl, &[key], 6.0, &Tessellation::default()).unwrap_err(),
+            KernelError::BlendTooLarge { .. }
+        ));
+    }
+
+    /// The concave case, where the tool is added rather than taken away: past the limit
+    /// the fillet's landing on the pocket floor is beyond the front of the block, and
+    /// the union raises a wall standing in mid-air where the pocket used to open out.
+    #[test]
+    fn a_fillet_that_would_overflow_a_pocket_is_refused() {
+        let (l, key) = l_block();
+        let limit = max_fillet_radius(&l, &[key]).unwrap();
+        assert_relative_eq!(limit, 5.0, epsilon = 1e-9);
+        assert!(matches!(
+            fillet(OpId::new(3), &l, &[key], 6.0, &fine()).unwrap_err(),
+            KernelError::BlendTooLarge { .. }
+        ));
+    }
+
+    /// Two edges of one face blended together divide the room between them rather than
+    /// each claiming all of it, so four edges round the top of a cube stop at half what
+    /// one of them alone could take.
+    #[test]
+    fn edges_blended_together_share_the_face_between_them() {
+        let c = cube();
+        let keys: Vec<EdgeKey> = (0..4)
+            .map(|i| edge_between(FaceRole::EndCap, FaceRole::Side(i)))
+            .collect();
+        assert_relative_eq!(max_fillet_radius(&c, &keys).unwrap(), 5.0, epsilon = 1e-9);
+        assert!(matches!(
+            fillet(OpId::new(2), &c, &keys, 6.0, &fine()).unwrap_err(),
+            KernelError::BlendTooLarge { .. }
+        ));
+    }
+
+    /// A chamfer's setback is its distance, so it is bounded by the room itself rather
+    /// than by the room turned back through the dihedral angle.
+    #[test]
+    fn a_chamfer_past_the_face_it_cuts_is_refused() {
+        let c = cube();
+        let key = edge_between(FaceRole::EndCap, FaceRole::Side(0));
+        assert_relative_eq!(
+            max_chamfer_distance(&c, &[key]).unwrap(),
+            10.0,
+            epsilon = 1e-9
+        );
+        assert!(matches!(
+            chamfer(OpId::new(2), &c, &[key], 11.0).unwrap_err(),
+            KernelError::BlendTooLarge { .. }
+        ));
+        assert!(chamfer(OpId::new(2), &c, &[key], 4.0).is_ok());
+    }
+
+    /// The limit is the largest blend that works, not the largest that is comfortable:
+    /// every one of the shapes above takes the radius it reports and still comes out a
+    /// closed, valid solid.
+    #[test]
+    fn the_largest_radius_the_limit_allows_still_makes_a_solid() {
+        let (l, pocket) = l_block();
+        let cases: Vec<(&str, Solid, Vec<EdgeKey>)> = vec![
+            (
+                "cube edge",
+                cube(),
+                vec![edge_between(FaceRole::EndCap, FaceRole::Side(0))],
+            ),
+            (
+                "cube top",
+                cube(),
+                (0..4)
+                    .map(|i| edge_between(FaceRole::EndCap, FaceRole::Side(i)))
+                    .collect(),
+            ),
+            (
+                "cylinder rim",
+                rimmed_cylinder(10.0),
+                vec![rim(FaceRole::EndCap)],
+            ),
+            ("pocket", l, vec![pocket]),
+        ];
+        for (name, solid, keys) in cases {
+            let limit = max_fillet_radius(&solid, &keys).unwrap();
+            let r = fillet(OpId::new(4), &solid, &keys, limit, &Tessellation::default())
+                .unwrap_or_else(|e| panic!("{name} at its own limit of {limit}: {e}"));
+            assert!(r.is_closed(), "{name}: {:?}", r.validate());
+            assert!(r.validate().is_ok(), "{name}: {:?}", r.validate());
+            assert!(r.volume() > 0.0, "{name} has no volume left");
+        }
+    }
+
+    /// The limit that rejects a fillet a machinist would ask for is a worse bug than the
+    /// one it fixes, so the ordinary sizes stay ordinary: a fifth of the face on a cube,
+    /// a fifth of the radius on a rim, and the same again with every edge of the face
+    /// taken at once.
+    #[test]
+    fn a_fillet_well_inside_the_material_is_not_refused() {
+        let c = cube();
+        let key = edge_between(FaceRole::EndCap, FaceRole::Side(0));
+        assert!(max_fillet_radius(&c, &[key]).unwrap() >= 2.0);
+        assert!(fillet(OpId::new(2), &c, &[key], 2.0, &fine()).is_ok());
+        let keys: Vec<EdgeKey> = (0..4)
+            .map(|i| edge_between(FaceRole::EndCap, FaceRole::Side(i)))
+            .collect();
+        assert!(fillet(OpId::new(2), &c, &keys, 2.0, &fine()).is_ok());
+
+        let cyl = rimmed_cylinder(10.0);
+        assert!(max_fillet_radius(&cyl, &[rim(FaceRole::EndCap)]).unwrap() >= 1.0);
+        assert!(
+            fillet(
+                OpId::new(2),
+                &cyl,
+                &[rim(FaceRole::EndCap), rim(FaceRole::StartCap)],
+                1.0,
+                &Tessellation::default(),
+            )
+            .is_ok()
+        );
+
+        let (l, pocket) = l_block();
+        assert!(fillet(OpId::new(3), &l, &[pocket], 2.0, &fine()).is_ok());
+    }
+
+    /// A thin wall is bounded by its thickness, because the setback down the wall's own
+    /// face is what has to fit; a 2 mm plate takes a 2 mm fillet on its rim and no more,
+    /// whatever the 50 mm faces either side of it would otherwise allow.
+    #[test]
+    fn a_thin_wall_bounds_the_fillet_that_rounds_its_rim() {
+        let plate = cuboid(OpId::new(1), Vec3::ZERO, Vec3::new(50.0, 50.0, 2.0));
+        let key = edge_between(FaceRole::EndCap, FaceRole::Side(0));
+        assert_relative_eq!(
+            max_fillet_radius(&plate, &[key]).unwrap(),
+            2.0,
+            epsilon = 1e-9
         );
     }
 }

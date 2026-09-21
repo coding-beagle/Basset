@@ -40,6 +40,10 @@ pub enum KernelError {
         "blend would need {needed} facets, over the budget of {budget}: coarsen the body's tessellation, or blend fewer edges at once"
     )]
     BlendTooDense { needed: usize, budget: usize },
+    #[error(
+        "blend of {size:.3} mm runs past the material it has to work with: this edge has room for {limit:.3} mm"
+    )]
+    BlendTooLarge { size: f64, limit: f64 },
     #[error("operation produced no solid")]
     EmptyResult,
     #[error("profile could not be triangulated near {0:?}")]
