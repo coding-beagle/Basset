@@ -9,6 +9,7 @@ use basset_viewport::ViewPreset;
 
 use super::sketch_mode::{self, SketchTool, ToolGroup, edit_text, parse_value};
 use super::tools::{self, ToolKind};
+use super::commands::{self, Command};
 use super::{DisplayMode, Editor, Mode, SelectMode};
 
 /// The blue the viewport draws under-constrained geometry in, so the words that explain it
@@ -16,75 +17,6 @@ use super::{DisplayMode, Editor, Mode, SelectMode};
 const LOOSE_LABEL: egui::Color32 = egui::Color32::from_rgb(140, 184, 255);
 /// Amber for a feature that built but warns about its result, matching the timeline chip.
 const WARNING_LABEL: egui::Color32 = egui::Color32::from_rgb(235, 190, 90);
-
-/// Deferred commands, so panel code never needs `&mut Editor` while it borrows state.
-enum Command {
-    Tool(ToolKind),
-    /// Start or leave the Measure tool, which owns no feature; see [`super::measure`].
-    Measure(bool),
-    New,
-    Open,
-    Save(bool),
-    ExportStl,
-    Export3mf,
-    Quit,
-    Undo,
-    Redo,
-    Fit,
-    View(ViewPreset),
-    ToggleProjection,
-    Display(DisplayMode),
-    ToggleGrid,
-    ToggleSnap,
-    ToggleOrigin,
-    SetCursor(usize),
-    Edit(FeatureId),
-    Suppress(FeatureId, bool),
-    Delete(FeatureId),
-    Rename(FeatureId),
-    SelectFeature(FeatureId),
-    ToggleBody(BodyRef),
-    ToggleSketch(FeatureId),
-    Activate(ComponentId),
-    FinishSketch(bool),
-    SketchTool(SketchTool),
-    SketchPick(sketch_mode::SketchPick),
-    SketchSelect(Vec<basset_sketch::EntityId>),
-    SketchDimension(basset_sketch::ConstraintId, f64),
-    SketchRemoveConstraint(basset_sketch::ConstraintId),
-    SketchDelete,
-    SketchConstruction,
-    /// Start a move of the selection, as `M` does.
-    SketchMoveBegin,
-    /// A number in the move palette changed: re-apply the move from where it started.
-    SketchMoveUpdate,
-    /// Keep (`true`) or undo (`false`) the move in progress.
-    SketchMoveFinish(bool),
-    /// Start a pattern of the selection.
-    SketchPattern,
-    /// A number in the pattern palette changed: re-make the copies.
-    SketchPatternUpdate,
-    /// Keep (`true`) or undo (`false`) the pattern in progress.
-    SketchPatternFinish(bool),
-    SketchOffset,
-    /// A setting in the offset palette changed: re-make the result.
-    SketchOffsetUpdate,
-    /// Keep (`true`) or undo (`false`) the offset in progress.
-    SketchOffsetFinish(bool),
-    /// The radius in the fillet palette changed: re-make the arc.
-    SketchFilletUpdate,
-    /// Keep (`true`) or undo (`false`) the corner fillet in progress.
-    SketchFilletFinish(bool),
-    SketchSetParameter(String, String),
-    SketchRemoveParameter(String),
-    SketchBindDimension(basset_sketch::ConstraintId, String),
-    /// Enter in an entry box: place the shape from the typed sizes.
-    SketchSubmitEntry,
-    /// The sketch editor changed its sketch outside a pointer event (a dragged label):
-    /// write it into the feature.
-    SketchCommit,
-    SelectMode(SelectMode),
-}
 
 pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
     let mut commands: Vec<Command> = Vec::new();
@@ -139,7 +71,7 @@ pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
     }
 }
 
-fn run(editor: &mut Editor, c: Command) {
+pub(super) fn run(editor: &mut Editor, c: Command) {
     match c {
         Command::Tool(kind) => tools::start_tool(editor, kind),
         Command::Measure(on) => {
@@ -147,6 +79,13 @@ fn run(editor: &mut Editor, c: Command) {
                 super::measure::start(editor)
             } else {
                 super::measure::stop(editor)
+            }
+        }
+        Command::ToggleMeasure => {
+            if editor.measure.is_some() {
+                super::measure::stop(editor)
+            } else {
+                super::measure::start(editor)
             }
         }
         Command::New => editor.new_document(),
@@ -161,6 +100,22 @@ fn run(editor: &mut Editor, c: Command) {
         Command::View(p) => editor.look_from(p),
         Command::ToggleProjection => editor.toggle_projection(),
         Command::Display(m) => editor.set_display_mode(m),
+        Command::CycleDisplay => editor.cycle_display_mode(),
+        Command::Cancel => editor.cancel(),
+        Command::Confirm => editor.confirm(),
+        Command::DeleteSelected => editor.delete_selected(),
+        Command::FocusNextEntry => {
+            if let Mode::Sketch(s) = &mut editor.mode {
+                s.focus_next_entry();
+            }
+        }
+        Command::ToggleShortcuts => editor.show_shortcuts = !editor.show_shortcuts,
+        Command::OpenPalette => {
+            editor.palette = Some(commands::Palette {
+                just_opened: true,
+                ..Default::default()
+            })
+        }
         Command::ToggleGrid => editor.show_grid = !editor.show_grid,
         Command::ToggleSnap => editor.set_snapping(!editor.snapping.to_grid),
         Command::ToggleOrigin => editor.show_origin = !editor.show_origin,
@@ -212,6 +167,18 @@ fn run(editor: &mut Editor, c: Command) {
                 s.set_pick(mode);
             }
         }
+        // A group key picks the variant its toolbar button is showing, which is what
+        // makes the key and the button the same button.
+        Command::SketchGroup(group) => {
+            if let Mode::Sketch(s) = &mut editor.mode {
+                let variant = s.variant_of(group);
+                s.set_tool(variant);
+                if s.take_dirty() {
+                    editor.commit_sketch();
+                }
+            }
+        }
+        Command::SketchExtrudeRegion => sketch_mode::extrude_region(editor),
         Command::SketchTool(t) => {
             if let Mode::Sketch(s) = &mut editor.mode {
                 // Picking another tool cancels a move or a pattern, and that revert has
@@ -287,9 +254,15 @@ fn run(editor: &mut Editor, c: Command) {
         Command::SketchOffset => {
             if let Mode::Sketch(s) = &mut editor.mode {
                 if s.begin_offset() {
+                    // The preview is real geometry in the feature by now, so it has to
+                    // reach the document for anything downstream to see it.
                     editor.commit_sketch();
                 } else {
-                    editor.set_status("Select the sketch geometry to offset, then Offset");
+                    // Somebody halfway through a move, told to select something first,
+                    // learns nothing about what to do next: say which it is.
+                    let why = super::busy(s)
+                        .unwrap_or("Select the path or loop to offset first".into());
+                    editor.set_status(why);
                 }
             }
         }
@@ -365,7 +338,9 @@ fn run(editor: &mut Editor, c: Command) {
             if let Mode::Sketch(s) = &mut editor.mode
                 && !s.begin_move()
             {
-                editor.set_status("Select the sketch geometry to move first");
+                let why =
+                    super::busy(s).unwrap_or("Select the sketch geometry to move first".into());
+                editor.set_status(why);
             }
         }
         Command::SketchCommit => {
