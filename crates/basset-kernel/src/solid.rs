@@ -972,22 +972,96 @@ fn smooth_normals(face: &Face) -> Vec<Vec<Vec3>> {
         .collect()
 }
 
-/// Snaps points within [`MERGE_TOL`] of each other to one id. Uses a grid of cell size
-/// `2·MERGE_TOL` and probes the neighbouring cells so points straddling a cell boundary
-/// still merge.
+/// Mixes the vertex grid's integer cell coordinates into a hash.
+///
+/// The map is keyed by grid coordinates of the model's own geometry, so there is nothing
+/// for the standard library's SipHash to defend against, and it is not cheap next to what
+/// a lookup here does with the result: welding a vertex is a handful of multiplies and a
+/// distance, and hashing was most of it. This is the usual multiply-xor mix.
+#[derive(Default)]
+pub(crate) struct CellHasher(u64);
+
+impl std::hash::Hasher for CellHasher {
+    fn finish(&self) -> u64 {
+        // A final avalanche, or the high bits the map takes its bucket from would be
+        // dominated by whichever coordinate was written last.
+        let h = self.0;
+        (h ^ (h >> 31)).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.write_i64(*b as i64);
+        }
+    }
+
+    fn write_i64(&mut self, i: i64) {
+        self.0 = (self.0.rotate_left(5) ^ i as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+type CellMap = HashMap<(i64, i64, i64), Vec<u32>, std::hash::BuildHasherDefault<CellHasher>>;
+
+/// Snaps points within [`MERGE_TOL`] of each other to one id. Uses a grid whose cells are
+/// comfortably wider than the tolerance and probes a neighbouring cell along an axis only
+/// where the point is close enough to that face for the neighbour to hold a match.
 #[derive(Default)]
 pub(crate) struct VertexIndex {
-    cells: HashMap<(i64, i64, i64), Vec<u32>>,
+    cells: CellMap,
     pub(crate) points: Vec<Vec3>,
 }
 
+/// Grid pitch, as a multiple of [`MERGE_TOL`].
+///
+/// A cell of exactly `2·MERGE_TOL` puts every point within the tolerance of one of its
+/// two faces on every axis, so all eight corner cells have to be probed however the probe
+/// is written; the old blanket 3×3×3 probed twenty-seven. Wider cells make that the
+/// exception — a point needs a neighbour on an axis only within `MERGE_TOL` of a face,
+/// which is a quarter of this one — at the price of a few more points per cell to compare
+/// against, and at this pitch a cell is still 80 nm across.
+const GRID: f64 = 8.0 * MERGE_TOL;
+
 impl VertexIndex {
     pub(crate) fn id(&mut self, p: Vec3) -> u32 {
-        let cell = |x: f64| (x / (2.0 * MERGE_TOL)).floor() as i64;
-        let c = (cell(p.x), cell(p.y), cell(p.z));
-        for dx in -1..=1 {
-            for dy in -1..=1 {
-                for dz in -1..=1 {
+        let c = (
+            (p.x / GRID).floor() as i64,
+            (p.y / GRID).floor() as i64,
+            (p.z / GRID).floor() as i64,
+        );
+        // The one neighbour each axis can need: below when the point is within the
+        // tolerance of the cell's low face, above when it is within it of the high face,
+        // and neither in the middle, which is where it usually is.
+        let near = |x: f64, c: i64| {
+            let low = x - c as f64 * GRID;
+            if low <= MERGE_TOL {
+                -1
+            } else if low >= GRID - MERGE_TOL {
+                1
+            } else {
+                0
+            }
+        };
+        let offsets = |n: i64| {
+            let both = [0, n];
+            if n == 0 { [0, 0] } else { both }
+        };
+        let (xs, ys, zs) = (
+            offsets(near(p.x, c.0)),
+            offsets(near(p.y, c.1)),
+            offsets(near(p.z, c.2)),
+        );
+        for (i, dx) in xs.iter().enumerate() {
+            if i == 1 && *dx == 0 {
+                break;
+            }
+            for (j, dy) in ys.iter().enumerate() {
+                if j == 1 && *dy == 0 {
+                    break;
+                }
+                for (k, dz) in zs.iter().enumerate() {
+                    if k == 1 && *dz == 0 {
+                        break;
+                    }
                     if let Some(ids) = self.cells.get(&(c.0 + dx, c.1 + dy, c.2 + dz)) {
                         for &id in ids {
                             if self.points[id as usize].distance_squared(p) <= MERGE_TOL * MERGE_TOL
