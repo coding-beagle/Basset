@@ -131,8 +131,8 @@ fn cases() -> Vec<Case> {
 
 fn main() {
     println!(
-        "{:<34} {:>7} {:>9} {:>8} {:>7} {:>7}  {}",
-        "case", "in", "time ms", "out", "closed", "valid", "volume"
+        "{:<34} {:>7} {:>9} {:>8} {:>7} {:>7}  volume",
+        "case", "in", "time ms", "out", "closed", "valid"
     );
     let mut total = 0.0;
     for case in cases() {
