@@ -62,6 +62,18 @@ What is left here:
 
 Sketch:
 
+- Snapping infers what the drawing names — endpoints, midpoints, centres, crossings, the
+  point on a curve, the origin, horizontal/vertical alignment with a touched point, a
+  line's extension, tangent and perpendicular off the curve a chain continues from — under
+  one ranking and one hold, both pure functions in `editor/snap.rs` and tested without a
+  window. What is left there: the guides come from the last three points the pointer
+  touched and from the origin, so an alignment with a point further back in the drawing
+  has to be re-hovered first; a guide's dashes are drawn on the sketch plane rather than in
+  screen space, so an orbited camera foreshortens them; there is no text beside the
+  crosshair naming the snap, only the glyph, because sketch mode has no egui overlay of
+  its own to put one in; crossings are found among the eight curves nearest the pointer,
+  which is a cap rather than an index; and nothing can be *locked* — Fusion lets a guide
+  be pinned by hovering it, and here it is only ever held.
 - Off plane sketch faces are unselectable outside of the sketch.
 - DXF import
 - Trim/break: no Extend (dragging a curve out to meet another one) yet
