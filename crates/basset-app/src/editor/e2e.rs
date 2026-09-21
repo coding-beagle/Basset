@@ -524,6 +524,10 @@ fn the_palette_lists_redundant_constraints_and_offers_to_delete_them() {
         .expect("consistent, so it is taken");
     let before = h.sketch().sketch.constraints().count();
 
+    // The palette is taller than an 800x600 window, so the section is scrolled to
+    // before it is read: everything below the degrees-of-freedom line is off the
+    // bottom otherwise, which is what the scroll area is there for.
+    scroll_palette(&mut h, -400.0);
     // The count is a line of its own, and the row sits under it. The toolbar has a
     // Horizontal button too, so the row is the "Horizontal" below the count.
     let (count, row) = {
