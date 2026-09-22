@@ -263,9 +263,21 @@ impl Sketch {
     // ----- solving --------------------------------------------------------------------
 
     pub fn solve(&mut self) -> Result<SolveReport, SolveError> {
+        self.solve_with(&crate::parameters::no_outer)
+    }
+
+    /// Solves with a table of names behind the sketch's own — the document's parameters.
+    ///
+    /// This is the entry point the timeline uses, so a document parameter re-drives the
+    /// dimensions bound to it on the next regeneration, exactly as a sketch parameter
+    /// always has.
+    pub fn solve_with(
+        &mut self,
+        outer: crate::parameters::Outer,
+    ) -> Result<SolveReport, SolveError> {
         // Parameters first: a dimension bound to an expression must reach the solver
         // holding the value that expression says, not the one it was last solved with.
-        self.apply_parameters();
+        self.apply_parameters_with(outer);
         crate::solver::solve(self)
     }
 

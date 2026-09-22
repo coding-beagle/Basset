@@ -10,8 +10,8 @@ basset-math      f64 vectors (glam), Frame/Plane/Ray, tolerances, TriMesh interc
 basset-sketch    2D sketch entities, constraints, solver, shapes, text, profile extraction
 basset-kernel    solid modelling: Solid/Face topology, CSG, extrude/revolve/sweep/loft,
                   fillet/chamfer/combine/transform, tessellation, picking, mass properties
-basset-core      Document, Components, Planes/Axes/Sketches/Bodies, Timeline + regeneration,
-                  document save/open (.bass JSON)
+basset-core      Document, Components, Planes/Axes/Sketches/Bodies, document parameters,
+                  Timeline + regeneration, document save/open (.bass JSON)
 basset-io        STL / 3MF export
 basset-viewport  wgpu renderer: camera, mesh/line/point/triangle batches, grid, selection highlight
 basset-app       winit + egui desktop application (Linux first)
@@ -20,6 +20,9 @@ basset-app       winit + egui desktop application (Linux first)
 Dependency direction is strictly downward: `math ← sketch, kernel ← core ← io, viewport ← app`.
 `sketch` and `kernel` do not know about each other; `core` converts sketch profiles into
 kernel profiles. This keeps both testable in isolation and lets the kernel be replaced.
+Where `core` has to put something of its own *into* a sketch — the document's parameter
+table — it goes in as a closure rather than as a type, so the arrow still points one way;
+see [Parameters](#parameters).
 
 ## Conventions
 
@@ -190,11 +193,107 @@ are true of it by construction — parallel, concentric, coincident corner centr
 where the source was smooth — but is not linked back to its source, for the same reason a
 pattern's copies are not.
 
-A sketch also carries a table of named parameters — expressions over each other in a tiny
-`+ - * / ()` language — and a binding from dimensions to expressions. Solving evaluates
-the bindings first, so changing one parameter re-drives everything written over it.
-Expressions are evaluated in the unit the dimension is typed in (degrees for angles), and
-typing a plain number over a driven dimension releases it.
+A sketch also carries a table of named parameters and a binding from dimensions to
+expressions. Solving evaluates the bindings first, so changing one parameter re-drives
+everything written over it, and typing a plain number over a driven dimension releases
+it. The same table now also exists once at the document, behind every sketch and in front
+of every feature; the next section is about both.
+
+## Parameters
+
+A named number — `bore = 12.5`, `wall = bore / 8` — is resolved in two scopes. A sketch
+looks a name up in its own table first and asks the document only for what it does not
+define, so a sketch parameter *shadows* a document one of the same name, as a local
+shadows a global. That ordering was chosen over migrating the existing per-sketch tables
+upwards because it needs no migration at all: every sketch that already had a `width`
+still means its own, and a file written before the document had a table loads with an
+empty one and behaves exactly as it did. The price is paid in one place and is
+deliberate: a sketch parameter written over a document one cannot refer outward to it, so
+`width = width * 2` is a cycle rather than a reference, because resolution is by name and
+there is no syntax for saying which scope is meant. The error names the cycle, so at
+least what happened is legible.
+
+`basset-sketch` never learns that documents exist. The outer table arrives as a closure,
+`basset_sketch::Outer` (`&dyn Fn(&str) -> Result<f64, SketchError>`), which
+`basset_core::Parameters::lookup` hands over. `expr::eval` already took a lookup closure
+for the sketch's own names, so this is that same seam carried one level up. A type would
+have meant `sketch` depending on `core` — the reverse of `math ← sketch, kernel ← core ←
+io` — and would have left the sketch crate untestable without a document behind it. The
+`_with` half of the sketch API (`solve_with`, `parameter_value_with`,
+`apply_parameters_with`, `failed_bindings_with`, `rename_parameter_with`) is each
+operation with that closure supplied; the plain half passes `no_outer`, which knows no
+names at all and is what the crate's own tests use.
+
+The expression language is arithmetic and a named function table, and nothing else,
+because every symbol in it has to be obvious to someone reading a dimension in a toolbar
+three months later. `+ - * /` and brackets, `^` binding tighter and *right*-associative
+so `2^3^2` is 512, exponent literals, and `sqrt abs floor ceil round sin cos tan asin
+acos atan atan2 hypot min max deg rad`. Trigonometry is in radians in and out, as `f64`'s
+own methods are, while the angle dimensions around it are in degrees: that mismatch is
+not papered over with unit magic, `deg` and `rad` are in the table so the conversion is
+written down where it happens. `pi` and `tau` are fallbacks rather than keywords — a name
+is offered to the lookup first and only becomes a constant when the lookup reports it
+unknown — so a user parameter called `pi` beats the constant, and any other lookup
+failure still reaches the caller instead of being swallowed by a constant.
+
+A feature's numbers are driven by the same expressions. `Feature::exprs` is a
+`BTreeMap<NumericField, String>` beside the kind rather than an `Option<String>` next to
+each number: the numbers live in the variants of `FeatureKind` and most of them are never
+driven, so a neighbour field would have to be added to a dozen variants, written `None`
+at every construction site, and could still come to disagree with the number it annotates.
+A `NumericField` names a value by role — `Distance`, `Negative`, `Angle`, `Radius` — so
+one key means the same thing across the kinds that offer it (an extrude's distance and
+second distance, a revolve's angle, a fillet's radius, a chamfer's distance, an offset
+plane's distance, an angled plane's angle) and a panel can label it without matching on
+the kind.
+
+Replay resolves those expressions into a *copy* of the feature (`Regenerator::drive`,
+handing back a `Cow` so the common case — a feature nobody drives — clones nothing).
+Regeneration must not write back into the timeline: the expression is the input and the
+number is derived from it, so a replay that edited the feature would make regeneration a
+mutation and undo a lie. The stored number is kept in step separately, because it is the
+only one a panel can read and releasing an expression has to keep the value the user
+currently sees: `Document::refresh_driven_values` writes the evaluated numbers back after
+every change to the table, including the wholesale swaps undo, redo and a rolled-back
+transaction perform. It records no undo entry and moves no cursor, because it derives
+nothing — it only catches the timeline up with a change that was recorded already. An
+expression that stops evaluating does not fail its feature: the number it last had
+stands and the feature is `Warned`, on the same grounds the sketch layer keeps a stale
+dimension. Deleting a parameter should say what stopped being driven, not collapse half
+the model to zero while the user works out what happened.
+
+A parameter can drive anything at any point in the history, so there is no earlier
+feature worth keeping: `Regenerator::set_parameters` throws the whole snapshot cache away
+and replay starts from feature zero. The document therefore hands the table over only
+when it has actually changed, since `state()` runs on every frame. Undo snapshots the
+table alongside the timeline for the matching reason — restoring a timeline into a
+document whose table had moved on would undo the edit and leave the model meaning
+something neither version ever meant.
+
+Expressions are evaluated in the unit the value is *typed* in: degrees for angles,
+millimetres for everything else. `FeatureKind::numeric_field` and `set_numeric_field` are
+the only place that conversion happens, because an expression is a number the user would
+otherwise have typed into that box and so must mean what typing it there would have
+meant. The feature path and the sketch path differ in exactly one respect, on purpose.
+`Sketch::apply_binding` takes the magnitude and copysigns it back onto the angle the
+constraint already held, because the sign of a sketch angle selects which solution the
+solver lands on, and re-driving a dimension must not flip the drawing into its mirror. A
+feature angle's sign is a direction the user chose rather than a solver branch, so there
+it comes from the expression as written.
+
+Renaming is what makes reference-by-name survivable. `expr::rename` is token-aware, so it
+rewrites the name and nothing that merely looks like it — a function call keeps its name,
+a longer identifier containing it is left alone, no number is touched — and copies the
+rest of the text through byte for byte, spacing included, because the lexer keeps each
+token's span and only spans are rewritten. `Document::rename_parameter` drives that over
+its own rows, over every feature's expressions, and over every sketch's table and bound
+dimensions; a sketch that *shadows* the old name is skipped, because there the references
+mean the local parameter and must not follow the document's rename. It refuses outright
+when a sketch both reads the old name and defines the new one for itself: rewriting would
+*capture* those references onto the sketch's own row, quietly changing the drawing, or
+turning it into a cycle where the sketch's own row is what mentioned the old name.
+Neither table can see that alone — capture is a collision between two scopes — and the
+document is the only place that holds both.
 
 ## Timeline
 
@@ -208,8 +307,16 @@ warning behaviour.
 
 `.bass` is JSON: `{ "format_version": N, "generator": "...", "document": ... }`. Version 2
 renamed the generators' `profiles` list to `regions` when a planar face became usable as a
-region. The document is the timeline plus metadata; geometry is never stored because it is
-fully regenerable. Old versions are migrated on load; newer versions are refused with a
+region. Version 3 added the document's parameter table and the expressions driving feature
+values, and its migration is the identity: both are new fields and both default, so a
+version 2 document loads with an empty table and no driven values, which is exactly what
+it had. The version was bumped all the same, because migration is only half of what a
+version number is for. A file written now can carry parameters, and an older build reading
+it would drop them silently and save back a document whose extrude distances no longer say
+where they came from; refusing to open it, which the existing unsupported-version path
+already does for anything newer than the build knows, is much better than that. The
+document is the timeline plus that table plus metadata; geometry is never stored because it
+is fully regenerable. Old versions are migrated on load; newer versions are refused with a
 clear error. Saves go through a temporary file and rename so a crash never truncates the
 previous copy.
 
@@ -229,7 +336,13 @@ view of the same surface (egui blends in gamma space, the viewport in linear). T
   editor's selection — no feature stores a vertex. A modelling tool
   owns one timeline feature which it creates as soon as the input is complete and re-edits
   on every parameter change, so the viewport is a live preview; the document's transaction
-  API makes the whole interaction one undo step and Cancel a rollback.
+  API makes the whole interaction one undo step and Cancel a rollback. A rollback also puts
+  back the redo stack that opening the transaction cleared, because a dialog the user
+  cancelled did not happen and should not have cost them the thing they were about to redo;
+  and every mutation that can be refused — an edit, rename, removal or reorder of a feature
+  that names no feature, or a reorder that would cross a dependency — is validated before an
+  undo entry is recorded, so a refusal no longer pushes a step that does nothing and clears
+  the redo stack on its way past.
 * **Sketch mode** draws on one plane with the same shape builders the sketch crate tests
   use, trims and breaks existing curves, rounds corners, patterns, offsets and moves a selection, names closed
   regions by a point inside them so `E` can hand them straight to Extrude, writes the
@@ -267,6 +380,30 @@ view of the same surface (egui blends in gamma space, the viewport in linear). T
   model mode's, over the kinds of thing a sketch has. It applies to the Select tool only:
   drawing and snapping must still see every point whatever the user is choosing to
   select.
+
+The document's parameter table is edited in the browser, beside the origin and the
+components, because that is the panel that describes the *document* and the one panel up
+whether or not a sketch is open — a table that only drove sketches would not have needed
+lifting out of them. A window off a menu would have hidden the very names the feature
+exists to keep in front of the user. The sketch palette lists the document's rows
+read-only underneath its own and strikes through any the sketch shadows, since a name in
+scope that the user cannot see is a name they have no way to know they may write. Editing
+the document's table is disabled while a sketch or a tool dialog is open: both hold an
+open document transaction, and a parameter changed inside one would be rolled back by an
+unrelated Cancel.
+
+Almost every number in the modelling dialogs goes through one helper (`tools::drag`),
+which is what makes "any of them can be driven by a parameter" one change rather than one per
+tool: the `ƒ` toggle swaps that number's drag box for an expression field, and while an
+expression is set the number is read-only and shows what the expression works out to,
+because there the expression is the input and the number only its result. The expression
+is written onto the previewed feature on every sync rather than at OK, because the feature
+*is* the preview and it is inside the tool's transaction either way. A field the kind
+stops offering — the second distance of an extrude that is no longer two-sided — is
+released rather than left driving nothing and warning on every regeneration afterwards.
+The numbers that do not go through that helper (Move's six translate and rotate
+components, and the whole sketch-operation dialog) therefore have no toggle; they would
+each need a field identity of their own first.
 
 A dashed line carries the distance already travelled along its polyline
 (`SegmentInstance::start`), because the dash pattern is measured in pixels along a

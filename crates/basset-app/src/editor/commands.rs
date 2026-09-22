@@ -93,6 +93,15 @@ pub(crate) enum Command {
     SketchFilletUpdate,
     /// Keep (`true`) or undo (`false`) the corner fillet in progress.
     SketchFilletFinish(bool),
+    /// Add the document parameter the panel's bottom row names. Distinct from
+    /// [`Command::SetParameter`] only in that the row empties itself when it is taken.
+    AddParameter(String, String),
+    /// Add a document parameter, or give an existing one a new expression.
+    SetParameter(String, String),
+    /// Rename a document parameter, following the old name into every feature and every
+    /// sketch that does not shadow it.
+    RenameParameter(String, String),
+    RemoveParameter(String),
     SketchSetParameter(String, String),
     SketchRemoveParameter(String),
     SketchBindDimension(basset_sketch::ConstraintId, String),

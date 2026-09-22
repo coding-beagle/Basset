@@ -15,7 +15,7 @@
 //! the value becomes a driving dimension, the way Fusion's entry boxes work: what the
 //! user stated stays true under later edits, what they merely pointed at stays free.
 
-use basset_core::{FeatureId, FeatureKind, PlaneRef, ProfileRef};
+use basset_core::{FeatureId, FeatureKind, Parameters, PlaneRef, ProfileRef};
 use basset_math::{Frame, Ray, Vec2, Vec3};
 pub use basset_sketch::offset::Corner;
 use basset_sketch::{
@@ -970,6 +970,17 @@ pub struct SketchEditor {
     pub param_drafts: Vec<(String, String)>,
     pub new_param: (String, String),
     pub param_error: Option<String>,
+    /// The document's parameter table, copied in so the names it defines resolve while
+    /// the user is drawing.
+    ///
+    /// A copy rather than a borrow because this editor owns a working copy of the sketch
+    /// and never holds the document: taking `&Document` into every solve would mean
+    /// threading it through the whole drawing path, which is driven from winit events
+    /// that have no document to hand. The copy is refreshed wherever the editor refreshes
+    /// its other caches, so it is at most one frame behind a table only the panels can
+    /// change — and the document re-evaluates every binding itself on regeneration, so a
+    /// stale copy can never be what the model is built from.
+    pub outer: Parameters,
     undo: Vec<Sketch>,
     redo: Vec<Sketch>,
     dirty: bool,
@@ -1033,6 +1044,7 @@ impl SketchEditor {
             param_drafts: Vec::new(),
             new_param: (String::new(), String::new()),
             param_error: None,
+            outer: Parameters::new(),
             undo: Vec::new(),
             redo: Vec::new(),
             dirty: false,
@@ -1263,7 +1275,8 @@ impl SketchEditor {
     }
 
     fn solve(&mut self) {
-        self.report = Some(self.sketch.solve());
+        let outer = self.outer.lookup();
+        self.report = Some(self.sketch.solve_with(&outer));
         self.profiles = self.sketch.profiles(&self.tess);
         self.hover_region = None;
     }
@@ -2738,10 +2751,36 @@ impl SketchEditor {
         }
     }
 
+    /// Replaces the copy of the document's table, re-solving if it has moved on.
+    ///
+    /// Re-solving rather than merely storing it: a dimension bound to a document
+    /// parameter is drawn at the length that name currently gives it, so the drawing has
+    /// to follow the table the moment the table changes.
+    pub fn set_outer(&mut self, outer: Parameters) {
+        if self.outer == outer {
+            return;
+        }
+        self.outer = outer;
+        self.solve();
+    }
+
+    /// Whether the document defines `name` too, so this sketch's own row shadows it.
+    /// Silent shadowing is the one genuinely confusing thing about two scopes, so the
+    /// panel says so.
+    pub fn shadows(&self, name: &str) -> bool {
+        self.outer.get(name).is_some() && self.sketch.parameter(name).is_some()
+    }
+
     /// Adds or re-expresses a named constant, re-driving the dimensions that use it.
     pub fn set_parameter(&mut self, name: &str, expression: &str) -> Result<(), String> {
         self.checkpoint();
-        match self.sketch.set_parameter(name, expression) {
+        // The lookup borrows the table, so it is dropped before `after_change` wants the
+        // whole editor again.
+        let set = {
+            let outer = self.outer.lookup();
+            self.sketch.set_parameter_with(name, expression, &outer)
+        };
+        match set {
             Ok(_) => {
                 self.after_change();
                 Ok(())
@@ -2762,10 +2801,16 @@ impl SketchEditor {
         }
     }
 
-    /// Drives a dimension by an expression instead of a number.
+    /// Drives a dimension by an expression instead of a number. Names the sketch does not
+    /// define are looked for in the document's table, so `bore / 2` works whichever scope
+    /// `bore` was declared in.
     pub fn bind_dimension(&mut self, id: ConstraintId, expression: &str) -> Result<(), String> {
         self.checkpoint();
-        match self.sketch.bind_dimension(id, expression) {
+        let bound = {
+            let outer = self.outer.lookup();
+            self.sketch.bind_dimension_with(id, expression, &outer)
+        };
+        match bound {
             Ok(_) => {
                 self.after_change();
                 Ok(())
@@ -4926,6 +4971,9 @@ fn start(
     editor.tool = None;
     let mut sketch_editor = SketchEditor::new(id, frame, sketch, saved);
     sketch_editor.restore_cursor = restore_cursor;
+    // Before the first solve below would want them: a dimension already bound to a
+    // document parameter must open showing the length that name gives it.
+    sketch_editor.set_outer(editor.doc.parameters().clone());
     // A sketch opens with snapping as the user left it, not as a fresh one would have
     // it: a switch that quietly turns itself back on is a switch nobody trusts.
     sketch_editor.snap_to_grid = editor.snapping.to_grid;

@@ -8,6 +8,7 @@
 //! The crate is split along those lines:
 //! * `ids`/`refs`  — how features name each other (the topological naming strategy).
 //! * `feature`     — the parametric inputs of every supported operation.
+//! * `parameters`  — the document-wide table of named values features and sketches read.
 //! * `timeline`    — ordering, rollback cursor, insertion at the cursor.
 //! * `regen`       — evaluating features into geometry, with per-feature caching.
 //! * `document`    — the user-facing aggregate with undo/redo.
@@ -18,14 +19,16 @@ pub mod feature;
 pub mod file;
 pub mod ids;
 pub mod model;
+pub mod parameters;
 pub mod refs;
 pub mod regen;
 pub mod timeline;
 
 pub use document::{Document, DocumentError, Units};
-pub use feature::{BodyOp, CombineOp, Extent, Feature, FeatureKind};
+pub use feature::{BodyOp, CombineOp, Extent, Feature, FeatureKind, NumericField};
 pub use ids::{ComponentId, FeatureId};
 pub use model::{Body, Component, FeatureStatus, ModelState, SolvedSketch};
+pub use parameters::Parameters;
 pub use refs::{
     AxisRef, BodyRef, EdgeRef, FaceRef, OriginAxis, OriginPlane, PathRef, PlaneRef, ProfileRef,
     RegionRef,

@@ -4131,3 +4131,277 @@ mod shortcuts {
         assert_eq!(commands::hint("sketch.finish"), "");
     }
 }
+
+/// Document parameters, which is the whole reason the table was lifted out of the
+/// sketch: one name drives a feature and a drawing at once, and moving it moves both.
+mod parameters {
+    use super::*;
+    use crate::editor::commands::Command;
+    use crate::editor::harness::Harness;
+    use crate::editor::panels;
+    use basset_core::{FeatureId, NumericField};
+
+    /// A 20×10 rectangle on XY, extruded by whatever `text` says. Returns the sketch and
+    /// the extrude.
+    fn driven_extrude(h: &mut Harness, text: &str) -> (FeatureId, FeatureId) {
+        h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+        h.rectangle(Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+        h.finish_sketch(true);
+        let sketch = h.last_feature();
+        h.start_tool(ToolKind::Extrude);
+        h.select_region(sketch, Vec2::new(10.0, 5.0));
+        h.sync_tool();
+        assert!(
+            tools::type_expression(&mut h.editor, NumericField::Distance, text),
+            "{text} was refused"
+        );
+        let extrude = h
+            .editor
+            .tool
+            .as_ref()
+            .and_then(|t| t.feature)
+            .expect("the extrude previews a feature");
+        h.confirm_tool();
+        (sketch, extrude)
+    }
+
+    #[test]
+    fn a_document_parameter_drives_an_extrude_through_the_editor() {
+        let mut h = Harness::new();
+        h.editor.set_document_parameter("thickness", "4");
+        assert!(h.editor.params_panel.error.is_none());
+        let (_, extrude) = driven_extrude(&mut h, "thickness * 2");
+
+        let body = BodyRef(extrude);
+        assert!((h.volume(body) - 1600.0).abs() < 1e-6, "{}", h.volume(body));
+        assert_eq!(
+            h.editor.doc.feature_expr(extrude, NumericField::Distance),
+            Some("thickness * 2"),
+            "the expression, not the 8 it works out to, is what the feature keeps"
+        );
+
+        // The point of the whole feature: the table moves and the body follows.
+        h.editor.set_document_parameter("thickness", "5");
+        assert!((h.volume(body) - 2000.0).abs() < 1e-6, "{}", h.volume(body));
+    }
+
+    #[test]
+    fn editing_a_driven_feature_re_opens_with_its_expression() {
+        let mut h = Harness::new();
+        h.editor.set_document_parameter("wall", "3");
+        let (_, extrude) = driven_extrude(&mut h, "wall * 2");
+        h.editor.edit_feature(extrude);
+        assert_eq!(
+            h.editor
+                .tool
+                .as_ref()
+                .expect("the extrude dialog re-opened")
+                .exprs
+                .get(NumericField::Distance),
+            Some("wall * 2"),
+            "re-editing showed the 6 rather than what states it"
+        );
+        h.cancel_tool();
+        assert_eq!(
+            h.editor.doc.feature_expr(extrude, NumericField::Distance),
+            Some("wall * 2"),
+            "cancelling the re-edit left the feature as it was"
+        );
+    }
+
+    #[test]
+    fn a_sketch_dimension_is_driven_by_a_document_parameter() {
+        let mut h = Harness::new();
+        h.editor.set_document_parameter("bore", "20");
+        h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+        h.rectangle(Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+        let (dim, _) = h.dimension(Vec2::new(10.0, 0.0), Vec2::new(10.0, -6.0));
+        h.sketch()
+            .bind_dimension(dim, "bore / 2")
+            .expect("a document name resolves from inside a sketch");
+        let length = h
+            .sketch()
+            .sketch
+            .constraint(dim)
+            .and_then(|c| c.dimension_value())
+            .expect("a dimension has a value");
+        assert!((length - 10.0).abs() < 1e-9, "{length}");
+    }
+
+    /// Renaming is the reason the operation exists at all: references are by name inside
+    /// expression text, so it has to reach a feature and a sketch alike.
+    #[test]
+    fn a_rename_follows_into_a_feature_and_a_sketch() {
+        let mut h = Harness::new();
+        h.editor.set_document_parameter("thickness", "4");
+        h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+        h.rectangle(Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+        let (dim, _) = h.dimension(Vec2::new(10.0, 0.0), Vec2::new(10.0, -6.0));
+        h.sketch().bind_dimension(dim, "thickness * 5").unwrap();
+        h.editor.commit_sketch();
+        h.finish_sketch(true);
+        let sketch = h.last_feature();
+
+        h.start_tool(ToolKind::Extrude);
+        h.select_region(sketch, Vec2::new(10.0, 5.0));
+        h.sync_tool();
+        assert!(tools::type_expression(
+            &mut h.editor,
+            NumericField::Distance,
+            "thickness"
+        ));
+        let extrude = h.editor.tool.as_ref().and_then(|t| t.feature).unwrap();
+        h.confirm_tool();
+        let before = h.volume(BodyRef(extrude));
+
+        h.editor.rename_document_parameter("thickness", "wall");
+        assert!(h.editor.params_panel.error.is_none());
+        assert_eq!(
+            h.editor.doc.feature_expr(extrude, NumericField::Distance),
+            Some("wall")
+        );
+        let expression = match &h.editor.doc.timeline().get(sketch).unwrap().kind {
+            FeatureKind::Sketch { sketch, .. } => sketch.dimension_expr(dim).map(str::to_string),
+            _ => None,
+        };
+        assert_eq!(expression.as_deref(), Some("wall * 5"));
+        assert!(
+            (h.volume(BodyRef(extrude)) - before).abs() < 1e-9,
+            "a rename is not a change of shape"
+        );
+    }
+
+    /// A sketch parameter of the same name means the sketch's own, and the panel says so
+    /// on both sides: silent shadowing is the one genuinely confusing thing here.
+    #[test]
+    fn a_sketch_parameter_that_shadows_a_document_one_is_flagged_on_both_sides() {
+        let mut h = Harness::new();
+        h.editor.set_document_parameter("width", "50");
+        h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+        h.sketch().set_parameter("width", "12").unwrap();
+        h.editor.commit_sketch();
+        assert!(h.sketch().shadows("width"));
+        assert_eq!(
+            h.editor.doc.sketches_shadowing("width").len(),
+            1,
+            "the document knows which sketches mean their own"
+        );
+        // The sketch resolves its own row, not the document's.
+        let outer = h.editor.doc.parameters().clone();
+        let lookup = outer.lookup();
+        let value = match &mut h.editor.mode {
+            Mode::Sketch(s) => s.sketch.parameter_value_with("width", &lookup),
+            Mode::Model => unreachable!(),
+        };
+        assert_eq!(value.unwrap(), 12.0);
+    }
+
+    /// The panel queues its edits and the editor applies them afterwards, so an edit the
+    /// user had half made when they reached for a tool arrives *after* the tool has
+    /// opened the document's transaction. Folded into it, it would record no undo entry
+    /// and be rolled back by a Cancel that has nothing to do with it.
+    #[test]
+    fn a_parameter_edit_pending_when_a_tool_opens_is_refused_rather_than_folded_into_it() {
+        let mut h = Harness::new();
+        h.editor.set_document_parameter("thickness", "4");
+        h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+        h.rectangle(Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+        h.finish_sketch(true);
+        let sketch = h.last_feature();
+        h.select_region(sketch, Vec2::new(10.0, 5.0));
+
+        // Exactly the order a frame produces: the toolbar is drawn before the browser,
+        // so the tool command is queued first and the panel's edit second.
+        panels::run(&mut h.editor, Command::Tool(ToolKind::Extrude));
+        assert!(
+            h.editor.doc.in_transaction(),
+            "the extrude is previewing inside a transaction"
+        );
+        panels::run(
+            &mut h.editor,
+            Command::SetParameter("thickness".into(), "6".into()),
+        );
+        assert_eq!(
+            h.editor.doc.parameters().value("thickness").unwrap(),
+            4.0,
+            "the edit went in under the tool"
+        );
+        assert!(
+            h.editor
+                .params_panel
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("still in the box")),
+            "{:?}",
+            h.editor.params_panel.error
+        );
+
+        // Cancelling the tool must not have taken a parameter edit with it, and the same
+        // edit goes through the moment the tool is out of the way.
+        h.cancel_tool();
+        assert_eq!(h.editor.doc.parameters().value("thickness").unwrap(), 4.0);
+        h.editor.set_document_parameter("thickness", "6");
+        assert_eq!(h.editor.doc.parameters().value("thickness").unwrap(), 6.0);
+    }
+
+    /// The same gate covers a delete: a warning latched before the tool opened must not
+    /// stay clickable through it.
+    #[test]
+    fn a_delete_warned_about_before_a_tool_opened_cannot_be_pressed_through_it() {
+        let mut h = Harness::new();
+        h.editor.set_document_parameter("thickness", "4");
+        h.editor.set_document_parameter("plate", "thickness * 3");
+        h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+        h.rectangle(Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+        h.finish_sketch(true);
+        let sketch = h.last_feature();
+        h.select_region(sketch, Vec2::new(10.0, 5.0));
+        h.editor.params_panel.confirm_delete = Some("thickness".into());
+        panels::run(&mut h.editor, Command::Tool(ToolKind::Extrude));
+
+        panels::run(&mut h.editor, Command::RemoveParameter("thickness".into()));
+        assert!(
+            h.editor.doc.parameters().get("thickness").is_some(),
+            "the delete ran inside the extrude's transaction"
+        );
+        assert!(
+            h.editor.params_panel.confirm_delete.is_none(),
+            "and the warning it belonged to is no longer on screen"
+        );
+        h.cancel_tool();
+        assert!(h.editor.doc.parameters().get("thickness").is_some());
+    }
+
+    #[test]
+    fn a_bad_expression_is_refused_with_the_reason_and_nothing_is_committed() {
+        let mut h = Harness::new();
+        h.editor.set_document_parameter("wall", "3");
+        h.editor.set_document_parameter("bad", "nope * 2");
+        assert!(
+            h.editor
+                .params_panel
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("nope")),
+            "{:?}",
+            h.editor.params_panel.error
+        );
+        assert!(h.editor.doc.parameters().get("bad").is_none());
+
+        let (_, extrude) = driven_extrude(&mut h, "wall * 2");
+        let before = h.volume(BodyRef(extrude));
+        h.editor.edit_feature(extrude);
+        assert!(!tools::type_expression(
+            &mut h.editor,
+            NumericField::Distance,
+            "wall * missing"
+        ));
+        assert_eq!(
+            h.editor.doc.feature_expr(extrude, NumericField::Distance),
+            Some("wall * 2"),
+            "a refused expression left the working one alone"
+        );
+        h.cancel_tool();
+        assert!((h.volume(BodyRef(extrude)) - before).abs() < 1e-9);
+    }
+}
