@@ -194,7 +194,38 @@ Fillet tool:
   tolerance against facets tens of microns wide rather than the tree. Out of reach of the
   budget today, but a body tessellated that finely elsewhere would hit it
 - Where several blended edges meet, the result is the intersection of their tools rather
-  than a corner patch, and a radius larger than the neighbouring face is not detected
+  than a corner patch
+- The size limit (`blend::size_limit`) now samples several points along each edge
+  segment, so a tapered face is measured at its narrow end; bounds a doubly-curved
+  neighbour by the nearest *folding* boundary rather than the face's bounding box; and
+  ray-casts a five-ray fan from convex edges into the whole solid, so a cavity or thin
+  wall behind the faces caps the radius. What is still loose, and what is now too tight:
+  - The curved-face bound treats the tool as if it lay on the surface, but the tool is
+    prismatic and straight while the surface curves away from it, so on a strongly
+    curved band the honest bound is neither the surface reach nor the boundary
+    distance; the interior fan is what actually catches the tool leaving the material,
+    and it only samples five directions per point
+  - That fan can pass either side of a small cavity corner that sits between two rays;
+    it is answered by bounding the whole removed cross-section by its widest reach,
+    which is conservative on the diagonal, and a cavity far behind the middle of a face
+    is still only seen once a ray from the edge reaches it
+  - The conservative fallback bounds reach by *distance* to a folding boundary even
+    when that boundary lies beside the ray rather than ahead of it, so an edge near a
+    cut corner on a curved band gets a much smaller limit than the material warrants
+  - Concave edges get no interior bound: the tool adds material, so the hazard is not
+    breaking through a wall but bridging a gap, and only the in-face reach guards that
+  - Filleting an edge a boolean left across a fillet band leaks at some radii well
+    inside any honest limit (0.1 on the half-cylinder fixture, where 0.05 and 0.25
+    close): the healer against the band's mitred facets, not the limit, which is why
+    `an_edge_across_a_curved_band…` asserts closure at a small radius rather than at
+    the limit
+- `TANGENT_EDGE_COS` (20°, `solid.rs`) also decides what counts as a *wall* for the
+  curved-face fallback here, the same threshold that keeps near-tangent boundaries
+  undrawn. The flip side stands: an edge whose faces genuinely fold by less than 20°
+  gets no line, so there is nothing on screen to aim a fillet at, and a deliberately
+  shallow edge is unpickable in practice. A deliberate trade — a blend coarsened to
+  the tool budget's 45°-per-facet arcs must not come out ringed like a chamfer —
+  recorded here rather than changed
 
 Keyboard:
 
