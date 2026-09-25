@@ -44,6 +44,12 @@ pub enum KernelError {
         "blend of {size:.3} mm runs past the material it has to work with: this edge has room for {limit:.3} mm"
     )]
     BlendTooLarge { size: f64, limit: f64 },
+    #[error("the target face is parallel to the extrude direction")]
+    TargetFaceParallel,
+    #[error("the target face is behind the profile")]
+    TargetFaceBehind,
+    #[error("the extrusion never reaches the target face")]
+    TargetFaceMissed,
     #[error("operation produced no solid")]
     EmptyResult,
     #[error("profile could not be triangulated near {0:?}")]

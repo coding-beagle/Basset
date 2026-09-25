@@ -710,3 +710,135 @@ fn transactions_group_edits_into_one_undo_step() {
     assert!(doc.timeline().get(extra).is_none());
     assert!(!doc.in_transaction());
 }
+
+/// A body plus a second sketch whose region will be pushed up to the body's face.
+///
+/// The base is a 10×5 rectangle extruded 4; the second sketch is a 2×2 rectangle on the
+/// same plane, so an extrude of it to the base's top face should be 2·2·4 = 16.
+fn base_and_small_sketch() -> (Document, FeatureId, FeatureId) {
+    let mut doc = Document::new("test");
+    let (sketch, _) = rect_sketch(10.0, 5.0);
+    let sk = sketch_on(&mut doc, PlaneRef::Origin(OriginPlane::XY), sketch);
+    let base = extrude(&mut doc, sk, Vec2::new(1.0, 1.0), 4.0, BodyOp::NewBody);
+    let (small, _) = rect_sketch(2.0, 2.0);
+    let sk2 = sketch_on(&mut doc, PlaneRef::Origin(OriginPlane::XY), small);
+    (doc, base, sk2)
+}
+
+fn extrude_to(doc: &mut Document, sketch: FeatureId, target: FaceRef) -> FeatureId {
+    doc.add_feature(FeatureKind::Extrude {
+        regions: vec![RegionRef::Profile(ProfileRef {
+            sketch,
+            sample: Vec2::new(1.0, 1.0),
+        })],
+        extent: Extent::ToFace(target),
+        operation: BodyOp::NewBody,
+        component: ComponentId::ROOT,
+    })
+}
+
+/// The whole point of a to-face extent: the reach is worked out from the target on
+/// every replay, so growing the target body grows the extrusion with it.
+#[test]
+fn an_extrude_to_a_face_reaches_it_and_follows_edits_of_the_target() {
+    let (mut doc, base, sk2) = base_and_small_sketch();
+    let up = extrude_to(
+        &mut doc,
+        sk2,
+        FaceRef {
+            body: BodyRef(base),
+            key: face(base, FaceRole::EndCap),
+        },
+    );
+    assert_eq!(doc.state().status(up), Some(&FeatureStatus::Ok));
+    assert_relative_eq!(volume(&mut doc, up), 2.0 * 2.0 * 4.0, epsilon = 1e-9);
+
+    doc.edit_feature_kind(base, |k| {
+        if let FeatureKind::Extrude { extent, .. } = k {
+            *extent = Extent::OneSide(7.0);
+        }
+    })
+    .unwrap();
+    assert_relative_eq!(volume(&mut doc, up), 2.0 * 2.0 * 7.0, epsilon = 1e-9);
+}
+
+/// The refusals surface as feature errors, not panics: a target the direction runs
+/// along, and a target behind the profile, each name their problem and replay goes on.
+#[test]
+fn an_impossible_to_face_target_fails_the_feature_with_its_reason() {
+    // The base's bottom cap shares the profile's own plane, so the reach is zero.
+    let (mut doc, base, sk2) = base_and_small_sketch();
+    let up = extrude_to(
+        &mut doc,
+        sk2,
+        FaceRef {
+            body: BodyRef(base),
+            key: face(base, FaceRole::StartCap),
+        },
+    );
+    let state = doc.state();
+    let Some(FeatureStatus::Failed(message)) = state.status(up) else {
+        panic!("{:?}", state.status(up));
+    };
+    assert!(message.contains("behind"), "{message}");
+
+    // A sketch on YZ extrudes along x; the top cap's normal is z, at right angles.
+    let (mut doc, base, _) = base_and_small_sketch();
+    let (side, _) = rect_sketch(2.0, 2.0);
+    let sk3 = sketch_on(&mut doc, PlaneRef::Origin(OriginPlane::YZ), side);
+    let along = extrude_to(
+        &mut doc,
+        sk3,
+        FaceRef {
+            body: BodyRef(base),
+            key: face(base, FaceRole::EndCap),
+        },
+    );
+    let state = doc.state();
+    let Some(FeatureStatus::Failed(message)) = state.status(along) else {
+        panic!("{:?}", state.status(along));
+    };
+    assert!(message.contains("parallel"), "{message}");
+}
+
+/// Deleting the body a to-face extrude reaches for degrades to a per-feature failure,
+/// exactly as deleting a referenced sketch does.
+#[test]
+fn deleting_the_target_body_marks_the_to_face_extrude_failed() {
+    let (mut doc, base, sk2) = base_and_small_sketch();
+    let up = extrude_to(
+        &mut doc,
+        sk2,
+        FaceRef {
+            body: BodyRef(base),
+            key: face(base, FaceRole::EndCap),
+        },
+    );
+    doc.remove_feature(base).unwrap();
+    let state = doc.state();
+    let Some(FeatureStatus::Failed(message)) = state.status(up) else {
+        panic!("{:?}", state.status(up));
+    };
+    assert!(message.contains("does not exist"), "{message}");
+}
+
+/// The extent round-trips through the file format and regenerates to the same body.
+#[test]
+fn a_to_face_extent_survives_a_round_trip_through_bass() {
+    let (mut doc, base, sk2) = base_and_small_sketch();
+    let target = FaceRef {
+        body: BodyRef(base),
+        key: face(base, FaceRole::EndCap),
+    };
+    let up = extrude_to(&mut doc, sk2, target);
+    let before = volume(&mut doc, up);
+    let mut bytes = Vec::new();
+    basset_core::file::write(&mut bytes, &doc).unwrap();
+    let mut loaded = basset_core::file::read(bytes.as_slice()).unwrap();
+    let Some(FeatureKind::Extrude { extent, .. }) = loaded.timeline().get(up).map(|f| &f.kind)
+    else {
+        panic!("the extrude is missing after the round trip");
+    };
+    assert_eq!(*extent, Extent::ToFace(target));
+    assert_relative_eq!(volume(&mut loaded, up), before, epsilon = 1e-9);
+}

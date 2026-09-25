@@ -149,6 +149,21 @@ What is left here:
 
 Extrude tool:
 
+- "To face" extent: done for planar targets — the target is stored as the same `FaceRef`
+  a sketch-on-face uses, resolved fresh on every replay, and a planar target is treated
+  as its infinite plane. A plane parallel to the profile's is one exact distance; a
+  tilted one is overshot and trimmed back with a boolean so the end lies on the plane
+  exactly. Parallel-to-direction, behind-the-profile and never-reached targets are
+  refused with per-feature errors rather than approximated
+- Still open there: a *curved* target ends the extrusion flat, at the first contact —
+  rays from the profile's boundary and an interior grid are cast against the target's
+  facets and the shortest hit is the reach, so the result touches the surface without
+  piercing it but does not wrap it. The honest end is the surface itself: extrude past
+  the farthest hit and trim with the target's body, which the kernel's booleans could do
+  but which grazes tangentially at the silhouette, exactly where a BSP boolean is at its
+  flakiest. Also, while the extent is armed but no face is clicked yet, the preview
+  keeps the last extent's shape (OK is disabled until a face is chosen, so nothing wrong
+  can be committed)
 - Silhouettes are drawn: `basset-viewport`'s `silhouette` module takes an edge to be on the
   outline when one of the two facets sharing it faces the camera and the other does not,
   which is view-dependent and so recomputed per camera change rather than baked at

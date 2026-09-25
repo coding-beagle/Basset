@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::document::Document;
 
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 pub const EXTENSION: &str = "bass";
 
 #[derive(Serialize, Deserialize)]
@@ -84,8 +84,20 @@ fn migrate_step(mut value: serde_json::Value, version: u32) -> serde_json::Value
             value
         }
         2 => migrate_v2_parameters(value),
+        3 => migrate_v3_to_face(value),
         _ => value,
     }
+}
+
+/// Version 4 added the to-face extrude extent.
+///
+/// Another additive change, so again there is nothing to rewrite: a version 3 document
+/// has no such extent and loads as it is. The bump exists for the same reason version 3's
+/// did — this time an older build reading a newer file would not even drop the extent
+/// silently, it would refuse the unknown variant with a "malformed document" error, and
+/// "this file is newer than your build" is the honest version of that message.
+fn migrate_v3_to_face(value: serde_json::Value) -> serde_json::Value {
+    value
 }
 
 /// Version 3 added document parameters and the expressions that drive feature values.

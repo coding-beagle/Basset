@@ -43,6 +43,8 @@ pub enum RegenError {
     BadAxis,
     #[error("edge {0:?} no longer exists on body")]
     MissingEdge(String),
+    #[error("target face {0:?} no longer exists on its body")]
+    MissingTargetFace(String),
     #[error("sketch did not solve: {0}")]
     Sketch(String),
     #[error("{0}")]
@@ -233,11 +235,27 @@ impl Regenerator {
             } => {
                 let solid = union_all(regions.iter().enumerate().map(|(k, p)| {
                     let profile = resolve_region(state, p)?;
-                    Ok(kernel::extrude(
-                        op_id(id, k),
-                        &profile,
-                        convert_extent(*extent),
-                    )?)
+                    match extent {
+                        // The target is resolved fresh on every replay, so the
+                        // extrusion follows the face through edits of the body it
+                        // belongs to, and a missing body or face is this feature's
+                        // failure rather than a stale distance.
+                        Extent::ToFace(target) => {
+                            let body = state
+                                .bodies
+                                .get(&target.body)
+                                .ok_or(RegenError::MissingBody(target.body.0))?;
+                            let face = body.solid.face(target.key).ok_or_else(|| {
+                                RegenError::MissingTargetFace(format!("{:?}", target.key))
+                            })?;
+                            Ok(kernel::extrude_to_face(op_id(id, k), &profile, face)?)
+                        }
+                        _ => Ok(kernel::extrude(
+                            op_id(id, k),
+                            &profile,
+                            convert_extent(*extent),
+                        )?),
+                    }
                 }))?;
                 self.finish_body(state, id, *component, solid, *operation)?;
             }
@@ -628,11 +646,15 @@ fn resolve_path(
     })
 }
 
+/// The kernel form of an extent whose distances are stored on the feature. `ToFace` has
+/// no such form — its reach exists only once the target is resolved, which the extrude
+/// arm of [`Regenerator::apply_kind`] does before ever calling this.
 fn convert_extent(e: Extent) -> kernel::Extent {
     match e {
         Extent::OneSide(d) => kernel::Extent::OneSide(d),
         Extent::Symmetric(d) => kernel::Extent::Symmetric(d),
         Extent::TwoSides { positive, negative } => kernel::Extent::TwoSides { positive, negative },
+        Extent::ToFace(_) => unreachable!("a to-face extent is resolved during replay"),
     }
 }
 

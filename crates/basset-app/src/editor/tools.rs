@@ -8,8 +8,8 @@
 use std::collections::BTreeMap;
 
 use basset_core::{
-    AxisRef, BodyOp, BodyRef, CombineOp, EdgeRef, Extent, FeatureId, FeatureKind, FeatureStatus,
-    NumericField, OriginAxis, Parameters, PathRef, PlaneRef, RegionRef,
+    AxisRef, BodyOp, BodyRef, CombineOp, EdgeRef, Extent, FaceRef, FeatureId, FeatureKind,
+    FeatureStatus, NumericField, OriginAxis, Parameters, PathRef, PlaneRef, RegionRef,
 };
 use basset_math::{Aabb, Affine3, Quat, Vec3};
 
@@ -74,6 +74,8 @@ pub enum ExtentKind {
     OneSide,
     Symmetric,
     TwoSides,
+    /// Up to a clicked face of an existing body; the face lands in [`Params::to_face`].
+    ToFace,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,6 +97,8 @@ pub struct Params {
     pub radius: f64,
     pub op: OpKind,
     pub target: Option<BodyRef>,
+    /// The face a to-face extrude reaches, once the user has clicked one.
+    pub to_face: Option<FaceRef>,
     pub combine: CombineOp,
     pub keep_tools: bool,
     pub translate: Vec3,
@@ -116,6 +120,7 @@ impl Default for Params {
             radius: 1.0,
             op: OpKind::NewBody,
             target: None,
+            to_face: None,
             combine: CombineOp::Join,
             keep_tools: false,
             translate: Vec3::ZERO,
@@ -272,6 +277,16 @@ impl Tool {
         matches!(self.kind, ToolKind::Fillet | ToolKind::Chamfer)
     }
 
+    /// Whether the extrude is armed for a to-face extent with no face chosen yet. While
+    /// this holds, the next face click is the target, and OK is held back: the feature
+    /// still carries whatever extent it had before, and confirming would quietly commit
+    /// that instead of what the dialog says.
+    pub fn awaits_face_target(&self) -> bool {
+        self.kind == ToolKind::Extrude
+            && self.params.extent == ExtentKind::ToFace
+            && self.params.to_face.is_none()
+    }
+
     /// The largest radius or distance this blend may be given, as last worked out for
     /// the selection it is running on. `None` for a tool that is not a blend, and while
     /// nothing is selected to measure.
@@ -316,6 +331,9 @@ impl Tool {
                         positive: p.distance,
                         negative: p.negative,
                     },
+                    // Armed but not yet aimed: the feature keeps its last shape until a
+                    // face is clicked, and OK is held back by `awaits_face_target`.
+                    ExtentKind::ToFace => Extent::ToFace(p.to_face?),
                 };
                 FeatureKind::Extrude {
                     regions,
@@ -517,6 +535,10 @@ pub fn edit_existing(editor: &mut Editor, id: FeatureId, previous_cursor: usize)
                     params.extent = ExtentKind::TwoSides;
                     params.distance = positive;
                     params.negative = negative;
+                }
+                Extent::ToFace(face) => {
+                    params.extent = ExtentKind::ToFace;
+                    params.to_face = Some(face);
                 }
             }
             load_op(&mut params, *operation);
@@ -875,31 +897,62 @@ pub fn dialog(editor: &mut Editor, ctx: &egui::Context) {
                             (ExtentKind::OneSide, "One side"),
                             (ExtentKind::Symmetric, "Symmetric"),
                             (ExtentKind::TwoSides, "Two sides"),
+                            (ExtentKind::ToFace, "To face"),
                         ] {
                             changed |= ui.selectable_value(&mut p.extent, k, name).changed();
                         }
                     });
-                    changed |= drag(
-                        ui,
-                        ex,
-                        &parameters,
-                        NumericField::Distance,
-                        "Distance",
-                        &mut p.distance,
-                        0.5,
-                        "mm",
-                    );
-                    if p.extent == ExtentKind::TwoSides {
+                    if p.extent == ExtentKind::ToFace {
+                        // No distance to type: the reach is the target's to give. The
+                        // dialog shows which face instead, and the way to re-aim it.
+                        match p.to_face {
+                            Some(f) => {
+                                let target = bodies
+                                    .iter()
+                                    .find(|(id, _)| *id == f.body)
+                                    .map(|(_, n)| n.clone())
+                                    .unwrap_or_else(|| format!("{}", f.body.0));
+                                ui.horizontal(|ui| {
+                                    ui.label(format!("Up to a face of {target}"));
+                                    if ui
+                                        .button("Clear")
+                                        .on_hover_text("Choose a different face")
+                                        .clicked()
+                                    {
+                                        p.to_face = None;
+                                        changed = true;
+                                    }
+                                });
+                            }
+                            None => {
+                                ui.label(
+                                    egui::RichText::new("Click the face to extrude up to").weak(),
+                                );
+                            }
+                        }
+                    } else {
                         changed |= drag(
                             ui,
                             ex,
                             &parameters,
-                            NumericField::Negative,
-                            "Negative",
-                            &mut p.negative,
+                            NumericField::Distance,
+                            "Distance",
+                            &mut p.distance,
                             0.5,
                             "mm",
                         );
+                        if p.extent == ExtentKind::TwoSides {
+                            changed |= drag(
+                                ui,
+                                ex,
+                                &parameters,
+                                NumericField::Negative,
+                                "Negative",
+                                &mut p.negative,
+                                0.5,
+                                "mm",
+                            );
+                        }
                     }
                     changed |= operation_ui(ui, p, &bodies);
                 }
@@ -1025,10 +1078,10 @@ pub fn dialog(editor: &mut Editor, ctx: &egui::Context) {
             }
             ui.separator();
             ui.horizontal(|ui| {
-                let ready = editor
-                    .tool
-                    .as_ref()
-                    .is_some_and(|t| t.feature.is_some() || t.kind == ToolKind::Component);
+                let ready = editor.tool.as_ref().is_some_and(|t| {
+                    (t.feature.is_some() || t.kind == ToolKind::Component)
+                        && !t.awaits_face_target()
+                });
                 if ui.add_enabled(ready, egui::Button::new("OK")).clicked() {
                     action = Some(true);
                 }
@@ -1093,6 +1146,8 @@ pub fn handle(editor: &Editor) -> Option<Handle> {
                 ExtentKind::OneSide => p.distance,
                 ExtentKind::Symmetric => p.distance * 0.5,
                 ExtentKind::TwoSides => p.distance,
+                // The reach is the target's to give; there is no number to drag.
+                ExtentKind::ToFace => return None,
             };
             Some(Handle {
                 origin,
@@ -1332,6 +1387,15 @@ fn extrude_lands_on(editor: &Editor) -> Option<BodyRef> {
             tool.params.distance.abs() * 0.5,
         ),
         ExtentKind::TwoSides => (-tool.params.negative.abs(), tool.params.distance.abs()),
+        // An extrusion aimed at a face ends on that face, so the body it belongs to is
+        // the body it lands on; no box arithmetic can say it better.
+        ExtentKind::ToFace => {
+            return tool
+                .params
+                .to_face
+                .map(|f| f.body)
+                .filter(|b| Some(*b) != own);
+        }
     };
     let mut swept = Aabb::empty();
     let mut face_bodies: Vec<BodyRef> = Vec::new();
@@ -1406,6 +1470,28 @@ pub fn tangent_chain(editor: &Editor, edge: &basset_core::EdgeRef) -> Vec<basset
             key,
         })
         .collect()
+}
+
+/// While the extrude's extent is "to face", a click on a body face aims the extrusion at
+/// that face rather than adding it as a region — Fusion's rule, and the least surprising
+/// one, because the user armed the mode themselves in the dialog. Sketch regions keep
+/// toggling as usual, so the profile can still be adjusted mid-flight. Returns whether
+/// the pick was consumed this way.
+pub fn take_to_face_pick(editor: &mut Editor, pick: &Pick) -> bool {
+    let armed = editor
+        .tool
+        .as_ref()
+        .is_some_and(|t| t.kind == ToolKind::Extrude && t.params.extent == ExtentKind::ToFace);
+    if !armed {
+        return false;
+    }
+    let Pick::Face(face, _) = pick else {
+        return false;
+    };
+    if let Some(tool) = editor.tool.as_mut() {
+        tool.params.to_face = Some(*face);
+    }
+    true
 }
 
 /// Fillet and Chamfer read a pick as shorthand for a group of edges: a face stands for
@@ -1703,6 +1789,92 @@ mod tests {
             "{:?}",
             h.frame().text()
         );
+    }
+
+    /// The whole to-face flow, driven the way a user drives it: arm the mode in the
+    /// dialog, click a face of another body, confirm. The feature carries the extent,
+    /// the body stops exactly at the face's plane, undo and redo treat it like any other
+    /// feature, and re-editing reopens the dialog in the same state.
+    #[test]
+    fn an_extrude_reaches_the_face_the_user_clicks() {
+        let mut h = Harness::new();
+        let base = h.block(); // 10×10, 2 mm thick: its top face sits at z = 2.
+        h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+        h.sketch().snap_to_grid = false;
+        h.rectangle(Vec2::new(14.0, 0.0), Vec2::new(18.0, 4.0));
+        h.finish_sketch(true);
+        let sketch = h.last_feature();
+        h.start_tool(ToolKind::Extrude);
+        h.select_region(sketch, Vec2::new(16.0, 2.0));
+        h.sync_tool();
+        // A window egui has not laid out before spends its first frame sizing itself,
+        // so the frame whose widgets can be clicked is the second one.
+        h.frame();
+        h.frame();
+        assert!(h.click_ui("To face"), "the extent offers a to-face mode");
+        assert!(
+            h.editor.tool.as_ref().unwrap().awaits_face_target(),
+            "armed but not yet aimed"
+        );
+        h.frame();
+        assert!(
+            h.frame().has_text("Click the face to extrude up to"),
+            "{:?}",
+            h.frame().text()
+        );
+
+        // The next face click aims the extrusion instead of becoming a region.
+        h.editor
+            .apply_pick(Some(Pick::Face(top_face(base), 0.0)), false);
+        let tool = h.editor.tool.as_ref().unwrap();
+        assert_eq!(tool.params.to_face, Some(top_face(base)));
+        assert!(
+            h.editor.selection.faces.is_empty(),
+            "consumed, not selected"
+        );
+        let feature = tool.feature.expect("the tool previews a feature");
+        h.frame();
+        assert!(
+            h.frame().has_text("Up to a face of"),
+            "{:?}",
+            h.frame().text()
+        );
+
+        // The profile sits clear of the block, so keep the result its own body.
+        {
+            let tool = h.editor.tool.as_mut().unwrap();
+            (tool.params.op, tool.params.target) = (OpKind::NewBody, None);
+            tool.op_chosen = true;
+        }
+        h.sync_tool();
+        h.confirm_tool();
+        let body = BodyRef(feature);
+        let Some(FeatureKind::Extrude {
+            extent, regions, ..
+        }) = h.editor.doc.timeline().get(feature).map(|f| &f.kind)
+        else {
+            panic!("the extrude landed in the timeline");
+        };
+        assert_eq!(*extent, Extent::ToFace(top_face(base)), "{regions:?}");
+        assert!(
+            (h.volume(body) - 4.0 * 4.0 * 2.0).abs() < 1e-9,
+            "reached z = 2: {}",
+            h.volume(body)
+        );
+
+        // One undo step for the whole interaction, like any other tool.
+        h.editor.undo();
+        assert!(!h.bodies().contains(&body));
+        h.editor.redo();
+        assert!((h.volume(body) - 32.0).abs() < 1e-9);
+
+        // Re-editing reopens in to-face mode with the target loaded, not a stale number.
+        let cursor = h.editor.doc.timeline().cursor();
+        edit_existing(&mut h.editor, feature, cursor);
+        let tool = h.editor.tool.as_ref().unwrap();
+        assert_eq!(tool.params.extent, ExtentKind::ToFace);
+        assert_eq!(tool.params.to_face, Some(top_face(base)));
+        h.cancel_tool();
     }
 
     /// The radius arrow points at the material the fillet works on: into the body at a

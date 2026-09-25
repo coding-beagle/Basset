@@ -11,7 +11,7 @@ use basset_sketch::Sketch;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{ComponentId, FeatureId};
-use crate::refs::{AxisRef, BodyRef, EdgeRef, PathRef, PlaneRef, RegionRef};
+use crate::refs::{AxisRef, BodyRef, EdgeRef, FaceRef, PathRef, PlaneRef, RegionRef};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Feature {
@@ -74,7 +74,16 @@ impl std::fmt::Display for NumericField {
 pub enum Extent {
     OneSide(f64),
     Symmetric(f64),
-    TwoSides { positive: f64, negative: f64 },
+    TwoSides {
+        positive: f64,
+        negative: f64,
+    },
+    /// Up to a face of an existing body, Fusion's "to object": the reach is worked out
+    /// from the target at replay time, so the extrusion follows the target through
+    /// edits. The face is named by the same [`FaceRef`] a sketch-on-face stores, whose
+    /// `FaceKey` is derived from the operation that made the face and so survives
+    /// regeneration.
+    ToFace(FaceRef),
 }
 
 /// What a body-creating feature does with the solid it produces.
@@ -195,6 +204,8 @@ impl FeatureKind {
             FeatureKind::Extrude { extent, .. } => match extent {
                 Extent::OneSide(_) | Extent::Symmetric(_) => &[Distance],
                 Extent::TwoSides { .. } => &[Distance, Negative],
+                // The reach comes from the target, so there is no number to drive.
+                Extent::ToFace(_) => &[],
             },
             FeatureKind::Fillet { .. } => &[Radius],
             _ => &[],
@@ -212,10 +223,11 @@ impl FeatureKind {
             (FeatureKind::Fillet { radius, .. }, NumericField::Radius) => Some(*radius),
             (FeatureKind::AngledPlane { angle, .. }, NumericField::Angle)
             | (FeatureKind::Revolve { angle, .. }, NumericField::Angle) => Some(angle.to_degrees()),
-            (FeatureKind::Extrude { extent, .. }, NumericField::Distance) => Some(match extent {
-                Extent::OneSide(d) | Extent::Symmetric(d) => *d,
-                Extent::TwoSides { positive, .. } => *positive,
-            }),
+            (FeatureKind::Extrude { extent, .. }, NumericField::Distance) => match extent {
+                Extent::OneSide(d) | Extent::Symmetric(d) => Some(*d),
+                Extent::TwoSides { positive, .. } => Some(*positive),
+                Extent::ToFace(_) => None,
+            },
             (
                 FeatureKind::Extrude {
                     extent: Extent::TwoSides { negative, .. },
@@ -257,13 +269,17 @@ impl FeatureKind {
                 *angle = value.to_radians();
                 true
             }
-            (FeatureKind::Extrude { extent, .. }, NumericField::Distance) => {
-                match extent {
-                    Extent::OneSide(d) | Extent::Symmetric(d) => *d = value,
-                    Extent::TwoSides { positive, .. } => *positive = value,
+            (FeatureKind::Extrude { extent, .. }, NumericField::Distance) => match extent {
+                Extent::OneSide(d) | Extent::Symmetric(d) => {
+                    *d = value;
+                    true
                 }
-                true
-            }
+                Extent::TwoSides { positive, .. } => {
+                    *positive = value;
+                    true
+                }
+                Extent::ToFace(_) => false,
+            },
             (
                 FeatureKind::Extrude {
                     extent: Extent::TwoSides { negative, .. },
@@ -313,9 +329,18 @@ impl FeatureKind {
                 }
             }
             FeatureKind::Extrude {
-                regions, operation, ..
+                regions,
+                extent,
+                operation,
+                ..
+            } => {
+                out.extend(regions.iter().map(RegionRef::source));
+                if let Extent::ToFace(face) = extent {
+                    out.push(face.body.0);
+                }
+                out.extend(operation.target().map(|b| b.0));
             }
-            | FeatureKind::Loft {
+            FeatureKind::Loft {
                 regions, operation, ..
             } => {
                 out.extend(regions.iter().map(RegionRef::source));
@@ -397,6 +422,18 @@ mod tests {
                     positive: 1.0,
                     negative: 2.0,
                 },
+                operation: BodyOp::NewBody,
+                component: ComponentId::ROOT,
+            },
+            FeatureKind::Extrude {
+                regions: Vec::new(),
+                extent: Extent::ToFace(crate::refs::FaceRef {
+                    body: BodyRef(FeatureId(1)),
+                    key: basset_kernel::FaceKey::new(
+                        basset_kernel::OpId::new(1),
+                        basset_kernel::FaceRole::EndCap,
+                    ),
+                }),
                 operation: BodyOp::NewBody,
                 component: ComponentId::ROOT,
             },

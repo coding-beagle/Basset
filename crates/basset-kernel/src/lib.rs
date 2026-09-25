@@ -37,7 +37,7 @@ pub mod solid;
 pub use blend::{chamfer, fillet};
 pub use csg::{BoolOp, boolean};
 pub use error::KernelError;
-pub use generate::{extrude, loft, revolve, sweep};
+pub use generate::{extrude, extrude_to_face, loft, revolve, sweep};
 pub use geometry::{Axis, Contour, Extent, Path3, Profile, Segment, SegmentKind, Tessellation};
 pub use ids::{EdgeKey, FaceKey, FaceRole, OpId};
 pub use measure::{
