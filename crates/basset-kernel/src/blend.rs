@@ -26,7 +26,9 @@ use crate::csg::{BoolOp, boolean};
 use crate::error::KernelError;
 use crate::geometry::Tessellation;
 use crate::ids::{EdgeKey, FaceKey, FaceRole, OpId};
-use crate::solid::{Edge, EdgeSegment, MERGE_TOL, Solid, SolidBuilder, SurfaceKind, newell_normal};
+use crate::solid::{
+    Edge, EdgeSegment, MERGE_TOL, Solid, SolidBuilder, SurfaceKind, TANGENT_EDGE_COS, newell_normal,
+};
 
 /// How far the tool reaches beyond the faces it trims. Keeps the tool's planes off the
 /// solid's planes so the boolean never has to resolve coincident faces, and closes the
@@ -244,8 +246,8 @@ const OWN_BOUNDARY: f64 = 8.0 * MERGE_TOL;
 
 /// How close a ray and a boundary segment come before they count as crossing. Inside a
 /// planar face the two are coplanar and the crossing is exact, so this only absorbs
-/// rounding; a ray that finds nothing falls back to the face's bounding box, which is
-/// never smaller than the truth.
+/// rounding; a ray that finds nothing has left a curved surface, and falls back to the
+/// nearest boundary under the face's bounding box (see [`reach_in_face`]).
 const CROSSES: f64 = 1e-6;
 
 /// Relative slack on the limit. It arrives through a normalise, a dot product and a
@@ -301,13 +303,15 @@ fn size_limit(solid: &Solid, all_edges: &[Edge], keys: &[EdgeKey], kind: BlendKi
             };
             // The face's own boundary, each segment flagged with whether this feature is
             // blending it too, which is what decides whether the room ahead of a segment
-            // is this blend's alone or shared with the one coming the other way.
-            let boundary: Vec<(&EdgeSegment, bool)> = all_edges
+            // is this blend's alone or shared with the one coming the other way, and with
+            // the edge it belongs to, so a segment can be told apart from the edge being
+            // measured.
+            let boundary: Vec<(&EdgeSegment, bool, EdgeKey)> = all_edges
                 .iter()
                 .filter(|e| e.key.touches(face_key))
                 .flat_map(|e| {
                     let blended = keys.contains(&e.key);
-                    e.segments.iter().map(move |s| (s, blended))
+                    e.segments.iter().map(move |s| (s, blended, e.key))
                 })
                 .collect();
             let extent = Aabb::from_points(
@@ -325,19 +329,127 @@ fn size_limit(solid: &Solid, all_edges: &[Edge], keys: &[EdgeKey], kind: BlendKi
                     continue;
                 }
                 let into = if face_key == edge.key.a { da } else { db };
-                let from = (seg.start + seg.end) * 0.5;
-                let (reach, blocker) = reach_in_face(from, into, &boundary, &extent);
-                let there = blocker
-                    .map(|p| kind.setback_per_size(p))
-                    .filter(|s| s.is_finite() && *s > 0.0)
-                    .unwrap_or(0.0);
-                limit = limit.min(reach / (here + there));
+                // The face is measured from several points along the segment, not its
+                // midpoint alone. A straight edge on a planar face is one segment however
+                // long it is, so on a tapered face — a trapezoid's long side, a drafted
+                // wall — the room at the narrow end is nothing like the room in the
+                // middle, and a midpoint ray sails past the very corner the blend will
+                // overrun. The ends are sampled just inside the segment because its exact
+                // endpoints sit on the neighbouring boundary, where a ray is all
+                // `OWN_BOUNDARY` cases.
+                for from in sample_points(seg) {
+                    let (reach, blocker) = reach_in_face(from, into, edge.key, &boundary, &extent);
+                    let there = blocker
+                        .map(|p| kind.setback_per_size(p))
+                        .filter(|s| s.is_finite() && *s > 0.0)
+                        .unwrap_or(0.0);
+                    limit = limit.min(reach / (here + there));
+                }
+            }
+        }
+        // The two adjacent faces say nothing about what is *behind* them: a wall with a
+        // cavity at its back is as roomy as a solid block until the tool breaks through.
+        // For a convex edge — where the tool is subtracted — every point of the removed
+        // cross-section lies within one setback of the edge, so rays fanned across the
+        // wedge between the two inward normals must each find that much material ahead
+        // of them, measured against the whole solid rather than the two faces. Slightly
+        // stricter than the true cross-section, which only reaches a full setback along
+        // the faces themselves, but never looser; the symmetric shapes the exact limits
+        // are pinned on all have more room diagonally than along a face, so they are
+        // untouched. Concave edges add material and are not bounded here.
+        for seg in &edge.segments {
+            let (_, _, db, phi) = dihedral(seg);
+            let here = kind.setback_per_size(phi);
+            if !here.is_finite() || here <= 0.0 || seg.normal_a.dot(db) >= 0.0 {
+                continue;
+            }
+            for from in sample_points(seg) {
+                for dir in interior_fan(seg.normal_a, seg.normal_b) {
+                    if let Some(depth) = ray_into_solid(solid, from, dir) {
+                        limit = limit.min(depth / here);
+                    }
+                }
             }
         }
     }
     limit
         .is_finite()
         .then_some(limit.max(0.0) * (1.0 + LIMIT_SLACK))
+}
+
+/// Where along a segment the face is measured: near both ends, the middle, and the
+/// quarters. The ends are what catch a tapered face; the quarters catch a boundary —
+/// a hole, a notch — that bulges toward the middle third of a long segment without
+/// reaching either end or the midpoint. Not the endpoints themselves: those lie on the
+/// neighbouring boundary, within [`OWN_BOUNDARY`] of everything a ray from there would
+/// have to measure against.
+fn sample_points(seg: &EdgeSegment) -> impl Iterator<Item = Vec3> + '_ {
+    [0.05, 0.25, 0.5, 0.75, 0.95]
+        .into_iter()
+        .map(|u| seg.start.lerp(seg.end, u))
+}
+
+/// Directions across the wedge of material at a convex edge, from one face's inward
+/// normal to the other's. Five is a compromise: a cavity corner can still slip between
+/// neighbouring rays, which the fan answers by bounding the whole cross-section by its
+/// widest reach (see the caller) rather than by each ray's own share of it.
+fn interior_fan(na: Vec3, nb: Vec3) -> impl Iterator<Item = Vec3> {
+    (0..5).filter_map(move |k| {
+        let w = k as f64 / 4.0;
+        (-(na * (1.0 - w) + nb * w)).try_normalize()
+    })
+}
+
+/// Distance along `dir` from `from` to the first face of the solid ahead of it, or
+/// `None` when the ray leaves without meeting one. The origin sits on the solid's own
+/// surface — an edge of it — so anything within [`OWN_BOUNDARY`] is the surface the ray
+/// started from, and a hit on a polygon's border counts as a hit: for a bound the
+/// grazing ray is the one that must not be waved through.
+fn ray_into_solid(solid: &Solid, from: Vec3, dir: Vec3) -> Option<f64> {
+    let mut best = f64::INFINITY;
+    for face in &solid.faces {
+        for p in &face.polygons {
+            let denom = p.plane.normal.dot(dir);
+            // Only crossings that *leave* material count — the polygon's outward normal
+            // has to agree with the ray. The ray starts inside the material at the edge,
+            // so where it ends is an exit; an entry seen first means the ray grazed out
+            // between two facets of a tessellated curve a fraction of a facet ago, and
+            // stopping at that re-entry would bound every blend on a fine rim by the
+            // sagitta of one facet. Near-parallel crossings are skipped too — the
+            // fan's endmost rays run *inside* the adjacent faces, and both sides of
+            // this quotient are then rounding noise, which measured a ten-millimetre
+            // cylinder at a sixth of a millimetre deep. Normal and direction are unit
+            // vectors, so the cut is a cosine and scale-free.
+            if denom < 1e-6 {
+                continue;
+            }
+            let t = p.plane.normal.dot(p.plane.origin - from) / denom;
+            if t <= OWN_BOUNDARY || t >= best {
+                continue;
+            }
+            let q = from + dir * t;
+            let inside = p.vertices.iter().enumerate().all(|(i, a)| {
+                let b = p.vertices[(i + 1) % p.vertices.len()];
+                let along = b - *a;
+                along.cross(q - *a).dot(p.plane.normal) >= -MERGE_TOL * along.length()
+            });
+            if inside {
+                best = t;
+            }
+        }
+    }
+    best.is_finite().then_some(best)
+}
+
+/// Distance from `p` to the nearest point of the segment `a`–`b`.
+fn distance_to_segment(p: Vec3, a: Vec3, b: Vec3) -> f64 {
+    let along = b - a;
+    let len2 = along.length_squared();
+    if len2 < 1e-24 {
+        return p.distance(a);
+    }
+    let u = ((p - a).dot(along) / len2).clamp(0.0, 1.0);
+    p.distance(a + along * u)
 }
 
 /// How far a point `from` on the boundary of a face travels across it along `into` before
@@ -349,12 +461,20 @@ fn size_limit(solid: &Solid, all_edges: &[Edge], keys: &[EdgeKey], kind: BlendKi
 /// for the ruled curved faces a blend actually meets, where `into` runs along the ruling
 /// and the ray stays on the surface — the side of a cylinder measured down from one rim
 /// to the other. On a curved face where it does neither, the ray leaves the surface and
-/// finds nothing; the answer is then the face's bounding box measured along `into`, which
-/// the face cannot reach past and which is an honest ceiling, if a loose one.
+/// finds nothing; the answer is then the *nearest* piece of the face's boundary other
+/// than the edge being measured, still capped by the face's bounding box along `into`.
+/// The straight distance to a boundary point can only under-state the distance across
+/// the surface to it, so this never claims room the face does not have, where the plain
+/// bounding-box ceiling it replaced did: from an edge cut across a blend that wraps a
+/// rim, the box spans the whole rim while the band itself is a fillet-width wide. The
+/// price is paid in the other direction — a boundary lying beside the ray rather than
+/// ahead of it, as a band's own tangent boundaries do, bounds a reach it would never
+/// stop — and that conservatism is accepted; TODO.md carries the honest account.
 fn reach_in_face(
     from: Vec3,
     into: Vec3,
-    boundary: &[(&EdgeSegment, bool)],
+    own: EdgeKey,
+    boundary: &[(&EdgeSegment, bool, EdgeKey)],
     extent: &Aabb,
 ) -> (f64, Option<f64>) {
     let cap: f64 = (0..3)
@@ -362,7 +482,7 @@ fn reach_in_face(
         .sum();
     let mut best = f64::INFINITY;
     let mut blocker = None;
-    for (seg, blended) in boundary {
+    for (seg, blended, _) in boundary {
         let along = seg.end - seg.start;
         // Nowhere near the ray's line: no point of the segment reaches within half its
         // own length of the line its midpoint sits that far off. Most of a rim is ruled
@@ -404,7 +524,25 @@ fn reach_in_face(
     if best <= cap {
         (best, blocker)
     } else {
-        (cap, None)
+        // No crossing: the ray left a doubly-curved surface. The edge's own segments are
+        // left out — the ray starts on them, and on a closed rim the edge's far side is
+        // beside the surface path rather than across it — and so are boundaries that do
+        // not fold, by the same 20° the rest of the kernel calls tangent
+        // ([`TANGENT_EDGE_COS`]): a fillet band's tangent circles run *beside* a path
+        // along the band, and material continues across them onto the face the band
+        // blends into, so they are where the face's name changes and not where its room
+        // ends. What remains — real folds, cut ends — bounds the reach by plain
+        // distance, and anything within `OWN_BOUNDARY` is the corner the sample itself
+        // sits near.
+        let nearest = boundary
+            .iter()
+            .filter(|(seg, _, key)| {
+                *key != own && seg.normal_a.dot(seg.normal_b) < TANGENT_EDGE_COS
+            })
+            .map(|(seg, _, _)| distance_to_segment(from, seg.start, seg.end))
+            .filter(|d| *d > OWN_BOUNDARY)
+            .fold(f64::INFINITY, f64::min);
+        (cap.min(nearest), None)
     }
 }
 
@@ -1543,5 +1681,159 @@ mod tests {
             2.0,
             epsilon = 1e-6
         );
+    }
+
+    /// Extruded trapezoid, 10 mm tall: the top face is 10 mm deep behind the middle of
+    /// its long side and 2.5 mm behind either end, where the slanted sides close in.
+    fn trapezoid_block() -> Solid {
+        let mut outer = crate::geometry::Contour::polygon(
+            vec![
+                basset_math::Vec2::ZERO,
+                basset_math::Vec2::new(10.0, 0.0),
+                basset_math::Vec2::new(8.0, 10.0),
+                basset_math::Vec2::new(2.0, 10.0),
+            ],
+            0,
+        );
+        for (i, s) in outer.segments.iter_mut().enumerate() {
+            s.curve = i as u32;
+        }
+        crate::generate::extrude(
+            OpId::new(1),
+            &crate::geometry::Profile::new(basset_math::Frame::XY, outer),
+            crate::geometry::Extent::OneSide(10.0),
+        )
+        .unwrap()
+    }
+
+    /// A face is measured where it is narrowest, not only behind the segment's midpoint.
+    /// A straight edge on a planar face is one segment however long it is, so on a
+    /// tapered face the midpoint ray reports the room in the middle — 10 mm here — while
+    /// the ends have 2.5 mm before the slanted sides close in, and a fillet sized to the
+    /// middle overruns both corners.
+    #[test]
+    fn a_tapered_face_is_measured_at_its_narrow_ends_too() {
+        let block = trapezoid_block();
+        let key = edge_between(FaceRole::EndCap, FaceRole::Side(0));
+        let limit = max_fillet_radius(&block, &[key]).unwrap();
+        // A ray across the top face from x = 0.5 — the sample near the segment's start —
+        // leaves through the slanted side x = 0.2·y at y = 2.5.
+        assert_relative_eq!(limit, 2.5, epsilon = 1e-6);
+        // Sized to what the midpoint alone would have allowed: refused, not overrun.
+        assert!(matches!(
+            fillet(OpId::new(2), &block, &[key], 4.0, &fine()).unwrap_err(),
+            KernelError::BlendTooLarge { .. }
+        ));
+        let r = fillet(
+            OpId::new(2),
+            &block,
+            &[key],
+            limit,
+            &Tessellation::default(),
+        )
+        .unwrap();
+        assert!(r.is_closed(), "{:?}", r.validate());
+        assert!(r.validate().is_ok(), "{:?}", r.validate());
+        assert!(r.volume() < block.volume() && r.volume() > 0.0);
+    }
+
+    /// An edge a boolean left across a rim's fillet band. The band is doubly curved, so
+    /// the in-face ray leaves it without meeting a boundary, and the reach used to fall
+    /// back to the band's bounding box: the whole rim, about 5 mm, for a band one
+    /// fillet-radius wide. The conservative fallback and the interior rays bound it by
+    /// what is actually there instead.
+    ///
+    /// The at-the-limit closure invariant is not asserted here: the healer already
+    /// fails on this edge at radii well inside *any* limit (0.1 leaks where 0.05 and
+    /// 0.25 close), under the old loose bound as much as this one, so closure is
+    /// checked at a small radius the boolean handles. TODO.md carries the account.
+    #[test]
+    fn an_edge_across_a_curved_band_is_not_measured_by_the_bands_bounding_box() {
+        let cyl = crate::primitives::cylinder(
+            OpId::new(1),
+            Vec3::ZERO,
+            Vec3::Z,
+            5.0,
+            10.0,
+            &Tessellation::default(),
+        );
+        let rimmed = fillet(
+            OpId::new(2),
+            &cyl,
+            &[rim(FaceRole::EndCap)],
+            1.0,
+            &Tessellation::default(),
+        )
+        .unwrap();
+        // Cut the filleted cylinder in half; the cut plane crosses the band, leaving a
+        // quarter-arc edge between the cut face and the doubly-curved band.
+        let cutter = cuboid(
+            OpId::new(3),
+            Vec3::new(0.0, -7.0, -1.0),
+            Vec3::new(7.0, 7.0, 12.0),
+        );
+        let half = boolean(&rimmed, &cutter, BoolOp::Subtract).unwrap();
+        assert!(half.is_closed(), "{:?}", half.validate());
+        let key = EdgeKey::new(
+            FaceKey::new(OpId::new(2), FaceRole::Fillet(0)),
+            FaceKey::new(OpId::new(3), FaceRole::Side(3)),
+        );
+        assert!(
+            half.edges().iter().any(|e| e.key == key && !e.smooth),
+            "the cut leaves a pickable edge on the band"
+        );
+        let limit = max_fillet_radius(&half, &[key]).unwrap();
+        assert!(
+            limit < 1.0,
+            "a band one fillet-width wide cannot take {limit}"
+        );
+        assert!(limit > 0.02, "and the bound must not collapse: {limit}");
+        assert!(matches!(
+            fillet(OpId::new(4), &half, &[key], 1.0, &Tessellation::default()).unwrap_err(),
+            KernelError::BlendTooLarge { .. }
+        ));
+        let r = fillet(OpId::new(4), &half, &[key], 0.05, &Tessellation::default()).unwrap();
+        assert!(r.is_closed(), "{:?}", r.validate());
+        assert!(r.validate().is_ok(), "{:?}", r.validate());
+    }
+
+    /// A cavity behind the faces bounds the blend, where the two adjacent faces alone
+    /// see a solid 10 mm block. The interior rays fanned across the material's wedge
+    /// meet the cavity √2 mm from the edge along the diagonal, and the fillet sized to
+    /// that stays out of it: the same box without the cavity pins its limit at 10.
+    #[test]
+    fn a_cavity_behind_the_faces_bounds_the_fillet() {
+        let hollow = boolean(
+            &cube(),
+            &cuboid(
+                OpId::new(5),
+                Vec3::new(2.0, 1.0, 4.0),
+                Vec3::new(8.0, 6.0, 9.5),
+            ),
+            BoolOp::Subtract,
+        )
+        .unwrap();
+        assert!(hollow.is_closed(), "{:?}", hollow.validate());
+        assert_relative_eq!(hollow.volume(), 835.0, epsilon = 1e-6);
+        let key = edge_between(FaceRole::EndCap, FaceRole::Side(0));
+        let limit = max_fillet_radius(&hollow, &[key]).unwrap();
+        assert_relative_eq!(limit, 2f64.sqrt(), epsilon = 1e-6);
+        assert!(matches!(
+            fillet(OpId::new(6), &hollow, &[key], 3.0, &fine()).unwrap_err(),
+            KernelError::BlendTooLarge { .. }
+        ));
+        let r = fillet(
+            OpId::new(6),
+            &hollow,
+            &[key],
+            limit,
+            &Tessellation::default(),
+        )
+        .unwrap();
+        assert!(r.is_closed(), "{:?}", r.validate());
+        assert!(r.validate().is_ok(), "{:?}", r.validate());
+        // The fillet took its corner strip off the outside and nothing off the cavity.
+        let removed = (1.0 - PI / 4.0) * limit * limit * 10.0;
+        assert_relative_eq!(r.volume(), 835.0 - removed, epsilon = 0.5);
     }
 }

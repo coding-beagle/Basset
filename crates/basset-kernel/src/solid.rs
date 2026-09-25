@@ -56,7 +56,7 @@ const DISPLAY_CREASE_COS: f64 = 0.7; // ≈ 45.6°
 /// defaults to 10° facets, and a blend coarsened against the tool's polygon budget can
 /// reach 45°/facet; 20° covers everything down to a 40°-facet arc while staying far below
 /// a fold anyone would call an edge.
-const TANGENT_EDGE_COS: f64 = 0.94; // ≈ 20°
+pub(crate) const TANGENT_EDGE_COS: f64 = 0.94; // ≈ 20°
 
 /// One polygon's use of an edge: (face index, directed a→b, polygon normal).
 type EdgeUser = (usize, bool, Vec3);
