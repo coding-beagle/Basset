@@ -5,9 +5,11 @@
 //! is always a live preview of exactly what OK will keep. The document transaction makes
 //! the whole interaction a single undo step, and Cancel is a rollback.
 
+use std::collections::BTreeMap;
+
 use basset_core::{
     AxisRef, BodyOp, BodyRef, CombineOp, EdgeRef, Extent, FeatureId, FeatureKind, FeatureStatus,
-    OriginAxis, PathRef, PlaneRef, RegionRef,
+    NumericField, OriginAxis, Parameters, PathRef, PlaneRef, RegionRef,
 };
 use basset_math::{Aabb, Affine3, Quat, Vec3};
 
@@ -125,10 +127,108 @@ impl Default for Params {
     }
 }
 
+/// Every field a dialog can offer, so a tool that stops offering one can take back the
+/// expression that was driving it.
+const FIELDS: [NumericField; 4] = [
+    NumericField::Distance,
+    NumericField::Negative,
+    NumericField::Angle,
+    NumericField::Radius,
+];
+
+/// The expressions driving a running tool's numbers.
+///
+/// Held by the tool rather than in [`Params`] because an expression belongs to the
+/// *feature*: `Params` is the flat bag of numbers every dialog shares, and the number is
+/// what the expression works out to, not what the user stated. These are written onto the
+/// feature on every sync, so they are part of the tool's transaction and a Cancel takes
+/// them back with everything else.
+#[derive(Clone, Debug, Default)]
+pub struct FieldExprs {
+    /// Text being edited, one entry per field whose toggle is on. Separate from the live
+    /// expressions so a half-typed name does not un-drive the field on every keystroke.
+    drafts: BTreeMap<NumericField, String>,
+    /// The expressions that last evaluated: what actually drives the feature.
+    live: BTreeMap<NumericField, String>,
+    /// Which field was refused and why, for the dialog to show beside it. A refusal has
+    /// to be visible where the user typed, not swallowed or sent to a popup over the
+    /// dialog they are still working in.
+    error: Option<(NumericField, String)>,
+}
+
+impl FieldExprs {
+    /// The expression driving a field, if one does.
+    #[cfg(test)]
+    pub fn get(&self, field: NumericField) -> Option<&str> {
+        self.live.get(&field).map(String::as_str)
+    }
+
+    /// Takes what a field's box says: if it works out, the field is driven by it and the
+    /// number becomes its result.
+    ///
+    /// Returns whether the value moved. A refusal is kept for the dialog to show and the
+    /// field keeps whatever drove it before, so a typo never un-drives a feature that was
+    /// working.
+    fn commit(
+        &mut self,
+        field: NumericField,
+        parameters: &Parameters,
+        text: &str,
+        value: &mut f64,
+    ) -> bool {
+        match parameters.evaluate(text) {
+            Ok(v) => {
+                *value = v;
+                self.live.insert(field, text.to_string());
+                self.clear_error(field);
+                true
+            }
+            Err(e) => {
+                self.error = Some((field, e.to_string()));
+                false
+            }
+        }
+    }
+
+    fn is_open(&self, field: NumericField) -> bool {
+        self.drafts.contains_key(&field)
+    }
+
+    /// Opens the expression box for a field, starting from whatever already drives it.
+    fn open(&mut self, field: NumericField) {
+        let text = self.live.get(&field).cloned().unwrap_or_default();
+        self.drafts.insert(field, text);
+    }
+
+    /// Releases a field back to a plain number, keeping the value the expression gave it.
+    fn close(&mut self, field: NumericField) {
+        self.drafts.remove(&field);
+        self.live.remove(&field);
+        self.clear_error(field);
+    }
+
+    fn clear_error(&mut self, field: NumericField) {
+        if self.error.as_ref().is_some_and(|(f, _)| *f == field) {
+            self.error = None;
+        }
+    }
+
+    /// Loads what already drives a feature, so re-editing one shows `wall * 2` rather
+    /// than the 10 it works out to.
+    fn load(&mut self, exprs: &BTreeMap<NumericField, String>) {
+        for (field, text) in exprs {
+            self.live.insert(*field, text.clone());
+            self.drafts.insert(*field, text.clone());
+        }
+    }
+}
+
 pub struct Tool {
     pub kind: ToolKind,
     pub feature: Option<FeatureId>,
     pub params: Params,
+    /// What drives this tool's numbers, for as long as the dialog is open.
+    pub exprs: FieldExprs,
     /// Cursor position to restore when editing an existing feature ends.
     restore_cursor: Option<usize>,
     /// The user picked the operation themselves. Until they do, an extrude follows
@@ -338,6 +438,7 @@ pub fn start_tool(editor: &mut Editor, kind: ToolKind) {
         kind,
         feature: None,
         params: params.clone(),
+        exprs: FieldExprs::default(),
         restore_cursor: None,
         op_chosen: false,
         limit: (Vec::new(), None),
@@ -375,6 +476,7 @@ pub fn start_tool(editor: &mut Editor, kind: ToolKind) {
         kind,
         feature: None,
         params,
+        exprs: FieldExprs::default(),
         restore_cursor: None,
         op_chosen: false,
         limit: (Vec::new(), None),
@@ -496,12 +598,17 @@ pub fn edit_existing(editor: &mut Editor, id: FeatureId, previous_cursor: usize)
         FeatureKind::Sketch { .. } | FeatureKind::NewComponent { .. } => return,
     };
     let restore_cursor = Some(previous_cursor);
+    // A driven feature re-opens showing what drives it, not the number it works out to:
+    // anything else would quietly replace the intent with its result on the next OK.
+    let mut exprs = FieldExprs::default();
+    exprs.load(&feature.exprs);
     editor.doc.begin_transaction();
     editor.selection = sel;
     editor.tool = Some(Tool {
         kind,
         feature: Some(id),
         params,
+        exprs,
         restore_cursor,
         // An existing feature's operation was decided when it was made.
         op_chosen: true,
@@ -604,7 +711,45 @@ pub fn sync_tool(editor: &mut Editor) {
             }
         }
     }
+    apply_field_exprs(editor);
     editor.request_repaint();
+}
+
+/// Writes what the dialog says drives each number onto the feature it is previewing.
+///
+/// It runs on every sync rather than once at OK because the feature is the preview: an
+/// expression has to reach it to be seen, and it is inside the tool's transaction either
+/// way, so Cancel takes it back with the rest. The number itself is already in the kind
+/// the sync just wrote — [`basset_core::Document::set_feature_expr`] writes the same
+/// value again — so the text and the number cannot disagree.
+fn apply_field_exprs(editor: &mut Editor) {
+    let Some(tool) = editor.tool.as_ref() else {
+        return;
+    };
+    let Some(id) = tool.feature else {
+        return;
+    };
+    let live = tool.exprs.live.clone();
+    let Some(offered) = editor
+        .doc
+        .timeline()
+        .get(id)
+        .map(|f| f.kind.numeric_fields().to_vec())
+    else {
+        return;
+    };
+    for field in FIELDS {
+        // A field the kind no longer offers — the second distance of an extrude that is
+        // no longer two-sided — is released rather than left driving nothing, which would
+        // warn on every regeneration from then on.
+        let result = match live.get(&field).filter(|_| offered.contains(&field)) {
+            Some(text) => editor.doc.set_feature_expr(id, field, text).map(|_| ()),
+            None => editor.doc.clear_feature_expr(id, field).map(|_| ()),
+        };
+        if let Err(e) = result {
+            editor.report_error(e);
+        }
+    }
 }
 
 /// Works out how large the running blend may be, if the selection has moved since the
@@ -705,6 +850,10 @@ pub fn dialog(editor: &mut Editor, ctx: &egui::Context) {
     let bodies: Vec<(BodyRef, String)> = editor.cached_bodies.clone();
     let selection_text = editor.selection.summary();
     let edge_count = editor.selection.edges.len();
+    // Cloned out before the window closure takes the editor mutably. It is a handful of
+    // rows, and an expression typed into a dialog has to be judged against the table as
+    // it stands this frame.
+    let parameters = editor.doc.parameters().clone();
 
     let op_before = tool.params.op;
     egui::Window::new(kind.title())
@@ -713,7 +862,8 @@ pub fn dialog(editor: &mut Editor, ctx: &egui::Context) {
         .resizable(false)
         .anchor(egui::Align2::RIGHT_TOP, [-12.0, 190.0])
         .show(ctx, |ui| {
-            let p = &mut editor.tool.as_mut().unwrap().params;
+            let tool = editor.tool.as_mut().expect("checked above");
+            let (p, ex) = (&mut tool.params, &mut tool.exprs);
             ui.label(kind.prompt());
             ui.label(egui::RichText::new(&selection_text).weak());
             ui.separator();
@@ -729,15 +879,42 @@ pub fn dialog(editor: &mut Editor, ctx: &egui::Context) {
                             changed |= ui.selectable_value(&mut p.extent, k, name).changed();
                         }
                     });
-                    changed |= drag(ui, "Distance", &mut p.distance, 0.5, "mm");
+                    changed |= drag(
+                        ui,
+                        ex,
+                        &parameters,
+                        NumericField::Distance,
+                        "Distance",
+                        &mut p.distance,
+                        0.5,
+                        "mm",
+                    );
                     if p.extent == ExtentKind::TwoSides {
-                        changed |= drag(ui, "Negative", &mut p.negative, 0.5, "mm");
+                        changed |= drag(
+                            ui,
+                            ex,
+                            &parameters,
+                            NumericField::Negative,
+                            "Negative",
+                            &mut p.negative,
+                            0.5,
+                            "mm",
+                        );
                     }
                     changed |= operation_ui(ui, p, &bodies);
                 }
                 ToolKind::Revolve => {
                     changed |= axis_ui(ui, p);
-                    changed |= drag(ui, "Angle", &mut p.angle_deg, 1.0, "°");
+                    changed |= drag(
+                        ui,
+                        ex,
+                        &parameters,
+                        NumericField::Angle,
+                        "Angle",
+                        &mut p.angle_deg,
+                        1.0,
+                        "°",
+                    );
                     changed |= operation_ui(ui, p, &bodies);
                 }
                 ToolKind::Sweep | ToolKind::Loft => {
@@ -758,11 +935,13 @@ pub fn dialog(editor: &mut Editor, ctx: &egui::Context) {
                              (hold Ctrl while clicking for a single edge)",
                         )
                         .changed();
-                    let (label, speed) = match kind {
-                        ToolKind::Fillet => ("Radius", 0.1),
-                        _ => ("Distance", 0.1),
+                    // The one parameter is a radius on a fillet and a setback on a
+                    // chamfer, which is also which field an expression on it drives.
+                    let (label, field) = match kind {
+                        ToolKind::Fillet => ("Radius", NumericField::Radius),
+                        _ => ("Distance", NumericField::Distance),
                     };
-                    changed |= drag(ui, label, &mut p.radius, speed, "mm");
+                    changed |= drag(ui, ex, &parameters, field, label, &mut p.radius, 0.1, "mm");
                     // What the material allows. The handle in the viewport stops there of
                     // its own accord, so this is for the box, which does not: a number
                     // typed past it is still sent to the kernel and still refused, and
@@ -801,11 +980,29 @@ pub fn dialog(editor: &mut Editor, ctx: &egui::Context) {
                     changed |= vec3_ui(ui, &mut p.rotate_deg, 1.0);
                 }
                 ToolKind::OffsetPlane => {
-                    changed |= drag(ui, "Distance", &mut p.distance, 0.5, "mm")
+                    changed |= drag(
+                        ui,
+                        ex,
+                        &parameters,
+                        NumericField::Distance,
+                        "Distance",
+                        &mut p.distance,
+                        0.5,
+                        "mm",
+                    );
                 }
                 ToolKind::AngledPlane => {
                     changed |= axis_ui(ui, p);
-                    changed |= drag(ui, "Angle", &mut p.angle_deg, 1.0, "°");
+                    changed |= drag(
+                        ui,
+                        ex,
+                        &parameters,
+                        NumericField::Angle,
+                        "Angle",
+                        &mut p.angle_deg,
+                        1.0,
+                        "°",
+                    );
                 }
                 ToolKind::Component => {
                     ui.horizontal(|ui| {
@@ -869,6 +1066,19 @@ pub struct Handle {
     pub dir: Vec3,
 }
 
+/// The number the viewport handle drags, for the kinds that have one. The handle is the
+/// same value as the dialog's box under a different skin, so it has to obey the same rule
+/// about being driven.
+fn handle_field(kind: ToolKind) -> Option<NumericField> {
+    match kind {
+        ToolKind::Extrude | ToolKind::OffsetPlane | ToolKind::Chamfer => {
+            Some(NumericField::Distance)
+        }
+        ToolKind::Fillet => Some(NumericField::Radius),
+        _ => None,
+    }
+}
+
 /// The handle for the running tool, or `None` when it has nothing to drag yet.
 pub fn handle(editor: &Editor) -> Option<Handle> {
     let tool = editor.tool.as_ref()?;
@@ -921,6 +1131,51 @@ pub fn handle(editor: &Editor) -> Option<Handle> {
     }
 }
 
+/// The number a field's box edits, for a caller that names a field rather than holding
+/// the box.
+///
+/// The dialog hands its `&mut f64` straight to [`drag`], so this is the one other place
+/// that has to agree with it about which of the flat [`Params`] each field is. A blend's
+/// single size is `radius` whether the kind calls it a radius or a setback.
+#[cfg(test)]
+fn params_field(kind: ToolKind, params: &mut Params, field: NumericField) -> Option<&mut f64> {
+    match (kind, field) {
+        (ToolKind::Fillet | ToolKind::Chamfer, NumericField::Radius | NumericField::Distance) => {
+            Some(&mut params.radius)
+        }
+        (_, NumericField::Distance) => Some(&mut params.distance),
+        (_, NumericField::Negative) => Some(&mut params.negative),
+        (_, NumericField::Angle) => Some(&mut params.angle_deg),
+        (_, NumericField::Radius) => None,
+    }
+}
+
+/// Drives one of the running tool's numbers by an expression, as typing it into the
+/// dialog's box and leaving the box does.
+///
+/// A test cannot type into an egui box, so this is how one states an expression: it fills
+/// the same draft, takes it through the same [`FieldExprs::commit`] the box does, and
+/// syncs the tool. Returns whether it was taken.
+#[cfg(test)]
+pub(crate) fn type_expression(editor: &mut Editor, field: NumericField, text: &str) -> bool {
+    let parameters = editor.doc.parameters().clone();
+    let Some(tool) = editor.tool.as_mut() else {
+        return false;
+    };
+    let kind = tool.kind;
+    tool.exprs.drafts.insert(field, text.to_string());
+    let mut spare = 0.0;
+    let value = match params_field(kind, &mut tool.params, field) {
+        Some(slot) => slot,
+        None => &mut spare,
+    };
+    if !tool.exprs.commit(field, &parameters, text, value) {
+        return false;
+    }
+    sync_tool(editor);
+    true
+}
+
 /// Draws the handle's grip at its tip and applies a drag of it to the tool's size.
 /// Returns whether the size changed. The arrow shaft itself is drawn by the scene, so
 /// it sits in 3D with the geometry; only the grip is an egui widget.
@@ -961,6 +1216,22 @@ fn handle_drag(editor: &mut Editor, ctx: &egui::Context) -> bool {
         })
         .inner;
     if !response.dragged() {
+        return false;
+    }
+    // A driven size is read-only wherever it is shown, and the arrow is one of the places
+    // it is shown. Letting the drag through would write a number the next sync overwrites
+    // from the expression, leaving the arrow, the dialog's readout and the solid all
+    // saying different things; releasing the expression on a drag would throw away what
+    // the user stated because they brushed a grip. So the drag is ignored and the reason
+    // is said, which is the only part of it the user cannot already see.
+    if let Some(tool) = editor.tool.as_ref()
+        && let Some(field) = handle_field(tool.kind)
+        && tool.exprs.is_open(field)
+    {
+        editor.set_status(format!(
+            "{} is driven by an expression: turn the expression off to drag it",
+            field.label()
+        ));
         return false;
     }
     // Project the drag onto the arrow's direction on screen, then scale by the world
@@ -1192,17 +1463,76 @@ impl Editor {
     }
 }
 
-fn drag(ui: &mut egui::Ui, label: &str, value: &mut f64, speed: f64, suffix: &str) -> bool {
+/// One number of a dialog: a drag box, or the expression driving it.
+///
+/// Every number in every tool goes through here, which is what makes "any of them can be
+/// driven by a parameter" one change rather than one per tool. The toggle swaps the box
+/// for an expression; while an expression is set the number is read-only and shows what
+/// the expression works out to, because there the expression is the input and the number
+/// is only its result.
+///
+/// Returns whether the value moved, which is the same signal the plain drag box gave: the
+/// caller syncs the feature on it.
+fn drag(
+    ui: &mut egui::Ui,
+    exprs: &mut FieldExprs,
+    parameters: &Parameters,
+    field: NumericField,
+    label: &str,
+    value: &mut f64,
+    speed: f64,
+    suffix: &str,
+) -> bool {
+    let mut changed = false;
     ui.horizontal(|ui| {
         ui.label(label);
-        ui.add(
-            egui::DragValue::new(value)
-                .speed(speed)
-                .suffix(format!(" {suffix}")),
-        )
-        .changed()
-    })
-    .inner
+        match exprs.drafts.get_mut(&field) {
+            Some(draft) => {
+                let response = ui.add(
+                    egui::TextEdit::singleline(draft)
+                        .desired_width(96.0)
+                        .hint_text("expression"),
+                );
+                let text = draft.trim().to_string();
+                // Taken when the box is left or Enter is pressed, as everywhere else an
+                // expression is typed: a name half written is not yet an error.
+                if response.lost_focus() && !text.is_empty() {
+                    changed |= exprs.commit(field, parameters, &text, value);
+                }
+                ui.label(egui::RichText::new(format!("= {value:.3} {suffix}")).weak());
+            }
+            None => {
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(value)
+                            .speed(speed)
+                            .suffix(format!(" {suffix}")),
+                    )
+                    .changed();
+            }
+        }
+        let open = exprs.is_open(field);
+        if ui
+            .selectable_label(open, "\u{192}")
+            .on_hover_text("Drive this by an expression over the document's parameters")
+            .clicked()
+        {
+            if open {
+                // Releasing keeps the value the expression gave it, the same rule
+                // retyping a number over a driven sketch dimension follows.
+                exprs.close(field);
+                changed = true;
+            } else {
+                exprs.open(field);
+            }
+        }
+    });
+    if let Some((f, message)) = &exprs.error
+        && *f == field
+    {
+        ui.colored_label(egui::Color32::from_rgb(230, 120, 100), message);
+    }
+    changed
 }
 
 fn vec3_ui(ui: &mut egui::Ui, v: &mut Vec3, speed: f64) -> bool {

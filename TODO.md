@@ -81,8 +81,71 @@ Sketch:
 - Trim/break: no Extend (dragging a curve out to meet another one) yet
 - Sketch patterns are plain copies: there is no pattern entity to re-generate from, so
   editing the seed does not update the copies
-- Parameters live on the sketch; document-wide parameters shared between sketches and
-  feature dimensions are the next step
+
+Parameters:
+
+Parameters are document-wide. A `.bass` file carries a table of named expressions beside
+its timeline, and a name is resolved in two scopes: a sketch's own table first, the
+document's behind it, so a sketch parameter shadows a document one of the same name.
+That ordering is why lifting them up needed no migration — every sketch that already had
+a `width` still means its own — and the format version went 2 to 3 with an identity
+migration all the same, so that an older build refuses a file carrying parameters rather
+than dropping them on the next save. `basset-sketch` still knows nothing about documents:
+the outer table reaches it as a closure (`basset_sketch::Outer`), the same seam
+`expr::eval` already had for names, carried one level up.
+
+Features read the table too. `Feature::exprs` is a `BTreeMap<NumericField, String>`
+beside the kind, so an extrude's distance and second distance, a revolve's angle, a
+fillet's radius, a chamfer's distance, an offset plane's distance and an angled plane's
+angle can each be driven. Replay resolves the text into a copy of the feature, never into
+the timeline, and an expression that stops evaluating leaves the last number standing and
+warns rather than failing the feature. The accessors work in the unit the user types —
+degrees for angles, where the model holds radians — and unlike the sketch's angle
+dimension the sign comes from the expression, because a feature angle's sign is a
+direction the user chose rather than a solver branch. The expression language grew `^`
+(right-associative), exponent literals, `pi` and `tau` as fallbacks a user parameter still
+beats, and `sqrt abs floor ceil round sin cos tan asin acos atan atan2 hypot min max deg
+rad`. Renaming rewrites every expression that mentions the name — document rows, feature
+expressions, and every sketch's table and bound dimensions — and refuses a rename that
+would capture references onto a narrower scope's row. Undo covers the table, and a change
+to it invalidates regeneration from feature zero. In the app: a Parameters section in the
+browser, an `ƒ` toggle on every feature-dialog number that goes through the shared
+`drag` helper, the document's rows listed read-only in the sketch palette with the
+shadowed ones struck through, and a delete that says what still reads the name.
+
+What is left here:
+
+- `Move`'s six translate and rotate components, and the whole sketch-operation dialog
+  (sketch move, pattern, offset, fillet), still take plain numbers. They bypass the shared
+  `drag` helper the `ƒ` toggle lives in, and each would need a field identity — the
+  equivalent of a `NumericField` — before a toggle could be hung on it
+- The sketch's own parameter panel has no rename, only add, re-express and delete, so
+  `Sketch::rename_parameter_with` exists and is unused from the app
+- Document parameters cannot be edited while a sketch or a tool dialog is open. Both hold
+  an open document transaction, and an edit made inside one would be rolled back by a
+  Cancel that had nothing to do with it. Lifting the restriction means sorting out the
+  transaction story — a nested or independently committed edit — not adding more UI
+- `Parameters::resolve`, and the identically shaped `Sketch::resolve`, clone the name
+  stack for every reference they follow, so a diamond reference graph costs time
+  exponential in its depth: thirty chained rows each mentioning the previous one twice is
+  2³⁰ evaluations, enough to wedge a `set`. It always terminates, and at the handful of
+  rows a document has it is free. The fix is to pass one stack down and pop on the way
+  out, in both places at once so the two stay legible as the same algorithm
+- `flag_sketch_faults` re-evaluates every bound dimension of every sketch on every
+  `evaluate_prefix`, including on a frame where nothing was regenerated at all. Caching it
+  needs an invalidation key over the document table and each sketch's bindings, which is
+  the awkward part: the pass is recomputed from scratch precisely so that restoring a
+  parameter, or deleting the feature that consumed a sketch, takes the warning away again
+- `min` and `max` inherit `f64`'s NaN-dropping, so `max(sqrt(-1), 5)` is 5 rather than
+  being refused. The finiteness check at the end of `eval` never sees the NaN, because the
+  comparison already discarded it
+- `referenced_names` cannot tell a user parameter named `pi` or `tau` from the constant —
+  it has no lookup closure — so it leaves both out, and deleting such a parameter gives no
+  "still in use" warning. Evaluation still prefers the parameter, and the cycle check does
+  not rely on the list to terminate
+- A sketch parameter written over a document one of the same name cannot refer outward to
+  it: `width = width * 2` is a cycle, not a reference. Resolution is by name and there is
+  no syntax for saying which scope is meant
 
 Extrude tool:
 

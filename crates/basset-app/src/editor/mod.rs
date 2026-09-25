@@ -194,6 +194,9 @@ pub struct Editor {
     pub show_shortcuts: bool,
     /// The command palette, while it is open. See [`commands::Palette`].
     pub(crate) palette: Option<commands::Palette>,
+    /// What the user is typing in the document's parameter panel, which is not the same
+    /// as what the document has accepted. See [`panels::ParametersUi`].
+    pub(crate) params_panel: panels::ParametersUi,
     rename: Option<(FeatureId, String)>,
     meshes: HashMap<BodyRef, BodyMesh>,
     /// Bodies as picking sees them, see [`PickBody`]. Refreshed with the cache.
@@ -245,6 +248,7 @@ impl Editor {
             font,
             show_shortcuts: false,
             palette: None,
+            params_panel: panels::ParametersUi::default(),
             rename: None,
             meshes: HashMap::new(),
             pick_bodies: HashMap::new(),
@@ -327,6 +331,13 @@ impl Editor {
     /// Copies the parts of the regenerated state that panels and picking read.
     pub fn refresh_cache(&mut self) {
         self.refresh_pick_bodies();
+        // A sketch being drawn resolves document names through its own copy of the table;
+        // this is where that copy catches up with an edit made in the browser panel.
+        if let Mode::Sketch(s) = &mut self.mode
+            && s.outer != *self.doc.parameters()
+        {
+            s.set_outer(self.doc.parameters().clone());
+        }
         let state = self.doc.state();
         self.cached_planes = state.planes.iter().map(|(id, f)| (*id, *f)).collect();
         self.cached_sketches = state
@@ -881,6 +892,9 @@ impl Editor {
         }
         if self.doc.undo() {
             self.selection.clear();
+            // Undo restores the parameter table with the timeline, so the panel's drafts
+            // are now text from a version of the document that no longer exists.
+            self.params_panel.stale = true;
             self.set_status("Undo");
         }
         self.repaint = true;
@@ -905,6 +919,7 @@ impl Editor {
         }
         if self.doc.redo() {
             self.selection.clear();
+            self.params_panel.stale = true;
             self.set_status("Redo");
         }
         self.repaint = true;
@@ -945,6 +960,140 @@ impl Editor {
             sketch_mode::enter_existing(self, id, previous_cursor);
         } else {
             tools::edit_existing(self, id, previous_cursor);
+        }
+        self.repaint = true;
+    }
+
+    // --- Document parameters ----------------------------------------------------------
+
+    /// Whether a parameter edit has to wait, because a tool or a sketch is holding the
+    /// document's transaction open.
+    ///
+    /// Checked here, as the edit is applied, rather than by disabling the panel that
+    /// queued it. Disabling a widget is not refusing its commit: egui surrenders a
+    /// disabled widget's focus, so the very frame the panel greys out the box the user
+    /// was typing in fires `lost_focus` and queues its text — and a toolbar button is
+    /// drawn before the browser and applied after it, so a tool can open between the two
+    /// with the panel never having looked locked at all. Either way the edit would land
+    /// inside the tool's transaction, where it records no undo entry and is rolled back
+    /// wholesale by a Cancel the user thinks has nothing to do with it.
+    ///
+    /// The edit is dropped rather than queued, and the draft text is deliberately left in
+    /// the box: nothing the user typed is lost, the message says what to do, and pressing
+    /// Enter again once the tool is finished applies it. Deferring it instead would mean
+    /// applying an edit minutes later, against a table that may have moved, with nothing
+    /// on screen saying it was still pending.
+    fn parameters_held(&mut self) -> bool {
+        if !self.doc.in_transaction() {
+            return false;
+        }
+        // A delete the user was warned about before the tool opened is no longer
+        // something they can act on, so it does not stay latched on screen.
+        self.params_panel.confirm_delete = None;
+        let message = "Finish or cancel the sketch or tool first: a parameter changed now \
+                       would be undone along with it. What you typed is still in the box";
+        self.params_panel.error = Some(message.to_string());
+        self.set_status(message);
+        self.repaint = true;
+        true
+    }
+
+    /// Adds or re-expresses a document parameter.
+    ///
+    /// A refusal goes to the panel rather than to the error popup: the user is editing
+    /// text, and a name they have not finished typing is not worth a modal dialog. The
+    /// message still has to be visible, which is what the panel's error line is for.
+    pub(crate) fn set_document_parameter(&mut self, name: &str, expression: &str) {
+        if self.parameters_held() {
+            return;
+        }
+        match self.doc.set_parameter(name, expression) {
+            Ok(_) => {
+                self.params_panel.error = None;
+                self.after_parameter_change();
+            }
+            Err(e) => self.params_panel.error = Some(e.to_string()),
+        }
+    }
+
+    /// [`Self::set_document_parameter`] from the panel's add row, which empties itself
+    /// only once the parameter has actually been taken — clearing it on the click would
+    /// throw away a name and an expression the user then has to type again to fix a typo
+    /// in one of them.
+    pub(crate) fn add_document_parameter(&mut self, name: &str, expression: &str) {
+        self.set_document_parameter(name, expression);
+        if self.doc.parameters().get(name).is_some() && self.params_panel.error.is_none() {
+            self.params_panel.new_name.clear();
+            self.params_panel.new_expr.clear();
+        }
+    }
+
+    /// Renames a document parameter, following the rename into every feature and sketch
+    /// that reads it. This is the whole reason renaming is an operation of its own rather
+    /// than a delete and an add.
+    pub(crate) fn rename_document_parameter(&mut self, from: &str, to: &str) {
+        if self.parameters_held() {
+            self.params_panel.revert_name(from);
+            return;
+        }
+        match self.doc.rename_parameter(from, to) {
+            Ok(shadowing) => {
+                self.params_panel.error = None;
+                self.after_parameter_change();
+                // A sketch with a parameter of the old name was left alone, because there
+                // the name means its own row. Saying how many is the only way the user
+                // finds out the rename stopped short of them.
+                self.set_status(match shadowing.len() {
+                    0 => format!("Renamed {from} to {to}"),
+                    1 => format!("Renamed {from} to {to}; 1 sketch keeps its own {from}"),
+                    n => format!("Renamed {from} to {to}; {n} sketches keep their own {from}"),
+                });
+            }
+            // A capture refusal names the sketch that is in the way, and the user knows
+            // that sketch by its name in the browser, not by its id.
+            Err(basset_core::DocumentError::ParameterCaptured(id, name)) => {
+                self.params_panel.error = Some(format!(
+                    "{} has a parameter named {name} of its own, so renaming {from} to \
+                     {to} would change what that sketch means. Rename that one first, or \
+                     pick another name",
+                    self.feature_name(id)
+                ));
+                self.params_panel.revert_name(from);
+            }
+            Err(e) => {
+                self.params_panel.error = Some(e.to_string());
+                // The box goes back to the name the parameter still has. Left showing the
+                // rejected one it would re-fire the same refusal on every focus change,
+                // and read as though the rename had happened.
+                self.params_panel.revert_name(from);
+            }
+        }
+    }
+
+    /// Deletes a document parameter. Whatever read it keeps the value it last had and is
+    /// flagged on the next regeneration; the panel warns before getting here.
+    pub(crate) fn remove_document_parameter(&mut self, name: &str) {
+        if self.parameters_held() {
+            return;
+        }
+        if self.doc.remove_parameter(name) {
+            self.params_panel.error = None;
+            self.after_parameter_change();
+        }
+    }
+
+    /// The table has moved: the panel's drafts and any sketch being drawn have to follow
+    /// it, and the model has to be redrawn.
+    fn after_parameter_change(&mut self) {
+        self.params_panel.stale = true;
+        if let Mode::Sketch(s) = &mut self.mode {
+            // Belt and braces: a sketch holds the document's transaction open for its
+            // whole session, so a parameter edit cannot reach here while one is being
+            // drawn. If that ever changes, the re-solved drawing still has to be written
+            // back into its feature, or the model would keep the geometry the sketch had
+            // before the parameter moved.
+            s.set_outer(self.doc.parameters().clone());
+            self.commit_sketch();
         }
         self.repaint = true;
     }

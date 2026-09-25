@@ -9,6 +9,7 @@
 //! `Failed` and replay continues, so the user sees exactly which steps broke and the
 //! rest of the model stays live.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use basset_kernel::{self as kernel, Axis, BoolOp, OpId, Profile, Solid};
@@ -18,6 +19,7 @@ use basset_sketch::{Entity, Font, Tessellation};
 use crate::feature::{BodyOp, CombineOp, Extent, Feature, FeatureKind};
 use crate::ids::{ComponentId, FeatureId};
 use crate::model::{Body, Component, FeatureStatus, ModelState, SolvedSketch};
+use crate::parameters::Parameters;
 use crate::refs::{AxisRef, BodyRef, EdgeRef, PathRef, PlaneRef, ProfileRef, RegionRef};
 use crate::timeline::Timeline;
 
@@ -54,6 +56,10 @@ pub struct Regenerator {
     /// `snapshots[i]` is the state after replaying features `0..=i`.
     snapshots: Vec<ModelState>,
     font: Option<Arc<Font>>,
+    /// The document's parameter table, behind every sketch and in front of every driven
+    /// feature value. Held here rather than read from the timeline because it is not part
+    /// of the timeline: changing it re-drives everything, from feature zero.
+    parameters: Parameters,
     tessellation: Tessellation,
     kernel_tessellation: kernel::Tessellation,
 }
@@ -61,6 +67,17 @@ pub struct Regenerator {
 impl Regenerator {
     pub fn set_font(&mut self, font: Option<Arc<Font>>) {
         self.font = font;
+    }
+
+    /// Replaces the parameter table and discards every cached state: a parameter can drive
+    /// anything at any point in the history, so there is no earlier feature to keep.
+    pub fn set_parameters(&mut self, parameters: Parameters) {
+        self.parameters = parameters;
+        self.invalidate_from(0);
+    }
+
+    pub fn parameters(&self) -> &Parameters {
+        &self.parameters
     }
 
     pub fn invalidate_from(&mut self, index: usize) {
@@ -93,7 +110,7 @@ impl Regenerator {
         match count {
             0 => &EMPTY_STATE,
             n => {
-                flag_under_constrained(&mut self.snapshots[n - 1], &active[..n]);
+                flag_sketch_faults(&mut self.snapshots[n - 1], &active[..n], &self.parameters);
                 &self.snapshots[n - 1]
             }
         }
@@ -104,8 +121,10 @@ impl Regenerator {
             state.statuses.insert(feature.id, FeatureStatus::Suppressed);
             return state;
         }
-        let status = match self.apply_kind(&mut state, feature) {
-            Ok(()) => FeatureStatus::Ok,
+        let (driven, stale) = self.drive(feature);
+        let status = match self.apply_kind(&mut state, &driven) {
+            Ok(()) if stale.is_empty() => FeatureStatus::Ok,
+            Ok(()) => FeatureStatus::Warned(stale.join("; ")),
             Err(e) => {
                 log::warn!("feature {} ({}) failed: {e}", feature.id, feature.name);
                 FeatureStatus::Failed(e.to_string())
@@ -113,6 +132,36 @@ impl Regenerator {
         };
         state.statuses.insert(feature.id, status);
         state
+    }
+
+    /// Resolves a feature's expression-driven values into a copy of it, and reports the
+    /// ones that could not be resolved.
+    ///
+    /// A copy, because replay must not write back into the timeline: the stored expression
+    /// is the input and the number is derived from it, so a replay that edited the feature
+    /// would make regeneration a mutation and undo a lie. The common case — a feature
+    /// nobody drives — borrows and clones nothing.
+    ///
+    /// An expression that no longer evaluates does *not* fail the feature. It keeps the
+    /// number it last had and says so, following the same rule the sketch layer applies to
+    /// a dimension: deleting a parameter should tell the user what stopped being driven,
+    /// not collapse half the model to zero while they work out what happened.
+    fn drive<'f>(&self, feature: &'f Feature) -> (Cow<'f, Feature>, Vec<String>) {
+        if feature.exprs.is_empty() {
+            return (Cow::Borrowed(feature), Vec::new());
+        }
+        let mut driven = feature.clone();
+        let mut stale = Vec::new();
+        for (field, text) in &feature.exprs {
+            match self.parameters.evaluate(text) {
+                Ok(value) if driven.kind.set_numeric_field(*field, value) => {}
+                Ok(_) => stale.push(format!(
+                    "{field} is driven by {text:?}, but this feature no longer has that value"
+                )),
+                Err(e) => stale.push(format!("{field} keeps its value: {e}")),
+            }
+        }
+        (Cow::Owned(driven), stale)
     }
 
     fn apply_kind(&self, state: &mut ModelState, feature: &Feature) -> Result<(), RegenError> {
@@ -143,8 +192,11 @@ impl Regenerator {
                 }
                 let mut solved = sketch.clone();
                 solved.set_font(self.font.clone());
+                // The document's table sits behind the sketch's own, so a dimension bound
+                // to a document parameter is re-driven here, on every replay.
+                let outer = self.parameters.lookup();
                 let report = solved
-                    .solve()
+                    .solve_with(&outer)
                     .map_err(|e| RegenError::Sketch(e.to_string()))?;
                 let profiles = solved
                     .profiles(&self.tessellation)
@@ -350,7 +402,8 @@ impl Regenerator {
 static EMPTY_STATE: std::sync::LazyLock<ModelState> =
     std::sync::LazyLock::new(ModelState::with_root);
 
-/// Flags the sketches whose remaining degrees of freedom can actually damage the model.
+/// Flags the sketches whose state the user needs to know about: loose geometry a later
+/// feature builds from, and dimensions whose expression stopped evaluating.
 ///
 /// An under-constrained sketch on its own is an ordinary state of a drawing — Fusion
 /// colours it and says nothing more, and a warning on every such sketch would be
@@ -359,10 +412,18 @@ static EMPTY_STATE: std::sync::LazyLock<ModelState> =
 /// geometry off the edges it was drawn against, which changes what the profiles enclose
 /// and so what that feature builds, silently.
 ///
-/// It is computed over the finished state rather than while replaying, because whether a
-/// sketch is consumed depends on features that come after it, and it is recomputed from
-/// scratch each time so that deleting the consumer takes the warning away again.
-fn flag_under_constrained(state: &mut ModelState, active: &[Feature]) {
+/// A dimension bound to an expression that no longer evaluates — usually because the
+/// parameter behind it was deleted or renamed by hand — keeps the value it last had, so
+/// the sketch still solves and nothing here can go wrong on its own. It is worth saying
+/// anyway: the drawing is no longer the thing the user expressed, and nothing else in the
+/// model would ever mention it.
+///
+/// Both are computed over the finished state rather than while replaying, because whether
+/// a sketch is consumed depends on features that come after it, and both are recomputed
+/// from scratch each time so that deleting the consumer, or restoring the parameter, takes
+/// the warning away again. A sketch with both faults gets one message naming both, since
+/// a status holds one string and neither fault is the more urgent.
+fn flag_sketch_faults(state: &mut ModelState, active: &[Feature], parameters: &Parameters) {
     let consumed: Vec<FeatureId> = active
         .iter()
         // A suppressed feature builds nothing, so it puts nothing at risk either.
@@ -370,6 +431,7 @@ fn flag_under_constrained(state: &mut ModelState, active: &[Feature]) {
         .flat_map(|f| f.kind.dependencies())
         .filter(|id| state.sketches.contains_key(id))
         .collect();
+    let outer = parameters.lookup();
     for feature in active {
         let Some(solved) = state.sketches.get(&feature.id) else {
             continue;
@@ -382,15 +444,26 @@ fn flag_under_constrained(state: &mut ModelState, active: &[Feature]) {
         ) {
             continue;
         }
+        let mut faults = Vec::new();
         let dof = solved.report.degrees_of_freedom;
-        let status = if dof > 0 && consumed.contains(&feature.id) {
+        if dof > 0 && consumed.contains(&feature.id) {
             let plural = if dof == 1 { "" } else { "s" };
-            FeatureStatus::Warned(format!(
+            faults.push(format!(
                 "under-constrained: {dof} degree{plural} of freedom, and a feature builds \
                  from it \u{2014} an edit elsewhere can move this geometry"
-            ))
-        } else {
-            FeatureStatus::Ok
+            ));
+        }
+        let stale = solved.sketch.failed_bindings_with(&outer).len();
+        if stale > 0 {
+            let plural = if stale == 1 { "" } else { "s" };
+            faults.push(format!(
+                "{stale} dimension{plural} stopped being driven: the expression no longer \
+                 evaluates, so the value it last had is being used"
+            ));
+        }
+        let status = match faults.is_empty() {
+            true => FeatureStatus::Ok,
+            false => FeatureStatus::Warned(faults.join("; ")),
         };
         state.statuses.insert(feature.id, status);
     }

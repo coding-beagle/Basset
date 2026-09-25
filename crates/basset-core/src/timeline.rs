@@ -48,6 +48,13 @@ impl Timeline {
         &self.features[..self.cursor]
     }
 
+    /// Every feature, mutably, for edits that touch the whole timeline at once — renaming
+    /// a document parameter, which every feature and sketch may mention. Ordinary edits go
+    /// through [`Timeline::edit`], which reports where regeneration has to restart.
+    pub fn features_mut(&mut self) -> &mut [Feature] {
+        &mut self.features
+    }
+
     pub fn get(&self, id: FeatureId) -> Option<&Feature> {
         self.features.iter().find(|f| f.id == id)
     }
@@ -68,6 +75,7 @@ impl Timeline {
                 name,
                 suppressed: false,
                 kind,
+                exprs: Default::default(),
             },
         );
         self.cursor += 1;

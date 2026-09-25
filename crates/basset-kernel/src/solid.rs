@@ -341,12 +341,18 @@ pub struct EdgeSegment {
 pub struct Edge {
     pub key: EdgeKey,
     pub segments: Vec<EdgeSegment>,
-    /// The two faces run into each other here with nothing to see: one surface split only
-    /// because two features happened to name the halves (a sketch line cut in two makes a
-    /// wall like this), or two surfaces meeting tangentially, as a fillet meets the face it
-    /// blends into. Nothing is drawn along such an edge and nothing can be picked on it,
-    /// because to the user there is no edge there — and there is no dihedral to fillet,
-    /// which is what [`blend`](crate::blend) refuses as a tangent edge.
+    /// The two faces are one surface, split only because two features happened to name
+    /// the halves: a sketch line cut in two makes a wall like this. There is no edge
+    /// there to the user, so nothing can be picked on it and there is no dihedral to
+    /// fillet.
+    ///
+    /// This is deliberately the strict test and not the looser one drawing asks
+    /// ([`Solid::flush`]). Whether a line is *drawn* along an edge and whether the edge
+    /// can be *selected* are different questions, and a fillet's two boundaries are the
+    /// case that separates them: they are tangent, so drawing a line there would claim a
+    /// fold that is not there, but they are still where one face stops and another
+    /// starts, and the user has to be able to click them. Answering both with one test
+    /// made a tangent boundary unpickable as the price of not drawing it.
     pub smooth: bool,
 }
 
@@ -788,8 +794,9 @@ impl Solid {
     ///
     /// Distinct from [`Solid::continuous`]: a fillet is genuinely a different face from the
     /// plane it runs out into — it has its own key, its own radius, and a user can select
-    /// it — but there is no line to draw between them, and no corner there to fillet
-    /// either, which is why [`Edge::smooth`] is decided by this test.
+    /// it — but there is no line to draw between them. This decides drawing only.
+    /// [`Edge::smooth`], which decides what can be picked and what can be filleted, is
+    /// the strict test, or a fillet's own boundaries would stop being selectable.
     fn flush(&self, a: (usize, Vec3), b: (usize, Vec3)) -> bool {
         self.continuous(a, b) || a.1.dot(b.1) >= TANGENT_EDGE_COS
     }
@@ -870,7 +877,7 @@ impl Solid {
                     normal_a: na,
                     normal_b: nb,
                 },
-                self.flush((fa, na), (fb, nb)),
+                self.continuous((fa, na), (fb, nb)),
             ));
         }
         // Hash-map order would make the chain start point (and so blend tool geometry)
@@ -1535,11 +1542,15 @@ mod tests {
     }
 
     /// The tangent half of the problem: a fillet meets the faces it blends into with no
-    /// corner between them, so neither boundary is drawn and neither can be picked to
-    /// fillet again. Before the drawn-edge cut-off was split from the shading one, both
-    /// were drawn — the fillet came out ringed, exactly like the chamfer it is not.
+    /// corner between them, so neither boundary is drawn. Before the drawn-edge cut-off
+    /// was split from the shading one, both were drawn — the fillet came out ringed,
+    /// exactly like the chamfer it is not.
+    ///
+    /// Not drawn is as far as it goes. The boundary is still where one face stops and
+    /// another starts, so it stays selectable; see
+    /// [`a_fillets_tangent_boundaries_stay_selectable`].
     #[test]
-    fn a_fillets_tangent_boundaries_are_neither_drawn_nor_picked() {
+    fn a_fillets_tangent_boundaries_are_not_drawn() {
         let op = OpId::new(1);
         let cube = crate::primitives::cuboid(op, Vec3::ZERO, Vec3::splat(10.0));
         let key = EdgeKey::new(
@@ -1553,11 +1564,6 @@ mod tests {
         let edges = r.edges();
         let touching: Vec<&Edge> = edges.iter().filter(|e| e.key.touches(blend)).collect();
         assert_eq!(touching.len(), 4, "the blend is bounded by four edges");
-        assert_eq!(
-            touching.iter().filter(|e| e.smooth).count(),
-            2,
-            "the two long boundaries are tangent; the two ends fold against the side faces"
-        );
         // The blend is a quarter cylinder of radius 2 rounding the edge at y = 0, z = 10,
         // so it runs out along y = 0, z = 8 and along y = 2, z = 10.
         let on_a_tangent_line = |p: &Vec3| {
@@ -1571,8 +1577,42 @@ mod tests {
             "a line was drawn where the fillet runs tangentially into its neighbour"
         );
         // Every other edge of the cube survives as a drawn one: twelve, less the filleted
-        // one, plus the two short ends the blend adds at the faces it dies into.
-        assert_eq!(edges.iter().filter(|e| !e.smooth).count(), 11 + 2);
+        // one, plus the two short ends the blend adds at the faces it dies into, and the
+        // two tangent boundaries, which are not drawn but are still edges.
+        assert_eq!(edges.iter().filter(|e| !e.smooth).count(), 11 + 2 + 2);
+    }
+
+    /// The other half of the same question, and the one that regressed when both were
+    /// answered by the drawing test: a fillet's tangent boundary is still where one face
+    /// stops and another starts, so it has to stay selectable. Losing it means the user
+    /// cannot click the edge of a fillet at all.
+    #[test]
+    fn a_fillets_tangent_boundaries_stay_selectable() {
+        let op = OpId::new(1);
+        let cube = crate::primitives::cuboid(op, Vec3::ZERO, Vec3::splat(10.0));
+        let key = EdgeKey::new(
+            FaceKey::new(op, FaceRole::EndCap),
+            FaceKey::new(op, FaceRole::Side(0)),
+        );
+        let tess = crate::geometry::Tessellation::default();
+        let r = crate::blend::fillet(OpId::new(2), &cube, &[key], 2.0, &tess)
+            .expect("filleting one top edge of a cube");
+        let blend = FaceKey::new(OpId::new(2), FaceRole::Fillet(0));
+        let touching: Vec<Edge> = r
+            .edges()
+            .into_iter()
+            .filter(|e| e.key.touches(blend))
+            .collect();
+        assert_eq!(touching.len(), 4, "the blend is bounded by four edges");
+        assert!(
+            touching.iter().all(|e| !e.smooth),
+            "a boundary of the blend is unpickable: {:?}",
+            touching
+                .iter()
+                .filter(|e| e.smooth)
+                .map(|e| e.key)
+                .collect::<Vec<_>>()
+        );
     }
 
     /// The cube with its +x face split in two and the T-junctions that leaves healed:

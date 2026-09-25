@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::document::Document;
 
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 pub const EXTENSION: &str = "bass";
 
 #[derive(Serialize, Deserialize)]
@@ -76,15 +76,29 @@ fn migrate(from: u32, value: serde_json::Value) -> serde_json::Value {
 }
 
 /// Upgrades a document from `version` to `version + 1`. Each future format version adds
-/// one arm here, e.g. `2 => migrate_v2_to_v3(value)`.
+/// one arm here, e.g. `3 => migrate_v3_to_v4(value)`.
 fn migrate_step(mut value: serde_json::Value, version: u32) -> serde_json::Value {
     match version {
         1 => {
             migrate_v1_profiles_to_regions(&mut value);
             value
         }
+        2 => migrate_v2_parameters(value),
         _ => value,
     }
+}
+
+/// Version 3 added document parameters and the expressions that drive feature values.
+///
+/// There is nothing to do: both are new fields, both are `serde(default)`, so a version 2
+/// document loads with an empty table and no driven values — which is exactly what it
+/// had. The version was bumped all the same, because migration is only half of what it is
+/// for. A file *written* now can carry parameters, and an older build reading it would
+/// drop them silently, saving a document whose extrude distances no longer say where they
+/// came from. Refusing to open it is much better than that, and the existing
+/// [`FileError::UnsupportedVersion`] path already refuses anything newer than it knows.
+fn migrate_v2_parameters(value: serde_json::Value) -> serde_json::Value {
+    value
 }
 
 /// Version 2 let the generators take a planar body face as well as a sketch region, so
@@ -123,6 +137,37 @@ fn migrate_v1_profiles_to_regions(value: &mut serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_version_2_document_loads_with_an_empty_parameter_table() {
+        let file = serde_json::json!({
+            "format_version": 2,
+            "generator": "basset test",
+            "document": {
+                "name": "old",
+                "units": "Millimeters",
+                "timeline": { "features": [], "cursor": 0, "next_id": 1 },
+            }
+        });
+        let text = serde_json::to_string(&file).unwrap();
+        let doc = read(text.as_bytes()).expect("a version 2 file still loads");
+        assert_eq!(doc.name, "old");
+        assert!(doc.parameters().is_empty());
+    }
+
+    #[test]
+    fn a_file_newer_than_this_build_is_refused_rather_than_read_in_part() {
+        let file = serde_json::json!({
+            "format_version": FORMAT_VERSION + 1,
+            "generator": "basset from the future",
+            "document": {},
+        });
+        let text = serde_json::to_string(&file).unwrap();
+        assert!(matches!(
+            read(text.as_bytes()),
+            Err(FileError::UnsupportedVersion { .. })
+        ));
+    }
 
     #[test]
     fn v1_profiles_become_sketch_regions() {

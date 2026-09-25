@@ -35,7 +35,10 @@
 //! from the source or mitring them so every edge is.
 //!
 //! **Parameters** ([`parameters`]) are named constants, written as expressions over each
-//! other, that can drive dimensions; solving re-evaluates them first.
+//! other, that can drive dimensions; solving re-evaluates them first. A sketch's own
+//! table shadows an outer one supplied by the caller — the document's — so a name is
+//! resolved locally first and asked of the document only when the sketch does not hold
+//! it.
 //!
 //! **Shapes** ([`shapes`]) mirror Fusion's sketch tools and add the constraints those
 //! tools add, so a rectangle stays a rectangle under later edits.
@@ -72,7 +75,7 @@ pub use entity::{Entity, EntityData};
 pub use error::{SketchError, SolveError};
 pub use intersect::CurveGeom;
 pub use offset::Corner;
-pub use parameters::Parameter;
+pub use parameters::{Outer, Parameter, no_outer};
 pub use sketch::{Hit, JOIN_TOL, Sketch};
 pub use solver::SolveReport;
 pub use tessellation::Tessellation;
