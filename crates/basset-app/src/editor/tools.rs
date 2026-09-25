@@ -1176,6 +1176,10 @@ pub(crate) fn type_expression(editor: &mut Editor, field: NumericField, text: &s
     true
 }
 
+/// The increment a dragged size rounds to, in mm. See the comment at the drag itself
+/// for why it is fixed rather than the zoom-following one the sketch grid uses.
+pub(crate) const HANDLE_STEP: f64 = 1.0;
+
 /// Draws the handle's grip at its tip and applies a drag of it to the tool's size.
 /// Returns whether the size changed. The arrow shaft itself is drawn by the scene, so
 /// it sits in 3D with the geometry; only the grip is an egui widget.
@@ -1251,13 +1255,16 @@ fn handle_drag(editor: &mut Editor, ctx: &egui::Context) -> bool {
     let along =
         (f64::from(delta.x) * ppp) * screen_dir.x + (f64::from(delta.y) * ppp) * screen_dir.y;
     let world = along * camera.pixel_size_at(h.tip, window);
-    // The same rule every other handle in the app obeys: the size lands on the grid the
-    // user can see, and shift lets go of it for as long as it is held. A dragged extrude
-    // that stopped at 12.37 mm would make the grid decorative. The gesture's running
-    // total goes through [`snap::Drag`], as the gizmo's does: rounding each frame's
-    // slice instead would throw a slow drag's sub-step deltas away one by one and the
-    // handle would only ever move on a flick.
-    let snap = editor.snap_at(h.tip);
+    // A size lands on round numbers, and shift lets go of that for as long as it is
+    // held. A dragged extrude that stopped at 12.37 mm would make the number a chore to
+    // read back. Unlike a sketch drag, the increment here is fixed rather than following
+    // the zoom: a size is a number first and a picture second, so quantising it to 5 or
+    // 10 mm because the camera stood back — or changing the increment mid-gesture as the
+    // arrow's tip moved through the view — makes the handle feel arbitrary. The
+    // gesture's running total goes through [`snap::Drag`], as the gizmo's does: rounding
+    // each frame's slice instead would throw a slow drag's sub-step deltas away one by
+    // one and the handle would only ever move on a flick.
+    let snap = editor.snapping.at(HANDLE_STEP);
     let Some(tool) = editor.tool.as_mut() else {
         return false;
     };
@@ -1272,7 +1279,18 @@ fn handle_drag(editor: &mut Editor, ctx: &egui::Context) -> bool {
                 1.0
             };
             p.distance = if p.extent == ExtentKind::OneSide {
-                drag.advance(p.distance, world * scale, snap)
+                let at = drag.advance(p.distance, world * scale, snap);
+                // A one-sided extrude may cross to the other side of its sketch, but it
+                // cannot pause at no length on the way: the kernel refuses a zero
+                // extent, and a drag resting there would leave a dead preview and a
+                // warning per frame. The size holds one increment short, on whichever
+                // side it was already on, until the drag carries it across.
+                if at == 0.0 {
+                    let short = snap.step().unwrap_or(0.01);
+                    if p.distance < 0.0 { -short } else { short }
+                } else {
+                    at
+                }
             } else {
                 drag.advance_above(p.distance, world * scale, snap, 0.01)
             };

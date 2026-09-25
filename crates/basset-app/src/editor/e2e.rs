@@ -1110,14 +1110,9 @@ fn the_extrude_distance_arrow_snaps_and_shift_lets_go() {
     h.sync_tool();
     h.frame();
 
-    let handle = super::tools::handle(&h.editor).expect("the extrude has an arrow");
-    // The increment a modelling handle snaps to follows the zoom, so the test asks for
-    // the same one the handle will rather than assuming a number.
-    let step = basset_viewport::grid::snap_step_for(
-        h.editor
-            .camera
-            .pixel_size_at(handle.tip, h.editor.window_px),
-    );
+    // A modelling handle rounds to a fixed increment, not the zoom-following one the
+    // sketch grid uses: a size is a number first.
+    let step = super::tools::HANDLE_STEP;
     let ppp = h.points_per_pixel();
     let grab = |h: &Harness, reach: f64| {
         let handle = super::tools::handle(&h.editor).expect("still running");
@@ -1192,12 +1187,7 @@ fn a_slow_drag_of_the_extrude_arrow_still_walks_the_grid() {
     h.sync_tool();
     h.frame();
 
-    let handle = super::tools::handle(&h.editor).expect("the extrude has an arrow");
-    let step = basset_viewport::grid::snap_step_for(
-        h.editor
-            .camera
-            .pixel_size_at(handle.tip, h.editor.window_px),
-    );
+    let step = super::tools::HANDLE_STEP;
     let ppp = h.points_per_pixel();
     let distance = |h: &Harness| h.editor.tool.as_ref().expect("running").params.distance;
     // A drag delivered as `moves` pointer positions, so each frame carries only a
@@ -1245,6 +1235,61 @@ fn a_slow_drag_of_the_extrude_arrow_still_walks_the_grid() {
     assert!(
         (distance(&h) - after).abs() < 1e-9,
         "a new gesture starts from the value itself: {} (was {after})",
+        distance(&h)
+    );
+}
+
+/// The kernel refuses an extrude of no length, so the arrow must never rest at one: a
+/// drag headed through the sketch plane holds one increment short on the side it came
+/// from until the pointer carries it across, instead of parking the feature at zero —
+/// which regenerates as a failure and logs a warning every frame the pointer sits there.
+#[test]
+fn the_extrude_arrow_never_rests_at_zero() {
+    let mut h = Harness::new();
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    h.rectangle(Vec2::ZERO, Vec2::new(40.0, 20.0));
+    h.finish_sketch(true);
+    let sketch = h.last_feature();
+    h.start_tool(ToolKind::Extrude);
+    h.select_region(sketch, Vec2::new(20.0, 10.0));
+    h.sync_tool();
+    h.frame();
+
+    let step = super::tools::HANDLE_STEP;
+    let ppp = h.points_per_pixel();
+    let distance = |h: &Harness| h.editor.tool.as_ref().expect("running").params.distance;
+    let before = distance(&h);
+    assert!(
+        before > 0.0,
+        "the extrude starts with some length: {before}"
+    );
+
+    let handle = super::tools::handle(&h.editor).expect("the extrude has an arrow");
+    let from = h.at_world(handle.tip, ppp).expect("on screen");
+    // Well past the sketch plane and out the other side. Delivered in slices small
+    // enough that some frame's running total must fall inside the half-step window
+    // that rounds to zero — the spot the old code parked the feature at.
+    let to = h
+        .at_world(handle.tip - handle.dir * (before + step * 4.0), ppp)
+        .expect("on screen");
+    let button = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::default(),
+    };
+    let moves = ((before + step * 4.0) / (step * 0.25)).ceil() as usize;
+    h.frame_with(vec![egui::Event::PointerMoved(from)]);
+    h.frame_with(vec![button(from, true)]);
+    for i in 1..=moves {
+        let at = from + (to - from) * (i as f32 / moves as f32);
+        h.frame_with(vec![egui::Event::PointerMoved(at)]);
+        assert_ne!(distance(&h), 0.0, "no frame of the drag rested at zero");
+    }
+    h.frame_with(vec![button(to, false)]);
+    assert!(
+        distance(&h) < 0.0,
+        "the hold is a pause, not a wall: the drag crossed to the other side, {}",
         distance(&h)
     );
 }
