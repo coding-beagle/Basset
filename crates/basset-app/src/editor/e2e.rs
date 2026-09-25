@@ -1174,6 +1174,81 @@ fn the_extrude_distance_arrow_snaps_and_shift_lets_go() {
     );
 }
 
+/// The pathology [`super::snap::Drag`] exists for, on the feature arrow: a drag arrives
+/// as one small delta per frame, and rounding each of them separately rounds every one
+/// back to where it started. A pointer creeping a fraction of the step per frame must
+/// still walk the extrude forward — and once the button is up the gesture's total is
+/// forgotten, so a fresh short drag starts from the value rather than from the old
+/// gesture's leftover.
+#[test]
+fn a_slow_drag_of_the_extrude_arrow_still_walks_the_grid() {
+    let mut h = Harness::new();
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    h.rectangle(Vec2::ZERO, Vec2::new(40.0, 20.0));
+    h.finish_sketch(true);
+    let sketch = h.last_feature();
+    h.start_tool(ToolKind::Extrude);
+    h.select_region(sketch, Vec2::new(20.0, 10.0));
+    h.sync_tool();
+    h.frame();
+
+    let handle = super::tools::handle(&h.editor).expect("the extrude has an arrow");
+    let step = basset_viewport::grid::snap_step_for(
+        h.editor
+            .camera
+            .pixel_size_at(handle.tip, h.editor.window_px),
+    );
+    let ppp = h.points_per_pixel();
+    let distance = |h: &Harness| h.editor.tool.as_ref().expect("running").params.distance;
+    // A drag delivered as `moves` pointer positions, so each frame carries only a
+    // slice of the travel — the shape a slow hand really produces.
+    let slow_drag = |h: &mut Harness, reach: f64, moves: usize| {
+        let handle = super::tools::handle(&h.editor).expect("still running");
+        let from = h.at_world(handle.tip, ppp).expect("on screen");
+        let to = h
+            .at_world(handle.tip + handle.dir * reach, ppp)
+            .expect("on screen");
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        h.frame_with(vec![egui::Event::PointerMoved(from)]);
+        h.frame_with(vec![button(from, true)]);
+        for i in 1..=moves {
+            let at = from + (to - from) * (i as f32 / moves as f32);
+            h.frame_with(vec![egui::Event::PointerMoved(at)]);
+        }
+        h.frame_with(vec![button(to, false)]);
+    };
+
+    // 2.3 steps of travel in sixteen moves: every frame's delta is well under half a
+    // step, which the old per-frame rounding threw away entirely.
+    let before = distance(&h);
+    slow_drag(&mut h, step * 2.3, 16);
+    let after = distance(&h);
+    assert!(
+        after > before + step * 1.5,
+        "the slow drag was not stuck: {before} -> {after} (step {step})"
+    );
+    assert!(
+        (after / step).fract().abs() < 1e-9,
+        "and still landed on the grid ({step}): {after}"
+    );
+
+    // The first gesture banked 0.3 of a step past the line it landed on. Released and
+    // grabbed again, another 0.3 of a step is not yet half a step from the value, so
+    // the size stays put — leftover total from the last gesture would have tipped it
+    // over a line the pointer never earned.
+    slow_drag(&mut h, step * 0.3, 4);
+    assert!(
+        (distance(&h) - after).abs() < 1e-9,
+        "a new gesture starts from the value itself: {} (was {after})",
+        distance(&h)
+    );
+}
+
 /// Runs frames until the layout has stopped moving. A collapsing section opens over
 /// several frames, and a rectangle read while it is still growing has moved by the time
 /// the click lands on it.

@@ -1216,6 +1216,9 @@ fn handle_drag(editor: &mut Editor, ctx: &egui::Context) -> bool {
         })
         .inner;
     if !response.dragged() {
+        // The gesture is over, so its running total goes with it: the next grab of the
+        // grip starts from wherever the size actually is. See [`snap::Drag::release`].
+        editor.drags.slide.release();
         return false;
     }
     // A driven size is read-only wherever it is shown, and the arrow is one of the places
@@ -1250,11 +1253,15 @@ fn handle_drag(editor: &mut Editor, ctx: &egui::Context) -> bool {
     let world = along * camera.pixel_size_at(h.tip, window);
     // The same rule every other handle in the app obeys: the size lands on the grid the
     // user can see, and shift lets go of it for as long as it is held. A dragged extrude
-    // that stopped at 12.37 mm would make the grid decorative.
+    // that stopped at 12.37 mm would make the grid decorative. The gesture's running
+    // total goes through [`snap::Drag`], as the gizmo's does: rounding each frame's
+    // slice instead would throw a slow drag's sub-step deltas away one by one and the
+    // handle would only ever move on a flick.
     let snap = editor.snap_at(h.tip);
     let Some(tool) = editor.tool.as_mut() else {
         return false;
     };
+    let drag = &mut editor.drags.slide;
     let limit = tool.blend_limit();
     let p = &mut tool.params;
     let value = match tool.kind {
@@ -1264,10 +1271,11 @@ fn handle_drag(editor: &mut Editor, ctx: &egui::Context) -> bool {
             } else {
                 1.0
             };
-            p.distance = snap.value(p.distance + world * scale);
-            if p.extent != ExtentKind::OneSide {
-                p.distance = p.distance.max(0.01);
-            }
+            p.distance = if p.extent == ExtentKind::OneSide {
+                drag.advance(p.distance, world * scale, snap)
+            } else {
+                drag.advance_above(p.distance, world * scale, snap, 0.01)
+            };
             p.distance
         }
         ToolKind::Fillet | ToolKind::Chamfer => {
@@ -1276,11 +1284,11 @@ fn handle_drag(editor: &mut Editor, ctx: &egui::Context) -> bool {
             // leave the user pulling back through a preview that is not there. The
             // handle simply stops, which is the same thing the geometry does.
             let ceiling = limit.unwrap_or(f64::INFINITY).max(0.01);
-            p.radius = snap.value(p.radius + world).clamp(0.01, ceiling);
+            p.radius = drag.advance_within(p.radius, world, snap, 0.01, ceiling);
             p.radius
         }
         ToolKind::OffsetPlane => {
-            p.distance = snap.value(p.distance + world);
+            p.distance = drag.advance(p.distance, world, snap);
             p.distance
         }
         _ => return false,

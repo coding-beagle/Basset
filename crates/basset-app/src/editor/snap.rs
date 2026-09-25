@@ -146,6 +146,27 @@ impl Drag {
         at
     }
 
+    /// Advances within `floor..=ceiling` — a blend's radius has both a smallest size
+    /// and the most the material allows, and the handle stops at each. The raw total is
+    /// pinned at whichever end stopped it, for the same reason [`Self::advance_above`]
+    /// pins at its floor: travel the grip never made must not be banked, or pulling
+    /// back off the stop would first have to retrace it.
+    pub fn advance_within(
+        &mut self,
+        value: f64,
+        by: f64,
+        snap: Snap,
+        floor: f64,
+        ceiling: f64,
+    ) -> f64 {
+        let at = self.advance(value, by, snap);
+        let held = at.clamp(floor, ceiling);
+        if held != at {
+            self.raw = Some(held);
+        }
+        held
+    }
+
     /// The same for an angle, which rounds to whole steps rather than to the grid.
     pub fn advance_angle(&mut self, value: f64, by: f64, snap: Snap) -> f64 {
         let raw = self.raw.unwrap_or(value) + by;
@@ -1015,6 +1036,27 @@ mod tests {
         assert_eq!(free.value(12.0), 12.0);
         assert_eq!(free.angle_deg(7.4), 7.4);
         assert!(!free.is_on());
+    }
+
+    /// A drag stopped at either end of its range must not bank the travel past it: the
+    /// raw total stops with the handle, so pulling back moves the value at once.
+    #[test]
+    fn a_clamped_drag_does_not_bank_travel_past_either_end() {
+        let snap = Snapping::default().at(1.0);
+        let mut drag = Drag::default();
+        assert_eq!(drag.advance_within(5.0, 4.0, snap, 0.5, 6.0), 6.0);
+        assert_eq!(
+            drag.advance_within(6.0, -1.0, snap, 0.5, 6.0),
+            5.0,
+            "one step back off the ceiling is one step, not the banked overshoot first"
+        );
+        drag.release();
+        assert_eq!(drag.advance_within(5.0, -7.0, snap, 0.5, 6.0), 0.5);
+        assert_eq!(
+            drag.advance_within(0.5, 1.5, snap, 0.5, 6.0),
+            2.0,
+            "and the same coming back up off the floor"
+        );
     }
 
     /// A nonsensical increment must not silently quantise everything to zero or NaN; it
