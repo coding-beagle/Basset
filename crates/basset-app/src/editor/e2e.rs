@@ -136,6 +136,48 @@ fn a_click_beside_a_blends_run_out_selects_the_face_the_user_sees() {
     );
 }
 
+/// A sketch left behind after leaving sketch mode is still on screen, and the default
+/// filter has to reach it: draw a shape, leave the sketch, click it. Narrower filters
+/// were never the problem — Face and Sketch both reached it — but "Any" refusing the
+/// drawing the user just made read as a broken pick, not as a filter choice.
+#[test]
+fn the_any_filter_selects_a_sketch_left_on_screen() {
+    let mut h = Harness::new();
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    // On round tens, which survive the coarse grid step the default far camera puts on
+    // the drawing pointer.
+    h.rectangle(Vec2::new(0.0, 0.0), Vec2::new(10.0, 10.0));
+    h.finish_sketch(true);
+    // Framed by hand: fitting a flat sketch leaves the camera far enough away that the
+    // eight pixels of picking slack cover the whole rectangle, and the outline would
+    // catch every click meant for the region inside it.
+    h.editor.camera.zoom_to_fit(&basset_math::Aabb {
+        min: Vec3::new(0.0, 0.0, -3.0),
+        max: Vec3::new(10.0, 10.0, 3.0),
+    });
+    assert_eq!(h.editor.select_mode, SelectMode::Any);
+
+    // On the outline, away from the corners: the curve.
+    h.click_world(Vec3::new(5.0, 0.0, 0.0));
+    assert_eq!(
+        h.editor.selection.curves.len(),
+        1,
+        "{:?}",
+        h.editor.selection
+    );
+
+    // Inside the outline: the region, and the earlier pick is dropped with it, because
+    // a bare click replaces the selection.
+    h.click_world(Vec3::new(5.0, 5.0, 0.0));
+    assert_eq!(
+        h.editor.selection.profiles.len(),
+        1,
+        "{:?}",
+        h.editor.selection
+    );
+    assert!(h.editor.selection.curves.is_empty());
+}
+
 #[test]
 fn the_pointer_navigates_the_camera() {
     let mut h = Harness::new();

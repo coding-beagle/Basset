@@ -87,10 +87,23 @@ pub struct SelectionFilter {
 }
 
 impl Default for SelectionFilter {
+    /// What "Any" lets a bare click land on: solids and drawings alike, because a
+    /// sketch left on screen after leaving sketch mode is still something the user can
+    /// see and point at. Two visible kinds stay out, deliberately. Body corners, because
+    /// a blend's undrawn run-out boundaries have corners too, and within tolerance a
+    /// corner beats everything — each one would be an invisible spot that steals the
+    /// click from the face around it, which is the same trap the undrawn edges
+    /// themselves are kept out of in [`pick`]. And planes, because a click that misses
+    /// everything is how a selection is dropped, and a shown origin plane is large
+    /// enough to sit behind most of those misses. Both stay a keystroke away, on their
+    /// own filters.
     fn default() -> Self {
         Self {
             faces: true,
             edges: true,
+            profiles: true,
+            curves: true,
+            points: true,
             ..Self::NONE
         }
     }
@@ -211,8 +224,8 @@ impl SelectMode {
     /// tool cannot satisfy would leave the user unable to finish it, with no hint why.
     ///
     /// `Any` means "no restriction", so it hands the tool's filter back untouched. Its
-    /// own filter is what a click picks with *no* tool running (faces and edges) and
-    /// intersecting that with the tool's would quietly drop the planes Sketch needs.
+    /// own filter is what a click picks with *no* tool running, and intersecting that
+    /// with the tool's would quietly drop the planes Sketch needs.
     pub fn narrow(self, tool: SelectionFilter) -> SelectionFilter {
         if self == SelectMode::Any {
             return tool;

@@ -546,9 +546,10 @@ fn select_mode_narrows_what_a_click_picks() {
     assert!(matches!(pick(&editor, 5.0, 5.0), Some(Pick::Profile(..))));
     assert_eq!(pick(&editor, 15.0, 15.0), None);
 
-    // Any is the default and leaves sketches alone, as before.
+    // Any is the default and reaches the sketch too: the drawing is on screen, and the
+    // filter that refuses it reads as a broken pick, not as a choice.
     editor.set_select_mode(SelectMode::Any);
-    assert_eq!(pick(&editor, 0.0, 0.0), None);
+    assert!(matches!(pick(&editor, 0.0, 0.0), Some(Pick::Point { .. })));
 
     // Clicking in Sketch mode records the point.
     editor.set_select_mode(SelectMode::Sketch);
