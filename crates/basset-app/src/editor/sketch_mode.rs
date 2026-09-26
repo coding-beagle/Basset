@@ -1404,10 +1404,7 @@ impl SketchEditor {
         // Shift, or the palette's switch turned off, leaves only the joins: see the
         // snap module's header for why those two mean the same thing here.
         let joins_only = self.free_snap || !self.snap_to_grid;
-        let grid = self
-            .snap_rule()
-            .is_on()
-            .then(|| self.snap_rule().point(pos));
+        let grid = self.snap_rule();
         match self
             .inference
             .resolve(&self.sketch, cont, pos, tol, joins_only, grid)
@@ -1437,10 +1434,7 @@ impl SketchEditor {
             ..Default::default()
         };
         let joins_only = self.free_snap || !self.snap_to_grid;
-        let grid = self
-            .snap_rule()
-            .is_on()
-            .then(|| self.snap_rule().point(pos));
+        let grid = self.snap_rule();
         match self
             .inference
             .resolve(&self.sketch, cont, pos, tol, joins_only, grid)
@@ -5389,5 +5383,104 @@ mod offset_entry_tests {
             (min.y + 7.0).abs() < 1e-9 && (max.y - 27.0).abs() < 1e-9,
             "what was typed is what was kept: {min:?} {max:?}"
         );
+    }
+}
+
+/// Where a drawn click lands, through the same `snap` the pointer path calls: the grid
+/// when the drawing names nothing, the drawing when it does — and never the raw pointer
+/// while the grid is on, which is the regression these were written against.
+#[cfg(test)]
+mod snap_tests {
+    use super::*;
+
+    /// An empty sketch on a 1 mm grid, holding the Line tool.
+    fn drawing_board() -> SketchEditor {
+        let mut s = SketchEditor::new(FeatureId(0), Frame::XY, Sketch::new(), Camera::default());
+        s.grid_step = 1.0;
+        s.tool = SketchTool::Line;
+        s
+    }
+
+    /// A click with nothing nearby lands on the grid, exactly as it always has.
+    #[test]
+    fn a_click_in_empty_space_lands_on_the_grid() {
+        let mut s = drawing_board();
+        let click = s.snap(Vec2::new(3.7, 2.2), 0.5);
+        assert_eq!(click.pos, Vec2::new(4.0, 2.0));
+        assert!(click.snapped.is_none() && click.on_curve.is_none());
+    }
+
+    /// A click near an existing point joins it, wherever it sits: joining is what the
+    /// user meant, and a point already placed off-grid would otherwise be impossible to
+    /// pick up again.
+    #[test]
+    fn a_click_near_an_existing_endpoint_joins_it() {
+        let mut s = drawing_board();
+        let a = s.sketch.add_point(Vec2::new(0.0, 0.0));
+        let b = s.sketch.add_point(Vec2::new(20.3, 0.0));
+        s.sketch.add_line(a, b).expect("line");
+        let click = s.snap(Vec2::new(20.15, 0.2), 0.5);
+        assert_eq!(click.snapped, Some(b), "the endpoint is shared, not copied");
+        assert_eq!(
+            click.pos,
+            Vec2::new(20.3, 0.0),
+            "at the point, not the grid"
+        );
+    }
+
+    /// Drawing a roughly-level line from a placed point: the alignment guide holds the
+    /// caught axis, and the *free* axis still lands on the grid. Landing at the raw
+    /// pointer instead is the regression — a drawing made by eye stopped coming out in
+    /// round numbers the moment a guide caught it, and with the previous click always
+    /// growing guides, that was nearly every click.
+    #[test]
+    fn the_free_axis_of_an_alignment_guide_still_lands_on_the_grid() {
+        let mut s = drawing_board();
+        let first = s.snap(Vec2::new(0.05, -0.03), 0.5);
+        assert_eq!(first.pos, Vec2::ZERO);
+        s.inference.touch(first.pos);
+        s.line_click(first);
+        // Nearly level with the start: caught by its horizontal guide, so y is 0 — and
+        // x is the grid's 5, not the pointer's 5.3.
+        let second = s.snap(Vec2::new(5.3, 0.2), 0.5);
+        assert_eq!(second.pos, Vec2::new(5.0, 0.0));
+    }
+
+    /// The same when the anchor is off-grid: aligned with the touched point on the
+    /// caught axis, round along the other. Round *from the anchor*, because "5 mm along
+    /// from that corner" is the measurement the guide is offering.
+    #[test]
+    fn an_off_grid_alignment_is_kept_and_the_free_axis_stays_round() {
+        let mut s = drawing_board();
+        s.sketch.add_point(Vec2::new(0.3, 2.13));
+        // Hovering the point is touching it, which is what grows its guides.
+        let hover = s.snap(Vec2::new(0.32, 2.1), 0.5);
+        assert_eq!(hover.pos, Vec2::new(0.3, 2.13));
+        let click = s.snap(Vec2::new(4.1, 2.2), 0.5);
+        assert_eq!(
+            click.pos,
+            Vec2::new(4.3, 2.13),
+            "level with the point, a round 4 mm along from it"
+        );
+    }
+
+    /// Shift frees everything computed — the guides and the grid both — leaving only
+    /// the joins; the palette's switch off says the same thing for good.
+    #[test]
+    fn shift_and_the_palette_leave_only_the_joins() {
+        let mut s = drawing_board();
+        let a = s.sketch.add_point(Vec2::new(0.0, 0.0));
+        let b = s.sketch.add_point(Vec2::new(20.3, 0.0));
+        s.sketch.add_line(a, b).expect("line");
+        s.set_free_snap(true);
+        let free = s.snap(Vec2::new(3.7, 2.2), 0.5);
+        assert_eq!(free.pos, Vec2::new(3.7, 2.2), "shift means the raw pointer");
+        let join = s.snap(Vec2::new(20.15, 0.2), 0.5);
+        assert_eq!(join.snapped, Some(b), "but a join is never given up");
+        s.set_free_snap(false);
+        s.snap_to_grid = false;
+        let off = s.snap(Vec2::new(3.7, 2.2), 0.5);
+        assert_eq!(off.pos, Vec2::new(3.7, 2.2));
+        assert_eq!(s.snap(Vec2::new(20.15, 0.2), 0.5).snapped, Some(b));
     }
 }

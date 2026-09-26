@@ -57,6 +57,13 @@
 //! by eye stops coming out with round numbers — which is the thing the grid was for.
 //! Geometry that is really there (a point, a midpoint, a crossing, a curve) is exempt:
 //! it is a place in the model, not a suggestion.
+//!
+//! A single guide also only names *one* axis. The other one — where along the guide the
+//! click lands — is nobody's but the grid's, so it is rounded to it, measured from the
+//! guide's own anchor: "level with that corner, a round 5 mm along from it" is the
+//! measurement being offered. Left at the raw pointer instead, every nearly-level line
+//! in the drawing would come out 5.3 mm long, which is exactly the drawing-by-eye
+//! roundness the grid exists to provide.
 
 use std::collections::HashMap;
 
@@ -532,8 +539,8 @@ pub struct Inference {
 impl Inference {
     /// Resolves the pointer against the sketch. `tol` is the pick radius in millimetres
     /// (the same screen-space tolerance the hit test uses); `joins_only` is shift or the
-    /// palette's switch being off; `grid` is where the click would land without any of
-    /// this, which the guides have to beat to be worth taking.
+    /// palette's switch being off; `grid` is the grid rule in force, which the guides
+    /// have to beat to be worth taking and which rounds their free axis.
     ///
     /// `None` means nothing was inferred and the caller should fall back to the grid,
     /// which is the one rule this module already owned.
@@ -544,10 +551,26 @@ impl Inference {
         pointer: Vec2,
         tol: f64,
         joins_only: bool,
-        grid: Option<Vec2>,
+        grid: Snap,
     ) -> Option<Candidate> {
-        let candidates = gather(sketch, &self.recent, cont, pointer, tol, joins_only);
-        let chosen = choose(&candidates, self.held, pointer, tol, grid).map(|i| candidates[i]);
+        let mut candidates = gather(sketch, &self.recent, cont, pointer, tol, joins_only);
+        if grid.is_on() {
+            // A single guide names one axis; where along it the click lands is the
+            // grid's, rounded from the guide's own anchor so the alignment survives and
+            // the distance from what it aligns with is a round number. See the module
+            // header. A spot that rounds back onto the anchor itself is dropped rather
+            // than offered: the anchor is already on offer as what it is, and a fresh
+            // point placed exactly on it would only *look* joined.
+            candidates.retain_mut(|c| match c.guides {
+                [Some(g), None] => {
+                    c.at = g.anchor + g.dir * grid.value((c.at - g.anchor).dot(g.dir));
+                    c.at.distance(g.anchor) > JOIN_TOL
+                }
+                _ => true,
+            });
+        }
+        let grid_at = grid.is_on().then(|| grid.point(pointer));
+        let chosen = choose(&candidates, self.held, pointer, tol, grid_at).map(|i| candidates[i]);
         // Hovering a point is touching it: the guides the *next* point lines up with
         // grow from wherever the pointer has just been resting, which is what makes
         // "level with that corner" available without asking for it.
@@ -603,7 +626,7 @@ pub fn choose(
         candidates
             .iter()
             .enumerate()
-            .map(|(i, c)| (i, c, pointer.distance(c.at)))
+            .map(|(i, c)| (i, c, reach_of(c, pointer)))
             .filter(|(_, c, d)| {
                 c.key() == key
                     && *d <= c.kind.pick_radius(tol) * HOLD_FACTOR
@@ -617,7 +640,7 @@ pub fn choose(
     let best = candidates
         .iter()
         .enumerate()
-        .map(|(i, c)| (i, c.kind, pointer.distance(c.at)))
+        .map(|(i, c)| (i, c.kind, reach_of(c, pointer)))
         .filter(|(_, kind, d)| *d <= kind.pick_radius(tol) && worth_it(*kind, *d))
         .min_by(|a, b| {
             a.1.tier()
@@ -635,6 +658,17 @@ pub fn choose(
         }
         (Some((hi, _, _)), None) => Some(hi),
         (None, best) => best.map(|(i, _, _)| i),
+    }
+}
+
+/// How far the pointer is from a candidate, for acquiring and holding it. A candidate
+/// on a single guide is measured to the guide *line*: along the guide its landing spot
+/// has been put on the grid, and the grid never measures how far the rounding moved a
+/// click — only the caught axis is a distance the pointer can be off by.
+fn reach_of(c: &Candidate, pointer: Vec2) -> f64 {
+    match c.guides {
+        [Some(g), None] => g.foot(pointer).1,
+        _ => pointer.distance(c.at),
     }
 }
 
@@ -1431,7 +1465,14 @@ mod tests {
         let mut inference = Inference::default();
         let cont = Continuation::default();
         let found = inference
-            .resolve(&sketch, cont, Vec2::new(19.8, 0.1), 1.0, false, None)
+            .resolve(
+                &sketch,
+                cont,
+                Vec2::new(19.8, 0.1),
+                1.0,
+                false,
+                Snap::default(),
+            )
             .expect("the endpoint");
         assert_eq!(found.kind, SnapKind::Endpoint);
         assert!(
@@ -1440,12 +1481,92 @@ mod tests {
         );
         assert_eq!(inference.recent.first(), Some(&Vec2::new(20.0, 0.0)));
         let held = inference
-            .resolve(&sketch, cont, Vec2::new(18.6, 0.1), 1.0, false, None)
+            .resolve(
+                &sketch,
+                cont,
+                Vec2::new(18.6, 0.1),
+                1.0,
+                false,
+                Snap::default(),
+            )
             .expect("still held");
         assert_eq!(held.kind, SnapKind::Endpoint);
         assert!(inference.current().is_some(), "and the overlay can draw it");
         inference.release();
         assert!(inference.current().is_none());
+    }
+
+    /// A single guide names one axis; the grid still owns the other. Carrying a line on
+    /// past its end with a 1 mm grid lands a round distance along it, not at the raw
+    /// pointer — and with the grid let go, the raw foot is exactly what is wanted.
+    #[test]
+    fn the_free_axis_along_a_guide_is_rounded_to_the_grid() {
+        let mut sketch = Sketch::new();
+        let a = sketch.add_point(Vec2::new(0.0, 0.0));
+        let b = sketch.add_point(Vec2::new(10.0, 0.0));
+        let line = sketch.add_line(a, b).expect("line");
+        let cont = Continuation {
+            from: Some(Vec2::new(10.0, 0.0)),
+            curve: Some(line),
+            moving: None,
+        };
+        let mut inference = Inference::default();
+        let grid = Snapping::default().at(1.0);
+        let found = inference
+            .resolve(&sketch, cont, Vec2::new(16.3, 0.05), 1.0, false, grid)
+            .expect("carried on along the line");
+        // The tangent and the horizontal guide name the same line here; either way it
+        // is a guide, and the position is what matters.
+        assert!(found.kind.yields_to_grid(), "{:?}", found.kind);
+        assert!(
+            found.at.distance(Vec2::new(16.0, 0.0)) < 1e-9,
+            "a round 6 mm past the end, not the pointer's 6.3: {:?}",
+            found.at
+        );
+        // The same spot with the grid off keeps the raw foot: there is no step for the
+        // free axis to land on, and the guide still holds the caught one.
+        inference.release();
+        let free = inference
+            .resolve(
+                &sketch,
+                cont,
+                Vec2::new(16.3, 0.05),
+                1.0,
+                false,
+                Snap::default(),
+            )
+            .expect("still caught");
+        assert!(
+            free.at.distance(Vec2::new(16.3, 0.0)) < 1e-9,
+            "{:?}",
+            free.at
+        );
+    }
+
+    /// A guide spot that rounds back onto its own anchor is not offered: the anchor is
+    /// already a candidate as what it really is, and a fresh point placed exactly on it
+    /// would only look joined.
+    #[test]
+    fn a_guide_never_lands_the_click_back_on_its_own_anchor() {
+        let mut inference = Inference::default();
+        inference.touch(Vec2::new(7.0, 3.0));
+        let grid = Snapping::default().at(1.0);
+        // Just level with and just beside the touched point: along the horizontal
+        // guide the grid rounds to the anchor itself, so the guide stands aside and
+        // the grid answers.
+        let sketch = Sketch::new();
+        let found = inference.resolve(
+            &sketch,
+            Continuation::default(),
+            Vec2::new(7.3, 3.1),
+            1.0,
+            false,
+            grid,
+        );
+        assert!(
+            found.is_none_or(|c| c.at.distance(Vec2::new(7.0, 3.0)) > JOIN_TOL),
+            "{found:?}"
+        );
     }
 
     /// The feedback is geometry the overlay can draw: a glyph on the point, different
