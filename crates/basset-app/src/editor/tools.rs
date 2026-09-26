@@ -96,7 +96,10 @@ pub struct Params {
     pub angle_deg: f64,
     pub radius: f64,
     pub op: OpKind,
-    pub target: Option<BodyRef>,
+    /// The bodies a Join/Cut/Intersect applies to. Several, as in Fusion: a cut whose
+    /// path passes through more than one body offers to cut them all, and the dialog's
+    /// checklist is where any of them is taken back out.
+    pub targets: Vec<BodyRef>,
     /// The face a to-face extrude reaches, once the user has clicked one.
     pub to_face: Option<FaceRef>,
     pub combine: CombineOp,
@@ -119,7 +122,7 @@ impl Default for Params {
             angle_deg: 360.0,
             radius: 1.0,
             op: OpKind::NewBody,
-            target: None,
+            targets: Vec::new(),
             to_face: None,
             combine: CombineOp::Join,
             keep_tools: false,
@@ -308,12 +311,15 @@ impl Tool {
     fn build_kind(&self, editor: &Editor) -> Option<FeatureKind> {
         let sel = &editor.selection;
         let component = editor.active_component;
+        // No targets means the input is incomplete, not a feature that errors: the
+        // dialog holds the feature back the same way it does for a missing region.
         let operation = |p: &Params| -> Option<BodyOp> {
+            let targets = || (!p.targets.is_empty()).then(|| p.targets.clone());
             match p.op {
                 OpKind::NewBody => Some(BodyOp::NewBody),
-                OpKind::Join => p.target.map(BodyOp::Join),
-                OpKind::Cut => p.target.map(BodyOp::Cut),
-                OpKind::Intersect => p.target.map(BodyOp::Intersect),
+                OpKind::Join => targets().map(BodyOp::Join),
+                OpKind::Cut => targets().map(BodyOp::Cut),
+                OpKind::Intersect => targets().map(BodyOp::Intersect),
             }
         };
         let p = &self.params;
@@ -541,7 +547,7 @@ pub fn edit_existing(editor: &mut Editor, id: FeatureId, previous_cursor: usize)
                     params.to_face = Some(face);
                 }
             }
-            load_op(&mut params, *operation);
+            load_op(&mut params, operation);
             ToolKind::Extrude
         }
         FeatureKind::Revolve {
@@ -554,7 +560,7 @@ pub fn edit_existing(editor: &mut Editor, id: FeatureId, previous_cursor: usize)
             load_regions(&mut sel, regions);
             params.axis = Some(*axis);
             params.angle_deg = angle.to_degrees();
-            load_op(&mut params, *operation);
+            load_op(&mut params, operation);
             ToolKind::Revolve
         }
         FeatureKind::Sweep {
@@ -565,14 +571,14 @@ pub fn edit_existing(editor: &mut Editor, id: FeatureId, previous_cursor: usize)
         } => {
             load_regions(&mut sel, regions);
             sel.curves = path.curves.iter().map(|c| (path.sketch, *c)).collect();
-            load_op(&mut params, *operation);
+            load_op(&mut params, operation);
             ToolKind::Sweep
         }
         FeatureKind::Loft {
             regions, operation, ..
         } => {
             load_regions(&mut sel, regions);
-            load_op(&mut params, *operation);
+            load_op(&mut params, operation);
             ToolKind::Loft
         }
         FeatureKind::Fillet { edges, radius } => {
@@ -655,12 +661,12 @@ fn load_regions(sel: &mut Selection, regions: &[RegionRef]) {
     }
 }
 
-fn load_op(params: &mut Params, op: BodyOp) {
+fn load_op(params: &mut Params, op: &BodyOp) {
     match op {
         BodyOp::NewBody => params.op = OpKind::NewBody,
-        BodyOp::Join(t) => (params.op, params.target) = (OpKind::Join, Some(t)),
-        BodyOp::Cut(t) => (params.op, params.target) = (OpKind::Cut, Some(t)),
-        BodyOp::Intersect(t) => (params.op, params.target) = (OpKind::Intersect, Some(t)),
+        BodyOp::Join(t) => (params.op, params.targets) = (OpKind::Join, t.clone()),
+        BodyOp::Cut(t) => (params.op, params.targets) = (OpKind::Cut, t.clone()),
+        BodyOp::Intersect(t) => (params.op, params.targets) = (OpKind::Intersect, t.clone()),
     }
 }
 
@@ -689,20 +695,21 @@ pub fn sync_tool(editor: &mut Editor) {
         return;
     }
     if tool.kind == ToolKind::Extrude && !tool.op_chosen {
-        let target = extrude_lands_on(editor);
+        let targets = extrude_lands_on(editor);
         if let Some(t) = editor.tool.as_mut() {
-            match target {
-                Some(body) => (t.params.op, t.params.target) = (OpKind::Join, Some(body)),
-                None => (t.params.op, t.params.target) = (OpKind::NewBody, None),
+            if targets.is_empty() {
+                (t.params.op, t.params.targets) = (OpKind::NewBody, Vec::new());
+            } else {
+                (t.params.op, t.params.targets) = (OpKind::Join, targets);
             }
         }
     }
     let tool = editor.tool.as_ref().unwrap();
-    // Join/Cut/Intersect need a target; default to the first other body.
+    // Join/Cut/Intersect need at least one target; default to the first other body.
     if matches!(
         tool.params.op,
         OpKind::Join | OpKind::Cut | OpKind::Intersect
-    ) && tool.params.target.is_none()
+    ) && tool.params.targets.is_empty()
     {
         let own = tool.feature.map(BodyRef);
         let target = editor
@@ -711,7 +718,7 @@ pub fn sync_tool(editor: &mut Editor) {
             .map(|(id, _)| *id)
             .find(|id| Some(*id) != own);
         if let Some(t) = editor.tool.as_mut() {
-            t.params.target = target;
+            t.params.targets.extend(target);
         }
     }
     refresh_blend_limit(editor);
@@ -878,6 +885,7 @@ pub fn dialog(editor: &mut Editor, ctx: &egui::Context) {
     let parameters = editor.doc.parameters().clone();
 
     let op_before = tool.params.op;
+    let targets_before = tool.params.targets.clone();
     egui::Window::new(kind.title())
         .id(egui::Id::new("tool-dialog"))
         .collapsible(false)
@@ -1091,8 +1099,10 @@ pub fn dialog(editor: &mut Editor, ctx: &egui::Context) {
             });
         });
 
+    // Editing the target list is as deliberate a choice as picking the operation, and
+    // the join heuristic must stop rewriting either once the user has spoken.
     if let Some(t) = editor.tool.as_mut()
-        && t.params.op != op_before
+        && (t.params.op != op_before || t.params.targets != targets_before)
     {
         t.op_chosen = true;
     }
@@ -1373,12 +1383,16 @@ fn handle_drag(editor: &mut Editor, ctx: &egui::Context) -> bool {
     true
 }
 
-/// The body an extrude of the current selection would touch, so it can join it the way
-/// Fusion's default does. Bounding boxes stand in for the real geometry: a false
-/// positive only means a union with something the extrusion does not reach, which the
-/// kernel handles, and the dialog still lets the user choose otherwise.
-fn extrude_lands_on(editor: &Editor) -> Option<BodyRef> {
-    let tool = editor.tool.as_ref()?;
+/// Every body an extrude of the current selection would touch, so they can all become
+/// the default targets the way Fusion's does: a cut through a stack offers the whole
+/// stack. Bounding boxes stand in for the real geometry: a false positive only means a
+/// boolean with something the extrusion does not reach, which the kernel handles, and
+/// the dialog's checklist still lets the user take any of them out. The body a picked
+/// face belongs to comes first, because it is the one the user pointed at.
+fn extrude_lands_on(editor: &Editor) -> Vec<BodyRef> {
+    let Some(tool) = editor.tool.as_ref() else {
+        return Vec::new();
+    };
     let own = tool.feature.map(BodyRef);
     let (lo, hi) = match tool.params.extent {
         ExtentKind::OneSide => (tool.params.distance.min(0.0), tool.params.distance.max(0.0)),
@@ -1394,7 +1408,9 @@ fn extrude_lands_on(editor: &Editor) -> Option<BodyRef> {
                 .params
                 .to_face
                 .map(|f| f.body)
-                .filter(|b| Some(*b) != own);
+                .filter(|b| Some(*b) != own)
+                .into_iter()
+                .collect();
         }
     };
     let mut swept = Aabb::empty();
@@ -1415,7 +1431,7 @@ fn extrude_lands_on(editor: &Editor) -> Option<BodyRef> {
         }
     }
     if swept.is_empty() {
-        return None;
+        return Vec::new();
     }
     // Two boxes that merely touch count: extruding up from a body's top face must join
     // that body, and the extrusion's box only touches it there.
@@ -1433,9 +1449,11 @@ fn extrude_lands_on(editor: &Editor) -> Option<BodyRef> {
                 .is_some_and(|b| touches(&b.solid.aabb(), &swept))
         })
         .collect();
-    // The body a picked face belongs to is the one the user means.
-    candidates.sort_by_key(|id| !face_bodies.contains(id));
-    candidates.first().copied()
+    // The body a picked face belongs to is the one the user means first; after that,
+    // timeline order, because the source map iterates in no order of its own and a
+    // default that shuffles between syncs would count as a user edit.
+    candidates.sort_by_key(|id| (!face_bodies.contains(id), id.0));
+    candidates
 }
 
 /// Every edge bordering a face, so a face pick can stand for all of them.
@@ -1673,19 +1691,24 @@ fn operation_ui(ui: &mut egui::Ui, p: &mut Params, bodies: &[(BodyRef, String)])
         }
     });
     if p.op != OpKind::NewBody {
-        let current = p
-            .target
-            .and_then(|t| bodies.iter().find(|(id, _)| *id == t))
-            .map(|(_, n)| n.clone());
-        egui::ComboBox::from_label("Target body")
-            .selected_text(current.unwrap_or_else(|| "(none)".into()))
-            .show_ui(ui, |ui| {
-                for (id, name) in bodies {
-                    changed |= ui
-                        .selectable_value(&mut p.target, Some(*id), name)
-                        .changed();
+        // A checkbox per body rather than a combo, because the operation takes several:
+        // a cut through a stack of bodies offers the whole stack ticked, and unticking
+        // one is how it is spared. The same presentation Combine gives its tool bodies,
+        // as a list the user edits in place.
+        ui.label(format!("Target bodies ({} selected)", p.targets.len()));
+        for (id, name) in bodies {
+            let mut on = p.targets.contains(id);
+            if ui.checkbox(&mut on, name).changed() {
+                match on {
+                    true => p.targets.push(*id),
+                    false => p.targets.retain(|t| t != id),
                 }
-            });
+                changed = true;
+            }
+        }
+        if p.targets.is_empty() {
+            ui.label(egui::RichText::new("Tick at least one body").weak());
+        }
     }
     changed
 }
@@ -1843,7 +1866,7 @@ mod tests {
         // The profile sits clear of the block, so keep the result its own body.
         {
             let tool = h.editor.tool.as_mut().unwrap();
-            (tool.params.op, tool.params.target) = (OpKind::NewBody, None);
+            (tool.params.op, tool.params.targets) = (OpKind::NewBody, Vec::new());
             tool.op_chosen = true;
         }
         h.sync_tool();

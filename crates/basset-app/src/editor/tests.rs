@@ -388,8 +388,8 @@ fn extrude_tool_accepts_a_planar_face_as_a_region() {
         super::tools::OpKind::Join
     );
     assert_eq!(
-        editor.tool.as_ref().unwrap().params.target,
-        Some(BodyRef(base))
+        editor.tool.as_ref().unwrap().params.targets,
+        vec![BodyRef(base)]
     );
     let feature = editor
         .tool

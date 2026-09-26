@@ -149,6 +149,17 @@ What is left here:
 
 Extrude tool:
 
+- Multi-body targets: done — Join/Cut/Intersect carry a list of target bodies
+  (`BodyOp::Cut(Vec<BodyRef>)` and friends, file format v5 wraps a v4 single target into
+  a one-element list), the auto-target defaults to every body the extrusion's swept box
+  touches, and the dialog shows the targets as a checklist. A body the tool never
+  reaches still takes the boolean, as Fusion applies it: a missed cut is a no-op, a
+  missed join keeps the tool as a second disjoint shell of that body. Still open: a
+  join that bridges two targets does not merge them into one body the way Fusion's
+  does — each target is unioned with the tool separately and they stay separate bodies;
+  merging is `Combine`'s job for now. Clicking bodies in the viewport does not toggle
+  the checklist either — the extrude tool's viewport picks mean regions, and
+  overloading them was judged more surprising than the checklist
 - "To face" extent: done for planar targets — the target is stored as the same `FaceRef`
   a sketch-on-face uses, resolved fresh on every replay, and a planar target is treated
   as its infinite plane. A plane parallel to the profile's is one exact distance; a

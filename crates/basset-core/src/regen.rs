@@ -35,6 +35,8 @@ pub enum RegenError {
     MissingComponent(ComponentId),
     #[error("face {0:?} is not planar or no longer exists")]
     NotAPlanarFace(String),
+    #[error("no target bodies: pick at least one body to apply the operation to")]
+    NoTargets,
     #[error("no closed profile around ({0}, {1}) in sketch {2}")]
     NoProfileAt(f64, f64, FeatureId),
     #[error("face {0:?} cannot be used as a profile: {1}")]
@@ -257,7 +259,7 @@ impl Regenerator {
                         )?),
                     }
                 }))?;
-                self.finish_body(state, id, *component, solid, *operation)?;
+                self.finish_body(state, id, *component, solid, operation)?;
             }
             FeatureKind::Revolve {
                 regions,
@@ -277,7 +279,7 @@ impl Regenerator {
                         &self.kernel_tessellation,
                     )?)
                 }))?;
-                self.finish_body(state, id, *component, solid, *operation)?;
+                self.finish_body(state, id, *component, solid, operation)?;
             }
             FeatureKind::Sweep {
                 regions,
@@ -290,7 +292,7 @@ impl Regenerator {
                     let profile = resolve_region(state, p)?;
                     Ok(kernel::sweep(op_id(id, k), &profile, &path)?)
                 }))?;
-                self.finish_body(state, id, *component, solid, *operation)?;
+                self.finish_body(state, id, *component, solid, operation)?;
             }
             FeatureKind::Loft {
                 regions,
@@ -302,7 +304,7 @@ impl Regenerator {
                     .map(|p| resolve_region(state, p))
                     .collect::<Result<Vec<_>, _>>()?;
                 let solid = kernel::loft(op_id(id, 0), &sections)?;
-                self.finish_body(state, id, *component, solid, *operation)?;
+                self.finish_body(state, id, *component, solid, operation)?;
             }
             FeatureKind::Fillet { edges, radius } => {
                 for (body_ref, keys) in group_edges(edges) {
@@ -382,7 +384,7 @@ impl Regenerator {
         id: FeatureId,
         component: ComponentId,
         solid: Solid,
-        operation: BodyOp,
+        operation: &BodyOp,
     ) -> Result<(), RegenError> {
         if !state.components.contains_key(&component) {
             return Err(RegenError::MissingComponent(component));
@@ -400,17 +402,29 @@ impl Regenerator {
                     },
                 );
             }
-            BodyOp::Join(t) | BodyOp::Cut(t) | BodyOp::Intersect(t) => {
+            BodyOp::Join(targets) | BodyOp::Cut(targets) | BodyOp::Intersect(targets) => {
                 let op = match operation {
                     BodyOp::Join(_) => BoolOp::Union,
                     BodyOp::Cut(_) => BoolOp::Subtract,
                     _ => BoolOp::Intersect,
                 };
-                let body = state
-                    .bodies
-                    .get_mut(&t)
-                    .ok_or(RegenError::MissingBody(t.0))?;
-                body.solid = Arc::new(kernel::boolean(&body.solid, &solid, op)?);
+                if targets.is_empty() {
+                    return Err(RegenError::NoTargets);
+                }
+                // The same tool solid is applied to every listed body, as Fusion does:
+                // a body the tool never reaches is a no-op for a cut, a second disjoint
+                // shell for a join — the kernel keeps both shells in one solid — and an
+                // empty result for an intersect, which the kernel refuses and this
+                // feature reports. Each boolean reads and writes only its own body, so
+                // the shared operation id cannot collide: face and edge keys are looked
+                // up per body, never across them.
+                for t in targets {
+                    let body = state
+                        .bodies
+                        .get_mut(t)
+                        .ok_or(RegenError::MissingBody(t.0))?;
+                    body.solid = Arc::new(kernel::boolean(&body.solid, &solid, op)?);
+                }
             }
         }
         Ok(())

@@ -1493,3 +1493,129 @@ fn a_refused_rename_puts_the_name_box_back() {
     );
     assert_eq!(h.editor.params_panel.rows[0].draft_name, "a");
 }
+
+/// The multi-body default and the checklist that edits it, end to end: a cut extruded
+/// through two stacked plates offers both as targets, unticking one in the dialog spares
+/// it, the whole interaction is one undo step, and re-editing shows the list it kept.
+#[test]
+fn an_extrude_cut_through_a_stack_targets_every_plate_it_passes() {
+    use super::tools::OpKind;
+    use basset_core::{BodyOp, BodyRef, FeatureKind};
+
+    let mut h = Harness::new();
+    let lower = h.block(); // 10×10×2 at z 0..2.
+    let plane = h.editor.doc.add_feature(FeatureKind::OffsetPlane {
+        base: PlaneRef::Origin(OriginPlane::XY),
+        distance: 2.0,
+    });
+    h.editor.refresh_cache();
+    h.start_sketch(PlaneRef::Feature(plane));
+    h.rectangle(Vec2::ZERO, Vec2::new(10.0, 10.0));
+    h.finish_sketch(true);
+    let sk_upper = h.last_feature();
+    h.start_tool(ToolKind::Extrude);
+    h.select_region(sk_upper, Vec2::new(5.0, 5.0));
+    h.sync_tool();
+    // The new plate rests on the block and the default would join it; this stack wants
+    // two separate bodies.
+    {
+        let tool = h.editor.tool.as_mut().unwrap();
+        (tool.params.op, tool.params.targets) = (OpKind::NewBody, Vec::new());
+        tool.op_chosen = true;
+        tool.params.distance = 2.0;
+    }
+    h.sync_tool();
+    let upper = BodyRef(h.editor.tool.as_ref().unwrap().feature.unwrap());
+    h.confirm_tool();
+    assert!((h.volume(lower) - 200.0).abs() < 1e-9);
+    assert!((h.volume(upper) - 200.0).abs() < 1e-9);
+
+    // A 2×2 hole through the middle: the default reach of 10 mm sweeps up through both
+    // plates, so both arrive as targets without being asked for.
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    // The default grid is coarser than this rectangle, so snapping would fold it up.
+    h.sketch().snap_to_grid = false;
+    h.rectangle(Vec2::new(4.0, 4.0), Vec2::new(6.0, 6.0));
+    h.finish_sketch(true);
+    let sk_cut = h.last_feature();
+    h.start_tool(ToolKind::Extrude);
+    h.select_region(sk_cut, Vec2::new(5.0, 5.0));
+    h.sync_tool();
+    {
+        let tool = h.editor.tool.as_ref().unwrap();
+        assert_eq!(tool.params.op, OpKind::Join, "the Fusion default");
+        assert_eq!(tool.params.targets, vec![lower, upper]);
+    }
+    h.frame();
+    h.frame();
+    assert!(h.click_ui("Cut"), "the dialog offers Cut");
+    assert!(
+        h.frame().has_text("Target bodies (2 selected)"),
+        "{:?}",
+        h.frame().text()
+    );
+
+    // Untick the upper plate. The browser lists the same name on the left, so the
+    // dialog's checkbox is the rightmost occurrence of it on screen.
+    let name = format!("Body{}", (upper.0).0);
+    let pos = h
+        .frame()
+        .texts
+        .iter()
+        .filter(|(_, t)| t.trim() == name)
+        .map(|(r, _)| r.center())
+        .max_by(|a, b| a.x.total_cmp(&b.x))
+        .expect("the dialog lists the upper plate");
+    h.click_at_ui(pos);
+    let tool = h.editor.tool.as_ref().unwrap();
+    assert_eq!(
+        tool.params.targets,
+        vec![lower],
+        "the upper plate is spared"
+    );
+    let cut_feature = tool.feature.expect("the cut previews a feature");
+    h.confirm_tool();
+
+    let Some(FeatureKind::Extrude { operation, .. }) = h
+        .editor
+        .doc
+        .timeline()
+        .get(cut_feature)
+        .map(|f| f.kind.clone())
+    else {
+        panic!("the cut landed in the timeline");
+    };
+    assert_eq!(operation, BodyOp::Cut(vec![lower]));
+    assert!(
+        (h.volume(lower) - 192.0).abs() < 1e-9,
+        "{}",
+        h.volume(lower)
+    );
+    assert!(
+        (h.volume(upper) - 200.0).abs() < 1e-9,
+        "{}",
+        h.volume(upper)
+    );
+
+    // One undo step for the whole interaction, and redo brings the cut back.
+    h.editor.undo();
+    h.editor.refresh_cache();
+    assert!((h.volume(lower) - 200.0).abs() < 1e-9);
+    h.editor.redo();
+    h.editor.refresh_cache();
+    assert!((h.volume(lower) - 192.0).abs() < 1e-9);
+    assert!((h.volume(upper) - 200.0).abs() < 1e-9);
+
+    // Re-editing reopens the dialog with the kept list, not a stale single target.
+    h.editor.edit_feature(cut_feature);
+    let tool = h.editor.tool.as_ref().unwrap();
+    assert_eq!(tool.params.op, OpKind::Cut);
+    assert_eq!(tool.params.targets, vec![lower]);
+    h.cancel_tool();
+
+    // And the document carries the list through a file round trip.
+    let dir = TempDir::new("multi-cut");
+    let mut reopened = h.round_trip(&dir.join("stack.bass"));
+    assert!((reopened.volume(lower) - 192.0).abs() < 1e-9);
+    assert!((reopened.volume(upper) - 200.0).abs() < 1e-9);
+}

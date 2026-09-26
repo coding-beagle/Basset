@@ -87,19 +87,25 @@ pub enum Extent {
 }
 
 /// What a body-creating feature does with the solid it produces.
-#[derive(Copy, Clone, PartialEq, Debug, Serialize, Deserialize)]
+///
+/// The boolean variants carry every body the solid is applied to, as Fusion's do: a cut
+/// whose path passes through several bodies cuts each of the ones listed, with the same
+/// tool solid. An empty list is a feature error at replay time, not a panic — the dialog
+/// never builds one, but an edited file can say anything.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum BodyOp {
     NewBody,
-    Join(BodyRef),
-    Cut(BodyRef),
-    Intersect(BodyRef),
+    Join(Vec<BodyRef>),
+    Cut(Vec<BodyRef>),
+    Intersect(Vec<BodyRef>),
 }
 
 impl BodyOp {
-    pub fn target(&self) -> Option<BodyRef> {
+    /// The bodies the produced solid is applied to; empty for a new body.
+    pub fn targets(&self) -> &[BodyRef] {
         match self {
-            BodyOp::NewBody => None,
-            BodyOp::Join(b) | BodyOp::Cut(b) | BodyOp::Intersect(b) => Some(*b),
+            BodyOp::NewBody => &[],
+            BodyOp::Join(b) | BodyOp::Cut(b) | BodyOp::Intersect(b) => b,
         }
     }
 }
@@ -338,13 +344,13 @@ impl FeatureKind {
                 if let Extent::ToFace(face) = extent {
                     out.push(face.body.0);
                 }
-                out.extend(operation.target().map(|b| b.0));
+                out.extend(operation.targets().iter().map(|b| b.0));
             }
             FeatureKind::Loft {
                 regions, operation, ..
             } => {
                 out.extend(regions.iter().map(RegionRef::source));
-                out.extend(operation.target().map(|b| b.0));
+                out.extend(operation.targets().iter().map(|b| b.0));
             }
             FeatureKind::Revolve {
                 regions,
@@ -356,7 +362,7 @@ impl FeatureKind {
                 if let AxisRef::SketchLine { sketch, .. } = axis {
                     out.push(*sketch);
                 }
-                out.extend(operation.target().map(|b| b.0));
+                out.extend(operation.targets().iter().map(|b| b.0));
             }
             FeatureKind::Sweep {
                 regions,
@@ -366,7 +372,7 @@ impl FeatureKind {
             } => {
                 out.extend(regions.iter().map(RegionRef::source));
                 out.push(path.sketch);
-                out.extend(operation.target().map(|b| b.0));
+                out.extend(operation.targets().iter().map(|b| b.0));
             }
             FeatureKind::Fillet { edges, .. } | FeatureKind::Chamfer { edges, .. } => {
                 out.extend(edges.iter().map(|e| e.body.0));

@@ -12,7 +12,7 @@ rewritten when the next tool arrives.
 | --- | --- |
 | Object model | Document, Components, origin & construction Planes/Axes, Sketches, Bodies; a document-wide table of named parameters every sketch and every feature can read |
 | Sketching | points, lines, arcs, circles, construction geometry, text; rectangles (2-point, centre), circles (centre, 2-point, 3-point), polygons, slots, arcs; geometric constraints and driving dimensions; Levenberg–Marquardt solver that names both the loose geometry and, when a sketch will not solve, the constraints that disagree; selection / hit testing including box select; snapping to the grid and to what the drawing names — endpoints, midpoints, centres, crossings, the nearest point on a curve, the origin, alignment with a touched point, a line's own extension, tangent and perpendicular — ranked, held steady and marked on screen; closed-region detection with curves split at their crossings; trim and break; rectangular and circular patterns with a live preview; offset with rounded or squared corners; dimensions driven by expressions over the sketch's own named parameters and the document's |
-| Solids | extrude (one side / symmetric / two sides / to a face of another body, clicked while the tool runs), revolve, sweep, loft, from a sketch region or a planar face; join / cut / intersect; fillet, chamfer, combine, move |
+| Solids | extrude (one side / symmetric / two sides / to a face of another body, clicked while the tool runs), revolve, sweep, loft, from a sketch region or a planar face; join / cut / intersect, each against any number of target bodies chosen from a checklist (a cut through a stack offers the whole stack); fillet, chamfer, combine, move |
 | Construction | offset plane, plane at an angle, sketch on a planar face |
 | Timeline | insert at cursor, edit, suppress, reorder, delete, roll back / forward; edits replay forward with per-feature caching; extrude, revolve, fillet, chamfer and construction-plane values drivable by expression; per-feature failure reporting |
 | Files | `.bass` documents (versioned JSON); STL and 3MF export of bodies and components |
@@ -162,8 +162,10 @@ cargo clippy --workspace --all-targets -- -D warnings
   result; pressing the ƒ again hands the value back as a
   plain number, keeping whatever it currently reads. Re-opening a driven feature shows the
   expression rather than its answer. Move's own six numbers and the sketch operations have
-  no ƒ yet. An extrude that lands on an existing body joins it unless
-  you pick another operation, so stacked and overlapping extrudes make one body. While
+  no ƒ yet. An extrude that lands on existing bodies joins every body it
+  touches unless you pick another operation, so stacked and overlapping extrudes make
+  one body; the dialog lists the target bodies as checkboxes, and unticking one spares
+  it — a cut through a stack of plates cuts exactly the plates left ticked. While
   a preview shows, clicks still pick from the body as it was before the feature, so the
   second edge of a fillet is an edge of the original body.
 * **Parameters**: the browser has a Parameters section — beside the origin and the

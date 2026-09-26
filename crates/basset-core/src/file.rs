@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::document::Document;
 
-pub const FORMAT_VERSION: u32 = 4;
+pub const FORMAT_VERSION: u32 = 5;
 pub const EXTENSION: &str = "bass";
 
 #[derive(Serialize, Deserialize)]
@@ -85,7 +85,48 @@ fn migrate_step(mut value: serde_json::Value, version: u32) -> serde_json::Value
         }
         2 => migrate_v2_parameters(value),
         3 => migrate_v3_to_face(value),
+        4 => {
+            migrate_v4_single_targets(&mut value);
+            value
+        }
         _ => value,
+    }
+}
+
+/// Version 5 let a boolean feature name several target bodies, so the `Join`, `Cut` and
+/// `Intersect` variants of a generator's operation carry a list where they carried one
+/// body. Every version 4 operation meant exactly that one body, which is the one-element
+/// list. `NewBody` serialises as a bare string and needs nothing.
+fn migrate_v4_single_targets(value: &mut serde_json::Value) {
+    const GENERATORS: [&str; 4] = ["Extrude", "Revolve", "Sweep", "Loft"];
+    const BOOLEANS: [&str; 3] = ["Join", "Cut", "Intersect"];
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                migrate_v4_single_targets(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for name in GENERATORS {
+                let Some(serde_json::Value::Object(body)) = map.get_mut(name) else {
+                    continue;
+                };
+                let Some(serde_json::Value::Object(op)) = body.get_mut("operation") else {
+                    continue;
+                };
+                for boolean in BOOLEANS {
+                    if let Some(target) = op.get_mut(boolean)
+                        && !target.is_array()
+                    {
+                        *target = serde_json::Value::Array(vec![target.take()]);
+                    }
+                }
+            }
+            for (_, v) in map.iter_mut() {
+                migrate_v4_single_targets(v);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -179,6 +220,118 @@ mod tests {
             read(text.as_bytes()),
             Err(FileError::UnsupportedVersion { .. })
         ));
+    }
+
+    #[test]
+    fn v4_single_targets_become_one_element_lists() {
+        let mut doc = serde_json::json!({
+            "timeline": { "features": [
+                { "id": 2, "kind": { "Extrude": {
+                    "regions": [{ "Profile": { "sketch": 1, "sample": [1.0, 1.0] } }],
+                    "extent": { "OneSide": 5.0 },
+                    "operation": "NewBody"
+                } } },
+                { "id": 3, "kind": { "Extrude": {
+                    "regions": [{ "Profile": { "sketch": 1, "sample": [2.0, 2.0] } }],
+                    "extent": { "OneSide": 5.0 },
+                    "operation": { "Cut": 2 }
+                } } },
+                { "id": 4, "kind": { "Revolve": {
+                    "regions": [], "axis": { "Origin": "Y" }, "angle": 1.0,
+                    "operation": { "Join": 2 }
+                } } },
+            ] }
+        });
+        migrate_v4_single_targets(&mut doc);
+        let features = &doc["timeline"]["features"];
+        assert_eq!(
+            features[0]["kind"]["Extrude"]["operation"],
+            serde_json::json!("NewBody"),
+            "a new body carries no target to wrap"
+        );
+        assert_eq!(
+            features[1]["kind"]["Extrude"]["operation"],
+            serde_json::json!({ "Cut": [2] })
+        );
+        assert_eq!(
+            features[2]["kind"]["Revolve"]["operation"],
+            serde_json::json!({ "Join": [2] })
+        );
+        // A second pass is a no-op: an already-listed target is not wrapped again.
+        let once = doc.clone();
+        migrate_v4_single_targets(&mut doc);
+        assert_eq!(doc, once);
+    }
+
+    /// The whole journey of an old file: a document is built with today's types, its
+    /// JSON is rewritten to the version 4 single-target shape, and loading it back must
+    /// regenerate the very same solids the original document held.
+    #[test]
+    fn a_version_4_file_with_a_single_target_cut_loads_and_regenerates_identically() {
+        use basset_math::Vec2;
+        use basset_sketch::{Sketch, shapes};
+
+        use crate::feature::{BodyOp, Extent, FeatureKind};
+        use crate::ids::ComponentId;
+        use crate::refs::{BodyRef, OriginPlane, PlaneRef, ProfileRef, RegionRef};
+
+        let mut doc = Document::new("old cut");
+        let mut sketch = Sketch::new();
+        shapes::rectangle_two_point(&mut sketch, Vec2::ZERO, Vec2::new(10.0, 10.0));
+        shapes::rectangle_two_point(&mut sketch, Vec2::new(4.0, 4.0), Vec2::new(6.0, 6.0));
+        let sk = doc.add_feature(FeatureKind::Sketch {
+            plane: PlaneRef::Origin(OriginPlane::XY),
+            component: ComponentId::ROOT,
+            sketch,
+        });
+        let base = doc.add_feature(FeatureKind::Extrude {
+            regions: vec![RegionRef::Profile(ProfileRef {
+                sketch: sk,
+                sample: Vec2::new(1.0, 1.0),
+            })],
+            extent: Extent::OneSide(2.0),
+            operation: BodyOp::NewBody,
+            component: ComponentId::ROOT,
+        });
+        doc.add_feature(FeatureKind::Extrude {
+            regions: vec![RegionRef::Profile(ProfileRef {
+                sketch: sk,
+                sample: Vec2::new(5.0, 5.0),
+            })],
+            extent: Extent::OneSide(2.0),
+            operation: BodyOp::Cut(vec![BodyRef(base)]),
+            component: ComponentId::ROOT,
+        });
+        let expected = doc.state().body(BodyRef(base)).unwrap().solid.volume();
+        assert!(
+            (expected - (200.0 - 8.0)).abs() < 1e-9,
+            "the document itself cuts the hole: {expected}"
+        );
+
+        // Rewrite what `write` produces into the shape a version 4 build saved: the
+        // target list back to the bare body, and the version stamp to match.
+        let mut bytes = Vec::new();
+        write(&mut bytes, &doc).unwrap();
+        let mut file: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        file["format_version"] = serde_json::json!(4);
+        let op = &mut file["document"]["timeline"]["features"][2]["kind"]["Extrude"]["operation"];
+        assert_eq!(*op, serde_json::json!({ "Cut": [base.0] }));
+        *op = serde_json::json!({ "Cut": base.0 });
+
+        let text = serde_json::to_string(&file).unwrap();
+        let mut loaded = read(text.as_bytes()).expect("a version 4 file still loads");
+        let volume = loaded.state().body(BodyRef(base)).unwrap().solid.volume();
+        assert!(
+            (volume - expected).abs() < 1e-12,
+            "loaded {volume}, built {expected}"
+        );
+
+        // And a fresh save of the loaded document round-trips as itself.
+        let mut again = Vec::new();
+        write(&mut again, &loaded).unwrap();
+        let mut reread = read(again.as_slice()).unwrap();
+        let volume = reread.state().body(BodyRef(base)).unwrap().solid.volume();
+        assert!((volume - expected).abs() < 1e-12);
     }
 
     #[test]

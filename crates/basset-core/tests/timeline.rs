@@ -188,7 +188,13 @@ fn rollback_inserts_at_cursor_and_replays_forward() {
         key: face(ex, FaceRole::EndCap),
     });
     let sk2 = sketch_on(&mut doc, top, cut_sketch);
-    let hole = extrude(&mut doc, sk2, Vec2::ZERO, -4.0, BodyOp::Cut(BodyRef(ex)));
+    let hole = extrude(
+        &mut doc,
+        sk2,
+        Vec2::ZERO,
+        -4.0,
+        BodyOp::Cut(vec![BodyRef(ex)]),
+    );
     assert_eq!(doc.timeline().index_of(hole), Some(3));
     assert_eq!(
         doc.timeline().index_of(fi),
@@ -414,7 +420,13 @@ fn sketch_on_face_and_join() {
         s
     };
     let sk2 = sketch_on(&mut doc, top, boss);
-    let _ = extrude(&mut doc, sk2, Vec2::ZERO, 5.0, BodyOp::Join(BodyRef(base)));
+    let _ = extrude(
+        &mut doc,
+        sk2,
+        Vec2::ZERO,
+        5.0,
+        BodyOp::Join(vec![BodyRef(base)]),
+    );
     let state = doc.state();
     assert!(
         state.failed_features().next().is_none(),
@@ -444,7 +456,7 @@ fn extruding_a_planar_face_joins_onto_the_body() {
     let grown = doc.add_feature(FeatureKind::Extrude {
         regions: vec![RegionRef::Face(top)],
         extent: Extent::OneSide(3.0),
-        operation: BodyOp::Join(BodyRef(base)),
+        operation: BodyOp::Join(vec![BodyRef(base)]),
         component: ComponentId::ROOT,
     });
     let state = doc.state();
@@ -485,7 +497,7 @@ fn extruding_a_face_inward_cuts_the_body() {
             key: face(base, FaceRole::EndCap),
         })],
         extent: Extent::OneSide(-1.5),
-        operation: BodyOp::Cut(BodyRef(base)),
+        operation: BodyOp::Cut(vec![BodyRef(base)]),
         component: ComponentId::ROOT,
     });
     let state = doc.state();
@@ -841,4 +853,175 @@ fn a_to_face_extent_survives_a_round_trip_through_bass() {
     };
     assert_eq!(*extent, Extent::ToFace(target));
     assert_relative_eq!(volume(&mut loaded, up), before, epsilon = 1e-9);
+}
+
+// --- Multi-body boolean targets --------------------------------------------------------
+
+/// A sketch holding one w×h rectangle whose lower-left corner is at `at`.
+fn rect_at(at: Vec2, w: f64, h: f64) -> Sketch {
+    let mut s = Sketch::new();
+    shapes::rectangle_two_point(&mut s, at, at + Vec2::new(w, h));
+    s
+}
+
+/// Two 10×10×2 plates stacked at z 0..2 and z 2..4, as separate bodies: the shape a cut
+/// through a stack meets.
+fn stacked_plates(doc: &mut Document) -> (FeatureId, FeatureId) {
+    let sk = sketch_on(
+        doc,
+        PlaneRef::Origin(OriginPlane::XY),
+        rect_at(Vec2::ZERO, 10.0, 10.0),
+    );
+    let lower = extrude(doc, sk, Vec2::new(5.0, 5.0), 2.0, BodyOp::NewBody);
+    let plane = doc.add_feature(FeatureKind::OffsetPlane {
+        base: PlaneRef::Origin(OriginPlane::XY),
+        distance: 2.0,
+    });
+    let sk2 = sketch_on(
+        doc,
+        PlaneRef::Feature(plane),
+        rect_at(Vec2::ZERO, 10.0, 10.0),
+    );
+    let upper = extrude(doc, sk2, Vec2::new(5.0, 5.0), 2.0, BodyOp::NewBody);
+    (lower, upper)
+}
+
+/// One cut listing two bodies removes the same tool from both of them, and the tool's
+/// face keys land on each body independently: keys are scoped per body, so the shared
+/// operation id cannot collide across them.
+#[test]
+fn one_cut_through_two_stacked_plates_cuts_both() {
+    let mut doc = Document::new("stack");
+    let (lower, upper) = stacked_plates(&mut doc);
+    let sk = sketch_on(
+        &mut doc,
+        PlaneRef::Origin(OriginPlane::XY),
+        rect_at(Vec2::new(4.0, 4.0), 2.0, 2.0),
+    );
+    let cut = extrude(
+        &mut doc,
+        sk,
+        Vec2::new(5.0, 5.0),
+        10.0,
+        BodyOp::Cut(vec![BodyRef(lower), BodyRef(upper)]),
+    );
+    let state = doc.state();
+    assert_eq!(state.status(cut), Some(&FeatureStatus::Ok));
+    for body in [lower, upper] {
+        let solid = &state.body(BodyRef(body)).unwrap().solid;
+        assert_relative_eq!(solid.volume(), 200.0 - 8.0, epsilon = 1e-9);
+        assert!(solid.is_closed());
+        // The hole's walls on this body are faces the cut's operation id made.
+        assert!(
+            solid.faces.iter().any(|f| f.key.op.feature == cut.0),
+            "body {body} carries no face of the cut"
+        );
+    }
+}
+
+/// One join listing two bodies unions the same tool into both. The bodies stay separate
+/// — Fusion merges targets a join bridges, which this kernel-level rule does not attempt
+/// — but each of them gains exactly the material of the tool it did not already have.
+#[test]
+fn one_join_across_two_stacked_plates_adds_to_both() {
+    let mut doc = Document::new("stack join");
+    let (lower, upper) = stacked_plates(&mut doc);
+    let sk = sketch_on(
+        &mut doc,
+        PlaneRef::Origin(OriginPlane::XY),
+        rect_at(Vec2::new(4.0, 4.0), 2.0, 2.0),
+    );
+    let join = extrude(
+        &mut doc,
+        sk,
+        Vec2::new(5.0, 5.0),
+        4.0,
+        BodyOp::Join(vec![BodyRef(lower), BodyRef(upper)]),
+    );
+    let state = doc.state();
+    assert_eq!(state.status(join), Some(&FeatureStatus::Ok));
+    // The tool is 2×2×4; each plate already holds half of it.
+    for body in [lower, upper] {
+        let solid = &state.body(BodyRef(body)).unwrap().solid;
+        assert_relative_eq!(solid.volume(), 200.0 + 8.0, epsilon = 1e-9);
+        assert!(solid.is_closed());
+    }
+}
+
+/// A body the tool never reaches still takes the boolean, as Fusion applies it: a missed
+/// cut leaves that body unchanged, and a missed join keeps the tool as a second disjoint
+/// shell of the target rather than refusing. Neither fails the feature.
+#[test]
+fn a_listed_body_the_tool_misses_takes_the_boolean_anyway() {
+    let mut doc = Document::new("miss");
+    let sk = sketch_on(
+        &mut doc,
+        PlaneRef::Origin(OriginPlane::XY),
+        rect_at(Vec2::ZERO, 10.0, 10.0),
+    );
+    let near = extrude(&mut doc, sk, Vec2::new(5.0, 5.0), 2.0, BodyOp::NewBody);
+    let sk_far = sketch_on(
+        &mut doc,
+        PlaneRef::Origin(OriginPlane::XY),
+        rect_at(Vec2::new(20.0, 0.0), 10.0, 10.0),
+    );
+    let far = extrude(&mut doc, sk_far, Vec2::new(25.0, 5.0), 2.0, BodyOp::NewBody);
+
+    let sk_cut = sketch_on(
+        &mut doc,
+        PlaneRef::Origin(OriginPlane::XY),
+        rect_at(Vec2::new(4.0, 4.0), 2.0, 2.0),
+    );
+    let cut = extrude(
+        &mut doc,
+        sk_cut,
+        Vec2::new(5.0, 5.0),
+        10.0,
+        BodyOp::Cut(vec![BodyRef(near), BodyRef(far)]),
+    );
+    {
+        let state = doc.state();
+        assert_eq!(state.status(cut), Some(&FeatureStatus::Ok));
+        assert_relative_eq!(volume(&mut doc, near), 192.0, epsilon = 1e-9);
+        assert_relative_eq!(volume(&mut doc, far), 200.0, epsilon = 1e-9);
+    }
+
+    // The same tool joined instead: the far body keeps its own 200 and gains the whole
+    // 40 of the tool as a second shell, still one closed solid.
+    doc.edit_feature_kind(cut, |k| {
+        if let FeatureKind::Extrude { operation, .. } = k {
+            *operation = BodyOp::Join(vec![BodyRef(far)]);
+        }
+    })
+    .unwrap();
+    let state = doc.state();
+    assert_eq!(state.status(cut), Some(&FeatureStatus::Ok));
+    let solid = &state.body(BodyRef(far)).unwrap().solid;
+    assert_relative_eq!(solid.volume(), 200.0 + 40.0, epsilon = 1e-9);
+    assert!(solid.is_closed());
+}
+
+/// A boolean with no bodies listed is a per-feature failure with a message, never a
+/// panic: the UI cannot build one, but a file can say anything.
+#[test]
+fn a_boolean_with_no_targets_fails_the_feature_with_a_message() {
+    let mut doc = Document::new("empty");
+    let sk = sketch_on(
+        &mut doc,
+        PlaneRef::Origin(OriginPlane::XY),
+        rect_at(Vec2::ZERO, 10.0, 10.0),
+    );
+    let cut = extrude(
+        &mut doc,
+        sk,
+        Vec2::new(5.0, 5.0),
+        2.0,
+        BodyOp::Cut(Vec::new()),
+    );
+    match doc.state().status(cut) {
+        Some(FeatureStatus::Failed(msg)) => {
+            assert!(msg.contains("no target bodies"), "{msg}");
+        }
+        other => panic!("an empty target list came back {other:?}"),
+    }
 }
