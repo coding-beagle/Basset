@@ -9,6 +9,7 @@
 //! `Failed` and replay continues, so the user sees exactly which steps broke and the
 //! rest of the model stays live.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use basset_kernel::{self as kernel, Axis, BoolOp, OpId, Profile, Solid};
@@ -18,6 +19,7 @@ use basset_sketch::{Entity, Font, Tessellation};
 use crate::feature::{BodyOp, CombineOp, Extent, Feature, FeatureKind};
 use crate::ids::{ComponentId, FeatureId};
 use crate::model::{Body, Component, FeatureStatus, ModelState, SolvedSketch};
+use crate::parameters::Parameters;
 use crate::refs::{AxisRef, BodyRef, EdgeRef, PathRef, PlaneRef, ProfileRef, RegionRef};
 use crate::timeline::Timeline;
 
@@ -33,6 +35,8 @@ pub enum RegenError {
     MissingComponent(ComponentId),
     #[error("face {0:?} is not planar or no longer exists")]
     NotAPlanarFace(String),
+    #[error("no target bodies: pick at least one body to apply the operation to")]
+    NoTargets,
     #[error("no closed profile around ({0}, {1}) in sketch {2}")]
     NoProfileAt(f64, f64, FeatureId),
     #[error("face {0:?} cannot be used as a profile: {1}")]
@@ -41,6 +45,8 @@ pub enum RegenError {
     BadAxis,
     #[error("edge {0:?} no longer exists on body")]
     MissingEdge(String),
+    #[error("target face {0:?} no longer exists on its body")]
+    MissingTargetFace(String),
     #[error("sketch did not solve: {0}")]
     Sketch(String),
     #[error("{0}")]
@@ -54,6 +60,10 @@ pub struct Regenerator {
     /// `snapshots[i]` is the state after replaying features `0..=i`.
     snapshots: Vec<ModelState>,
     font: Option<Arc<Font>>,
+    /// The document's parameter table, behind every sketch and in front of every driven
+    /// feature value. Held here rather than read from the timeline because it is not part
+    /// of the timeline: changing it re-drives everything, from feature zero.
+    parameters: Parameters,
     tessellation: Tessellation,
     kernel_tessellation: kernel::Tessellation,
 }
@@ -61,6 +71,17 @@ pub struct Regenerator {
 impl Regenerator {
     pub fn set_font(&mut self, font: Option<Arc<Font>>) {
         self.font = font;
+    }
+
+    /// Replaces the parameter table and discards every cached state: a parameter can drive
+    /// anything at any point in the history, so there is no earlier feature to keep.
+    pub fn set_parameters(&mut self, parameters: Parameters) {
+        self.parameters = parameters;
+        self.invalidate_from(0);
+    }
+
+    pub fn parameters(&self) -> &Parameters {
+        &self.parameters
     }
 
     pub fn invalidate_from(&mut self, index: usize) {
@@ -93,7 +114,7 @@ impl Regenerator {
         match count {
             0 => &EMPTY_STATE,
             n => {
-                flag_under_constrained(&mut self.snapshots[n - 1], &active[..n]);
+                flag_sketch_faults(&mut self.snapshots[n - 1], &active[..n], &self.parameters);
                 &self.snapshots[n - 1]
             }
         }
@@ -104,8 +125,10 @@ impl Regenerator {
             state.statuses.insert(feature.id, FeatureStatus::Suppressed);
             return state;
         }
-        let status = match self.apply_kind(&mut state, feature) {
-            Ok(()) => FeatureStatus::Ok,
+        let (driven, stale) = self.drive(feature);
+        let status = match self.apply_kind(&mut state, &driven) {
+            Ok(()) if stale.is_empty() => FeatureStatus::Ok,
+            Ok(()) => FeatureStatus::Warned(stale.join("; ")),
             Err(e) => {
                 log::warn!("feature {} ({}) failed: {e}", feature.id, feature.name);
                 FeatureStatus::Failed(e.to_string())
@@ -113,6 +136,36 @@ impl Regenerator {
         };
         state.statuses.insert(feature.id, status);
         state
+    }
+
+    /// Resolves a feature's expression-driven values into a copy of it, and reports the
+    /// ones that could not be resolved.
+    ///
+    /// A copy, because replay must not write back into the timeline: the stored expression
+    /// is the input and the number is derived from it, so a replay that edited the feature
+    /// would make regeneration a mutation and undo a lie. The common case — a feature
+    /// nobody drives — borrows and clones nothing.
+    ///
+    /// An expression that no longer evaluates does *not* fail the feature. It keeps the
+    /// number it last had and says so, following the same rule the sketch layer applies to
+    /// a dimension: deleting a parameter should tell the user what stopped being driven,
+    /// not collapse half the model to zero while they work out what happened.
+    fn drive<'f>(&self, feature: &'f Feature) -> (Cow<'f, Feature>, Vec<String>) {
+        if feature.exprs.is_empty() {
+            return (Cow::Borrowed(feature), Vec::new());
+        }
+        let mut driven = feature.clone();
+        let mut stale = Vec::new();
+        for (field, text) in &feature.exprs {
+            match self.parameters.evaluate(text) {
+                Ok(value) if driven.kind.set_numeric_field(*field, value) => {}
+                Ok(_) => stale.push(format!(
+                    "{field} is driven by {text:?}, but this feature no longer has that value"
+                )),
+                Err(e) => stale.push(format!("{field} keeps its value: {e}")),
+            }
+        }
+        (Cow::Owned(driven), stale)
     }
 
     fn apply_kind(&self, state: &mut ModelState, feature: &Feature) -> Result<(), RegenError> {
@@ -143,8 +196,11 @@ impl Regenerator {
                 }
                 let mut solved = sketch.clone();
                 solved.set_font(self.font.clone());
+                // The document's table sits behind the sketch's own, so a dimension bound
+                // to a document parameter is re-driven here, on every replay.
+                let outer = self.parameters.lookup();
                 let report = solved
-                    .solve()
+                    .solve_with(&outer)
                     .map_err(|e| RegenError::Sketch(e.to_string()))?;
                 let profiles = solved
                     .profiles(&self.tessellation)
@@ -181,13 +237,29 @@ impl Regenerator {
             } => {
                 let solid = union_all(regions.iter().enumerate().map(|(k, p)| {
                     let profile = resolve_region(state, p)?;
-                    Ok(kernel::extrude(
-                        op_id(id, k),
-                        &profile,
-                        convert_extent(*extent),
-                    )?)
+                    match extent {
+                        // The target is resolved fresh on every replay, so the
+                        // extrusion follows the face through edits of the body it
+                        // belongs to, and a missing body or face is this feature's
+                        // failure rather than a stale distance.
+                        Extent::ToFace(target) => {
+                            let body = state
+                                .bodies
+                                .get(&target.body)
+                                .ok_or(RegenError::MissingBody(target.body.0))?;
+                            let face = body.solid.face(target.key).ok_or_else(|| {
+                                RegenError::MissingTargetFace(format!("{:?}", target.key))
+                            })?;
+                            Ok(kernel::extrude_to_face(op_id(id, k), &profile, face)?)
+                        }
+                        _ => Ok(kernel::extrude(
+                            op_id(id, k),
+                            &profile,
+                            convert_extent(*extent),
+                        )?),
+                    }
                 }))?;
-                self.finish_body(state, id, *component, solid, *operation)?;
+                self.finish_body(state, id, *component, solid, operation)?;
             }
             FeatureKind::Revolve {
                 regions,
@@ -207,7 +279,7 @@ impl Regenerator {
                         &self.kernel_tessellation,
                     )?)
                 }))?;
-                self.finish_body(state, id, *component, solid, *operation)?;
+                self.finish_body(state, id, *component, solid, operation)?;
             }
             FeatureKind::Sweep {
                 regions,
@@ -220,7 +292,7 @@ impl Regenerator {
                     let profile = resolve_region(state, p)?;
                     Ok(kernel::sweep(op_id(id, k), &profile, &path)?)
                 }))?;
-                self.finish_body(state, id, *component, solid, *operation)?;
+                self.finish_body(state, id, *component, solid, operation)?;
             }
             FeatureKind::Loft {
                 regions,
@@ -232,7 +304,7 @@ impl Regenerator {
                     .map(|p| resolve_region(state, p))
                     .collect::<Result<Vec<_>, _>>()?;
                 let solid = kernel::loft(op_id(id, 0), &sections)?;
-                self.finish_body(state, id, *component, solid, *operation)?;
+                self.finish_body(state, id, *component, solid, operation)?;
             }
             FeatureKind::Fillet { edges, radius } => {
                 for (body_ref, keys) in group_edges(edges) {
@@ -312,7 +384,7 @@ impl Regenerator {
         id: FeatureId,
         component: ComponentId,
         solid: Solid,
-        operation: BodyOp,
+        operation: &BodyOp,
     ) -> Result<(), RegenError> {
         if !state.components.contains_key(&component) {
             return Err(RegenError::MissingComponent(component));
@@ -330,17 +402,29 @@ impl Regenerator {
                     },
                 );
             }
-            BodyOp::Join(t) | BodyOp::Cut(t) | BodyOp::Intersect(t) => {
+            BodyOp::Join(targets) | BodyOp::Cut(targets) | BodyOp::Intersect(targets) => {
                 let op = match operation {
                     BodyOp::Join(_) => BoolOp::Union,
                     BodyOp::Cut(_) => BoolOp::Subtract,
                     _ => BoolOp::Intersect,
                 };
-                let body = state
-                    .bodies
-                    .get_mut(&t)
-                    .ok_or(RegenError::MissingBody(t.0))?;
-                body.solid = Arc::new(kernel::boolean(&body.solid, &solid, op)?);
+                if targets.is_empty() {
+                    return Err(RegenError::NoTargets);
+                }
+                // The same tool solid is applied to every listed body, as Fusion does:
+                // a body the tool never reaches is a no-op for a cut, a second disjoint
+                // shell for a join — the kernel keeps both shells in one solid — and an
+                // empty result for an intersect, which the kernel refuses and this
+                // feature reports. Each boolean reads and writes only its own body, so
+                // the shared operation id cannot collide: face and edge keys are looked
+                // up per body, never across them.
+                for t in targets {
+                    let body = state
+                        .bodies
+                        .get_mut(t)
+                        .ok_or(RegenError::MissingBody(t.0))?;
+                    body.solid = Arc::new(kernel::boolean(&body.solid, &solid, op)?);
+                }
             }
         }
         Ok(())
@@ -350,7 +434,8 @@ impl Regenerator {
 static EMPTY_STATE: std::sync::LazyLock<ModelState> =
     std::sync::LazyLock::new(ModelState::with_root);
 
-/// Flags the sketches whose remaining degrees of freedom can actually damage the model.
+/// Flags the sketches whose state the user needs to know about: loose geometry a later
+/// feature builds from, and dimensions whose expression stopped evaluating.
 ///
 /// An under-constrained sketch on its own is an ordinary state of a drawing — Fusion
 /// colours it and says nothing more, and a warning on every such sketch would be
@@ -359,10 +444,18 @@ static EMPTY_STATE: std::sync::LazyLock<ModelState> =
 /// geometry off the edges it was drawn against, which changes what the profiles enclose
 /// and so what that feature builds, silently.
 ///
-/// It is computed over the finished state rather than while replaying, because whether a
-/// sketch is consumed depends on features that come after it, and it is recomputed from
-/// scratch each time so that deleting the consumer takes the warning away again.
-fn flag_under_constrained(state: &mut ModelState, active: &[Feature]) {
+/// A dimension bound to an expression that no longer evaluates — usually because the
+/// parameter behind it was deleted or renamed by hand — keeps the value it last had, so
+/// the sketch still solves and nothing here can go wrong on its own. It is worth saying
+/// anyway: the drawing is no longer the thing the user expressed, and nothing else in the
+/// model would ever mention it.
+///
+/// Both are computed over the finished state rather than while replaying, because whether
+/// a sketch is consumed depends on features that come after it, and both are recomputed
+/// from scratch each time so that deleting the consumer, or restoring the parameter, takes
+/// the warning away again. A sketch with both faults gets one message naming both, since
+/// a status holds one string and neither fault is the more urgent.
+fn flag_sketch_faults(state: &mut ModelState, active: &[Feature], parameters: &Parameters) {
     let consumed: Vec<FeatureId> = active
         .iter()
         // A suppressed feature builds nothing, so it puts nothing at risk either.
@@ -370,6 +463,7 @@ fn flag_under_constrained(state: &mut ModelState, active: &[Feature]) {
         .flat_map(|f| f.kind.dependencies())
         .filter(|id| state.sketches.contains_key(id))
         .collect();
+    let outer = parameters.lookup();
     for feature in active {
         let Some(solved) = state.sketches.get(&feature.id) else {
             continue;
@@ -382,15 +476,26 @@ fn flag_under_constrained(state: &mut ModelState, active: &[Feature]) {
         ) {
             continue;
         }
+        let mut faults = Vec::new();
         let dof = solved.report.degrees_of_freedom;
-        let status = if dof > 0 && consumed.contains(&feature.id) {
+        if dof > 0 && consumed.contains(&feature.id) {
             let plural = if dof == 1 { "" } else { "s" };
-            FeatureStatus::Warned(format!(
+            faults.push(format!(
                 "under-constrained: {dof} degree{plural} of freedom, and a feature builds \
                  from it \u{2014} an edit elsewhere can move this geometry"
-            ))
-        } else {
-            FeatureStatus::Ok
+            ));
+        }
+        let stale = solved.sketch.failed_bindings_with(&outer).len();
+        if stale > 0 {
+            let plural = if stale == 1 { "" } else { "s" };
+            faults.push(format!(
+                "{stale} dimension{plural} stopped being driven: the expression no longer \
+                 evaluates, so the value it last had is being used"
+            ));
+        }
+        let status = match faults.is_empty() {
+            true => FeatureStatus::Ok,
+            false => FeatureStatus::Warned(faults.join("; ")),
         };
         state.statuses.insert(feature.id, status);
     }
@@ -555,11 +660,15 @@ fn resolve_path(
     })
 }
 
+/// The kernel form of an extent whose distances are stored on the feature. `ToFace` has
+/// no such form — its reach exists only once the target is resolved, which the extrude
+/// arm of [`Regenerator::apply_kind`] does before ever calling this.
 fn convert_extent(e: Extent) -> kernel::Extent {
     match e {
         Extent::OneSide(d) => kernel::Extent::OneSide(d),
         Extent::Symmetric(d) => kernel::Extent::Symmetric(d),
         Extent::TwoSides { positive, negative } => kernel::Extent::TwoSides { positive, negative },
+        Extent::ToFace(_) => unreachable!("a to-face extent is resolved during replay"),
     }
 }
 

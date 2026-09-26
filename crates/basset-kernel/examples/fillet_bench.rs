@@ -131,13 +131,19 @@ fn cases() -> Vec<Case> {
 
 fn main() {
     println!(
-        "{:<34} {:>7} {:>9} {:>8} {:>7} {:>7}  {}",
-        "case", "in", "time ms", "out", "closed", "valid", "volume"
+        "{:<34} {:>7} {:>9} {:>8} {:>7} {:>7}  volume",
+        "case", "in", "time ms", "out", "closed", "valid"
     );
     let mut total = 0.0;
     for case in cases() {
         let t = Instant::now();
-        let result = fillet(OpId::new(2), &case.solid, &case.edges, case.radius, &case.tess);
+        let result = fillet(
+            OpId::new(2),
+            &case.solid,
+            &case.edges,
+            case.radius,
+            &case.tess,
+        );
         let ms = t.elapsed().as_secs_f64() * 1e3;
         total += ms;
         match result {

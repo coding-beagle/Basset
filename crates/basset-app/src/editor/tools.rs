@@ -5,9 +5,11 @@
 //! is always a live preview of exactly what OK will keep. The document transaction makes
 //! the whole interaction a single undo step, and Cancel is a rollback.
 
+use std::collections::BTreeMap;
+
 use basset_core::{
-    AxisRef, BodyOp, BodyRef, CombineOp, Extent, FeatureId, FeatureKind, FeatureStatus, OriginAxis,
-    PathRef, PlaneRef, RegionRef,
+    AxisRef, BodyOp, BodyRef, CombineOp, EdgeRef, Extent, FaceRef, FeatureId, FeatureKind,
+    FeatureStatus, NumericField, OriginAxis, Parameters, PathRef, PlaneRef, RegionRef,
 };
 use basset_math::{Aabb, Affine3, Quat, Vec3};
 
@@ -72,6 +74,8 @@ pub enum ExtentKind {
     OneSide,
     Symmetric,
     TwoSides,
+    /// Up to a clicked face of an existing body; the face lands in [`Params::to_face`].
+    ToFace,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,7 +96,12 @@ pub struct Params {
     pub angle_deg: f64,
     pub radius: f64,
     pub op: OpKind,
-    pub target: Option<BodyRef>,
+    /// The bodies a Join/Cut/Intersect applies to. Several, as in Fusion: a cut whose
+    /// path passes through more than one body offers to cut them all, and the dialog's
+    /// checklist is where any of them is taken back out.
+    pub targets: Vec<BodyRef>,
+    /// The face a to-face extrude reaches, once the user has clicked one.
+    pub to_face: Option<FaceRef>,
     pub combine: CombineOp,
     pub keep_tools: bool,
     pub translate: Vec3,
@@ -113,7 +122,8 @@ impl Default for Params {
             angle_deg: 360.0,
             radius: 1.0,
             op: OpKind::NewBody,
-            target: None,
+            targets: Vec::new(),
+            to_face: None,
             combine: CombineOp::Join,
             keep_tools: false,
             translate: Vec3::ZERO,
@@ -125,15 +135,118 @@ impl Default for Params {
     }
 }
 
+/// Every field a dialog can offer, so a tool that stops offering one can take back the
+/// expression that was driving it.
+const FIELDS: [NumericField; 4] = [
+    NumericField::Distance,
+    NumericField::Negative,
+    NumericField::Angle,
+    NumericField::Radius,
+];
+
+/// The expressions driving a running tool's numbers.
+///
+/// Held by the tool rather than in [`Params`] because an expression belongs to the
+/// *feature*: `Params` is the flat bag of numbers every dialog shares, and the number is
+/// what the expression works out to, not what the user stated. These are written onto the
+/// feature on every sync, so they are part of the tool's transaction and a Cancel takes
+/// them back with everything else.
+#[derive(Clone, Debug, Default)]
+pub struct FieldExprs {
+    /// Text being edited, one entry per field whose toggle is on. Separate from the live
+    /// expressions so a half-typed name does not un-drive the field on every keystroke.
+    drafts: BTreeMap<NumericField, String>,
+    /// The expressions that last evaluated: what actually drives the feature.
+    live: BTreeMap<NumericField, String>,
+    /// Which field was refused and why, for the dialog to show beside it. A refusal has
+    /// to be visible where the user typed, not swallowed or sent to a popup over the
+    /// dialog they are still working in.
+    error: Option<(NumericField, String)>,
+}
+
+impl FieldExprs {
+    /// The expression driving a field, if one does.
+    #[cfg(test)]
+    pub fn get(&self, field: NumericField) -> Option<&str> {
+        self.live.get(&field).map(String::as_str)
+    }
+
+    /// Takes what a field's box says: if it works out, the field is driven by it and the
+    /// number becomes its result.
+    ///
+    /// Returns whether the value moved. A refusal is kept for the dialog to show and the
+    /// field keeps whatever drove it before, so a typo never un-drives a feature that was
+    /// working.
+    fn commit(
+        &mut self,
+        field: NumericField,
+        parameters: &Parameters,
+        text: &str,
+        value: &mut f64,
+    ) -> bool {
+        match parameters.evaluate(text) {
+            Ok(v) => {
+                *value = v;
+                self.live.insert(field, text.to_string());
+                self.clear_error(field);
+                true
+            }
+            Err(e) => {
+                self.error = Some((field, e.to_string()));
+                false
+            }
+        }
+    }
+
+    fn is_open(&self, field: NumericField) -> bool {
+        self.drafts.contains_key(&field)
+    }
+
+    /// Opens the expression box for a field, starting from whatever already drives it.
+    fn open(&mut self, field: NumericField) {
+        let text = self.live.get(&field).cloned().unwrap_or_default();
+        self.drafts.insert(field, text);
+    }
+
+    /// Releases a field back to a plain number, keeping the value the expression gave it.
+    fn close(&mut self, field: NumericField) {
+        self.drafts.remove(&field);
+        self.live.remove(&field);
+        self.clear_error(field);
+    }
+
+    fn clear_error(&mut self, field: NumericField) {
+        if self.error.as_ref().is_some_and(|(f, _)| *f == field) {
+            self.error = None;
+        }
+    }
+
+    /// Loads what already drives a feature, so re-editing one shows `wall * 2` rather
+    /// than the 10 it works out to.
+    fn load(&mut self, exprs: &BTreeMap<NumericField, String>) {
+        for (field, text) in exprs {
+            self.live.insert(*field, text.clone());
+            self.drafts.insert(*field, text.clone());
+        }
+    }
+}
+
 pub struct Tool {
     pub kind: ToolKind,
     pub feature: Option<FeatureId>,
     pub params: Params,
+    /// What drives this tool's numbers, for as long as the dialog is open.
+    pub exprs: FieldExprs,
     /// Cursor position to restore when editing an existing feature ends.
     restore_cursor: Option<usize>,
     /// The user picked the operation themselves. Until they do, an extrude follows
     /// Fusion's rule: it joins whatever body it lands on and is a new body otherwise.
     pub op_chosen: bool,
+    /// Fillet and Chamfer: the largest size the selected edges can take, and the
+    /// selection it was worked out for. Asking the kernel costs a pass over the body's
+    /// edges, which is nothing beside a boolean but too much to spend on every frame of
+    /// a drag, so it is kept until the selection itself moves on.
+    limit: (Vec<EdgeRef>, Option<f64>),
 }
 
 impl Tool {
@@ -167,6 +280,23 @@ impl Tool {
         matches!(self.kind, ToolKind::Fillet | ToolKind::Chamfer)
     }
 
+    /// Whether the extrude is armed for a to-face extent with no face chosen yet. While
+    /// this holds, the next face click is the target, and OK is held back: the feature
+    /// still carries whatever extent it had before, and confirming would quietly commit
+    /// that instead of what the dialog says.
+    pub fn awaits_face_target(&self) -> bool {
+        self.kind == ToolKind::Extrude
+            && self.params.extent == ExtentKind::ToFace
+            && self.params.to_face.is_none()
+    }
+
+    /// The largest radius or distance this blend may be given, as last worked out for
+    /// the selection it is running on. `None` for a tool that is not a blend, and while
+    /// nothing is selected to measure.
+    pub fn blend_limit(&self) -> Option<f64> {
+        self.limit.1
+    }
+
     pub fn selection_changed(&mut self, selection: &Selection) {
         // A sketch line picked while an axis is wanted becomes the axis.
         if matches!(self.kind, ToolKind::Revolve | ToolKind::AngledPlane)
@@ -181,12 +311,15 @@ impl Tool {
     fn build_kind(&self, editor: &Editor) -> Option<FeatureKind> {
         let sel = &editor.selection;
         let component = editor.active_component;
+        // No targets means the input is incomplete, not a feature that errors: the
+        // dialog holds the feature back the same way it does for a missing region.
         let operation = |p: &Params| -> Option<BodyOp> {
+            let targets = || (!p.targets.is_empty()).then(|| p.targets.clone());
             match p.op {
                 OpKind::NewBody => Some(BodyOp::NewBody),
-                OpKind::Join => p.target.map(BodyOp::Join),
-                OpKind::Cut => p.target.map(BodyOp::Cut),
-                OpKind::Intersect => p.target.map(BodyOp::Intersect),
+                OpKind::Join => targets().map(BodyOp::Join),
+                OpKind::Cut => targets().map(BodyOp::Cut),
+                OpKind::Intersect => targets().map(BodyOp::Intersect),
             }
         };
         let p = &self.params;
@@ -204,6 +337,9 @@ impl Tool {
                         positive: p.distance,
                         negative: p.negative,
                     },
+                    // Armed but not yet aimed: the feature keeps its last shape until a
+                    // face is clicked, and OK is held back by `awaits_face_target`.
+                    ExtentKind::ToFace => Extent::ToFace(p.to_face?),
                 };
                 FeatureKind::Extrude {
                     regions,
@@ -326,8 +462,10 @@ pub fn start_tool(editor: &mut Editor, kind: ToolKind) {
         kind,
         feature: None,
         params: params.clone(),
+        exprs: FieldExprs::default(),
         restore_cursor: None,
         op_chosen: false,
+        limit: (Vec::new(), None),
     }
     .filter();
     let mut sel = Selection::default();
@@ -362,8 +500,10 @@ pub fn start_tool(editor: &mut Editor, kind: ToolKind) {
         kind,
         feature: None,
         params,
+        exprs: FieldExprs::default(),
         restore_cursor: None,
         op_chosen: false,
+        limit: (Vec::new(), None),
     });
     if kind == ToolKind::Component {
         editor.doc.begin_transaction();
@@ -402,8 +542,12 @@ pub fn edit_existing(editor: &mut Editor, id: FeatureId, previous_cursor: usize)
                     params.distance = positive;
                     params.negative = negative;
                 }
+                Extent::ToFace(face) => {
+                    params.extent = ExtentKind::ToFace;
+                    params.to_face = Some(face);
+                }
             }
-            load_op(&mut params, *operation);
+            load_op(&mut params, operation);
             ToolKind::Extrude
         }
         FeatureKind::Revolve {
@@ -416,7 +560,7 @@ pub fn edit_existing(editor: &mut Editor, id: FeatureId, previous_cursor: usize)
             load_regions(&mut sel, regions);
             params.axis = Some(*axis);
             params.angle_deg = angle.to_degrees();
-            load_op(&mut params, *operation);
+            load_op(&mut params, operation);
             ToolKind::Revolve
         }
         FeatureKind::Sweep {
@@ -427,14 +571,14 @@ pub fn edit_existing(editor: &mut Editor, id: FeatureId, previous_cursor: usize)
         } => {
             load_regions(&mut sel, regions);
             sel.curves = path.curves.iter().map(|c| (path.sketch, *c)).collect();
-            load_op(&mut params, *operation);
+            load_op(&mut params, operation);
             ToolKind::Sweep
         }
         FeatureKind::Loft {
             regions, operation, ..
         } => {
             load_regions(&mut sel, regions);
-            load_op(&mut params, *operation);
+            load_op(&mut params, operation);
             ToolKind::Loft
         }
         FeatureKind::Fillet { edges, radius } => {
@@ -482,15 +626,21 @@ pub fn edit_existing(editor: &mut Editor, id: FeatureId, previous_cursor: usize)
         FeatureKind::Sketch { .. } | FeatureKind::NewComponent { .. } => return,
     };
     let restore_cursor = Some(previous_cursor);
+    // A driven feature re-opens showing what drives it, not the number it works out to:
+    // anything else would quietly replace the intent with its result on the next OK.
+    let mut exprs = FieldExprs::default();
+    exprs.load(&feature.exprs);
     editor.doc.begin_transaction();
     editor.selection = sel;
     editor.tool = Some(Tool {
         kind,
         feature: Some(id),
         params,
+        exprs,
         restore_cursor,
         // An existing feature's operation was decided when it was made.
         op_chosen: true,
+        limit: (Vec::new(), None),
     });
     editor.set_status(format!("Editing {}", feature.name));
 }
@@ -511,12 +661,12 @@ fn load_regions(sel: &mut Selection, regions: &[RegionRef]) {
     }
 }
 
-fn load_op(params: &mut Params, op: BodyOp) {
+fn load_op(params: &mut Params, op: &BodyOp) {
     match op {
         BodyOp::NewBody => params.op = OpKind::NewBody,
-        BodyOp::Join(t) => (params.op, params.target) = (OpKind::Join, Some(t)),
-        BodyOp::Cut(t) => (params.op, params.target) = (OpKind::Cut, Some(t)),
-        BodyOp::Intersect(t) => (params.op, params.target) = (OpKind::Intersect, Some(t)),
+        BodyOp::Join(t) => (params.op, params.targets) = (OpKind::Join, t.clone()),
+        BodyOp::Cut(t) => (params.op, params.targets) = (OpKind::Cut, t.clone()),
+        BodyOp::Intersect(t) => (params.op, params.targets) = (OpKind::Intersect, t.clone()),
     }
 }
 
@@ -545,20 +695,21 @@ pub fn sync_tool(editor: &mut Editor) {
         return;
     }
     if tool.kind == ToolKind::Extrude && !tool.op_chosen {
-        let target = extrude_lands_on(editor);
+        let targets = extrude_lands_on(editor);
         if let Some(t) = editor.tool.as_mut() {
-            match target {
-                Some(body) => (t.params.op, t.params.target) = (OpKind::Join, Some(body)),
-                None => (t.params.op, t.params.target) = (OpKind::NewBody, None),
+            if targets.is_empty() {
+                (t.params.op, t.params.targets) = (OpKind::NewBody, Vec::new());
+            } else {
+                (t.params.op, t.params.targets) = (OpKind::Join, targets);
             }
         }
     }
     let tool = editor.tool.as_ref().unwrap();
-    // Join/Cut/Intersect need a target; default to the first other body.
+    // Join/Cut/Intersect need at least one target; default to the first other body.
     if matches!(
         tool.params.op,
         OpKind::Join | OpKind::Cut | OpKind::Intersect
-    ) && tool.params.target.is_none()
+    ) && tool.params.targets.is_empty()
     {
         let own = tool.feature.map(BodyRef);
         let target = editor
@@ -567,9 +718,10 @@ pub fn sync_tool(editor: &mut Editor) {
             .map(|(id, _)| *id)
             .find(|id| Some(*id) != own);
         if let Some(t) = editor.tool.as_mut() {
-            t.params.target = target;
+            t.params.targets.extend(target);
         }
     }
+    refresh_blend_limit(editor);
     let tool = editor.tool.as_ref().unwrap();
     let Some(kind) = tool.build_kind(editor) else {
         return;
@@ -588,7 +740,88 @@ pub fn sync_tool(editor: &mut Editor) {
             }
         }
     }
+    apply_field_exprs(editor);
     editor.request_repaint();
+}
+
+/// Writes what the dialog says drives each number onto the feature it is previewing.
+///
+/// It runs on every sync rather than once at OK because the feature is the preview: an
+/// expression has to reach it to be seen, and it is inside the tool's transaction either
+/// way, so Cancel takes it back with the rest. The number itself is already in the kind
+/// the sync just wrote — [`basset_core::Document::set_feature_expr`] writes the same
+/// value again — so the text and the number cannot disagree.
+fn apply_field_exprs(editor: &mut Editor) {
+    let Some(tool) = editor.tool.as_ref() else {
+        return;
+    };
+    let Some(id) = tool.feature else {
+        return;
+    };
+    let live = tool.exprs.live.clone();
+    let Some(offered) = editor
+        .doc
+        .timeline()
+        .get(id)
+        .map(|f| f.kind.numeric_fields().to_vec())
+    else {
+        return;
+    };
+    for field in FIELDS {
+        // A field the kind no longer offers — the second distance of an extrude that is
+        // no longer two-sided — is released rather than left driving nothing, which would
+        // warn on every regeneration from then on.
+        let result = match live.get(&field).filter(|_| offered.contains(&field)) {
+            Some(text) => editor.doc.set_feature_expr(id, field, text).map(|_| ()),
+            None => editor.doc.clear_feature_expr(id, field).map(|_| ()),
+        };
+        if let Err(e) = result {
+            editor.report_error(e);
+        }
+    }
+}
+
+/// Works out how large the running blend may be, if the selection has moved since the
+/// last time it was asked.
+///
+/// The bodies picking runs against are the model *before* the previewed feature, which
+/// is the same body the fillet is applied to, so the number is the one the kernel will
+/// hold the radius against. Several bodies blended at once take the smallest of theirs:
+/// one feature carries one radius, and it has to fit everywhere it lands.
+fn refresh_blend_limit(editor: &mut Editor) {
+    let Some(tool) = editor.tool.as_ref() else {
+        return;
+    };
+    if !matches!(tool.kind, ToolKind::Fillet | ToolKind::Chamfer)
+        || tool.limit.0 == editor.selection.edges
+    {
+        return;
+    }
+    let kind = tool.kind;
+    let edges = editor.selection.edges.clone();
+    let mut by_body: Vec<(BodyRef, Vec<basset_kernel::EdgeKey>)> = Vec::new();
+    for e in &edges {
+        match by_body.iter_mut().find(|(b, _)| *b == e.body) {
+            Some((_, keys)) => keys.push(e.key),
+            None => by_body.push((e.body, vec![e.key])),
+        }
+    }
+    let mut limit: Option<f64> = None;
+    for (body, keys) in by_body {
+        let Some(solid) = editor.pick_body(body).map(|p| p.solid.clone()) else {
+            continue;
+        };
+        let found = match kind {
+            ToolKind::Chamfer => basset_kernel::blend::max_chamfer_distance(&solid, &keys),
+            _ => basset_kernel::blend::max_fillet_radius(&solid, &keys),
+        };
+        if let Some(found) = found {
+            limit = Some(limit.map_or(found, |l: f64| l.min(found)));
+        }
+    }
+    if let Some(tool) = editor.tool.as_mut() {
+        tool.limit = (edges, limit);
+    }
 }
 
 pub fn confirm_tool(editor: &mut Editor) {
@@ -642,18 +875,25 @@ pub fn dialog(editor: &mut Editor, ctx: &egui::Context) {
     let status = tool
         .feature
         .and_then(|id| editor.cached_statuses.get(&id).cloned());
+    let blend_limit = tool.blend_limit();
     let bodies: Vec<(BodyRef, String)> = editor.cached_bodies.clone();
     let selection_text = editor.selection.summary();
     let edge_count = editor.selection.edges.len();
+    // Cloned out before the window closure takes the editor mutably. It is a handful of
+    // rows, and an expression typed into a dialog has to be judged against the table as
+    // it stands this frame.
+    let parameters = editor.doc.parameters().clone();
 
     let op_before = tool.params.op;
+    let targets_before = tool.params.targets.clone();
     egui::Window::new(kind.title())
         .id(egui::Id::new("tool-dialog"))
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::RIGHT_TOP, [-12.0, 190.0])
         .show(ctx, |ui| {
-            let p = &mut editor.tool.as_mut().unwrap().params;
+            let tool = editor.tool.as_mut().expect("checked above");
+            let (p, ex) = (&mut tool.params, &mut tool.exprs);
             ui.label(kind.prompt());
             ui.label(egui::RichText::new(&selection_text).weak());
             ui.separator();
@@ -665,19 +905,77 @@ pub fn dialog(editor: &mut Editor, ctx: &egui::Context) {
                             (ExtentKind::OneSide, "One side"),
                             (ExtentKind::Symmetric, "Symmetric"),
                             (ExtentKind::TwoSides, "Two sides"),
+                            (ExtentKind::ToFace, "To face"),
                         ] {
                             changed |= ui.selectable_value(&mut p.extent, k, name).changed();
                         }
                     });
-                    changed |= drag(ui, "Distance", &mut p.distance, 0.5, "mm");
-                    if p.extent == ExtentKind::TwoSides {
-                        changed |= drag(ui, "Negative", &mut p.negative, 0.5, "mm");
+                    if p.extent == ExtentKind::ToFace {
+                        // No distance to type: the reach is the target's to give. The
+                        // dialog shows which face instead, and the way to re-aim it.
+                        match p.to_face {
+                            Some(f) => {
+                                let target = bodies
+                                    .iter()
+                                    .find(|(id, _)| *id == f.body)
+                                    .map(|(_, n)| n.clone())
+                                    .unwrap_or_else(|| format!("{}", f.body.0));
+                                ui.horizontal(|ui| {
+                                    ui.label(format!("Up to a face of {target}"));
+                                    if ui
+                                        .button("Clear")
+                                        .on_hover_text("Choose a different face")
+                                        .clicked()
+                                    {
+                                        p.to_face = None;
+                                        changed = true;
+                                    }
+                                });
+                            }
+                            None => {
+                                ui.label(
+                                    egui::RichText::new("Click the face to extrude up to").weak(),
+                                );
+                            }
+                        }
+                    } else {
+                        changed |= drag(
+                            ui,
+                            ex,
+                            &parameters,
+                            NumericField::Distance,
+                            "Distance",
+                            &mut p.distance,
+                            0.5,
+                            "mm",
+                        );
+                        if p.extent == ExtentKind::TwoSides {
+                            changed |= drag(
+                                ui,
+                                ex,
+                                &parameters,
+                                NumericField::Negative,
+                                "Negative",
+                                &mut p.negative,
+                                0.5,
+                                "mm",
+                            );
+                        }
                     }
                     changed |= operation_ui(ui, p, &bodies);
                 }
                 ToolKind::Revolve => {
                     changed |= axis_ui(ui, p);
-                    changed |= drag(ui, "Angle", &mut p.angle_deg, 1.0, "°");
+                    changed |= drag(
+                        ui,
+                        ex,
+                        &parameters,
+                        NumericField::Angle,
+                        "Angle",
+                        &mut p.angle_deg,
+                        1.0,
+                        "°",
+                    );
                     changed |= operation_ui(ui, p, &bodies);
                 }
                 ToolKind::Sweep | ToolKind::Loft => {
@@ -698,11 +996,30 @@ pub fn dialog(editor: &mut Editor, ctx: &egui::Context) {
                              (hold Ctrl while clicking for a single edge)",
                         )
                         .changed();
-                    let (label, speed) = match kind {
-                        ToolKind::Fillet => ("Radius", 0.1),
-                        _ => ("Distance", 0.1),
+                    // The one parameter is a radius on a fillet and a setback on a
+                    // chamfer, which is also which field an expression on it drives.
+                    let (label, field) = match kind {
+                        ToolKind::Fillet => ("Radius", NumericField::Radius),
+                        _ => ("Distance", NumericField::Distance),
                     };
-                    changed |= drag(ui, label, &mut p.radius, speed, "mm");
+                    changed |= drag(ui, ex, &parameters, field, label, &mut p.radius, 0.1, "mm");
+                    // What the material allows. The handle in the viewport stops there of
+                    // its own accord, so this is for the box, which does not: a number
+                    // typed past it is still sent to the kernel and still refused, and
+                    // the user should be able to see why before that happens.
+                    if let Some(max) = blend_limit {
+                        let over = p.radius > max;
+                        let text = egui::RichText::new(format!(
+                            "{} {max:.2} mm fits between these edges and the faces they \
+                             sit on",
+                            if over { "only" } else { "up to" }
+                        ));
+                        ui.label(if over {
+                            text.color(egui::Color32::from_rgb(235, 190, 90))
+                        } else {
+                            text.weak()
+                        });
+                    }
                 }
                 ToolKind::Combine => {
                     ui.horizontal(|ui| {
@@ -724,11 +1041,29 @@ pub fn dialog(editor: &mut Editor, ctx: &egui::Context) {
                     changed |= vec3_ui(ui, &mut p.rotate_deg, 1.0);
                 }
                 ToolKind::OffsetPlane => {
-                    changed |= drag(ui, "Distance", &mut p.distance, 0.5, "mm")
+                    changed |= drag(
+                        ui,
+                        ex,
+                        &parameters,
+                        NumericField::Distance,
+                        "Distance",
+                        &mut p.distance,
+                        0.5,
+                        "mm",
+                    );
                 }
                 ToolKind::AngledPlane => {
                     changed |= axis_ui(ui, p);
-                    changed |= drag(ui, "Angle", &mut p.angle_deg, 1.0, "°");
+                    changed |= drag(
+                        ui,
+                        ex,
+                        &parameters,
+                        NumericField::Angle,
+                        "Angle",
+                        &mut p.angle_deg,
+                        1.0,
+                        "°",
+                    );
                 }
                 ToolKind::Component => {
                     ui.horizontal(|ui| {
@@ -751,10 +1086,10 @@ pub fn dialog(editor: &mut Editor, ctx: &egui::Context) {
             }
             ui.separator();
             ui.horizontal(|ui| {
-                let ready = editor
-                    .tool
-                    .as_ref()
-                    .is_some_and(|t| t.feature.is_some() || t.kind == ToolKind::Component);
+                let ready = editor.tool.as_ref().is_some_and(|t| {
+                    (t.feature.is_some() || t.kind == ToolKind::Component)
+                        && !t.awaits_face_target()
+                });
                 if ui.add_enabled(ready, egui::Button::new("OK")).clicked() {
                     action = Some(true);
                 }
@@ -764,8 +1099,10 @@ pub fn dialog(editor: &mut Editor, ctx: &egui::Context) {
             });
         });
 
+    // Editing the target list is as deliberate a choice as picking the operation, and
+    // the join heuristic must stop rewriting either once the user has spoken.
     if let Some(t) = editor.tool.as_mut()
-        && t.params.op != op_before
+        && (t.params.op != op_before || t.params.targets != targets_before)
     {
         t.op_chosen = true;
     }
@@ -792,6 +1129,19 @@ pub struct Handle {
     pub dir: Vec3,
 }
 
+/// The number the viewport handle drags, for the kinds that have one. The handle is the
+/// same value as the dialog's box under a different skin, so it has to obey the same rule
+/// about being driven.
+fn handle_field(kind: ToolKind) -> Option<NumericField> {
+    match kind {
+        ToolKind::Extrude | ToolKind::OffsetPlane | ToolKind::Chamfer => {
+            Some(NumericField::Distance)
+        }
+        ToolKind::Fillet => Some(NumericField::Radius),
+        _ => None,
+    }
+}
+
 /// The handle for the running tool, or `None` when it has nothing to drag yet.
 pub fn handle(editor: &Editor) -> Option<Handle> {
     let tool = editor.tool.as_ref()?;
@@ -806,6 +1156,8 @@ pub fn handle(editor: &Editor) -> Option<Handle> {
                 ExtentKind::OneSide => p.distance,
                 ExtentKind::Symmetric => p.distance * 0.5,
                 ExtentKind::TwoSides => p.distance,
+                // The reach is the target's to give; there is no number to drag.
+                ExtentKind::ToFace => return None,
             };
             Some(Handle {
                 origin,
@@ -843,6 +1195,55 @@ pub fn handle(editor: &Editor) -> Option<Handle> {
         _ => None,
     }
 }
+
+/// The number a field's box edits, for a caller that names a field rather than holding
+/// the box.
+///
+/// The dialog hands its `&mut f64` straight to [`drag`], so this is the one other place
+/// that has to agree with it about which of the flat [`Params`] each field is. A blend's
+/// single size is `radius` whether the kind calls it a radius or a setback.
+#[cfg(test)]
+fn params_field(kind: ToolKind, params: &mut Params, field: NumericField) -> Option<&mut f64> {
+    match (kind, field) {
+        (ToolKind::Fillet | ToolKind::Chamfer, NumericField::Radius | NumericField::Distance) => {
+            Some(&mut params.radius)
+        }
+        (_, NumericField::Distance) => Some(&mut params.distance),
+        (_, NumericField::Negative) => Some(&mut params.negative),
+        (_, NumericField::Angle) => Some(&mut params.angle_deg),
+        (_, NumericField::Radius) => None,
+    }
+}
+
+/// Drives one of the running tool's numbers by an expression, as typing it into the
+/// dialog's box and leaving the box does.
+///
+/// A test cannot type into an egui box, so this is how one states an expression: it fills
+/// the same draft, takes it through the same [`FieldExprs::commit`] the box does, and
+/// syncs the tool. Returns whether it was taken.
+#[cfg(test)]
+pub(crate) fn type_expression(editor: &mut Editor, field: NumericField, text: &str) -> bool {
+    let parameters = editor.doc.parameters().clone();
+    let Some(tool) = editor.tool.as_mut() else {
+        return false;
+    };
+    let kind = tool.kind;
+    tool.exprs.drafts.insert(field, text.to_string());
+    let mut spare = 0.0;
+    let value = match params_field(kind, &mut tool.params, field) {
+        Some(slot) => slot,
+        None => &mut spare,
+    };
+    if !tool.exprs.commit(field, &parameters, text, value) {
+        return false;
+    }
+    sync_tool(editor);
+    true
+}
+
+/// The increment a dragged size rounds to, in mm. See the comment at the drag itself
+/// for why it is fixed rather than the zoom-following one the sketch grid uses.
+pub(crate) const HANDLE_STEP: f64 = 1.0;
 
 /// Draws the handle's grip at its tip and applies a drag of it to the tool's size.
 /// Returns whether the size changed. The arrow shaft itself is drawn by the scene, so
@@ -884,6 +1285,25 @@ fn handle_drag(editor: &mut Editor, ctx: &egui::Context) -> bool {
         })
         .inner;
     if !response.dragged() {
+        // The gesture is over, so its running total goes with it: the next grab of the
+        // grip starts from wherever the size actually is. See [`snap::Drag::release`].
+        editor.drags.slide.release();
+        return false;
+    }
+    // A driven size is read-only wherever it is shown, and the arrow is one of the places
+    // it is shown. Letting the drag through would write a number the next sync overwrites
+    // from the expression, leaving the arrow, the dialog's readout and the solid all
+    // saying different things; releasing the expression on a drag would throw away what
+    // the user stated because they brushed a grip. So the drag is ignored and the reason
+    // is said, which is the only part of it the user cannot already see.
+    if let Some(tool) = editor.tool.as_ref()
+        && let Some(field) = handle_field(tool.kind)
+        && tool.exprs.is_open(field)
+    {
+        editor.set_status(format!(
+            "{} is driven by an expression: turn the expression off to drag it",
+            field.label()
+        ));
         return false;
     }
     // Project the drag onto the arrow's direction on screen, then scale by the world
@@ -900,13 +1320,21 @@ fn handle_drag(editor: &mut Editor, ctx: &egui::Context) -> bool {
     let along =
         (f64::from(delta.x) * ppp) * screen_dir.x + (f64::from(delta.y) * ppp) * screen_dir.y;
     let world = along * camera.pixel_size_at(h.tip, window);
-    // The same rule every other handle in the app obeys: the size lands on the grid the
-    // user can see, and shift lets go of it for as long as it is held. A dragged extrude
-    // that stopped at 12.37 mm would make the grid decorative.
-    let snap = editor.snap_at(h.tip);
+    // A size lands on round numbers, and shift lets go of that for as long as it is
+    // held. A dragged extrude that stopped at 12.37 mm would make the number a chore to
+    // read back. Unlike a sketch drag, the increment here is fixed rather than following
+    // the zoom: a size is a number first and a picture second, so quantising it to 5 or
+    // 10 mm because the camera stood back — or changing the increment mid-gesture as the
+    // arrow's tip moved through the view — makes the handle feel arbitrary. The
+    // gesture's running total goes through [`snap::Drag`], as the gizmo's does: rounding
+    // each frame's slice instead would throw a slow drag's sub-step deltas away one by
+    // one and the handle would only ever move on a flick.
+    let snap = editor.snapping.at(HANDLE_STEP);
     let Some(tool) = editor.tool.as_mut() else {
         return false;
     };
+    let drag = &mut editor.drags.slide;
+    let limit = tool.blend_limit();
     let p = &mut tool.params;
     let value = match tool.kind {
         ToolKind::Extrude => {
@@ -915,18 +1343,35 @@ fn handle_drag(editor: &mut Editor, ctx: &egui::Context) -> bool {
             } else {
                 1.0
             };
-            p.distance = snap.value(p.distance + world * scale);
-            if p.extent != ExtentKind::OneSide {
-                p.distance = p.distance.max(0.01);
-            }
+            p.distance = if p.extent == ExtentKind::OneSide {
+                let at = drag.advance(p.distance, world * scale, snap);
+                // A one-sided extrude may cross to the other side of its sketch, but it
+                // cannot pause at no length on the way: the kernel refuses a zero
+                // extent, and a drag resting there would leave a dead preview and a
+                // warning per frame. The size holds one increment short, on whichever
+                // side it was already on, until the drag carries it across.
+                if at == 0.0 {
+                    let short = snap.step().unwrap_or(0.01);
+                    if p.distance < 0.0 { -short } else { short }
+                } else {
+                    at
+                }
+            } else {
+                drag.advance_above(p.distance, world * scale, snap, 0.01)
+            };
             p.distance
         }
         ToolKind::Fillet | ToolKind::Chamfer => {
-            p.radius = snap.value(p.radius + world).max(0.01);
+            // Stopped at what the material allows rather than let past it and refused:
+            // a blend dragged out of range would take the shell off the screen and
+            // leave the user pulling back through a preview that is not there. The
+            // handle simply stops, which is the same thing the geometry does.
+            let ceiling = limit.unwrap_or(f64::INFINITY).max(0.01);
+            p.radius = drag.advance_within(p.radius, world, snap, 0.01, ceiling);
             p.radius
         }
         ToolKind::OffsetPlane => {
-            p.distance = snap.value(p.distance + world);
+            p.distance = drag.advance(p.distance, world, snap);
             p.distance
         }
         _ => return false,
@@ -938,12 +1383,16 @@ fn handle_drag(editor: &mut Editor, ctx: &egui::Context) -> bool {
     true
 }
 
-/// The body an extrude of the current selection would touch, so it can join it the way
-/// Fusion's default does. Bounding boxes stand in for the real geometry: a false
-/// positive only means a union with something the extrusion does not reach, which the
-/// kernel handles, and the dialog still lets the user choose otherwise.
-fn extrude_lands_on(editor: &Editor) -> Option<BodyRef> {
-    let tool = editor.tool.as_ref()?;
+/// Every body an extrude of the current selection would touch, so they can all become
+/// the default targets the way Fusion's does: a cut through a stack offers the whole
+/// stack. Bounding boxes stand in for the real geometry: a false positive only means a
+/// boolean with something the extrusion does not reach, which the kernel handles, and
+/// the dialog's checklist still lets the user take any of them out. The body a picked
+/// face belongs to comes first, because it is the one the user pointed at.
+fn extrude_lands_on(editor: &Editor) -> Vec<BodyRef> {
+    let Some(tool) = editor.tool.as_ref() else {
+        return Vec::new();
+    };
     let own = tool.feature.map(BodyRef);
     let (lo, hi) = match tool.params.extent {
         ExtentKind::OneSide => (tool.params.distance.min(0.0), tool.params.distance.max(0.0)),
@@ -952,6 +1401,17 @@ fn extrude_lands_on(editor: &Editor) -> Option<BodyRef> {
             tool.params.distance.abs() * 0.5,
         ),
         ExtentKind::TwoSides => (-tool.params.negative.abs(), tool.params.distance.abs()),
+        // An extrusion aimed at a face ends on that face, so the body it belongs to is
+        // the body it lands on; no box arithmetic can say it better.
+        ExtentKind::ToFace => {
+            return tool
+                .params
+                .to_face
+                .map(|f| f.body)
+                .filter(|b| Some(*b) != own)
+                .into_iter()
+                .collect();
+        }
     };
     let mut swept = Aabb::empty();
     let mut face_bodies: Vec<BodyRef> = Vec::new();
@@ -971,7 +1431,7 @@ fn extrude_lands_on(editor: &Editor) -> Option<BodyRef> {
         }
     }
     if swept.is_empty() {
-        return None;
+        return Vec::new();
     }
     // Two boxes that merely touch count: extruding up from a body's top face must join
     // that body, and the extrusion's box only touches it there.
@@ -989,9 +1449,11 @@ fn extrude_lands_on(editor: &Editor) -> Option<BodyRef> {
                 .is_some_and(|b| touches(&b.solid.aabb(), &swept))
         })
         .collect();
-    // The body a picked face belongs to is the one the user means.
-    candidates.sort_by_key(|id| !face_bodies.contains(id));
-    candidates.first().copied()
+    // The body a picked face belongs to is the one the user means first; after that,
+    // timeline order, because the source map iterates in no order of its own and a
+    // default that shuffles between syncs would count as a user edit.
+    candidates.sort_by_key(|id| (!face_bodies.contains(id), id.0));
+    candidates
 }
 
 /// Every edge bordering a face, so a face pick can stand for all of them.
@@ -1026,6 +1488,28 @@ pub fn tangent_chain(editor: &Editor, edge: &basset_core::EdgeRef) -> Vec<basset
             key,
         })
         .collect()
+}
+
+/// While the extrude's extent is "to face", a click on a body face aims the extrusion at
+/// that face rather than adding it as a region — Fusion's rule, and the least surprising
+/// one, because the user armed the mode themselves in the dialog. Sketch regions keep
+/// toggling as usual, so the profile can still be adjusted mid-flight. Returns whether
+/// the pick was consumed this way.
+pub fn take_to_face_pick(editor: &mut Editor, pick: &Pick) -> bool {
+    let armed = editor
+        .tool
+        .as_ref()
+        .is_some_and(|t| t.kind == ToolKind::Extrude && t.params.extent == ExtentKind::ToFace);
+    if !armed {
+        return false;
+    }
+    let Pick::Face(face, _) = pick else {
+        return false;
+    };
+    if let Some(tool) = editor.tool.as_mut() {
+        tool.params.to_face = Some(*face);
+    }
+    true
 }
 
 /// Fillet and Chamfer read a pick as shorthand for a group of edges: a face stands for
@@ -1109,17 +1593,76 @@ impl Editor {
     }
 }
 
-fn drag(ui: &mut egui::Ui, label: &str, value: &mut f64, speed: f64, suffix: &str) -> bool {
+/// One number of a dialog: a drag box, or the expression driving it.
+///
+/// Every number in every tool goes through here, which is what makes "any of them can be
+/// driven by a parameter" one change rather than one per tool. The toggle swaps the box
+/// for an expression; while an expression is set the number is read-only and shows what
+/// the expression works out to, because there the expression is the input and the number
+/// is only its result.
+///
+/// Returns whether the value moved, which is the same signal the plain drag box gave: the
+/// caller syncs the feature on it.
+fn drag(
+    ui: &mut egui::Ui,
+    exprs: &mut FieldExprs,
+    parameters: &Parameters,
+    field: NumericField,
+    label: &str,
+    value: &mut f64,
+    speed: f64,
+    suffix: &str,
+) -> bool {
+    let mut changed = false;
     ui.horizontal(|ui| {
         ui.label(label);
-        ui.add(
-            egui::DragValue::new(value)
-                .speed(speed)
-                .suffix(format!(" {suffix}")),
-        )
-        .changed()
-    })
-    .inner
+        match exprs.drafts.get_mut(&field) {
+            Some(draft) => {
+                let response = ui.add(
+                    egui::TextEdit::singleline(draft)
+                        .desired_width(96.0)
+                        .hint_text("expression"),
+                );
+                let text = draft.trim().to_string();
+                // Taken when the box is left or Enter is pressed, as everywhere else an
+                // expression is typed: a name half written is not yet an error.
+                if response.lost_focus() && !text.is_empty() {
+                    changed |= exprs.commit(field, parameters, &text, value);
+                }
+                ui.label(egui::RichText::new(format!("= {value:.3} {suffix}")).weak());
+            }
+            None => {
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(value)
+                            .speed(speed)
+                            .suffix(format!(" {suffix}")),
+                    )
+                    .changed();
+            }
+        }
+        let open = exprs.is_open(field);
+        if ui
+            .selectable_label(open, "\u{192}")
+            .on_hover_text("Drive this by an expression over the document's parameters")
+            .clicked()
+        {
+            if open {
+                // Releasing keeps the value the expression gave it, the same rule
+                // retyping a number over a driven sketch dimension follows.
+                exprs.close(field);
+                changed = true;
+            } else {
+                exprs.open(field);
+            }
+        }
+    });
+    if let Some((f, message)) = &exprs.error
+        && *f == field
+    {
+        ui.colored_label(egui::Color32::from_rgb(230, 120, 100), message);
+    }
+    changed
 }
 
 fn vec3_ui(ui: &mut egui::Ui, v: &mut Vec3, speed: f64) -> bool {
@@ -1148,19 +1691,24 @@ fn operation_ui(ui: &mut egui::Ui, p: &mut Params, bodies: &[(BodyRef, String)])
         }
     });
     if p.op != OpKind::NewBody {
-        let current = p
-            .target
-            .and_then(|t| bodies.iter().find(|(id, _)| *id == t))
-            .map(|(_, n)| n.clone());
-        egui::ComboBox::from_label("Target body")
-            .selected_text(current.unwrap_or_else(|| "(none)".into()))
-            .show_ui(ui, |ui| {
-                for (id, name) in bodies {
-                    changed |= ui
-                        .selectable_value(&mut p.target, Some(*id), name)
-                        .changed();
+        // A checkbox per body rather than a combo, because the operation takes several:
+        // a cut through a stack of bodies offers the whole stack ticked, and unticking
+        // one is how it is spared. The same presentation Combine gives its tool bodies,
+        // as a list the user edits in place.
+        ui.label(format!("Target bodies ({} selected)", p.targets.len()));
+        for (id, name) in bodies {
+            let mut on = p.targets.contains(id);
+            if ui.checkbox(&mut on, name).changed() {
+                match on {
+                    true => p.targets.push(*id),
+                    false => p.targets.retain(|t| t != id),
                 }
-            });
+                changed = true;
+            }
+        }
+        if p.targets.is_empty() {
+            ui.label(egui::RichText::new("Tick at least one body").weak());
+        }
     }
     changed
 }
@@ -1266,6 +1814,92 @@ mod tests {
         );
     }
 
+    /// The whole to-face flow, driven the way a user drives it: arm the mode in the
+    /// dialog, click a face of another body, confirm. The feature carries the extent,
+    /// the body stops exactly at the face's plane, undo and redo treat it like any other
+    /// feature, and re-editing reopens the dialog in the same state.
+    #[test]
+    fn an_extrude_reaches_the_face_the_user_clicks() {
+        let mut h = Harness::new();
+        let base = h.block(); // 10×10, 2 mm thick: its top face sits at z = 2.
+        h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+        h.sketch().snap_to_grid = false;
+        h.rectangle(Vec2::new(14.0, 0.0), Vec2::new(18.0, 4.0));
+        h.finish_sketch(true);
+        let sketch = h.last_feature();
+        h.start_tool(ToolKind::Extrude);
+        h.select_region(sketch, Vec2::new(16.0, 2.0));
+        h.sync_tool();
+        // A window egui has not laid out before spends its first frame sizing itself,
+        // so the frame whose widgets can be clicked is the second one.
+        h.frame();
+        h.frame();
+        assert!(h.click_ui("To face"), "the extent offers a to-face mode");
+        assert!(
+            h.editor.tool.as_ref().unwrap().awaits_face_target(),
+            "armed but not yet aimed"
+        );
+        h.frame();
+        assert!(
+            h.frame().has_text("Click the face to extrude up to"),
+            "{:?}",
+            h.frame().text()
+        );
+
+        // The next face click aims the extrusion instead of becoming a region.
+        h.editor
+            .apply_pick(Some(Pick::Face(top_face(base), 0.0)), false);
+        let tool = h.editor.tool.as_ref().unwrap();
+        assert_eq!(tool.params.to_face, Some(top_face(base)));
+        assert!(
+            h.editor.selection.faces.is_empty(),
+            "consumed, not selected"
+        );
+        let feature = tool.feature.expect("the tool previews a feature");
+        h.frame();
+        assert!(
+            h.frame().has_text("Up to a face of"),
+            "{:?}",
+            h.frame().text()
+        );
+
+        // The profile sits clear of the block, so keep the result its own body.
+        {
+            let tool = h.editor.tool.as_mut().unwrap();
+            (tool.params.op, tool.params.targets) = (OpKind::NewBody, Vec::new());
+            tool.op_chosen = true;
+        }
+        h.sync_tool();
+        h.confirm_tool();
+        let body = BodyRef(feature);
+        let Some(FeatureKind::Extrude {
+            extent, regions, ..
+        }) = h.editor.doc.timeline().get(feature).map(|f| &f.kind)
+        else {
+            panic!("the extrude landed in the timeline");
+        };
+        assert_eq!(*extent, Extent::ToFace(top_face(base)), "{regions:?}");
+        assert!(
+            (h.volume(body) - 4.0 * 4.0 * 2.0).abs() < 1e-9,
+            "reached z = 2: {}",
+            h.volume(body)
+        );
+
+        // One undo step for the whole interaction, like any other tool.
+        h.editor.undo();
+        assert!(!h.bodies().contains(&body));
+        h.editor.redo();
+        assert!((h.volume(body) - 32.0).abs() < 1e-9);
+
+        // Re-editing reopens in to-face mode with the target loaded, not a stale number.
+        let cursor = h.editor.doc.timeline().cursor();
+        edit_existing(&mut h.editor, feature, cursor);
+        let tool = h.editor.tool.as_ref().unwrap();
+        assert_eq!(tool.params.extent, ExtentKind::ToFace);
+        assert_eq!(tool.params.to_face, Some(top_face(base)));
+        h.cancel_tool();
+    }
+
     /// The radius arrow points at the material the fillet works on: into the body at a
     /// convex edge. It used to point straight out of it.
     #[test]
@@ -1286,5 +1920,60 @@ mod tests {
         let inside = |v: f64| (0.0..=10.0).contains(&v);
         assert!(inside(h.tip.x) && inside(h.tip.y), "{:?}", h.tip);
         assert!(matches!(editor.mode, Mode::Model));
+    }
+
+    /// The block is 10 mm across and 2 mm thick, so a fillet round the rim of its top
+    /// face is bounded by the thickness: past 2 mm the round has eaten the whole side
+    /// and is taking material from under it. The dialog says so before the kernel has
+    /// to, and a radius typed past it anyway comes back as a refusal rather than as a
+    /// body that quietly stops changing.
+    #[test]
+    fn a_fillet_is_bounded_by_the_material_and_the_dialog_says_by_how_much() {
+        let mut h = Harness::new();
+        let body = h.block();
+        h.start_tool(ToolKind::Fillet);
+        h.editor
+            .apply_pick(Some(Pick::Face(top_face(body), 0.0)), false);
+        let limit = h
+            .editor
+            .tool
+            .as_ref()
+            .unwrap()
+            .blend_limit()
+            .expect("a limit for the top rim");
+        let thickness = h.editor.pick_body(body).unwrap().solid.aabb().extent().z;
+        assert!(
+            (limit - thickness).abs() < 1e-6,
+            "the rim of a {thickness} mm wall took {limit}"
+        );
+        h.frame();
+        assert!(
+            h.frame().has_text(&format!("up to {limit:.2} mm fits")),
+            "{:?}",
+            h.frame().text()
+        );
+
+        h.editor.tool.as_mut().unwrap().params.radius = limit * 2.0;
+        sync_tool(&mut h.editor);
+        let feature = h.editor.tool.as_ref().unwrap().feature.unwrap();
+        assert!(
+            matches!(
+                h.editor.doc.state().status(feature),
+                Some(FeatureStatus::Failed(_))
+            ),
+            "twice the limit went through"
+        );
+        h.frame();
+        assert!(
+            h.frame()
+                .has_text("runs past the material it has to work with"),
+            "{:?}",
+            h.frame().text()
+        );
+        assert!(
+            h.frame().has_text(&format!("only {limit:.2} mm fits")),
+            "{:?}",
+            h.frame().text()
+        );
     }
 }

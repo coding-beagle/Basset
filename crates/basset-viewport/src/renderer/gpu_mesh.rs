@@ -7,6 +7,7 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use crate::error::ViewportError;
+use crate::silhouette::Silhouette;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -73,6 +74,9 @@ pub(crate) struct GpuMesh {
     pub edge_count: u32,
     /// Number of `u32` words needed to hold one highlight bit per face id.
     pub highlight_words: u32,
+    /// Facet adjacency for the silhouette. Built here, with the upload, because that is
+    /// the one moment the mesh is known to have changed.
+    pub silhouette: Silhouette,
 }
 
 impl GpuMesh {
@@ -113,6 +117,7 @@ impl GpuMesh {
             edges: edge_buffer,
             edge_count: edges.len() as u32,
             highlight_words: max_face_id / 32 + 1,
+            silhouette: Silhouette::build(mesh),
         })
     }
 }

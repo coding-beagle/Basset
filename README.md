@@ -10,14 +10,14 @@ rewritten when the next tool arrives.
 
 | Area | What exists |
 | --- | --- |
-| Object model | Document, Components, origin & construction Planes/Axes, Sketches, Bodies |
-| Sketching | points, lines, arcs, circles, construction geometry, text; rectangles (2-point, centre), circles (centre, 2-point, 3-point), polygons, slots, arcs; geometric constraints and driving dimensions; Levenberg–Marquardt solver that names both the loose geometry and, when a sketch will not solve, the constraints that disagree; selection / hit testing including box select; grid snapping; closed-region detection with curves split at their crossings; trim and break; rectangular and circular patterns with a live preview; offset with rounded or squared corners; named parameters driving dimensions |
-| Solids | extrude (one side / symmetric / two sides), revolve, sweep, loft, from a sketch region or a planar face; join / cut / intersect; fillet, chamfer, combine, move |
+| Object model | Document, Components, origin & construction Planes/Axes, Sketches, Bodies; a document-wide table of named parameters every sketch and every feature can read |
+| Sketching | points, lines, arcs, circles, construction geometry, text; rectangles (2-point, centre), circles (centre, 2-point, 3-point), polygons, slots, arcs; geometric constraints and driving dimensions; Levenberg–Marquardt solver that names both the loose geometry and, when a sketch will not solve, the constraints that disagree; selection / hit testing including box select; snapping to the grid and to what the drawing names — endpoints, midpoints, centres, crossings, the nearest point on a curve, the origin, alignment with a touched point, a line's own extension, tangent and perpendicular — ranked, held steady and marked on screen; closed-region detection with curves split at their crossings; trim and break; rectangular and circular patterns with a live preview; offset with rounded or squared corners; dimensions driven by expressions over the sketch's own named parameters and the document's |
+| Solids | extrude (one side / symmetric / two sides / to a face of another body, clicked while the tool runs), revolve, sweep, loft, from a sketch region or a planar face; join / cut / intersect, each against any number of target bodies chosen from a checklist (a cut through a stack offers the whole stack); fillet, chamfer, combine, move |
 | Construction | offset plane, plane at an angle, sketch on a planar face |
-| Timeline | insert at cursor, edit, suppress, reorder, delete, roll back / forward; edits replay forward with per-feature caching; per-feature failure reporting |
+| Timeline | insert at cursor, edit, suppress, reorder, delete, roll back / forward; edits replay forward with per-feature caching; extrude, revolve, fillet, chamfer and construction-plane values drivable by expression; per-feature failure reporting |
 | Files | `.bass` documents (versioned JSON); STL and 3MF export of bodies and components |
-| Viewport | wgpu renderer with orbit camera, MSAA, pixel-width lines, a grid on any plane, face highlighting, translucent region fills, ray picking |
-| App | winit + egui desktop shell: browser, timeline with rollback marker and context menu, live-preview tool dialogs, viewport transform manipulator (arrows and rotation rings) for sketch and body moves, navigation cube, sketch mode with shape tools, constraint tools and click-to-edit dimensions, native open/save/export dialogs |
+| Viewport | wgpu renderer with orbit camera, MSAA, pixel-width lines, view-dependent silhouettes so a curved body is bounded against the background, a grid on any plane, face highlighting, translucent region fills, ray picking |
+| App | winit + egui desktop shell: browser, timeline with rollback marker and context menu, live-preview tool dialogs, viewport transform manipulator (arrows and rotation rings) for sketch and body moves, navigation cube, sketch mode with shape tools, constraint tools and click-to-edit dimensions, native open/save/export dialogs; one declared table of keyboard commands, a shortcut overlay and a fuzzy command palette over it |
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the crate layout, identity strategy and the
 honest list of kernel limitations.
@@ -42,13 +42,31 @@ cargo clippy --workspace --all-targets -- -D warnings
   shape with several ways to draw it (rectangle, circle, arc, slot) has one button that
   shows the kind used last, and holding it or right-clicking lists the others. Click
   points; clicks snap to existing points, which is how loops close. Right-click or Esc
-  ends a line chain. Points that snap to nothing land on the grid, which is drawn on the
+  ends a line chain. Clicks also land on the places the drawing already names: the middle
+  of a line, the centre of a hole, where two curves cross, the nearest point on a curve,
+  the origin, level with or straight above a point you have just touched, out along a
+  line's own direction past its end, and tangent or square to the curve a chain is
+  continuing from. A glyph on the crosshair says which of those caught it — a square for
+  an end, a triangle for a middle, a circle for a centre, a cross for a crossing — and an
+  alignment draws a dashed line back to the point it comes from, so a guide is never
+  mysterious. When several are in range at once one ranking decides: a point of the
+  drawing, then a place it implies, then two guides agreeing, then a curve, then a single
+  guide, then the grid, and the nearer of two of a kind. Once one is taken it is held
+  until the pointer clearly leaves it, so the preview does not flicker between two answers
+  under a resting hand, and a guide is only taken when it is nearer than the grid line it
+  would displace — a sketch drawn by eye still comes out in round numbers. Points that
+  land on none of it land on the grid, which is drawn on the
   sketch plane; the palette turns snapping off or pins the increment, and **holding shift
   lets go of the grid** for as long as it is down — for the one point that has to land
   between the lines, which is far commoner than wanting no grid at all. Shift frees the
-  manipulators too, not just the drawing. Snapping to an existing *point* is never given
-  up: it is how geometry gets joined, and shift is for escaping the grid rather than for
-  drawing something that only looks attached. After a shape's
+  manipulators too, not just the drawing, and it lets go of the inference with the grid,
+  since both are things standing between the pointer and a position of its own; the
+  palette's switch, off, says the same for good. What neither gives up is a *join*: an
+  existing point, which is how geometry gets tied together, or a curve, which the new
+  point is held onto with a constraint. Shift is for escaping the grid rather than for
+  drawing something that only looks attached. Dragging a single point aims it the same
+  way, so a corner can be put on the middle of the line beside it and not merely back on
+  the grid. After a shape's
   first click, type its sizes (length, width and height, diameter…) in the entry boxes
   that appear, Tab between them and press Enter to place it; a typed size pins the
   preview while the pointer picks the direction, and becomes a driving dimension. With
@@ -77,9 +95,13 @@ cargo clippy --workspace --all-targets -- -D warnings
   distance and two other lines their angle; a point or a circle's centre with a line
   gives their distance. Dimensions are drawn as in a drawing, with extension lines,
   arrowheads and leaders; drag the value to place one, click it to change it — with a
-  number, or with an expression such as `bore / 2`, which binds it to the sketch's named
-  parameters (the palette's Parameters section adds those, and a driven dimension is
-  drawn with an ƒ). If the sketch cannot be solved, the constraints that disagree turn red
+  number, or with an expression such as `bore / 2` or `sqrt(area)`, which binds it to the
+  named parameters. Names are looked for in this sketch first and then in the document, so
+  a sketch can be dimensioned from the plate thickness the rest of the model is built from
+  without repeating the number; the palette's Parameters section adds the sketch's own and
+  lists the document's below them, read-only and struck through where a row here hides one
+  of the same name. A driven dimension is drawn with an ƒ, and typing a plain number over
+  it lets it go again. If the sketch cannot be solved, the constraints that disagree turn red
   on the drawing and the palette lists them with a delete beside each, rather than
   reporting a residual. Trim takes the piece of a curve you click, cut at the curves that
   cross it, and draws that piece in red before you commit to it; Break cuts a curve at
@@ -131,15 +153,99 @@ cargo clippy --workspace --all-targets -- -D warnings
   and follows the dialog's parameters live; OK keeps it, Cancel removes it. Extrude,
   Fillet, Chamfer and Offset Plane also show an arrow in the viewport: drag its tip to
   set the distance or radius. Move shows the full manipulator — an arrow per axis and a
-  ring per axis of rotation — driving the same numbers as its dialog. An extrude that lands on an existing body joins it unless
-  you pick another operation, so stacked and overlapping extrudes make one body. While
+  ring per axis of rotation — driving the same numbers as its dialog. Almost every number
+  in those dialogs has an ƒ beside it: press it and the box becomes an expression field, so
+  an extrude distance, a revolve angle, a fillet radius, a chamfer distance and the
+  distance or angle of a construction plane can each be stated as `wall * 3` rather than
+  as a number. While an expression drives a value the box shows what it works out to and
+  cannot be dragged, because there the expression is what you said and the number only its
+  result; pressing the ƒ again hands the value back as a
+  plain number, keeping whatever it currently reads. Re-opening a driven feature shows the
+  expression rather than its answer. Move's own six numbers and the sketch operations have
+  no ƒ yet. An extrude that lands on existing bodies joins every body it
+  touches unless you pick another operation, so stacked and overlapping extrudes make
+  one body; the dialog lists the target bodies as checkboxes, and unticking one spares
+  it — a cut through a stack of plates cuts exactly the plates left ticked. While
   a preview shows, clicks still pick from the body as it was before the feature, so the
   second edge of a fillet is an edge of the original body.
+* **Parameters**: the browser has a Parameters section — beside the origin and the
+  components, because the names belong to the document rather than to any one sketch.
+  Add a name and a value or an expression over the names already there (`bore = 12.5`,
+  `wall = bore / 8`), and every sketch dimension and every feature value in the file may
+  then be written over it. Expressions take `+ - * /`, brackets, `^` for powers, `pi` and
+  `tau`, and the functions `sqrt abs floor ceil round sin cos tan asin acos atan atan2
+  hypot min max deg rad`; trigonometry works in radians, which is what `deg` and `rad`
+  are there to convert, and a parameter you name `pi` yourself wins over the constant. A
+  bad expression is refused as you leave the box and the table is left exactly as it was,
+  rather than un-driving everything that read the name. Renaming a parameter is editing
+  its name in place: the new name is written through every expression that mentioned the
+  old one, in the table, in the features and in every sketch — except a sketch that has a
+  parameter of that name of its own, which means its own, is left alone, and is listed as
+  such. A rename that would leave a sketch's references pointing at its own row instead is
+  refused and says which sketch, because that would silently change the drawing. Deleting
+  a parameter something still reads warns first, and deletes nothing else: whatever read
+  it keeps the value it last had and is flagged in the timeline until it is given another
+  one. The section is disabled while a sketch or a tool dialog is open, since both are one
+  undoable step in progress and a parameter changed inside one would go back with a Cancel
+  that had nothing to do with it.
 * **Timeline**: click a feature to select it, double-click to edit, right-click for
   suppress / rename / delete / roll to here. The blue marker is the rollback cursor; new
   features are inserted at the marker.
 * **Files**: `.bass` documents through the File menu or `Ctrl+S` / `Ctrl+O`; Export STL /
   3MF writes the selected bodies, or every visible body when nothing is selected.
+
+## Keyboard
+
+Every command — its name, its keys, the mode it is live in and whether it can run right
+now — is declared in one table, `crates/basset-app/src/editor/commands.rs`. The key
+handler is a lookup into that table and runs the same command the button would, so a key
+and its button cannot come to mean different things; the menus and tooltips print their
+key from it rather than carrying one in the label; and `?` or `F1` lists it, filtered to
+the mode you are in. `Ctrl+P` opens a command palette over the same table — a fuzzy
+search that reaches everything, including the commands that have no key at all.
+
+The letters follow Fusion where Fusion has one and it is free here. Two do not, and both
+are keys Basset already had: `F` fits the view and `D` walks the display modes, so Fillet
+takes `Shift+F` and Dimension — Fusion's `D` — takes `Shift+D`. Constraints take shift
+and a letter of their own name.
+
+| Anywhere | |
+| --- | --- |
+| `Esc` | Cancel, or put the tool down |
+| `Enter` | Confirm |
+| `Del` | Delete the selection |
+| `F` / `D` | Fit the view / next display mode |
+| `Ctrl+N` `Ctrl+O` `Ctrl+S` `Ctrl+Shift+S` | New, open, save, save as |
+| `Ctrl+Z` / `Ctrl+Shift+Z`, `Ctrl+Y` | Undo / redo |
+| `?` or `F1` | Keyboard shortcuts |
+| `Ctrl+P` | Command palette |
+
+| Model mode | |
+| --- | --- |
+| `1`–`5` | What a click may take: anything, faces, edges, vertices, sketch geometry |
+| `S` `E` `R` `W` `L` | Sketch, Extrude, Revolve, Sweep, Loft |
+| `Shift+F` `Shift+C` `B` `M` | Fillet, Chamfer, Combine, Move |
+| `P` / `Shift+P` | Offset Plane / Plane at Angle |
+| `Shift+N` | New Component |
+| `I` | Measure |
+
+| Sketch mode | |
+| --- | --- |
+| `1`–`4` | What a click may take: anything, curves, points, regions |
+| `L` `R` `C` `A` `P` `S` | Line, Rectangle, Circle, Arc, Polygon, Slot |
+| `T` `B` `Shift+G` | Trim, Break, fillet a corner |
+| `Shift+D` | Dimension |
+| `X` `M` `O` `E` | Construction, Move, Offset, Extrude the region under the pointer |
+| `H` `V` | Horizontal, Vertical |
+| `Shift+C` `Shift+P` `Shift+R` `Shift+T` | Coincident, Parallel, Perpendicular, Tangent |
+| `Shift+E` `Shift+N` `Shift+M` `Shift+S` `Shift+F` | Equal, Concentric, Midpoint, Symmetric, Fix |
+
+A shape's key opens whichever variant its toolbar button is showing — the one you drew
+with last — because the key and the button are the same button. Trim, Break and the
+corner fillet share a button but have a key each: a `T` that sometimes broke instead of
+trimming would be worse than no key. A digit typed while a shape's size boxes are open is
+a size, not a selection filter. Pattern, Text and Finish Sketch have no key yet; they are
+in the palette and on the toolbar.
 
 Requires a Vulkan-capable GPU driver (Mesa is fine) for the application; the library
 crates and their tests have no GPU requirement, and the renderer tests skip themselves

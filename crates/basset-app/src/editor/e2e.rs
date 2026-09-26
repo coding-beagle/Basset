@@ -524,6 +524,10 @@ fn the_palette_lists_redundant_constraints_and_offers_to_delete_them() {
         .expect("consistent, so it is taken");
     let before = h.sketch().sketch.constraints().count();
 
+    // The palette is taller than an 800x600 window, so the section is scrolled to
+    // before it is read: everything below the degrees-of-freedom line is off the
+    // bottom otherwise, which is what the scroll area is there for.
+    scroll_palette(&mut h, -400.0);
     // The count is a line of its own, and the row sits under it. The toolbar has a
     // Horizontal button too, so the row is the "Horizontal" below the count.
     let (count, row) = {
@@ -1106,14 +1110,9 @@ fn the_extrude_distance_arrow_snaps_and_shift_lets_go() {
     h.sync_tool();
     h.frame();
 
-    let handle = super::tools::handle(&h.editor).expect("the extrude has an arrow");
-    // The increment a modelling handle snaps to follows the zoom, so the test asks for
-    // the same one the handle will rather than assuming a number.
-    let step = basset_viewport::grid::snap_step_for(
-        h.editor
-            .camera
-            .pixel_size_at(handle.tip, h.editor.window_px),
-    );
+    // A modelling handle rounds to a fixed increment, not the zoom-following one the
+    // sketch grid uses: a size is a number first.
+    let step = super::tools::HANDLE_STEP;
     let ppp = h.points_per_pixel();
     let grab = |h: &Harness, reach: f64| {
         let handle = super::tools::handle(&h.editor).expect("still running");
@@ -1168,4 +1167,455 @@ fn the_extrude_distance_arrow_snaps_and_shift_lets_go() {
         (off / step).fract().abs() > 1e-6,
         "the switch is off, so nothing snapped: {off} (step {step})"
     );
+}
+
+/// The pathology [`super::snap::Drag`] exists for, on the feature arrow: a drag arrives
+/// as one small delta per frame, and rounding each of them separately rounds every one
+/// back to where it started. A pointer creeping a fraction of the step per frame must
+/// still walk the extrude forward — and once the button is up the gesture's total is
+/// forgotten, so a fresh short drag starts from the value rather than from the old
+/// gesture's leftover.
+#[test]
+fn a_slow_drag_of_the_extrude_arrow_still_walks_the_grid() {
+    let mut h = Harness::new();
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    h.rectangle(Vec2::ZERO, Vec2::new(40.0, 20.0));
+    h.finish_sketch(true);
+    let sketch = h.last_feature();
+    h.start_tool(ToolKind::Extrude);
+    h.select_region(sketch, Vec2::new(20.0, 10.0));
+    h.sync_tool();
+    h.frame();
+
+    let step = super::tools::HANDLE_STEP;
+    let ppp = h.points_per_pixel();
+    let distance = |h: &Harness| h.editor.tool.as_ref().expect("running").params.distance;
+    // A drag delivered as `moves` pointer positions, so each frame carries only a
+    // slice of the travel — the shape a slow hand really produces.
+    let slow_drag = |h: &mut Harness, reach: f64, moves: usize| {
+        let handle = super::tools::handle(&h.editor).expect("still running");
+        let from = h.at_world(handle.tip, ppp).expect("on screen");
+        let to = h
+            .at_world(handle.tip + handle.dir * reach, ppp)
+            .expect("on screen");
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        h.frame_with(vec![egui::Event::PointerMoved(from)]);
+        h.frame_with(vec![button(from, true)]);
+        for i in 1..=moves {
+            let at = from + (to - from) * (i as f32 / moves as f32);
+            h.frame_with(vec![egui::Event::PointerMoved(at)]);
+        }
+        h.frame_with(vec![button(to, false)]);
+    };
+
+    // 2.3 steps of travel in sixteen moves: every frame's delta is well under half a
+    // step, which the old per-frame rounding threw away entirely.
+    let before = distance(&h);
+    slow_drag(&mut h, step * 2.3, 16);
+    let after = distance(&h);
+    assert!(
+        after > before + step * 1.5,
+        "the slow drag was not stuck: {before} -> {after} (step {step})"
+    );
+    assert!(
+        (after / step).fract().abs() < 1e-9,
+        "and still landed on the grid ({step}): {after}"
+    );
+
+    // The first gesture banked 0.3 of a step past the line it landed on. Released and
+    // grabbed again, another 0.3 of a step is not yet half a step from the value, so
+    // the size stays put — leftover total from the last gesture would have tipped it
+    // over a line the pointer never earned.
+    slow_drag(&mut h, step * 0.3, 4);
+    assert!(
+        (distance(&h) - after).abs() < 1e-9,
+        "a new gesture starts from the value itself: {} (was {after})",
+        distance(&h)
+    );
+}
+
+/// The kernel refuses an extrude of no length, so the arrow must never rest at one: a
+/// drag headed through the sketch plane holds one increment short on the side it came
+/// from until the pointer carries it across, instead of parking the feature at zero —
+/// which regenerates as a failure and logs a warning every frame the pointer sits there.
+#[test]
+fn the_extrude_arrow_never_rests_at_zero() {
+    let mut h = Harness::new();
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    h.rectangle(Vec2::ZERO, Vec2::new(40.0, 20.0));
+    h.finish_sketch(true);
+    let sketch = h.last_feature();
+    h.start_tool(ToolKind::Extrude);
+    h.select_region(sketch, Vec2::new(20.0, 10.0));
+    h.sync_tool();
+    h.frame();
+
+    let step = super::tools::HANDLE_STEP;
+    let ppp = h.points_per_pixel();
+    let distance = |h: &Harness| h.editor.tool.as_ref().expect("running").params.distance;
+    let before = distance(&h);
+    assert!(
+        before > 0.0,
+        "the extrude starts with some length: {before}"
+    );
+
+    let handle = super::tools::handle(&h.editor).expect("the extrude has an arrow");
+    let from = h.at_world(handle.tip, ppp).expect("on screen");
+    // Well past the sketch plane and out the other side. Delivered in slices small
+    // enough that some frame's running total must fall inside the half-step window
+    // that rounds to zero — the spot the old code parked the feature at.
+    let to = h
+        .at_world(handle.tip - handle.dir * (before + step * 4.0), ppp)
+        .expect("on screen");
+    let button = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::default(),
+    };
+    let moves = ((before + step * 4.0) / (step * 0.25)).ceil() as usize;
+    h.frame_with(vec![egui::Event::PointerMoved(from)]);
+    h.frame_with(vec![button(from, true)]);
+    for i in 1..=moves {
+        let at = from + (to - from) * (i as f32 / moves as f32);
+        h.frame_with(vec![egui::Event::PointerMoved(at)]);
+        assert_ne!(distance(&h), 0.0, "no frame of the drag rested at zero");
+    }
+    h.frame_with(vec![button(to, false)]);
+    assert!(
+        distance(&h) < 0.0,
+        "the hold is a pause, not a wall: the drag crossed to the other side, {}",
+        distance(&h)
+    );
+}
+
+/// Runs frames until the layout has stopped moving. A collapsing section opens over
+/// several frames, and a rectangle read while it is still growing has moved by the time
+/// the click lands on it.
+fn settle(h: &mut Harness) {
+    for _ in 0..12 {
+        h.frame();
+    }
+}
+
+/// The document's parameter table is in the browser, where it is reachable without a
+/// sketch open — which is the point of having lifted it out of the sketch.
+#[test]
+fn the_browser_adds_a_document_parameter_and_shows_what_it_works_out_to() {
+    let mut h = Harness::new();
+    assert!(
+        h.frame().has_text("Parameters (0)"),
+        "{:?}",
+        h.frame().text()
+    );
+    assert!(h.click_ui("Parameters (0)"), "the section opens");
+    settle(&mut h);
+    // No test types into an egui box, so the drafts are filled as the boxes would fill
+    // them and the Add button is clicked for real.
+    h.editor.params_panel.new_name = "thickness".into();
+    h.editor.params_panel.new_expr = "3 + 1".into();
+    settle(&mut h);
+    assert!(h.click_ui("Add"));
+    assert_eq!(h.editor.doc.parameters().value("thickness").unwrap(), 4.0);
+    assert!(
+        h.frame().has_text("= 4.000"),
+        "the row shows the value: {:?}",
+        h.frame().text()
+    );
+}
+
+/// Deleting a parameter something still reads is warned about first, because nothing is
+/// deleted with it: the dependants simply stop being driven.
+#[test]
+fn deleting_a_parameter_something_reads_asks_first() {
+    let mut h = Harness::new();
+    h.editor.set_document_parameter("thickness", "4");
+    h.editor.set_document_parameter("plate", "thickness * 3");
+    assert!(h.click_ui("Parameters (2)"));
+    h.editor.params_panel.confirm_delete = Some("thickness".into());
+    settle(&mut h);
+    let frame = h.frame();
+    assert!(
+        frame.has_text("thickness is still read by another parameter"),
+        "{:?}",
+        frame.text()
+    );
+    assert!(h.editor.doc.parameters().get("thickness").is_some());
+    assert!(h.click_ui("Delete anyway"));
+    assert!(h.editor.doc.parameters().get("thickness").is_none());
+}
+
+/// A tool's number can be stated as an expression instead of dragged, and the dialog
+/// then shows what it works out to rather than letting the number be edited behind the
+/// expression's back.
+#[test]
+fn a_tool_dialog_shows_the_value_an_expression_gives_it() {
+    let mut h = Harness::new();
+    h.editor.set_document_parameter("wall", "2.5");
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    h.rectangle(Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+    h.finish_sketch(true);
+    let sketch = h.last_feature();
+    h.start_tool(ToolKind::Extrude);
+    h.select_region(sketch, Vec2::new(10.0, 5.0));
+    h.sync_tool();
+    assert!(super::tools::type_expression(
+        &mut h.editor,
+        basset_core::NumericField::Distance,
+        "wall * 4"
+    ));
+    // The dialog sizes itself on its first frame, so its contents are on the second.
+    h.frame();
+    assert!(h.frame().has_text("= 10.000 mm"), "{:?}", h.frame().text());
+
+    // A refusal is shown in the dialog, not swallowed and not sent to a popup over it.
+    assert!(!super::tools::type_expression(
+        &mut h.editor,
+        basset_core::NumericField::Distance,
+        "wall * nope"
+    ));
+    h.frame();
+    assert!(
+        h.frame().has_text("no parameter named \"nope\""),
+        "{:?}",
+        h.frame().text()
+    );
+    assert!(h.editor.error.is_none(), "and not as an error popup");
+}
+
+/// A number stated as an expression is read-only wherever it is shown, and the viewport
+/// arrow is one of the places it is shown.
+#[test]
+fn the_viewport_handle_does_not_drag_a_size_an_expression_is_driving() {
+    let mut h = Harness::new();
+    h.editor.set_document_parameter("wall", "2.5");
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    h.rectangle(Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+    h.finish_sketch(true);
+    let sketch = h.last_feature();
+    h.start_tool(ToolKind::Extrude);
+    h.select_region(sketch, Vec2::new(10.0, 5.0));
+    h.sync_tool();
+    assert!(super::tools::type_expression(
+        &mut h.editor,
+        basset_core::NumericField::Distance,
+        "wall * 4"
+    ));
+    let feature = h.editor.tool.as_ref().and_then(|t| t.feature).unwrap();
+    h.frame();
+
+    let handle = super::tools::handle(&h.editor).expect("the extrude has an arrow");
+    let ppp = h.points_per_pixel();
+    let from = h.at_world(handle.tip, ppp).expect("on screen");
+    let to = h
+        .at_world(handle.tip + handle.dir * 15.0, ppp)
+        .expect("on screen");
+    h.drag_ui(from, to, egui::Modifiers::default());
+
+    let distance = h
+        .editor
+        .tool
+        .as_ref()
+        .expect("still running")
+        .params
+        .distance;
+    assert!(
+        (distance - 10.0).abs() < 1e-9,
+        "the drag wrote a number behind the expression's back: {distance}"
+    );
+    assert_eq!(
+        h.editor
+            .doc
+            .feature_expr(feature, basset_core::NumericField::Distance),
+        Some("wall * 4")
+    );
+    assert!(
+        h.editor.status.contains("driven by an expression"),
+        "the grip says why it will not move: {:?}",
+        h.editor.status
+    );
+    h.cancel_tool();
+}
+
+/// A refused addition leaves what was typed where it was typed: fixing one character
+/// must not mean retyping both boxes.
+#[test]
+fn a_refused_addition_keeps_what_was_typed_and_a_good_one_clears_the_row() {
+    let mut h = Harness::new();
+    h.editor.set_document_parameter("thickness", "4");
+    assert!(h.click_ui("Parameters (1)"));
+    settle(&mut h);
+    h.editor.params_panel.new_name = "plate".into();
+    h.editor.params_panel.new_expr = "thicknes * 3".into();
+    assert!(h.click_ui("Add"));
+    assert!(h.editor.doc.parameters().get("plate").is_none());
+    assert_eq!(h.editor.params_panel.new_name, "plate");
+    assert_eq!(h.editor.params_panel.new_expr, "thicknes * 3");
+    assert!(
+        h.frame().has_text("thicknes"),
+        "the refusal names what it could not find: {:?}",
+        h.frame().text()
+    );
+
+    h.editor.params_panel.new_expr = "thickness * 3".into();
+    assert!(h.click_ui("Add"));
+    assert_eq!(h.editor.doc.parameters().value("plate").unwrap(), 12.0);
+    assert!(h.editor.params_panel.new_name.is_empty());
+    assert!(h.editor.params_panel.new_expr.is_empty());
+}
+
+/// A rename the document refuses puts the box back to the name the parameter still has.
+/// Left showing the rejected one it would read as though the rename had happened, and
+/// re-fire on every focus change.
+#[test]
+fn a_refused_rename_puts_the_name_box_back() {
+    let mut h = Harness::new();
+    h.editor.set_document_parameter("a", "1");
+    h.editor.set_document_parameter("b", "2");
+    assert!(h.click_ui("Parameters (2)"));
+    settle(&mut h);
+    assert_eq!(h.editor.params_panel.rows.len(), 2);
+    // What leaving the name box having typed the other row's name queues.
+    h.editor.params_panel.rows[0].draft_name = "b".into();
+    super::panels::run(
+        &mut h.editor,
+        super::commands::Command::RenameParameter("a".into(), "b".into()),
+    );
+    assert!(h.editor.doc.parameters().get("a").is_some());
+    assert!(
+        h.editor.params_panel.error.is_some(),
+        "the refusal is on screen"
+    );
+    assert_eq!(h.editor.params_panel.rows[0].draft_name, "a");
+}
+
+/// The multi-body default and the checklist that edits it, end to end: a cut extruded
+/// through two stacked plates offers both as targets, unticking one in the dialog spares
+/// it, the whole interaction is one undo step, and re-editing shows the list it kept.
+#[test]
+fn an_extrude_cut_through_a_stack_targets_every_plate_it_passes() {
+    use super::tools::OpKind;
+    use basset_core::{BodyOp, BodyRef, FeatureKind};
+
+    let mut h = Harness::new();
+    let lower = h.block(); // 10×10×2 at z 0..2.
+    let plane = h.editor.doc.add_feature(FeatureKind::OffsetPlane {
+        base: PlaneRef::Origin(OriginPlane::XY),
+        distance: 2.0,
+    });
+    h.editor.refresh_cache();
+    h.start_sketch(PlaneRef::Feature(plane));
+    h.rectangle(Vec2::ZERO, Vec2::new(10.0, 10.0));
+    h.finish_sketch(true);
+    let sk_upper = h.last_feature();
+    h.start_tool(ToolKind::Extrude);
+    h.select_region(sk_upper, Vec2::new(5.0, 5.0));
+    h.sync_tool();
+    // The new plate rests on the block and the default would join it; this stack wants
+    // two separate bodies.
+    {
+        let tool = h.editor.tool.as_mut().unwrap();
+        (tool.params.op, tool.params.targets) = (OpKind::NewBody, Vec::new());
+        tool.op_chosen = true;
+        tool.params.distance = 2.0;
+    }
+    h.sync_tool();
+    let upper = BodyRef(h.editor.tool.as_ref().unwrap().feature.unwrap());
+    h.confirm_tool();
+    assert!((h.volume(lower) - 200.0).abs() < 1e-9);
+    assert!((h.volume(upper) - 200.0).abs() < 1e-9);
+
+    // A 2×2 hole through the middle: the default reach of 10 mm sweeps up through both
+    // plates, so both arrive as targets without being asked for.
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    // The default grid is coarser than this rectangle, so snapping would fold it up.
+    h.sketch().snap_to_grid = false;
+    h.rectangle(Vec2::new(4.0, 4.0), Vec2::new(6.0, 6.0));
+    h.finish_sketch(true);
+    let sk_cut = h.last_feature();
+    h.start_tool(ToolKind::Extrude);
+    h.select_region(sk_cut, Vec2::new(5.0, 5.0));
+    h.sync_tool();
+    {
+        let tool = h.editor.tool.as_ref().unwrap();
+        assert_eq!(tool.params.op, OpKind::Join, "the Fusion default");
+        assert_eq!(tool.params.targets, vec![lower, upper]);
+    }
+    h.frame();
+    h.frame();
+    assert!(h.click_ui("Cut"), "the dialog offers Cut");
+    assert!(
+        h.frame().has_text("Target bodies (2 selected)"),
+        "{:?}",
+        h.frame().text()
+    );
+
+    // Untick the upper plate. The browser lists the same name on the left, so the
+    // dialog's checkbox is the rightmost occurrence of it on screen.
+    let name = format!("Body{}", (upper.0).0);
+    let pos = h
+        .frame()
+        .texts
+        .iter()
+        .filter(|(_, t)| t.trim() == name)
+        .map(|(r, _)| r.center())
+        .max_by(|a, b| a.x.total_cmp(&b.x))
+        .expect("the dialog lists the upper plate");
+    h.click_at_ui(pos);
+    let tool = h.editor.tool.as_ref().unwrap();
+    assert_eq!(
+        tool.params.targets,
+        vec![lower],
+        "the upper plate is spared"
+    );
+    let cut_feature = tool.feature.expect("the cut previews a feature");
+    h.confirm_tool();
+
+    let Some(FeatureKind::Extrude { operation, .. }) = h
+        .editor
+        .doc
+        .timeline()
+        .get(cut_feature)
+        .map(|f| f.kind.clone())
+    else {
+        panic!("the cut landed in the timeline");
+    };
+    assert_eq!(operation, BodyOp::Cut(vec![lower]));
+    assert!(
+        (h.volume(lower) - 192.0).abs() < 1e-9,
+        "{}",
+        h.volume(lower)
+    );
+    assert!(
+        (h.volume(upper) - 200.0).abs() < 1e-9,
+        "{}",
+        h.volume(upper)
+    );
+
+    // One undo step for the whole interaction, and redo brings the cut back.
+    h.editor.undo();
+    h.editor.refresh_cache();
+    assert!((h.volume(lower) - 200.0).abs() < 1e-9);
+    h.editor.redo();
+    h.editor.refresh_cache();
+    assert!((h.volume(lower) - 192.0).abs() < 1e-9);
+    assert!((h.volume(upper) - 200.0).abs() < 1e-9);
+
+    // Re-editing reopens the dialog with the kept list, not a stale single target.
+    h.editor.edit_feature(cut_feature);
+    let tool = h.editor.tool.as_ref().unwrap();
+    assert_eq!(tool.params.op, OpKind::Cut);
+    assert_eq!(tool.params.targets, vec![lower]);
+    h.cancel_tool();
+
+    // And the document carries the list through a file round trip.
+    let dir = TempDir::new("multi-cut");
+    let mut reopened = h.round_trip(&dir.join("stack.bass"));
+    assert!((reopened.volume(lower) - 192.0).abs() < 1e-9);
+    assert!((reopened.volume(upper) - 200.0).abs() < 1e-9);
 }

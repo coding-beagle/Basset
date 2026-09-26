@@ -15,11 +15,11 @@
 //! the value becomes a driving dimension, the way Fusion's entry boxes work: what the
 //! user stated stays true under later edits, what they merely pointed at stays free.
 
-use basset_core::{FeatureId, FeatureKind, PlaneRef, ProfileRef};
+use basset_core::{FeatureId, FeatureKind, Parameters, PlaneRef, ProfileRef};
 use basset_math::{Frame, Ray, Vec2, Vec3};
 pub use basset_sketch::offset::Corner;
 use basset_sketch::{
-    Constraint, ConstraintId, Entity, EntityId, Hit, Profile, Sketch, SketchError, SolveError,
+    Constraint, ConstraintId, Entity, EntityId, Profile, Sketch, SketchError, SolveError,
     SolveReport, Tessellation, edit, fillet, offset, pattern, shapes,
 };
 use basset_viewport::{Camera, LineBatch, PointBatch, TriBatch, grid};
@@ -64,6 +64,12 @@ const REGION_SELECT_FILL: [f32; 4] = [0.25, 0.6, 1.0, 0.22];
 const MIN_FILLET_RADIUS: f64 = 0.01;
 /// Half-extent of a constraint badge.
 const GLYPH_PX: f64 = 5.0;
+/// The snap marker, in the same amber the crosshair turns when a click will join
+/// geometry: one colour means "the drawing caught this" wherever it appears.
+pub(crate) const SNAP_MARKER_COLOR: [f32; 4] = [1.0, 0.85, 0.3, 1.0];
+/// The guide lines, dimmer than the marker because they are scaffolding rather than a
+/// place — the eye should land on the point, not on the line that found it.
+pub(crate) const SNAP_GUIDE_COLOR: [f32; 4] = [1.0, 0.85, 0.3, 0.45];
 /// Clearance between the geometry and the first badge on it. Measured from the anchor,
 /// so it is wide enough that the first slot's box clears the curve it is written on.
 const GLYPH_GAP_PX: f64 = 15.0;
@@ -927,6 +933,10 @@ pub struct SketchEditor {
     /// the drawing is built on a grid at all; this says "not this one placement", which
     /// is the far commoner thing to want and is not worth a trip to the palette and back.
     free_snap: bool,
+    /// Where the pointer lands when the drawing itself names a place: the ranking, the
+    /// hold that stops it flickering, and the short memory of touched points that the
+    /// alignment guides grow from. See [`snap::Inference`].
+    inference: snap::Inference,
     /// A step the user pinned, or `None` to follow the zoom.
     pub fixed_grid_step: Option<f64>,
     /// The step actually in use, for the palette to display. Updated as the pointer moves
@@ -970,6 +980,17 @@ pub struct SketchEditor {
     pub param_drafts: Vec<(String, String)>,
     pub new_param: (String, String),
     pub param_error: Option<String>,
+    /// The document's parameter table, copied in so the names it defines resolve while
+    /// the user is drawing.
+    ///
+    /// A copy rather than a borrow because this editor owns a working copy of the sketch
+    /// and never holds the document: taking `&Document` into every solve would mean
+    /// threading it through the whole drawing path, which is driven from winit events
+    /// that have no document to hand. The copy is refreshed wherever the editor refreshes
+    /// its other caches, so it is at most one frame behind a table only the panels can
+    /// change — and the document re-evaluates every binding itself on regeneration, so a
+    /// stale copy can never be what the model is built from.
+    pub outer: Parameters,
     undo: Vec<Sketch>,
     redo: Vec<Sketch>,
     dirty: bool,
@@ -1011,6 +1032,7 @@ impl SketchEditor {
             report: None,
             snap_to_grid: true,
             free_snap: false,
+            inference: snap::Inference::default(),
             drags: Drags::default(),
             fixed_grid_step: None,
             grid_step: 1.0,
@@ -1033,6 +1055,7 @@ impl SketchEditor {
             param_drafts: Vec::new(),
             new_param: (String::new(), String::new()),
             param_error: None,
+            outer: Parameters::new(),
             undo: Vec::new(),
             redo: Vec::new(),
             dirty: false,
@@ -1146,6 +1169,9 @@ impl SketchEditor {
     /// gesture, and orbiting to look at a pattern must not be the gesture that throws it
     /// away. Only what is half-drawn goes.
     pub fn finish_current(&mut self) {
+        // The held snap goes with whatever was half-drawn: a hold the user can no longer
+        // see the reason for is exactly the stickiness this is meant to avoid.
+        self.inference.release();
         self.trim_preview = None;
         self.fillet_pick = None;
         self.clicks.clear();
@@ -1263,7 +1289,8 @@ impl SketchEditor {
     }
 
     fn solve(&mut self) {
-        self.report = Some(self.sketch.solve());
+        let outer = self.outer.lookup();
+        self.report = Some(self.sketch.solve_with(&outer));
         self.profiles = self.sketch.profiles(&self.tess);
         self.hover_region = None;
     }
@@ -1362,41 +1389,96 @@ impl SketchEditor {
         }
     }
 
-    /// Existing points win over the grid: joining geometry is what the user meant, and a
-    /// point already placed off-grid would otherwise be impossible to pick up again.
-    fn snap(&self, pos: Vec2, tol: f64) -> Click {
-        let hits = self.sketch.hit_test(pos, tol);
-        let is_point = |h: &&Hit| {
-            self.sketch
-                .entity(h.entity)
-                .is_some_and(|e| e.entity.is_point())
-        };
-        if let Some(h) = hits.iter().find(is_point) {
-            return Click {
-                pos: self.sketch.point_pos(h.entity).unwrap_or(pos),
-                snapped: Some(h.entity),
+    /// Where the pointer lands: whatever the drawing names there, and the grid when it
+    /// names nothing.
+    ///
+    /// The whole ranking — an existing point over an implied place over a curve over a
+    /// guide line — and the hold that keeps the answer still while the hand shakes live
+    /// in [`snap::Inference`], asked here rather than written out again. Landing on a
+    /// curve records the curve, so the point is held there by a constraint rather than
+    /// by where the grid happened to put it: without that a divider drawn to an edge
+    /// only *looks* attached, and the next re-solve is free to move it off and silently
+    /// open the regions either side of it.
+    fn snap(&mut self, pos: Vec2, tol: f64) -> Click {
+        let cont = self.continuation();
+        // Shift, or the palette's switch turned off, leaves only the joins: see the
+        // snap module's header for why those two mean the same thing here.
+        let joins_only = self.free_snap || !self.snap_to_grid;
+        let grid = self
+            .snap_rule()
+            .is_on()
+            .then(|| self.snap_rule().point(pos));
+        match self
+            .inference
+            .resolve(&self.sketch, cont, pos, tol, joins_only, grid)
+        {
+            Some(found) => Click {
+                pos: found.at,
+                snapped: found.point,
+                on_curve: found.curve,
+            },
+            None => Click {
+                pos: self.to_grid(pos),
+                snapped: None,
                 on_curve: None,
-            };
+            },
         }
-        // Landing on a curve drops the click onto it and records the curve, so the point
-        // is held there by a constraint rather than by where the grid happened to put it.
-        // Without this a divider drawn to an edge only *looks* attached: it is a free
-        // point that the next re-solve is free to move off, which silently opens the
-        // regions either side of it.
-        for h in &hits {
-            if let Some(on) = self.sketch.closest_point_on(h.entity, pos) {
-                return Click {
-                    pos: on,
-                    snapped: None,
-                    on_curve: Some(h.entity),
-                };
-            }
+    }
+
+    /// Where a single dragged point is being asked to go. The same inference the
+    /// drawing tools use, minus the joining: a drag moves a point that already exists
+    /// and sharing it with another one is a different operation than this gesture.
+    fn drag_goal(&mut self, dragged: EntityId, pos: Vec2, tol: f64) -> Vec2 {
+        // The point being dragged is its own nearest snap, and the curves hanging off
+        // it follow it about, so neither is any guide to where it should land: they are
+        // named here so the inference passes over them.
+        let cont = snap::Continuation {
+            moving: Some(dragged),
+            ..Default::default()
+        };
+        let joins_only = self.free_snap || !self.snap_to_grid;
+        let grid = self
+            .snap_rule()
+            .is_on()
+            .then(|| self.snap_rule().point(pos));
+        match self
+            .inference
+            .resolve(&self.sketch, cont, pos, tol, joins_only, grid)
+        {
+            Some(found) => found.at,
+            None => self.to_grid(pos),
         }
-        Click {
-            pos: self.to_grid(pos),
-            snapped: None,
-            on_curve: None,
+    }
+
+    /// What the point being placed is continuing from, which is what makes tangent and
+    /// perpendicular mean anything. A line chain continues from its open end; every
+    /// other tool continues from its last click.
+    fn continuation(&self) -> snap::Continuation {
+        let (from, curve) = match self.tool {
+            SketchTool::Line => (
+                self.chain_end.and_then(|id| self.sketch.point_pos(id)),
+                self.chain_curve(),
+            ),
+            _ => (self.clicks.last().map(|c| c.pos), None),
+        };
+        snap::Continuation {
+            from,
+            curve,
+            moving: None,
         }
+    }
+
+    /// The curve the open end of the chain belongs to — the one just drawn, when there
+    /// is more than one, because that is the direction the hand is carrying.
+    fn chain_curve(&self) -> Option<EntityId> {
+        let end = self.chain_end?;
+        self.sketch
+            .entities()
+            .filter(|(_, data)| {
+                data.entity.is_open_curve() && data.entity.references().contains(&end)
+            })
+            .map(|(id, _)| id)
+            .last()
     }
 
     fn to_grid(&self, pos: Vec2) -> Vec2 {
@@ -1434,7 +1516,7 @@ impl SketchEditor {
 
     /// Snaps, then applies typed sizes. A typed value beats the snap: the user has said
     /// exactly what they want, and a snapped point almost never lies at that size.
-    fn aim(&self, pos: Vec2, tol: f64) -> Click {
+    fn aim(&mut self, pos: Vec2, tol: f64) -> Click {
         let click = self.snap(pos, tol);
         let pos = self.constrained_cursor(click.pos);
         if pos == click.pos {
@@ -1717,7 +1799,19 @@ impl SketchEditor {
             if let Some(drag) = self.drag.clone() {
                 // The pointer's travel is snapped to the grid, so nudging a corner does
                 // not silently take the sketch off it and a moved shape stays on it.
-                let delta = self.to_grid(pos) - self.to_grid(drag.press);
+                //
+                // One point on its own is aimed rather than nudged: it goes where the
+                // pointer says, and so it is offered the drawing's own places too — the
+                // middle of that line, level with that corner. Several points are a
+                // shape being moved, and a shape has no one position to infer for, so
+                // those keep the grid.
+                let delta = match drag.points[..] {
+                    [(id, _)] => {
+                        let goal = self.drag_goal(id, pos, tol);
+                        goal - self.sketch.point_pos(id).unwrap_or(goal)
+                    }
+                    _ => self.to_grid(pos) - self.to_grid(drag.press),
+                };
                 let goals: Vec<(EntityId, Vec2)> = drag
                     .points
                     .iter()
@@ -1900,8 +1994,18 @@ impl SketchEditor {
             SketchTool::Constrain(kind) => self.constraint_click(kind, pos, tol),
             SketchTool::Trim | SketchTool::Break => self.trim_click(pos, tol),
             SketchTool::Fillet => self.fillet_click(pos, tol),
-            SketchTool::Line => self.line_click(self.aim(pos, tol)),
-            _ => self.shape_click(self.aim(pos, tol)),
+            SketchTool::Line => {
+                let click = self.aim(pos, tol);
+                // A placed point is a touched point: the next one may want to line up
+                // with it, which is the whole of what the alignment guides are for.
+                self.inference.touch(click.pos);
+                self.line_click(click);
+            }
+            _ => {
+                let click = self.aim(pos, tol);
+                self.inference.touch(click.pos);
+                self.shape_click(click);
+            }
         }
     }
 
@@ -2738,10 +2842,36 @@ impl SketchEditor {
         }
     }
 
+    /// Replaces the copy of the document's table, re-solving if it has moved on.
+    ///
+    /// Re-solving rather than merely storing it: a dimension bound to a document
+    /// parameter is drawn at the length that name currently gives it, so the drawing has
+    /// to follow the table the moment the table changes.
+    pub fn set_outer(&mut self, outer: Parameters) {
+        if self.outer == outer {
+            return;
+        }
+        self.outer = outer;
+        self.solve();
+    }
+
+    /// Whether the document defines `name` too, so this sketch's own row shadows it.
+    /// Silent shadowing is the one genuinely confusing thing about two scopes, so the
+    /// panel says so.
+    pub fn shadows(&self, name: &str) -> bool {
+        self.outer.get(name).is_some() && self.sketch.parameter(name).is_some()
+    }
+
     /// Adds or re-expresses a named constant, re-driving the dimensions that use it.
     pub fn set_parameter(&mut self, name: &str, expression: &str) -> Result<(), String> {
         self.checkpoint();
-        match self.sketch.set_parameter(name, expression) {
+        // The lookup borrows the table, so it is dropped before `after_change` wants the
+        // whole editor again.
+        let set = {
+            let outer = self.outer.lookup();
+            self.sketch.set_parameter_with(name, expression, &outer)
+        };
+        match set {
             Ok(_) => {
                 self.after_change();
                 Ok(())
@@ -2762,10 +2892,16 @@ impl SketchEditor {
         }
     }
 
-    /// Drives a dimension by an expression instead of a number.
+    /// Drives a dimension by an expression instead of a number. Names the sketch does not
+    /// define are looked for in the document's table, so `bore / 2` works whichever scope
+    /// `bore` was declared in.
     pub fn bind_dimension(&mut self, id: ConstraintId, expression: &str) -> Result<(), String> {
         self.checkpoint();
-        match self.sketch.bind_dimension(id, expression) {
+        let bound = {
+            let outer = self.outer.lookup();
+            self.sketch.bind_dimension_with(id, expression, &outer)
+        };
+        match bound {
             Ok(_) => {
                 self.after_change();
                 Ok(())
@@ -3782,6 +3918,44 @@ impl SketchEditor {
             marker.points.push(to3(cursor));
             points.push(marker);
         }
+        self.snap_feedback(lines);
+    }
+
+    /// What the pointer snapped to, and why: a glyph naming the kind, drawn on the
+    /// snapped point, and the guide lines that caught it drawn dashed back to the
+    /// geometry they come from.
+    ///
+    /// Both are needed. The glyph alone says "something held this" without saying what,
+    /// and an alignment with a corner off the other side of the screen is unreadable
+    /// without the line joining the two.
+    fn snap_feedback(&self, lines: &mut Vec<LineBatch>) {
+        let Some(found) = self.inference.current() else {
+            return;
+        };
+        // Only while the drawing tools are aiming: with Select the pointer is picking
+        // what is already there, and a marker on it would be a promise of a click that
+        // places nothing.
+        if self.cursor.is_none()
+            || (self.tool == SketchTool::Select && !self.picking_pattern_center())
+        {
+            return;
+        }
+        let to3 = |p: Vec2| self.frame.to_world(p);
+        let mut glyph = LineBatch::new(SNAP_MARKER_COLOR);
+        glyph.width_px = 1.8;
+        glyph.depth_test = false;
+        for seg in snap::marker(found.kind, found.at, self.cursor_px) {
+            glyph.segments.push([to3(seg[0]), to3(seg[1])]);
+        }
+        let mut guides = LineBatch::new(SNAP_GUIDE_COLOR);
+        guides.width_px = 1.0;
+        guides.depth_test = false;
+        for guide in found.guides.iter().flatten() {
+            for seg in snap::guide_dashes(*guide, found.at, self.cursor_px) {
+                guides.segments.push([to3(seg[0]), to3(seg[1])]);
+            }
+        }
+        lines.extend([glyph, guides]);
     }
 
     /// Rubber band of the shape the next click would make. It is built for real in a
@@ -4926,6 +5100,9 @@ fn start(
     editor.tool = None;
     let mut sketch_editor = SketchEditor::new(id, frame, sketch, saved);
     sketch_editor.restore_cursor = restore_cursor;
+    // Before the first solve below would want them: a dimension already bound to a
+    // document parameter must open showing the length that name gives it.
+    sketch_editor.set_outer(editor.doc.parameters().clone());
     // A sketch opens with snapping as the user left it, not as a fresh one would have
     // it: a switch that quietly turns itself back on is a switch nobody trusts.
     sketch_editor.snap_to_grid = editor.snapping.to_grid;

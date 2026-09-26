@@ -1938,6 +1938,165 @@ fn parameters_survive_a_round_trip_through_json() {
     assert_relative_eq!(back.parameter_value("len").unwrap(), 7.0);
 }
 
+/// A stand-in for the document's table, which this crate cannot see.
+fn document(pairs: &'static [(&'static str, f64)]) -> impl Fn(&str) -> Result<f64, SketchError> {
+    move |name: &str| {
+        pairs
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, v)| *v)
+            .ok_or_else(|| SketchError::UnknownParameter(name.to_string()))
+    }
+}
+
+#[test]
+fn a_name_the_sketch_does_not_define_is_asked_of_the_document() {
+    let outer = document(&[("thickness", 4.0)]);
+    let mut s = Sketch::new();
+    let (l, a, b) = line(&mut s, v(0.0, 0.0), v(10.0, 0.0));
+    s.add_constraint(Constraint::Fix(a)).unwrap();
+    s.add_constraint(Constraint::Horizontal(l)).unwrap();
+    let dim = s
+        .add_constraint(Constraint::Distance { a, b, value: 10.0 })
+        .unwrap();
+    assert_relative_eq!(
+        s.bind_dimension_with(dim, "thickness * 3", &outer).unwrap(),
+        12.0
+    );
+    s.solve_with(&outer).unwrap();
+    assert_relative_eq!(pos(&s, b).x, 12.0, epsilon = 1e-6);
+    // Without the document behind it the same binding has nothing to resolve, and the
+    // dimension keeps the value it last held rather than collapsing to zero.
+    s.solve().unwrap();
+    assert_relative_eq!(pos(&s, b).x, 12.0, epsilon = 1e-6);
+    assert_eq!(s.failed_bindings(), vec![dim]);
+    assert!(s.failed_bindings_with(&outer).is_empty());
+}
+
+#[test]
+fn a_sketch_parameter_shadows_the_document_parameter_of_the_same_name() {
+    let outer = document(&[("wall", 2.0)]);
+    let mut s = Sketch::new();
+    assert_relative_eq!(s.evaluate_with("wall * 10", &outer).unwrap(), 20.0);
+    s.set_parameter_with("wall", "5", &outer).unwrap();
+    assert_relative_eq!(s.evaluate_with("wall * 10", &outer).unwrap(), 50.0);
+    // A sketch parameter written over a document one cannot refer outward to it: the
+    // name resolves locally first, so this is a cycle rather than a reference.
+    assert!(matches!(
+        s.set_parameter_with("wall", "wall * 2", &outer),
+        Err(SketchError::CircularParameter(_))
+    ));
+    assert_relative_eq!(s.parameter_value_with("wall", &outer).unwrap(), 5.0);
+}
+
+#[test]
+fn renaming_a_parameter_rewrites_every_expression_that_mentions_it() {
+    let mut s = Sketch::new();
+    let (_, a, b) = line(&mut s, v(0.0, 0.0), v(10.0, 0.0));
+    let dim = s
+        .add_constraint(Constraint::Distance { a, b, value: 10.0 })
+        .unwrap();
+    s.set_parameter("wall", "2.5").unwrap();
+    s.set_parameter("bore", "wall * 4").unwrap();
+    s.bind_dimension(dim, "bore + wall").unwrap();
+    s.rename_parameter("wall", "thickness").unwrap();
+    assert!(s.parameter("wall").is_none());
+    assert_relative_eq!(s.parameter_value("thickness").unwrap(), 2.5);
+    assert_relative_eq!(s.parameter_value("bore").unwrap(), 10.0);
+    assert_eq!(s.dimension_expr(dim), Some("bore + thickness"));
+    assert_relative_eq!(s.evaluate(s.dimension_expr(dim).unwrap()).unwrap(), 12.5);
+    assert!(!s.mentions_parameter("wall"));
+    assert!(s.mentions_parameter("thickness"));
+}
+
+#[test]
+fn renaming_refuses_a_name_that_is_already_taken_or_not_a_name_at_all() {
+    let mut s = Sketch::new();
+    s.set_parameter("wall", "2").unwrap();
+    s.set_parameter("bore", "8").unwrap();
+    assert!(matches!(
+        s.rename_parameter("wall", "bore"),
+        Err(SketchError::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        s.rename_parameter("wall", "2gap"),
+        Err(SketchError::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        s.rename_parameter("nonesuch", "gap"),
+        Err(SketchError::UnknownParameter(_))
+    ));
+    // Every refusal left the table exactly as it was.
+    assert_relative_eq!(s.parameter_value("wall").unwrap(), 2.0);
+    assert_relative_eq!(s.parameter_value("bore").unwrap(), 8.0);
+}
+
+#[test]
+fn a_rename_that_would_capture_a_document_name_this_sketch_reads_is_refused() {
+    let outer = document(&[("bore", 8.0)]);
+    let mut s = Sketch::new();
+    let (_, a, b) = line(&mut s, v(0.0, 0.0), v(10.0, 0.0));
+    let dim = s
+        .add_constraint(Constraint::Distance { a, b, value: 10.0 })
+        .unwrap();
+    s.set_parameter_with("wall", "2", &outer).unwrap();
+    s.bind_dimension_with(dim, "bore * 2", &outer).unwrap();
+    // Renaming `wall` to `bore` would leave `bore * 2` reading 2 rather than 8.
+    assert!(matches!(
+        s.rename_parameter_with("wall", "bore", &outer),
+        Err(SketchError::InvalidArgument(_))
+    ));
+    assert_relative_eq!(s.evaluate_with("bore * 2", &outer).unwrap(), 16.0);
+    // Shadowing a document name nothing in this sketch reads is not a capture, so it
+    // stays allowed.
+    s.rename_parameter_with("wall", "gap", &outer).unwrap();
+    assert_relative_eq!(s.parameter_value_with("gap", &outer).unwrap(), 2.0);
+}
+
+#[test]
+fn a_document_rename_skips_a_sketch_that_shadows_the_name() {
+    // `wall` is the document's in this sketch, so the rename must follow.
+    let mut following = Sketch::new();
+    let (_, a, b) = line(&mut following, v(0.0, 0.0), v(10.0, 0.0));
+    let dim = following
+        .add_constraint(Constraint::Distance { a, b, value: 10.0 })
+        .unwrap();
+    let outer = document(&[("wall", 3.0)]);
+    following
+        .bind_dimension_with(dim, "wall * 2", &outer)
+        .unwrap();
+    assert!(following.rewrite_outer_parameter("wall", "thickness"));
+    assert_eq!(following.dimension_expr(dim), Some("thickness * 2"));
+
+    // A sketch with its own `wall` means its own, and must be left alone.
+    let mut shadowing = Sketch::new();
+    let (_, c, d) = line(&mut shadowing, v(0.0, 0.0), v(10.0, 0.0));
+    let dim = shadowing
+        .add_constraint(Constraint::Distance {
+            a: c,
+            b: d,
+            value: 10.0,
+        })
+        .unwrap();
+    shadowing.set_parameter("wall", "7").unwrap();
+    shadowing.bind_dimension(dim, "wall * 2").unwrap();
+    assert!(!shadowing.rewrite_outer_parameter("wall", "thickness"));
+    assert_eq!(shadowing.dimension_expr(dim), Some("wall * 2"));
+    assert_relative_eq!(shadowing.parameter_value("wall").unwrap(), 7.0);
+}
+
+#[test]
+fn a_rejected_parameter_edit_leaves_the_table_in_the_order_it_was_read_in() {
+    let mut s = Sketch::new();
+    s.set_parameter("first", "1").unwrap();
+    s.set_parameter("second", "2").unwrap();
+    s.set_parameter("third", "3").unwrap();
+    assert!(s.set_parameter("second", "nonesuch").is_err());
+    let names: Vec<&str> = s.parameters().iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["first", "second", "third"]);
+    assert_relative_eq!(s.parameter_value("second").unwrap(), 2.0);
+}
+
 #[test]
 fn the_trim_preview_is_the_piece_the_trim_removes() {
     let mut s = Sketch::new();

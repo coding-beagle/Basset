@@ -584,3 +584,52 @@ fn xray_blends_the_body_with_what_is_behind_it() {
         );
     }
 }
+
+/// The problem the silhouette exists for: a cylinder standing against the background has
+/// no feature edge down its side, so without one it is bounded only by its shading. With
+/// it, the pixels where the wall turns away darken to the edge colour.
+#[test]
+fn a_cylinder_is_bounded_against_the_background() {
+    let Some(gpu) = gpu() else { return };
+    let solid = basset_kernel::primitives::cylinder(
+        basset_kernel::OpId::new(1),
+        Vec3::new(0.0, 0.0, -20.0),
+        Vec3::Z,
+        20.0,
+        40.0,
+        &basset_kernel::Tessellation::default(),
+    );
+    let mut renderer = Renderer::new(&gpu.device, FORMAT, 1);
+    let handle = renderer
+        .upload_mesh(
+            &gpu.device,
+            &gpu.queue,
+            &solid.tessellate().mesh,
+            &solid.display_edges(),
+        )
+        .expect("a valid cylinder");
+    let camera = looking_at_origin();
+    let mut scene = Scene::new(&camera);
+    scene.background = BACKGROUND;
+    scene.show_grid = false;
+    scene.meshes.push(MeshInstance::new(handle));
+
+    // Half way up the wall, where neither rim is in the way.
+    let row = SIZE[1] / 2;
+    let darkest_at_the_boundary = |pixels: &[[u8; 4]]| {
+        let first = (0..SIZE[0])
+            .find(|&x| !is_background(pixel(pixels, x, row)))
+            .expect("the cylinder is somewhere in the row");
+        (first..first + 3)
+            .map(|x| pixel(pixels, x, row)[1])
+            .min()
+            .expect("three pixels")
+    };
+    let plain = darkest_at_the_boundary(&render_with(&gpu, &mut renderer, &scene));
+    scene.meshes[0].style = MeshStyle::ShadedWithEdges;
+    let outlined = darkest_at_the_boundary(&render_with(&gpu, &mut renderer, &scene));
+    assert!(
+        outlined + 30 < plain,
+        "the wall's boundary should darken to the edge colour: {outlined} against {plain}"
+    );
+}

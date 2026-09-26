@@ -17,7 +17,8 @@ use basset_math::{Mat4, TriMesh, Vec3};
 use crate::camera::Camera;
 use crate::error::ViewportError;
 use crate::grid;
-use crate::scene::{LineBatch, MeshHandle, MeshStyle, PointBatch, Scene, TriBatch};
+use crate::scene::{LineBatch, MeshHandle, MeshInstance, MeshStyle, PointBatch, Scene, TriBatch};
+use crate::silhouette::{SilhouetteCache, ViewPoint};
 
 use gpu_mesh::{GpuMesh, SegmentInstance};
 use pipelines::{DEPTH_FORMAT, Layouts, Pipelines};
@@ -41,6 +42,10 @@ pub struct Renderer {
     meshes: HashMap<MeshHandle, GpuMesh>,
     next_handle: u64,
     highlights: HashMap<HighlightKey, HighlightBits>,
+    /// One silhouette per drawn instance, keyed as the highlights are. Per instance
+    /// rather than per mesh because the answer depends on where the body is standing as
+    /// well as where the camera is.
+    silhouettes: HashMap<HighlightKey, SilhouetteCache>,
     uniforms: UniformArena,
     line_instances: StreamBuffer,
     point_instances: StreamBuffer,
@@ -153,6 +158,7 @@ impl Renderer {
             meshes: HashMap::new(),
             next_handle: 1,
             highlights: HashMap::new(),
+            silhouettes: HashMap::new(),
             uniforms: UniformArena::new(),
             line_instances: StreamBuffer::new("line instances", wgpu::BufferUsages::VERTEX),
             point_instances: StreamBuffer::new("point instances", wgpu::BufferUsages::VERTEX),
@@ -206,6 +212,7 @@ impl Renderer {
     pub fn remove_mesh(&mut self, handle: MeshHandle) {
         self.meshes.remove(&handle);
         self.highlights.retain(|(h, _), _| *h != handle);
+        self.silhouettes.retain(|(h, _), _| *h != handle);
     }
 
     pub fn has_mesh(&self, handle: MeshHandle) -> bool {
@@ -298,6 +305,9 @@ impl Renderer {
         for entry in self.highlights.values_mut() {
             entry.used_this_frame = false;
         }
+        for entry in self.silhouettes.values_mut() {
+            entry.used_this_frame = false;
+        }
 
         let mut draws = FrameDraws::default();
         let mut ordinals: HashMap<MeshHandle, u32> = HashMap::new();
@@ -348,9 +358,13 @@ impl Renderer {
                 });
             }
             let words = gpu.highlight_words;
+            if instance.style.draws_silhouette() {
+                self.push_silhouette(instance, key, scene.camera, &mut draws);
+            }
             self.sync_highlight(device, queue, key, words, &instance.highlight_faces);
         }
         self.highlights.retain(|_, entry| entry.used_this_frame);
+        self.silhouettes.retain(|_, entry| entry.used_this_frame);
 
         // The grid goes first so model lines drawn later paint over it where they coincide.
         let grid_batches = if scene.show_grid {
@@ -373,6 +387,62 @@ impl Renderer {
         self.point_instances.flush(device, queue, 0);
         self.tri_vertices.flush(device, queue, 0);
         draws
+    }
+
+    /// Adds the instance's silhouette to the frame's line stream — the same pixel-width
+    /// batch the kernel's feature edges and every sketch overlay go through, so it is the
+    /// same line, drawn the same width, in the same colour as the body's other edges.
+    ///
+    /// The segments are in the mesh's own coordinates and the draw carries the instance
+    /// transform, exactly as the feature-edge buffer does.
+    fn push_silhouette(
+        &mut self,
+        instance: &MeshInstance,
+        key: HighlightKey,
+        camera: &Camera,
+        draws: &mut FrameDraws,
+    ) {
+        // Disjoint field borrows: the cache is read while the stream and the uniform arena
+        // are written, and all three hang off `self`.
+        let Self {
+            meshes,
+            silhouettes,
+            line_instances,
+            uniforms,
+            ..
+        } = self;
+        let Some(gpu) = meshes.get(&instance.handle) else {
+            return;
+        };
+        if gpu.silhouette.is_empty() {
+            return;
+        }
+        let cache = silhouettes.entry(key).or_default();
+        cache.used_this_frame = true;
+        let view = ViewPoint::for_instance(camera, &instance.transform);
+        let segments = cache.segments(&gpu.silhouette, view);
+        if segments.is_empty() {
+            return;
+        }
+        let first = (line_instances.len() / size_of::<SegmentInstance>()) as u32;
+        for [a, b] in segments {
+            // No running distance: a silhouette is never dashed, and its segments arrive
+            // in vertex order rather than walked along a polyline, so there is no run for
+            // a dash pattern to follow anyway.
+            line_instances.push(&SegmentInstance::new(*a, *b));
+        }
+        let uniform_offset = uniforms.push(&LineDraw {
+            model: instance.transform.as_mat4().to_cols_array_2d(),
+            color: instance.edge_color,
+            params: [EDGE_WIDTH_PX, 0.0, DASH_PX, GAP_PX],
+        });
+        draws.lines.push(LineDrawCall {
+            uniform_offset,
+            instances: first..first + segments.len() as u32,
+            source: SegmentSource::Frame,
+            // As for the feature edges: only the shaded style hides what it occludes.
+            depth_test: instance.style == MeshStyle::ShadedWithEdges,
+        });
     }
 
     fn push_line_batch(&mut self, batch: &LineBatch, draws: &mut FrameDraws) {

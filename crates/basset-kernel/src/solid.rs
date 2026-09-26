@@ -33,10 +33,30 @@ use crate::ids::{EdgeKey, FaceKey};
 /// resolve, so nothing real is welded away by being generous here.
 pub const MERGE_TOL: f64 = 1e-5;
 
-/// Surfaces meeting at a sharper angle than this are separated by a visible crease.
-/// [`smooth_normals`] shades to the same cut-off, so an edge that reads as sharp is also
-/// drawn as one.
+/// Facets of one surface meeting at a sharper angle than this are shaded as a crease
+/// rather than smoothed together, and a fold that sharp inside a face is drawn as a line
+/// so that what reads as sharp is also outlined as sharp. Shading and the within-surface
+/// fold are one question, which is why they share one number.
 const DISPLAY_CREASE_COS: f64 = 0.7; // ≈ 45.6°
+
+/// The drawn-edge cut-off where two *different* surfaces meet: below this they fold and a
+/// line is drawn, above it they are tangent and nothing is.
+///
+/// It is a separate number from [`DISPLAY_CREASE_COS`] because the two answer different
+/// questions. 45° is where a fold stops being shading and starts being a corner — the
+/// right place to cut a crease *within* one surface. A fillet running out into the face it
+/// blends into is not a corner at all: the surfaces are tangent there, the shading already
+/// carries across it, and a line drawn along it says "fold" about something that is smooth.
+/// Before this constant existed that boundary was always drawn, because the two faces'
+/// surfaces differ, and every fillet came out ringed like a chamfer.
+///
+/// The only reason it is not 1.0 is that the blend is faceted: the first facet of an arc
+/// is tilted about half a facet angle off the neighbouring face, so the test has to absorb
+/// half of the coarsest arc the blend tool will draw. [`Tessellation`](crate::Tessellation)
+/// defaults to 10° facets, and a blend coarsened against the tool's polygon budget can
+/// reach 45°/facet; 20° covers everything down to a 40°-facet arc while staying far below
+/// a fold anyone would call an edge.
+pub(crate) const TANGENT_EDGE_COS: f64 = 0.94; // ≈ 20°
 
 /// One polygon's use of an edge: (face index, directed a→b, polygon normal).
 type EdgeUser = (usize, bool, Vec3);
@@ -321,10 +341,18 @@ pub struct EdgeSegment {
 pub struct Edge {
     pub key: EdgeKey,
     pub segments: Vec<EdgeSegment>,
-    /// The two faces continue into each other here: one surface, split only because two
-    /// features happened to name the halves. A sketch line cut in two makes a wall like
-    /// this. Nothing is drawn along such an edge and nothing can be picked on it, because
-    /// to the user there is no edge there.
+    /// The two faces are one surface, split only because two features happened to name
+    /// the halves: a sketch line cut in two makes a wall like this. There is no edge
+    /// there to the user, so nothing can be picked on it and there is no dihedral to
+    /// fillet.
+    ///
+    /// This is deliberately the strict test and not the looser one drawing asks
+    /// ([`Solid::flush`]). Whether a line is *drawn* along an edge and whether the edge
+    /// can be *selected* are different questions, and a fillet's two boundaries are the
+    /// case that separates them: they are tangent, so drawing a line there would claim a
+    /// fold that is not there, but they are still where one face stops and another
+    /// starts, and the user has to be able to click them. Answering both with one test
+    /// made a tangent boundary unpickable as the price of not drawing it.
     pub smooth: bool,
 }
 
@@ -553,8 +581,8 @@ impl Solid {
     /// one flat top as two or three faces. That is not a naming subtlety they can see:
     /// they cannot select the top, sketch on the whole of it, or read its area, and an
     /// exporter writes it as several patches. Faces that share an edge and continue
-    /// across it — the same test [`Solid::display_edges`] uses to draw nothing there —
-    /// are therefore collapsed into one.
+    /// across it — [`Solid::continuous`], the strict test, not the looser one drawing
+    /// asks — are therefore collapsed into one.
     ///
     /// The survivor is the group's lowest [`FaceKey`], so the patch is named by the
     /// earliest operation that made part of it and keeps that name as later features add
@@ -747,8 +775,12 @@ impl Solid {
         (index, shared)
     }
 
-    /// Whether two polygons meeting along an edge join without anything to see: they
+    /// Whether two polygons meeting along an edge are the same piece of surface: they
     /// belong to one face, or to two faces of the same surface, and they do not fold.
+    ///
+    /// This is the topological question — may these two faces be merged into one? — and
+    /// [`Solid::merge_continuous_faces`] is what asks it. What a *viewer* should see along
+    /// the edge is the looser [`Solid::flush`].
     fn continuous(&self, a: (usize, Vec3), b: (usize, Vec3)) -> bool {
         if a.1.dot(b.1) < DISPLAY_CREASE_COS {
             return false;
@@ -756,8 +788,24 @@ impl Solid {
         a.0 == b.0 || self.faces[a.0].surface.continues(&self.faces[b.0].surface)
     }
 
-    /// The straight pieces a viewer should see as the body's outline: every fold or change
-    /// of surface, whether or not the topology calls it a face boundary.
+    /// Whether two polygons meeting along an edge leave nothing to see there: either they
+    /// are the same surface and do not fold, or they are different surfaces meeting
+    /// tangentially, as a fillet meets the face it blends into.
+    ///
+    /// Distinct from [`Solid::continuous`]: a fillet is genuinely a different face from the
+    /// plane it runs out into — it has its own key, its own radius, and a user can select
+    /// it — but there is no line to draw between them. This decides drawing only.
+    /// [`Edge::smooth`], which decides what can be picked and what can be filleted, is
+    /// the strict test, or a fillet's own boundaries would stop being selectable.
+    fn flush(&self, a: (usize, Vec3), b: (usize, Vec3)) -> bool {
+        self.continuous(a, b) || a.1.dot(b.1) >= TANGENT_EDGE_COS
+    }
+
+    /// The straight pieces a viewer should see as the body's outline: every fold, and
+    /// every change of surface that is not tangent, whether or not the topology calls it a
+    /// face boundary. A fillet's two boundaries are tangent, so they are not in here; what
+    /// bounds a blend against the background is its silhouette, which is view-dependent and
+    /// so the viewport's business rather than the kernel's.
     ///
     /// These are segments, not polylines: one visual line comes back cut wherever a
     /// neighbouring face happens to end against it. That suits a line batch, and nothing
@@ -783,7 +831,7 @@ impl Solid {
                 users.iter().enumerate().any(|(i, (fa, _, na))| {
                     users[i + 1..]
                         .iter()
-                        .any(|(fb, _, nb)| !self.continuous((*fa, *na), (*fb, *nb)))
+                        .any(|(fb, _, nb)| !self.flush((*fa, *na), (*fb, *nb)))
                 })
             })
             .map(|((a, b), _)| ((a, b), [index.points[a as usize], index.points[b as usize]]))
@@ -972,22 +1020,96 @@ fn smooth_normals(face: &Face) -> Vec<Vec<Vec3>> {
         .collect()
 }
 
-/// Snaps points within [`MERGE_TOL`] of each other to one id. Uses a grid of cell size
-/// `2·MERGE_TOL` and probes the neighbouring cells so points straddling a cell boundary
-/// still merge.
+/// Mixes the vertex grid's integer cell coordinates into a hash.
+///
+/// The map is keyed by grid coordinates of the model's own geometry, so there is nothing
+/// for the standard library's SipHash to defend against, and it is not cheap next to what
+/// a lookup here does with the result: welding a vertex is a handful of multiplies and a
+/// distance, and hashing was most of it. This is the usual multiply-xor mix.
+#[derive(Default)]
+pub(crate) struct CellHasher(u64);
+
+impl std::hash::Hasher for CellHasher {
+    fn finish(&self) -> u64 {
+        // A final avalanche, or the high bits the map takes its bucket from would be
+        // dominated by whichever coordinate was written last.
+        let h = self.0;
+        (h ^ (h >> 31)).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.write_i64(*b as i64);
+        }
+    }
+
+    fn write_i64(&mut self, i: i64) {
+        self.0 = (self.0.rotate_left(5) ^ i as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+type CellMap = HashMap<(i64, i64, i64), Vec<u32>, std::hash::BuildHasherDefault<CellHasher>>;
+
+/// Snaps points within [`MERGE_TOL`] of each other to one id. Uses a grid whose cells are
+/// comfortably wider than the tolerance and probes a neighbouring cell along an axis only
+/// where the point is close enough to that face for the neighbour to hold a match.
 #[derive(Default)]
 pub(crate) struct VertexIndex {
-    cells: HashMap<(i64, i64, i64), Vec<u32>>,
+    cells: CellMap,
     pub(crate) points: Vec<Vec3>,
 }
 
+/// Grid pitch, as a multiple of [`MERGE_TOL`].
+///
+/// A cell of exactly `2·MERGE_TOL` puts every point within the tolerance of one of its
+/// two faces on every axis, so all eight corner cells have to be probed however the probe
+/// is written; the old blanket 3×3×3 probed twenty-seven. Wider cells make that the
+/// exception — a point needs a neighbour on an axis only within `MERGE_TOL` of a face,
+/// which is a quarter of this one — at the price of a few more points per cell to compare
+/// against, and at this pitch a cell is still 80 nm across.
+const GRID: f64 = 8.0 * MERGE_TOL;
+
 impl VertexIndex {
     pub(crate) fn id(&mut self, p: Vec3) -> u32 {
-        let cell = |x: f64| (x / (2.0 * MERGE_TOL)).floor() as i64;
-        let c = (cell(p.x), cell(p.y), cell(p.z));
-        for dx in -1..=1 {
-            for dy in -1..=1 {
-                for dz in -1..=1 {
+        let c = (
+            (p.x / GRID).floor() as i64,
+            (p.y / GRID).floor() as i64,
+            (p.z / GRID).floor() as i64,
+        );
+        // The one neighbour each axis can need: below when the point is within the
+        // tolerance of the cell's low face, above when it is within it of the high face,
+        // and neither in the middle, which is where it usually is.
+        let near = |x: f64, c: i64| {
+            let low = x - c as f64 * GRID;
+            if low <= MERGE_TOL {
+                -1
+            } else if low >= GRID - MERGE_TOL {
+                1
+            } else {
+                0
+            }
+        };
+        let offsets = |n: i64| {
+            let both = [0, n];
+            if n == 0 { [0, 0] } else { both }
+        };
+        let (xs, ys, zs) = (
+            offsets(near(p.x, c.0)),
+            offsets(near(p.y, c.1)),
+            offsets(near(p.z, c.2)),
+        );
+        for (i, dx) in xs.iter().enumerate() {
+            if i == 1 && *dx == 0 {
+                break;
+            }
+            for (j, dy) in ys.iter().enumerate() {
+                if j == 1 && *dy == 0 {
+                    break;
+                }
+                for (k, dz) in zs.iter().enumerate() {
+                    if k == 1 && *dz == 0 {
+                        break;
+                    }
                     if let Some(ids) = self.cells.get(&(c.0 + dx, c.1 + dy, c.2 + dz)) {
                         for &id in ids {
                             if self.points[id as usize].distance_squared(p) <= MERGE_TOL * MERGE_TOL
@@ -1389,6 +1511,107 @@ mod tests {
             c.display_edges().len(),
             before,
             "outline changed under a nudge inside MERGE_TOL"
+        );
+    }
+
+    /// A cylinder's curved wall is one face of many facets: the facet seams are shading,
+    /// not geometry, and drawing them would paint the mesh onto the body. Only the two
+    /// rims are drawn, and against the background the wall is bounded by its silhouette
+    /// instead, which the viewport recomputes per camera.
+    #[test]
+    fn a_cylinders_only_drawn_edges_are_its_two_rims() {
+        let tess = crate::geometry::Tessellation::default();
+        let c = crate::primitives::cylinder(OpId::new(1), Vec3::ZERO, Vec3::Z, 5.0, 10.0, &tess);
+        let wall = c
+            .face(FaceKey::new(OpId::new(1), FaceRole::Side(0)))
+            .expect("the curved wall is Side(0)");
+        let facets = wall.polygons.len();
+        assert!(facets >= 12, "a 5 mm cylinder at the default tessellation");
+        let drawn = c.display_edges();
+        assert_eq!(
+            drawn.len(),
+            2 * facets,
+            "one drawn segment per facet per rim"
+        );
+        assert!(
+            drawn.iter().all(|[a, b]| (a.z - b.z).abs() < 1e-9),
+            "a facet seam runs up the wall, and none of those may be drawn"
+        );
+        // And the rims themselves stay pickable: they are folds, not tangencies.
+        assert_eq!(c.edges().iter().filter(|e| !e.smooth).count(), 2);
+    }
+
+    /// The tangent half of the problem: a fillet meets the faces it blends into with no
+    /// corner between them, so neither boundary is drawn. Before the drawn-edge cut-off
+    /// was split from the shading one, both were drawn — the fillet came out ringed,
+    /// exactly like the chamfer it is not.
+    ///
+    /// Not drawn is as far as it goes. The boundary is still where one face stops and
+    /// another starts, so it stays selectable; see
+    /// [`a_fillets_tangent_boundaries_stay_selectable`].
+    #[test]
+    fn a_fillets_tangent_boundaries_are_not_drawn() {
+        let op = OpId::new(1);
+        let cube = crate::primitives::cuboid(op, Vec3::ZERO, Vec3::splat(10.0));
+        let key = EdgeKey::new(
+            FaceKey::new(op, FaceRole::EndCap),
+            FaceKey::new(op, FaceRole::Side(0)),
+        );
+        let tess = crate::geometry::Tessellation::default();
+        let r = crate::blend::fillet(OpId::new(2), &cube, &[key], 2.0, &tess)
+            .expect("filleting one top edge of a cube");
+        let blend = FaceKey::new(OpId::new(2), FaceRole::Fillet(0));
+        let edges = r.edges();
+        let touching: Vec<&Edge> = edges.iter().filter(|e| e.key.touches(blend)).collect();
+        assert_eq!(touching.len(), 4, "the blend is bounded by four edges");
+        // The blend is a quarter cylinder of radius 2 rounding the edge at y = 0, z = 10,
+        // so it runs out along y = 0, z = 8 and along y = 2, z = 10.
+        let on_a_tangent_line = |p: &Vec3| {
+            (p.y.abs() < 1e-6 && (p.z - 8.0).abs() < 1e-6)
+                || ((p.y - 2.0).abs() < 1e-6 && (p.z - 10.0).abs() < 1e-6)
+        };
+        assert!(
+            r.display_edges()
+                .iter()
+                .all(|[a, b]| !(on_a_tangent_line(a) && on_a_tangent_line(b))),
+            "a line was drawn where the fillet runs tangentially into its neighbour"
+        );
+        // Every other edge of the cube survives as a drawn one: twelve, less the filleted
+        // one, plus the two short ends the blend adds at the faces it dies into, and the
+        // two tangent boundaries, which are not drawn but are still edges.
+        assert_eq!(edges.iter().filter(|e| !e.smooth).count(), 11 + 2 + 2);
+    }
+
+    /// The other half of the same question, and the one that regressed when both were
+    /// answered by the drawing test: a fillet's tangent boundary is still where one face
+    /// stops and another starts, so it has to stay selectable. Losing it means the user
+    /// cannot click the edge of a fillet at all.
+    #[test]
+    fn a_fillets_tangent_boundaries_stay_selectable() {
+        let op = OpId::new(1);
+        let cube = crate::primitives::cuboid(op, Vec3::ZERO, Vec3::splat(10.0));
+        let key = EdgeKey::new(
+            FaceKey::new(op, FaceRole::EndCap),
+            FaceKey::new(op, FaceRole::Side(0)),
+        );
+        let tess = crate::geometry::Tessellation::default();
+        let r = crate::blend::fillet(OpId::new(2), &cube, &[key], 2.0, &tess)
+            .expect("filleting one top edge of a cube");
+        let blend = FaceKey::new(OpId::new(2), FaceRole::Fillet(0));
+        let touching: Vec<Edge> = r
+            .edges()
+            .into_iter()
+            .filter(|e| e.key.touches(blend))
+            .collect();
+        assert_eq!(touching.len(), 4, "the blend is bounded by four edges");
+        assert!(
+            touching.iter().all(|e| !e.smooth),
+            "a boundary of the blend is unpickable: {:?}",
+            touching
+                .iter()
+                .filter(|e| e.smooth)
+                .map(|e| e.key)
+                .collect::<Vec<_>>()
         );
     }
 

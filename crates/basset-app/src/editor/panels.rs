@@ -7,6 +7,7 @@
 use basset_core::{BodyRef, ComponentId, FeatureId, FeatureKind, FeatureStatus, PlaneRef};
 use basset_viewport::ViewPreset;
 
+use super::commands::{self, Command};
 use super::sketch_mode::{self, SketchTool, ToolGroup, edit_text, parse_value};
 use super::tools::{self, ToolKind};
 use super::{DisplayMode, Editor, Mode, SelectMode};
@@ -19,75 +20,6 @@ const WARNING_LABEL: egui::Color32 = egui::Color32::from_rgb(235, 190, 90);
 /// The orange the viewport draws a redundant constraint's badge in, so the row that
 /// names it matches the mark on the drawing.
 const REDUNDANT_LABEL: egui::Color32 = egui::Color32::from_rgb(255, 160, 80);
-
-/// Deferred commands, so panel code never needs `&mut Editor` while it borrows state.
-enum Command {
-    Tool(ToolKind),
-    /// Start or leave the Measure tool, which owns no feature; see [`super::measure`].
-    Measure(bool),
-    New,
-    Open,
-    Save(bool),
-    ExportStl,
-    Export3mf,
-    Quit,
-    Undo,
-    Redo,
-    Fit,
-    View(ViewPreset),
-    ToggleProjection,
-    Display(DisplayMode),
-    ToggleGrid,
-    ToggleSnap,
-    ToggleOrigin,
-    SetCursor(usize),
-    Edit(FeatureId),
-    Suppress(FeatureId, bool),
-    Delete(FeatureId),
-    Rename(FeatureId),
-    SelectFeature(FeatureId),
-    ToggleBody(BodyRef),
-    ToggleSketch(FeatureId),
-    Activate(ComponentId),
-    FinishSketch(bool),
-    SketchTool(SketchTool),
-    SketchPick(sketch_mode::SketchPick),
-    SketchSelect(Vec<basset_sketch::EntityId>),
-    SketchDimension(basset_sketch::ConstraintId, f64),
-    SketchRemoveConstraint(basset_sketch::ConstraintId),
-    SketchDelete,
-    SketchConstruction,
-    /// Start a move of the selection, as `M` does.
-    SketchMoveBegin,
-    /// A number in the move palette changed: re-apply the move from where it started.
-    SketchMoveUpdate,
-    /// Keep (`true`) or undo (`false`) the move in progress.
-    SketchMoveFinish(bool),
-    /// Start a pattern of the selection.
-    SketchPattern,
-    /// A number in the pattern palette changed: re-make the copies.
-    SketchPatternUpdate,
-    /// Keep (`true`) or undo (`false`) the pattern in progress.
-    SketchPatternFinish(bool),
-    SketchOffset,
-    /// A setting in the offset palette changed: re-make the result.
-    SketchOffsetUpdate,
-    /// Keep (`true`) or undo (`false`) the offset in progress.
-    SketchOffsetFinish(bool),
-    /// The radius in the fillet palette changed: re-make the arc.
-    SketchFilletUpdate,
-    /// Keep (`true`) or undo (`false`) the corner fillet in progress.
-    SketchFilletFinish(bool),
-    SketchSetParameter(String, String),
-    SketchRemoveParameter(String),
-    SketchBindDimension(basset_sketch::ConstraintId, String),
-    /// Enter in an entry box: place the shape from the typed sizes.
-    SketchSubmitEntry,
-    /// The sketch editor changed its sketch outside a pointer event (a dragged label):
-    /// write it into the feature.
-    SketchCommit,
-    SelectMode(SelectMode),
-}
 
 pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
     let mut commands: Vec<Command> = Vec::new();
@@ -134,6 +66,8 @@ pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
     dimension_overlay(editor, &ctx, &mut commands);
     measure_overlay(editor, &ctx);
     constraint_overlay(editor, &ctx, &mut commands);
+    shortcut_overlay(editor, &ctx);
+    command_palette(editor, &ctx, &mut commands);
     error_popup(editor, &ctx);
     rename_popup(editor, &ctx);
 
@@ -142,7 +76,7 @@ pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
     }
 }
 
-fn run(editor: &mut Editor, c: Command) {
+pub(super) fn run(editor: &mut Editor, c: Command) {
     match c {
         Command::Tool(kind) => tools::start_tool(editor, kind),
         Command::Measure(on) => {
@@ -150,6 +84,13 @@ fn run(editor: &mut Editor, c: Command) {
                 super::measure::start(editor)
             } else {
                 super::measure::stop(editor)
+            }
+        }
+        Command::ToggleMeasure => {
+            if editor.measure.is_some() {
+                super::measure::stop(editor)
+            } else {
+                super::measure::start(editor)
             }
         }
         Command::New => editor.new_document(),
@@ -164,6 +105,30 @@ fn run(editor: &mut Editor, c: Command) {
         Command::View(p) => editor.look_from(p),
         Command::ToggleProjection => editor.toggle_projection(),
         Command::Display(m) => editor.set_display_mode(m),
+        Command::CycleDisplay => editor.cycle_display_mode(),
+        // Escape dismisses the topmost thing first. The overlay is drawn over
+        // everything, and putting it away should not also put down the tool under it.
+        Command::Cancel => {
+            if editor.show_shortcuts {
+                editor.show_shortcuts = false;
+            } else {
+                editor.cancel();
+            }
+        }
+        Command::Confirm => editor.confirm(),
+        Command::DeleteSelected => editor.delete_selected(),
+        Command::FocusNextEntry => {
+            if let Mode::Sketch(s) = &mut editor.mode {
+                s.focus_next_entry();
+            }
+        }
+        Command::ToggleShortcuts => editor.show_shortcuts = !editor.show_shortcuts,
+        Command::OpenPalette => {
+            editor.palette = Some(commands::Palette {
+                just_opened: true,
+                ..Default::default()
+            })
+        }
         Command::ToggleGrid => editor.show_grid = !editor.show_grid,
         Command::ToggleSnap => editor.set_snapping(!editor.snapping.to_grid),
         Command::ToggleOrigin => editor.show_origin = !editor.show_origin,
@@ -215,6 +180,18 @@ fn run(editor: &mut Editor, c: Command) {
                 s.set_pick(mode);
             }
         }
+        // A group key picks the variant its toolbar button is showing, which is what
+        // makes the key and the button the same button.
+        Command::SketchGroup(group) => {
+            if let Mode::Sketch(s) = &mut editor.mode {
+                let variant = s.variant_of(group);
+                s.set_tool(variant);
+                if s.take_dirty() {
+                    editor.commit_sketch();
+                }
+            }
+        }
+        Command::SketchExtrudeRegion => sketch_mode::extrude_region(editor),
         Command::SketchTool(t) => {
             if let Mode::Sketch(s) = &mut editor.mode {
                 // Picking another tool cancels a move or a pattern, and that revert has
@@ -290,9 +267,15 @@ fn run(editor: &mut Editor, c: Command) {
         Command::SketchOffset => {
             if let Mode::Sketch(s) = &mut editor.mode {
                 if s.begin_offset() {
+                    // The preview is real geometry in the feature by now, so it has to
+                    // reach the document for anything downstream to see it.
                     editor.commit_sketch();
                 } else {
-                    editor.set_status("Select the sketch geometry to offset, then Offset");
+                    // Somebody halfway through a move, told to select something first,
+                    // learns nothing about what to do next: say which it is.
+                    let why =
+                        super::busy(s).unwrap_or("Select the path or loop to offset first".into());
+                    editor.set_status(why);
                 }
             }
         }
@@ -332,6 +315,14 @@ fn run(editor: &mut Editor, c: Command) {
                 });
             }
         }
+        Command::SetParameter(name, expression) => {
+            editor.set_document_parameter(&name, &expression);
+        }
+        Command::AddParameter(name, expression) => {
+            editor.add_document_parameter(&name, &expression);
+        }
+        Command::RenameParameter(from, to) => editor.rename_document_parameter(&from, &to),
+        Command::RemoveParameter(name) => editor.remove_document_parameter(&name),
         Command::SketchSetParameter(name, expression) => {
             if let Mode::Sketch(s) = &mut editor.mode {
                 match s.set_parameter(&name, &expression) {
@@ -368,7 +359,9 @@ fn run(editor: &mut Editor, c: Command) {
             if let Mode::Sketch(s) = &mut editor.mode
                 && !s.begin_move()
             {
-                editor.set_status("Select the sketch geometry to move first");
+                let why =
+                    super::busy(s).unwrap_or("Select the sketch geometry to move first".into());
+                editor.set_status(why);
             }
         }
         Command::SketchCommit => {
@@ -385,16 +378,28 @@ fn run(editor: &mut Editor, c: Command) {
 fn menu_bar(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
     egui::MenuBar::new().ui(ui, |ui| {
         ui.menu_button("File", |ui| {
-            if ui.button("New").clicked() {
+            if ui
+                .button(format!("New{}", commands::hint("file.new")))
+                .clicked()
+            {
                 commands.push(Command::New);
             }
-            if ui.button("Open…").clicked() {
+            if ui
+                .button(format!("Open…{}", commands::hint("file.open")))
+                .clicked()
+            {
                 commands.push(Command::Open);
             }
-            if ui.button("Save").clicked() {
+            if ui
+                .button(format!("Save{}", commands::hint("file.save")))
+                .clicked()
+            {
                 commands.push(Command::Save(false));
             }
-            if ui.button("Save As…").clicked() {
+            if ui
+                .button(format!("Save As…{}", commands::hint("file.save_as")))
+                .clicked()
+            {
                 commands.push(Command::Save(true));
             }
             ui.separator();
@@ -411,20 +416,29 @@ fn menu_bar(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
         });
         ui.menu_button("Edit", |ui| {
             if ui
-                .add_enabled(editor.doc.can_undo(), egui::Button::new("Undo"))
+                .add_enabled(
+                    editor.doc.can_undo(),
+                    egui::Button::new(format!("Undo{}", commands::hint("edit.undo"))),
+                )
                 .clicked()
             {
                 commands.push(Command::Undo);
             }
             if ui
-                .add_enabled(editor.doc.can_redo(), egui::Button::new("Redo"))
+                .add_enabled(
+                    editor.doc.can_redo(),
+                    egui::Button::new(format!("Redo{}", commands::hint("edit.redo"))),
+                )
                 .clicked()
             {
                 commands.push(Command::Redo);
             }
         });
         ui.menu_button("View", |ui| {
-            if ui.button("Fit (F)").clicked() {
+            if ui
+                .button(format!("Fit{}", commands::hint("view.fit")))
+                .clicked()
+            {
                 commands.push(Command::Fit);
             }
             for (name, p) in [
@@ -445,7 +459,9 @@ fn menu_bar(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
                 commands.push(Command::ToggleProjection);
             }
             ui.separator();
-            ui.label(egui::RichText::new("Display (D)").weak());
+            ui.label(
+                egui::RichText::new(format!("Display{}", commands::hint("view.display"))).weak(),
+            );
             for mode in DisplayMode::ALL {
                 if ui
                     .selectable_label(editor.display == mode, mode.title())
@@ -507,6 +523,26 @@ fn menu_bar(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
                 commands,
             );
         });
+        // The two ways to find a command without already knowing where it is. They are
+        // in a menu as well as on keys, because a shortcut overlay only reachable by a
+        // shortcut helps whoever needed it least.
+        ui.menu_button("Help", |ui| {
+            if ui
+                .button(format!(
+                    "Keyboard shortcuts{}",
+                    commands::hint("help.shortcuts")
+                ))
+                .clicked()
+            {
+                commands.push(Command::ToggleShortcuts);
+            }
+            if ui
+                .button(format!("Command palette{}", commands::hint("help.palette")))
+                .clicked()
+            {
+                commands.push(Command::OpenPalette);
+            }
+        });
     });
 }
 
@@ -539,7 +575,7 @@ fn toolbar(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
                 // Icon and label are one button, so the symbol is as clickable as the
                 // word beside it.
                 if tool_button(ui, "toolbar", *kind, Some(label), false, !busy)
-                    .on_hover_text(kind.title())
+                    .on_hover_text(format!("{}{}", kind.title(), commands::tool_hint(*kind)))
                     .clicked()
                 {
                     commands.push(Command::Tool(*kind));
@@ -579,7 +615,8 @@ fn toolbar(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
 /// another, which is exactly the bug the sketch variant menus had.
 fn tool_menu(ui: &mut egui::Ui, salt: &str, kinds: &[ToolKind], commands: &mut Vec<Command>) {
     for kind in kinds {
-        if tool_button(ui, salt, *kind, Some(kind.title()), false, true).clicked() {
+        let label = format!("{}{}", kind.title(), commands::tool_hint(*kind));
+        if tool_button(ui, salt, *kind, Some(&label), false, true).clicked() {
             commands.push(Command::Tool(*kind));
             ui.close();
         }
@@ -597,7 +634,11 @@ fn sketch_toolbar(s: &super::SketchEditor, ui: &mut egui::Ui, commands: &mut Vec
             let variant = s.variant_of(group);
             let selected = s.tool.group() == group;
             let response = tool_icon(ui, "toolbar", variant, selected).on_hover_ui(|ui| {
-                ui.label(variant.name());
+                ui.label(format!(
+                    "{}{}",
+                    variant.name(),
+                    commands::sketch_tool_hint(group, variant)
+                ));
                 if group.variants().len() > 1 {
                     ui.label(egui::RichText::new("Hold or right-click for other kinds").weak());
                 }
@@ -643,7 +684,14 @@ fn sketch_toolbar(s: &super::SketchEditor, ui: &mut egui::Ui, commands: &mut Vec
                                 // a click on it that did nothing was the row saying one
                                 // thing and meaning another.
                                 let icon = tool_icon(ui, "menu", *tool, s.tool == *tool);
-                                let label = ui.selectable_label(s.tool == *tool, tool.name());
+                                let label = ui.selectable_label(
+                                    s.tool == *tool,
+                                    format!(
+                                        "{}{}",
+                                        tool.name(),
+                                        commands::sketch_tool_hint(group, *tool)
+                                    ),
+                                );
                                 if icon.clicked() || label.clicked() {
                                     commands.push(Command::SketchTool(*tool));
                                     chosen = true;
@@ -690,7 +738,11 @@ fn sketch_toolbar(s: &super::SketchEditor, ui: &mut egui::Ui, commands: &mut Vec
             let ready = !s.constraints_for(kind, &s.selected).is_empty();
             let response =
                 constraint_button(ui, kind, armed == Some(kind), ready).on_hover_ui(|ui| {
-                    ui.strong(kind.name());
+                    ui.strong(format!(
+                        "{}{}",
+                        kind.name(),
+                        commands::constraint_hint(kind)
+                    ));
                     ui.label(kind.hint());
                     if ready {
                         ui.colored_label(LOOSE_LABEL, "The selection is ready for this");
@@ -712,19 +764,32 @@ fn sketch_toolbar(s: &super::SketchEditor, ui: &mut egui::Ui, commands: &mut Vec
         } else {
             s.construction
         };
+        // The keys live in the tooltips rather than in the names, here and along the
+        // rest of this row. The row already wraps on an ordinary window, and every line
+        // it gains is a line taken off the palette beside it — which is where the
+        // degrees of freedom and the redundant constraints are reported, and they are
+        // worth more than a key printed twice: the overlay and the palette have it.
         if ui
-            .add(egui::Button::new("Construction (X)").selected(lit))
-            .on_hover_text(if selection {
-                "Make the selection construction geometry, or ordinary geometry again"
-            } else {
-                "Draw the next shape as construction (reference) geometry"
-            })
+            .add(egui::Button::new("Construction").selected(lit))
+            .on_hover_text(format!(
+                "{}{}",
+                if selection {
+                    "Make the selection construction geometry, or ordinary geometry again"
+                } else {
+                    "Draw the next shape as construction (reference) geometry"
+                },
+                commands::hint("sketch.construction")
+            ))
             .clicked()
         {
             commands.push(Command::SketchConstruction);
         }
         if ui
             .add_enabled(!s.selected.is_empty(), egui::Button::new("Delete"))
+            .on_hover_text(format!(
+                "Delete the selection{}",
+                commands::hint("edit.delete")
+            ))
             .clicked()
         {
             commands.push(Command::SketchDelete);
@@ -736,7 +801,10 @@ fn sketch_toolbar(s: &super::SketchEditor, ui: &mut egui::Ui, commands: &mut Vec
                 !s.selected.is_empty() && !s.modal(),
                 egui::Button::new("Move"),
             )
-            .on_hover_text("Move the selection: drag the arrows and ring, or type offsets (M)")
+            .on_hover_text(format!(
+                "Move the selection: drag the arrows and ring, or type offsets{}",
+                commands::hint("sketch.move")
+            ))
             .on_disabled_hover_text("Select the geometry to move first")
             .clicked()
         {
@@ -763,7 +831,10 @@ fn sketch_toolbar(s: &super::SketchEditor, ui: &mut egui::Ui, commands: &mut Vec
                 !s.selected.is_empty() && !s.modal(),
                 egui::Button::new("Offset"),
             )
-            .on_hover_text("Draw a chain of curves alongside the selection at a fixed distance (O)")
+            .on_hover_text(format!(
+                "Draw a chain of curves alongside the selection at a fixed distance{}",
+                commands::hint("sketch.offset")
+            ))
             .on_disabled_hover_text("Select the path or loop to offset first")
             .clicked()
         {
@@ -1467,6 +1538,12 @@ fn browser(editor: &mut Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) 
             ui.checkbox(&mut editor.show_origin, "Show origin planes and axes");
             ui.checkbox(&mut editor.show_grid, "Show grid");
         });
+        // Salted, because the count is part of the header text and a section keyed on its
+        // own label would shut itself the moment a parameter was added to it.
+        egui::CollapsingHeader::new(format!("Parameters ({})", editor.doc.parameters().len()))
+            .id_salt("document-parameters")
+            .default_open(false)
+            .show(ui, |ui| document_parameters(editor, ui, commands));
         let planes = editor.cached_planes.clone();
         if !planes.is_empty() {
             ui.collapsing("Construction planes", |ui| {
@@ -1484,6 +1561,290 @@ fn browser(editor: &mut Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) 
         let components = editor.cached_components.clone();
         component_tree(editor, ui, ComponentId::ROOT, &components, commands);
     });
+}
+
+/// Editable text of the document's parameter panel.
+///
+/// Drafts rather than live values, for the same reason the sketch's panel keeps them: an
+/// expression is only taken when the user leaves the box or presses Enter, so a name half
+/// typed is not an error shouted about on every keystroke.
+#[derive(Default)]
+pub(crate) struct ParametersUi {
+    /// One row per parameter. The committed name is kept beside the draft one because
+    /// editing that box is a *rename* — an operation that has to say what it renames
+    /// from, and that follows the old name into every feature and sketch that reads it.
+    pub(crate) rows: Vec<ParamRow>,
+    pub(crate) new_name: String,
+    pub(crate) new_expr: String,
+    /// Why the last edit was refused, shown under the table rather than in the error
+    /// popup: the user is typing, and a modal over a typo is worse than the typo.
+    pub(crate) error: Option<String>,
+    /// The name of a delete the user is being warned about.
+    pub(crate) confirm_delete: Option<String>,
+    /// The table moved under the drafts (an edit went through, or an undo), so they are
+    /// rebuilt from it on the next pass.
+    pub(crate) stale: bool,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ParamRow {
+    pub(crate) name: String,
+    pub(crate) draft_name: String,
+    pub(crate) draft_expr: String,
+}
+
+impl ParametersUi {
+    /// Puts a row's name box back to the name the parameter still has, after a rename
+    /// was refused. [`Self::sync`] cannot do it: the live names have not changed, which
+    /// is precisely the case a refusal leaves behind.
+    pub(crate) fn revert_name(&mut self, name: &str) {
+        if let Some(row) = self.rows.iter_mut().find(|r| r.name == name) {
+            row.draft_name = name.to_string();
+        }
+    }
+
+    /// Rebuilds the drafts from the table when the set of names it holds has changed
+    /// underneath them, or when an edit of ours went through. Text the user is in the
+    /// middle of typing survives everything else.
+    fn sync(&mut self, live: &[(String, String)]) {
+        let same = self.rows.len() == live.len()
+            && self
+                .rows
+                .iter()
+                .zip(live)
+                .all(|(row, (name, _))| row.name == *name);
+        if same && !self.stale {
+            return;
+        }
+        self.stale = false;
+        self.rows = live
+            .iter()
+            .map(|(name, expr)| ParamRow {
+                name: name.clone(),
+                draft_name: name.clone(),
+                draft_expr: expr.clone(),
+            })
+            .collect();
+    }
+}
+
+/// The document's named constants: what every sketch and every feature in the file can
+/// read.
+///
+/// It lives in the browser, beside the origin and the components, because that is the
+/// panel that describes the *document* and it is the one panel that is up whether or not
+/// a sketch is open — and a table that only drives sketches would not need to have been
+/// lifted out of them. A window off a menu would have hidden the very names the feature
+/// exists to keep in front of the user.
+fn document_parameters(editor: &mut Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
+    let live: Vec<(String, String)> = editor
+        .doc
+        .parameters()
+        .rows()
+        .iter()
+        .map(|p| (p.name.clone(), p.expr.clone()))
+        .collect();
+    let values: Vec<Option<f64>> = live
+        .iter()
+        .map(|(name, _)| editor.doc.parameters().value(name).ok())
+        .collect();
+    // A sketch with a row of the same name means its own, and neither an edit here nor a
+    // rename reaches it. Said here as well as in the sketch's own panel, because from
+    // this side it is the reason a parameter change appears not to have worked.
+    let shadowed: Vec<Vec<String>> = live
+        .iter()
+        .map(|(name, _)| {
+            editor
+                .doc
+                .sketches_shadowing(name)
+                .into_iter()
+                .map(|id| editor.feature_name(id))
+                .collect()
+        })
+        .collect();
+    // Greyed out while a tool or a sketch holds the document's transaction open, because
+    // an edit made inside one is rolled back by a Cancel that has nothing to do with it.
+    // This is only what the panel *looks* like: greying a box does not stop it committing
+    // — egui takes focus off a disabled widget, which fires the very commit being
+    // prevented — so the refusal itself lives in `Editor::parameters_held`, at the moment
+    // the command is applied.
+    let locked = editor.doc.in_transaction();
+    editor.params_panel.sync(&live);
+    if locked {
+        // A warning the user can no longer act on does not stay on screen; the edit
+        // itself is refused where it is applied, see `Editor::parameters_held`.
+        editor.params_panel.confirm_delete = None;
+    }
+    let ui_state = &mut editor.params_panel;
+    ui.add_enabled_ui(!locked, |ui| {
+        for (index, (((name, expression), value), shadowed)) in
+            live.iter().zip(&values).zip(&shadowed).enumerate()
+        {
+            let mut blanked = false;
+            ui.horizontal(|ui| {
+                // The drafts were synced from this very list a moment ago, so the row is
+                // there; a missing one is not worth taking the panel down over.
+                let Some(row) = ui_state.rows.get_mut(index) else {
+                    return;
+                };
+                let name_box = ui.add(
+                    egui::TextEdit::singleline(&mut row.draft_name)
+                        .desired_width(64.0)
+                        .hint_text("name"),
+                );
+                let typed = row.draft_name.trim().to_string();
+                if name_box.lost_focus() && typed != *name {
+                    if typed.is_empty() {
+                        // Silently swallowing this would leave an empty box that never
+                        // becomes anything, over a parameter that still has its name.
+                        row.draft_name = name.clone();
+                        blanked = true;
+                    } else {
+                        commands.push(Command::RenameParameter(name.clone(), typed));
+                    }
+                }
+                let expr_box = ui.add(
+                    egui::TextEdit::singleline(&mut row.draft_expr)
+                        .desired_width(86.0)
+                        .hint_text("expression"),
+                );
+                if row.draft_expr != *expression && expr_box.lost_focus() {
+                    commands.push(Command::SetParameter(name.clone(), row.draft_expr.clone()));
+                }
+                match value {
+                    Some(v) => ui.label(egui::RichText::new(format!("= {v:.3}")).weak()),
+                    None => ui
+                        .colored_label(egui::Color32::YELLOW, "?")
+                        .on_hover_text("This expression does not work out to a number"),
+                };
+                if !shadowed.is_empty() {
+                    ui.colored_label(WARNING_LABEL, "shadowed")
+                        .on_hover_text(format!(
+                            "{} define a parameter named {name} of their own and mean \
+                             that one, so this value does not reach them",
+                            shadowed.join(", ")
+                        ));
+                }
+                if ui.small_button("\u{2715}").clicked() {
+                    ui_state.confirm_delete = Some(name.clone());
+                }
+            });
+            if blanked {
+                ui_state.error = Some(format!("{name} still needs a name"));
+            }
+        }
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut ui_state.new_name)
+                    .desired_width(64.0)
+                    .hint_text("name"),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut ui_state.new_expr)
+                    .desired_width(86.0)
+                    .hint_text("value or expression"),
+            );
+            let ready =
+                !ui_state.new_name.trim().is_empty() && !ui_state.new_expr.trim().is_empty();
+            if ui.add_enabled(ready, egui::Button::new("Add")).clicked() {
+                // The boxes are emptied by the command, once the parameter is actually
+                // in the table: clearing them here would throw away a name and an
+                // expression the user has to see to fix a typo in either.
+                commands.push(Command::AddParameter(
+                    ui_state.new_name.trim().to_string(),
+                    ui_state.new_expr.trim().to_string(),
+                ));
+            }
+        });
+        if let Some(e) = &ui_state.error {
+            ui.colored_label(egui::Color32::from_rgb(230, 120, 100), e);
+        }
+        ui.label(
+            egui::RichText::new(
+                "Every sketch and every feature in this document can read these names. A \
+                 sketch parameter of the same name hides the one here. Expressions take \
+                 + - * / ^, pi, and functions such as sqrt, min and rad",
+            )
+            .weak(),
+        );
+        if locked {
+            ui.label(
+                egui::RichText::new(
+                    "Finish or cancel the sketch or tool first: a parameter changed now \
+                     would be undone along with it",
+                )
+                .weak(),
+            );
+        }
+    });
+    // Inside the guard as well, so the buttons of a warning that latched before a tool
+    // opened cannot be pressed through it.
+    ui.add_enabled_ui(!locked, |ui| delete_confirmation(editor, ui, commands));
+}
+
+/// Warns before deleting a parameter something still reads, because nothing is deleted
+/// with it: the dependants keep the value they last had and start warning instead.
+fn delete_confirmation(editor: &mut Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
+    let Some(name) = editor.params_panel.confirm_delete.clone() else {
+        return;
+    };
+    let readers = readers_of(editor, &name);
+    if readers.is_empty() {
+        editor.params_panel.confirm_delete = None;
+        commands.push(Command::RemoveParameter(name));
+        return;
+    }
+    ui.colored_label(
+        WARNING_LABEL,
+        format!("{name} is still read by {}", readers.join(", ")),
+    );
+    ui.label(
+        egui::RichText::new(
+            "Deleting it changes nothing straight away: each of those keeps the value it \
+             has now and is flagged until it is given another one",
+        )
+        .weak(),
+    );
+    ui.horizontal(|ui| {
+        if ui.button("Delete anyway").clicked() {
+            editor.params_panel.confirm_delete = None;
+            commands.push(Command::RemoveParameter(name.clone()));
+        }
+        if ui.button("Keep it").clicked() {
+            editor.params_panel.confirm_delete = None;
+        }
+    });
+}
+
+/// What a named document parameter is read by, in the user's own words.
+///
+/// The document's own table, the driven values of features, and the sketches that do not
+/// define the name themselves — a sketch that shadows it reads its own parameter, which
+/// this name has nothing to do with. What cannot be checked is a sketch's *unbound*
+/// text: nothing outside an expression can mention a parameter, so there is nothing else
+/// to look in.
+fn readers_of(editor: &Editor, name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if editor.doc.parameters().mentions(name) {
+        out.push("another parameter".to_string());
+    }
+    for feature in editor.doc.timeline().features() {
+        let driven = feature.exprs.values().any(|text| {
+            basset_sketch::expr::referenced_names(text)
+                .iter()
+                .any(|n| n == name)
+        });
+        let in_sketch = match &feature.kind {
+            FeatureKind::Sketch { sketch, .. } => {
+                sketch.parameter(name).is_none() && sketch.mentions_parameter(name)
+            }
+            _ => false,
+        };
+        if driven || in_sketch {
+            out.push(feature.name.clone());
+        }
+    }
+    out
 }
 
 fn component_tree(
@@ -2465,10 +2826,21 @@ fn parameters_panel(s: &mut super::SketchEditor, ui: &mut egui::Ui, commands: &m
             if submit || (response.lost_focus() && *draft != *expression) {
                 commands.push(Command::SketchSetParameter(name.clone(), draft.clone()));
             }
-            match s.sketch.parameter_value(name) {
+            let outer = s.outer.lookup();
+            match s.sketch.parameter_value_with(name, &outer) {
                 Ok(v) => ui.label(egui::RichText::new(format!("= {v:.3}")).weak()),
                 Err(_) => ui.colored_label(egui::Color32::YELLOW, "?"),
             };
+            if s.shadows(name) {
+                // Shadowing is the one thing about two scopes that can genuinely mislead:
+                // the document's `width` is still there, this sketch simply means its own.
+                ui.colored_label(WARNING_LABEL, "hides")
+                    .on_hover_text(format!(
+                        "The document also has a parameter named {name}. Inside this \
+                         sketch the name means this row, and expressions here cannot \
+                         reach the document's one"
+                    ));
+            }
             if ui.small_button("✕").clicked() {
                 commands.push(Command::SketchRemoveParameter(name.clone()));
             }
@@ -2497,9 +2869,33 @@ fn parameters_panel(s: &mut super::SketchEditor, ui: &mut egui::Ui, commands: &m
     if let Some(e) = &s.param_error {
         ui.colored_label(egui::Color32::from_rgb(230, 120, 100), e);
     }
+    // The document's own table, read-only and visibly apart: these names are in scope
+    // here, and a user who cannot see them has no way to know what they may write.
+    if !s.outer.is_empty() {
+        ui.separator();
+        ui.label(egui::RichText::new("From the document").weak());
+        for row in s.outer.rows() {
+            let hidden = s.sketch.parameter(&row.name).is_some();
+            ui.horizontal(|ui| {
+                let name = egui::RichText::new(&row.name).weak();
+                ui.label(if hidden { name.strikethrough() } else { name });
+                match s.outer.value(&row.name) {
+                    Ok(v) => ui.label(egui::RichText::new(format!("= {v:.3}")).weak()),
+                    Err(_) => ui.colored_label(egui::Color32::YELLOW, "?"),
+                };
+                if hidden {
+                    ui.colored_label(WARNING_LABEL, "hidden here")
+                        .on_hover_text("This sketch has a parameter of the same name");
+                }
+            });
+        }
+        ui.label(egui::RichText::new("Edit these in the browser, under Parameters").weak());
+    }
     ui.label(
         egui::RichText::new(
-            "Click a dimension and type a name or a sum to drive it, e.g. wall * 2",
+            "Click a dimension and type a name or a sum to drive it, e.g. wall * 2. \
+             Names are looked for in this sketch first and then in the document, and \
+             expressions take + - * / ^, pi, and functions such as sqrt, min and rad",
         )
         .weak(),
     );
@@ -2783,8 +3179,11 @@ fn dimension_overlay(editor: &mut Editor, ctx: &egui::Context, commands: &mut Ve
             response.request_focus();
             let submit = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             ui.label(
-                egui::RichText::new("A number, or an expression over the sketch's parameters")
-                    .weak(),
+                egui::RichText::new(
+                    "A number, or an expression over this sketch's parameters and the \
+                     document's — sqrt, min, rad and the rest are available too",
+                )
+                .weak(),
             );
             ui.horizontal(|ui| {
                 if ui.button("OK").clicked() || submit {
@@ -2866,6 +3265,183 @@ fn rename_popup(editor: &mut Editor, ctx: &egui::Context) {
         }
         Some(false) => editor.rename = None,
         None => editor.rename = Some((id, name)),
+    }
+}
+
+/// How many matches the palette shows at once. More than this and the list is taller
+/// than the sketch it is covering.
+const PALETTE_ROWS: usize = 12;
+
+/// Every command live in this mode, grouped, with its key. Read straight out of the
+/// table, so a binding that exists is listed and a listing that exists is bound.
+fn shortcut_overlay(editor: &mut Editor, ctx: &egui::Context) {
+    if !editor.show_shortcuts {
+        return;
+    }
+    let sketching = editor.is_sketching();
+    let mut open = true;
+    egui::Window::new(if sketching {
+        "Keyboard shortcuts — sketch mode"
+    } else {
+        "Keyboard shortcuts"
+    })
+    .collapsible(false)
+    .resizable(false)
+    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+    .show(ctx, |ui| {
+        ui.label(
+            egui::RichText::new(
+                "Only what is live in this mode is listed; the rest appears in the other one.",
+            )
+            .weak(),
+        );
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .max_height(520.0)
+            .show(ui, |ui| {
+                // Two columns, because the list is long and a single column of thirty
+                // rows is a scroll rather than a thing you read.
+                ui.columns(2, |columns| {
+                    for (i, group) in commands::Group::ALL.iter().enumerate() {
+                        let rows: Vec<_> = commands::BINDINGS
+                            .iter()
+                            .filter(|b| b.group == *group && b.live.covers(sketching))
+                            .collect();
+                        if rows.is_empty() {
+                            continue;
+                        }
+                        let ui = &mut columns[i % 2];
+                        ui.strong(group.name());
+                        for binding in rows {
+                            let keys = binding
+                                .chords
+                                .iter()
+                                .map(|c| c.label())
+                                .collect::<Vec<_>>()
+                                .join(" / ");
+                            ui.horizontal(|ui| {
+                                let key = egui::RichText::new(if keys.is_empty() {
+                                    "—".to_string()
+                                } else {
+                                    keys
+                                })
+                                .monospace();
+                                ui.add_sized(
+                                    [92.0, 16.0],
+                                    egui::Label::new(key).halign(egui::Align::RIGHT),
+                                );
+                                let label = egui::RichText::new(binding.label);
+                                // A command that cannot do anything right now is dimmed
+                                // rather than hidden: the list is also how you learn the
+                                // key exists at all.
+                                ui.label(if (binding.enabled)(editor) {
+                                    label
+                                } else {
+                                    label.weak()
+                                });
+                            });
+                        }
+                        ui.add_space(6.0);
+                    }
+                });
+            });
+        ui.separator();
+        if ui.button("Close").clicked() {
+            open = false;
+        }
+    });
+    editor.show_shortcuts = open;
+}
+
+/// A fuzzy search over the same table, so every command is reachable without hunting
+/// the toolbar for it.
+fn command_palette(editor: &mut Editor, ctx: &egui::Context, queue: &mut Vec<Command>) {
+    let Some(mut palette) = editor.palette.take() else {
+        return;
+    };
+    let matches = commands::search(editor, &palette.query);
+    palette.selected = palette.selected.min(matches.len().saturating_sub(1));
+    let mut chosen: Option<&'static commands::Binding> = None;
+    let mut close = false;
+    egui::Window::new("Command")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_TOP, [0.0, 90.0])
+        .show(ctx, |ui| {
+            let entry = ui.add(
+                egui::TextEdit::singleline(&mut palette.query)
+                    .hint_text("Type a command…")
+                    .desired_width(380.0),
+            );
+            // Asked for once, on the frame it opens: requesting it every frame would
+            // take the focus back from anything the palette itself puts up.
+            if palette.just_opened {
+                entry.request_focus();
+                palette.just_opened = false;
+            }
+            let (down, up, enter, escape) = ui.input(|i| {
+                (
+                    i.key_pressed(egui::Key::ArrowDown),
+                    i.key_pressed(egui::Key::ArrowUp),
+                    i.key_pressed(egui::Key::Enter),
+                    i.key_pressed(egui::Key::Escape),
+                )
+            });
+            if down && !matches.is_empty() {
+                palette.selected = (palette.selected + 1).min(matches.len() - 1);
+            }
+            if up {
+                palette.selected = palette.selected.saturating_sub(1);
+            }
+            if escape {
+                close = true;
+            }
+            ui.separator();
+            if matches.is_empty() {
+                ui.label(egui::RichText::new("Nothing matches that").weak());
+            }
+            for (i, binding) in matches.iter().take(PALETTE_ROWS).enumerate() {
+                let runnable = (binding.enabled)(editor);
+                let label = egui::RichText::new(binding.label);
+                let row = ui
+                    .horizontal(|ui| {
+                        let hit = ui.selectable_label(
+                            i == palette.selected,
+                            if runnable { label } else { label.weak() },
+                        );
+                        if let Some(keys) = binding.shortcut_label() {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(egui::RichText::new(keys).monospace().weak());
+                                },
+                            );
+                        }
+                        hit
+                    })
+                    .inner;
+                if row.clicked() {
+                    chosen = Some(binding);
+                }
+                if row.hovered() {
+                    palette.selected = i;
+                }
+            }
+            if enter {
+                chosen = matches.get(palette.selected).copied();
+            }
+        });
+    if let Some(binding) = chosen {
+        // A command that cannot run is left alone rather than run and refused: the row
+        // is already dimmed, and the palette closing on a command that did nothing reads
+        // as the palette having eaten the keystroke.
+        if (binding.enabled)(editor) {
+            queue.push((binding.make)());
+            close = true;
+        }
+    }
+    if !close {
+        editor.palette = Some(palette);
     }
 }
 

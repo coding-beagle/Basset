@@ -7,14 +7,15 @@
 
 use std::f64::consts::TAU;
 
-use basset_math::{ANGULAR_TOL, LINEAR_TOL, Quat, Vec2, Vec3};
+use basset_math::{ANGULAR_TOL, Frame, LINEAR_TOL, Quat, Vec2, Vec3};
 
+use crate::csg::{BoolOp, boolean};
 use crate::error::KernelError;
 use crate::geometry::{
-    Axis, Contour, Extent, Path3, Profile, SegmentKind, Tessellation, triangulate,
+    Axis, Contour, Extent, Path3, Profile, SegmentKind, Tessellation, polygon_contains, triangulate,
 };
 use crate::ids::{FaceKey, FaceRole, OpId};
-use crate::solid::{Solid, SolidBuilder, SurfaceKind};
+use crate::solid::{Face, Solid, SolidBuilder, SurfaceKind};
 
 /// Closes a generator: heals the T-junctions its sections left and refuses to hand back a
 /// shell that leaks. A profile that touches itself makes faces that cancel out, and the
@@ -154,6 +155,145 @@ pub fn extrude(op: OpId, profile: &Profile, extent: Extent) -> Result<Solid, Ker
         },
     )?;
     seal(b)
+}
+
+/// Sub-operation bit marking the scaffolding `extrude_to_face` trims a tilted extrusion
+/// with. The trimmed end inherits the scaffolding's cap key, so the bit keeps it from
+/// colliding with any face another region of the same feature produces, while staying a
+/// deterministic function of the feature's inputs — which is what downstream references
+/// need to survive edits.
+const TRIM_SUB: u32 = 1 << 31;
+
+/// Pushes the profile along its plane normal exactly up to `target`, a face of another
+/// solid — Fusion's "to object" extent.
+///
+/// A planar target is treated as its infinite plane, as Fusion's "extend face" does, so
+/// the profile does not have to sit underneath the face itself. When that plane is
+/// parallel to the profile's the reach is one number and a plain extrude lands on it;
+/// when it is tilted the extrusion is pushed past the farthest corner and trimmed back
+/// with a boolean, so the end lies on the plane exactly. A curved target ends the
+/// extrusion flat at the first contact: rays from sample points across the profile are
+/// cast against the target's facets and the shortest hit is the reach, so the result
+/// touches the surface without piercing it. (The honest end shape there would be the
+/// surface itself; TODO.md records the flat-end limitation.)
+///
+/// Anything the semantics cannot promise is refused rather than approximated: a target
+/// parallel to the direction of travel, a target any part of the profile has already
+/// passed, and a curved target the extrusion never meets are each their own error.
+pub fn extrude_to_face(op: OpId, profile: &Profile, target: &Face) -> Result<Solid, KernelError> {
+    let profile = profile.normalised()?;
+    let frame = profile.frame;
+    if let SurfaceKind::Planar { normal } = target.surface {
+        let along = frame.z.dot(normal);
+        if along.abs() < ANGULAR_TOL {
+            return Err(KernelError::TargetFaceParallel);
+        }
+        // Reach of every profile corner: where its travel line pierces the target plane.
+        let anchor = target.centroid();
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for p in profile.loops().flat_map(|c| c.points.iter()) {
+            let t = (anchor - frame.to_world(*p)).dot(normal) / along;
+            lo = lo.min(t);
+            hi = hi.max(t);
+        }
+        // The whole profile must lie in front of the plane. A profile that crosses it
+        // would thin to nothing along the crossing line, and one behind it has nowhere
+        // to go; both are refusals, not zero-thickness shells.
+        if lo <= LINEAR_TOL {
+            return Err(KernelError::TargetFaceBehind);
+        }
+        if hi - lo <= LINEAR_TOL {
+            // Parallel planes: one distance serves the whole profile.
+            return extrude(op, &profile, Extent::OneSide(hi));
+        }
+        // Tilted plane: overshoot past the farthest corner, then keep only the material
+        // on the profile's side of the plane. The overshoot means the boolean never has
+        // to split coincident faces, and the trim box's near cap becomes the end face,
+        // lying on the target plane by construction.
+        let solid = extrude(op, &profile, Extent::OneSide(hi + (hi - lo)))?;
+        let back = -normal * along.signum();
+        let bframe = Frame::from_normal(anchor, back);
+        let aabb = solid.aabb();
+        let (mut min, mut max) = (Vec2::splat(f64::INFINITY), Vec2::splat(f64::NEG_INFINITY));
+        let mut depth = 0.0f64;
+        for i in 0..8 {
+            let corner = Vec3::new(
+                if i & 1 == 0 { aabb.min.x } else { aabb.max.x },
+                if i & 2 == 0 { aabb.min.y } else { aabb.max.y },
+                if i & 4 == 0 { aabb.min.z } else { aabb.max.z },
+            );
+            let local = bframe.to_local(corner);
+            min = min.min(local);
+            max = max.max(local);
+            depth = depth.max((corner - bframe.origin).dot(back));
+        }
+        // A millimetre of margin all round so the box's own sides never coincide with
+        // anything they are meant to keep.
+        let (min, max, depth) = (min - Vec2::splat(1.0), max + Vec2::splat(1.0), depth + 1.0);
+        let keep = Contour::polygon(
+            vec![min, Vec2::new(max.x, min.y), max, Vec2::new(min.x, max.y)],
+            0,
+        );
+        let trim_op = OpId {
+            feature: op.feature,
+            sub: op.sub | TRIM_SUB,
+        };
+        let half = extrude(trim_op, &Profile::new(bframe, keep), Extent::OneSide(depth))?;
+        let trimmed = boolean(&solid, &half, BoolOp::Intersect)?;
+        if trimmed.is_empty() {
+            return Err(KernelError::EmptyResult);
+        }
+        return Ok(trimmed);
+    }
+    // Curved target: the reach is the first contact of any point of the profile.
+    // Boundary points alone would miss a bulge facing the middle of the region, so a
+    // grid over the profile's interior samples that too.
+    let mut samples: Vec<Vec2> = profile
+        .loops()
+        .flat_map(|c| c.points.iter().copied())
+        .collect();
+    let (mut min2, mut max2) = (Vec2::splat(f64::INFINITY), Vec2::splat(f64::NEG_INFINITY));
+    for p in &samples {
+        min2 = min2.min(*p);
+        max2 = max2.max(*p);
+    }
+    const GRID: usize = 8;
+    for i in 0..=GRID {
+        for j in 0..=GRID {
+            let p =
+                min2 + (max2 - min2) * Vec2::new(i as f64 / GRID as f64, j as f64 / GRID as f64);
+            if profile.contains(p) {
+                samples.push(p);
+            }
+        }
+    }
+    let mut reach: Option<f64> = None;
+    let mut met = false;
+    for s in samples {
+        let origin = frame.to_world(s);
+        for poly in &target.polygons {
+            let along = frame.z.dot(poly.plane.normal);
+            if along.abs() < 1e-12 {
+                continue;
+            }
+            let t = (poly.plane.origin - origin).dot(poly.plane.normal) / along;
+            let pframe = Frame::from_normal(poly.plane.origin, poly.plane.normal);
+            let hit = pframe.to_local(origin + frame.z * t);
+            let flat: Vec<Vec2> = poly.vertices.iter().map(|v| pframe.to_local(*v)).collect();
+            if !polygon_contains(&flat, hit) {
+                continue;
+            }
+            met = true;
+            if t > LINEAR_TOL {
+                reach = Some(reach.map_or(t, |r: f64| r.min(t)));
+            }
+        }
+    }
+    match reach {
+        Some(d) => extrude(op, &profile, Extent::OneSide(d)),
+        None if met => Err(KernelError::TargetFaceBehind),
+        None => Err(KernelError::TargetFaceMissed),
+    }
 }
 
 /// Rotates the profile about `axis` by `angle` radians (right-handed). The axis must lie
@@ -802,5 +942,120 @@ mod tests {
             .face(FaceKey::new(OpId::new(3), FaceRole::Side(42)))
             .unwrap();
         assert_eq!(f.surface, SurfaceKind::Planar { normal: Vec3::Y });
+    }
+
+    /// The face of `solid` carrying `key`, for handing to `extrude_to_face` the way the
+    /// timeline resolves a stored face reference.
+    fn face_of(solid: &Solid, key: FaceKey) -> &Face {
+        solid.face(key).expect("the target face exists")
+    }
+
+    /// A target parallel to the profile plane is the plain case: one distance reaches
+    /// the whole profile, and the reach is measured to the face's plane even where the
+    /// profile does not sit underneath the face itself.
+    #[test]
+    fn extrude_to_a_parallel_face_reaches_its_plane_exactly() {
+        let target = crate::primitives::cuboid(
+            OpId::new(9),
+            Vec3::new(20.0, 20.0, 3.0),
+            Vec3::new(30.0, 30.0, 5.0),
+        );
+        let bottom = face_of(&target, FaceKey::new(OpId::new(9), FaceRole::StartCap));
+        let profile = Profile::new(Frame::XY, rect(4.0, 2.0));
+        let s = extrude_to_face(OpId::new(1), &profile, bottom).unwrap();
+        assert!(s.is_closed(), "{:?}", s.validate());
+        assert_relative_eq!(s.volume(), 4.0 * 2.0 * 3.0, epsilon = 1e-9);
+        assert_relative_eq!(s.aabb().max.z, 3.0, epsilon = 1e-9);
+    }
+
+    /// A tilted planar target: the reach differs across the profile, so the extrusion is
+    /// trimmed back to the plane and the volume is the integral of the varying height.
+    #[test]
+    fn extrude_to_a_tilted_face_ends_on_its_plane() {
+        // A slab whose start cap lies on the plane through (0, 0, 8) with normal
+        // (1, 0, 1)/√2; over the unit-ish profile below, the height is 8 − x.
+        let tilted = Frame::from_normal(Vec3::new(0.0, 0.0, 8.0), Vec3::new(1.0, 0.0, 1.0));
+        let slab = extrude(
+            OpId::new(9),
+            &Profile::new(tilted, rect(40.0, 40.0)),
+            Extent::OneSide(5.0),
+        )
+        .unwrap();
+        let face = face_of(&slab, FaceKey::new(OpId::new(9), FaceRole::StartCap));
+        let profile = Profile::new(Frame::XY, rect(2.0, 2.0));
+        let s = extrude_to_face(OpId::new(1), &profile, face).unwrap();
+        assert!(s.is_closed(), "{:?}", s.validate());
+        // ∫₀²∫₀² (8 − x) dy dx = 2 · (16 − 2) = 28.
+        assert_relative_eq!(s.volume(), 28.0, epsilon = 1e-6);
+        // Every point of the trimmed end lies on the target plane, none past it.
+        let plane = basset_math::Plane::new(tilted.origin, tilted.z);
+        let past = s
+            .faces
+            .iter()
+            .flat_map(|f| f.polygons.iter())
+            .flat_map(|p| p.vertices.iter())
+            .map(|v| plane.signed_distance(*v))
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(past.abs() < 1e-6, "material reaches {past} past the plane");
+    }
+
+    /// The refusals: a target the travel direction runs along, and one the profile has
+    /// already passed, are errors rather than degenerate solids.
+    #[test]
+    fn extrude_to_face_refuses_parallel_and_behind_targets() {
+        let target = crate::primitives::cuboid(
+            OpId::new(9),
+            Vec3::new(0.0, 20.0, -5.0),
+            Vec3::new(10.0, 30.0, -3.0),
+        );
+        let profile = Profile::new(Frame::XY, rect(4.0, 2.0));
+        // The −y side face stands parallel to the profile's travel along +z.
+        let side = face_of(&target, FaceKey::new(OpId::new(9), FaceRole::Side(0)));
+        assert_eq!(
+            extrude_to_face(OpId::new(1), &profile, side).unwrap_err(),
+            KernelError::TargetFaceParallel
+        );
+        // The slab's top cap sits at z = −3, behind a profile on the XY plane.
+        let top = face_of(&target, FaceKey::new(OpId::new(9), FaceRole::EndCap));
+        assert_eq!(
+            extrude_to_face(OpId::new(1), &profile, top).unwrap_err(),
+            KernelError::TargetFaceBehind
+        );
+    }
+
+    /// A curved target ends the extrusion flat at the first contact: a square pushed at
+    /// the side of a cylinder stops where the closest generator line of the cylinder is.
+    #[test]
+    fn extrude_to_a_cylinder_side_stops_at_first_contact() {
+        // Cylinder along y, axis through (0, ·, 10), radius 4: its lowest line is z = 6.
+        let cyl = crate::primitives::cylinder(
+            OpId::new(9),
+            Vec3::new(0.0, -10.0, 10.0),
+            Vec3::Y,
+            4.0,
+            20.0,
+            &fine(),
+        );
+        let side = face_of(&cyl, FaceKey::new(OpId::new(9), FaceRole::Side(0)));
+        // A 2×2 square centred under the axis, so a grid sample sits at x = 0 exactly.
+        let mut c = rect(2.0, 2.0);
+        for p in &mut c.points {
+            *p -= Vec2::new(1.0, 1.0);
+        }
+        let profile = Profile::new(Frame::XY, c);
+        let s = extrude_to_face(OpId::new(1), &profile, side).unwrap();
+        assert!(s.is_closed(), "{:?}", s.validate());
+        assert_relative_eq!(s.aabb().max.z, 6.0, epsilon = 1e-3);
+        assert_relative_eq!(s.volume(), 4.0 * 6.0, epsilon = 0.02);
+
+        // Aimed past the cylinder entirely, the same profile is refused.
+        let mut miss = rect(2.0, 2.0);
+        for p in &mut miss.points {
+            *p += Vec2::new(20.0, 0.0);
+        }
+        assert_eq!(
+            extrude_to_face(OpId::new(1), &Profile::new(Frame::XY, miss), side).unwrap_err(),
+            KernelError::TargetFaceMissed
+        );
     }
 }

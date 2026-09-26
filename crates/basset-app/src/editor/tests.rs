@@ -388,8 +388,8 @@ fn extrude_tool_accepts_a_planar_face_as_a_region() {
         super::tools::OpKind::Join
     );
     assert_eq!(
-        editor.tool.as_ref().unwrap().params.target,
-        Some(BodyRef(base))
+        editor.tool.as_ref().unwrap().params.targets,
+        vec![BodyRef(base)]
     );
     let feature = editor
         .tool
@@ -3773,5 +3773,750 @@ mod measure {
         );
         h.editor.cancel();
         unchanged(&mut h, features);
+    }
+}
+
+/// The keyboard, the overlay that lists it and the palette that searches it. All three
+/// read one table, and these tests are mostly about that: what a key does is what the
+/// button does, and what is listed is what is bound.
+mod shortcuts {
+    use basset_core::{OriginPlane, PlaneRef};
+    use basset_math::Vec2;
+    use winit::keyboard::NamedKey;
+
+    use crate::editor::Mode;
+    use crate::editor::commands;
+    use crate::editor::harness::{Harness, click_at};
+    use crate::editor::sketch_mode::{ConstraintKind, SketchTool};
+    use crate::editor::tools::ToolKind;
+
+    /// A keystroke with shift held, released afterwards. winit reports the shifted
+    /// letter in upper case, which is what a real window would deliver.
+    fn shift_key(h: &mut Harness, text: &str) {
+        h.set_modifiers(true, false);
+        h.type_key(&text.to_ascii_uppercase());
+        h.set_modifiers(false, false);
+    }
+
+    fn sketching() -> Harness {
+        let mut h = Harness::new();
+        h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+        h
+    }
+
+    fn tool(h: &Harness) -> SketchTool {
+        match &h.editor.mode {
+            Mode::Sketch(s) => s.tool,
+            Mode::Model => panic!("not sketching"),
+        }
+    }
+
+    /// Two commands live in the same mode cannot want the same chord: whichever the
+    /// table listed first would silently swallow the other.
+    #[test]
+    fn no_chord_is_claimed_twice_in_one_mode() {
+        for sketching in [false, true] {
+            let live: Vec<_> = commands::BINDINGS
+                .iter()
+                .filter(|b| b.live.covers(sketching))
+                .collect();
+            for (i, a) in live.iter().enumerate() {
+                for b in &live[i + 1..] {
+                    for chord in a.chords {
+                        assert!(
+                            !b.chords.contains(chord),
+                            "{} and {} both want {} (sketching: {sketching})",
+                            a.id,
+                            b.id,
+                            chord.label()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_command_has_its_own_id_and_says_what_it_is() {
+        for (i, a) in commands::BINDINGS.iter().enumerate() {
+            assert!(!a.label.is_empty(), "{} has no label", a.id);
+            for b in &commands::BINDINGS[i + 1..] {
+                assert_ne!(a.id, b.id, "two commands called {}", a.id);
+            }
+        }
+    }
+
+    /// The bindings that existed before the table did, still doing what they did.
+    #[test]
+    fn the_keys_that_worked_before_still_work() {
+        let mut h = Harness::new();
+        h.type_key("d");
+        assert_eq!(h.editor.display, crate::editor::DisplayMode::ALL[1]);
+        h.type_key("3");
+        assert_eq!(h.editor.select_mode, crate::editor::SelectMode::ALL[2]);
+
+        let mut h = sketching();
+        h.type_key("2");
+        let Mode::Sketch(s) = &h.editor.mode else {
+            unreachable!()
+        };
+        assert_eq!(s.pick, crate::editor::sketch_mode::SketchPick::ALL[1]);
+        h.type_key("x");
+        let Mode::Sketch(s) = &h.editor.mode else {
+            unreachable!()
+        };
+        assert!(s.construction, "X armed construction mode");
+    }
+
+    /// A shape key arms the tool its toolbar button would, which is the whole point of
+    /// routing the key through the same command.
+    #[test]
+    fn a_shape_key_arms_the_tool_its_button_would() {
+        let mut h = sketching();
+        for (key, expected) in [
+            ("l", SketchTool::Line),
+            ("r", SketchTool::Rectangle),
+            ("c", SketchTool::Circle),
+            ("a", SketchTool::Arc3Point),
+            ("p", SketchTool::Polygon),
+            ("s", SketchTool::Slot),
+            ("t", SketchTool::Trim),
+            ("b", SketchTool::Break),
+        ] {
+            h.type_key(key);
+            assert_eq!(tool(&h), expected, "{key} armed the wrong tool");
+        }
+        shift_key(&mut h, "d");
+        assert_eq!(tool(&h), SketchTool::Dimension);
+    }
+
+    /// A folded button shows the variant used last, and its key opens that same variant
+    /// rather than resetting to the group's first.
+    #[test]
+    fn a_shape_key_follows_the_variant_the_button_is_showing() {
+        let mut h = sketching();
+        let Mode::Sketch(s) = &mut h.editor.mode else {
+            unreachable!()
+        };
+        s.set_tool(SketchTool::CenterRectangle);
+        h.type_key("l");
+        h.type_key("r");
+        assert_eq!(tool(&h), SketchTool::CenterRectangle);
+    }
+
+    #[test]
+    fn shift_and_a_letter_arms_a_constraint() {
+        let mut h = sketching();
+        for (key, expected) in [
+            ("p", ConstraintKind::Parallel),
+            ("r", ConstraintKind::Perpendicular),
+            ("t", ConstraintKind::Tangent),
+            ("e", ConstraintKind::Equal),
+            ("n", ConstraintKind::Concentric),
+        ] {
+            shift_key(&mut h, key);
+            let Mode::Sketch(s) = &h.editor.mode else {
+                unreachable!()
+            };
+            assert_eq!(
+                s.armed_constraint(),
+                Some(expected),
+                "Shift+{key} armed the wrong constraint"
+            );
+        }
+        h.type_key("h");
+        let Mode::Sketch(s) = &h.editor.mode else {
+            unreachable!()
+        };
+        assert_eq!(s.armed_constraint(), Some(ConstraintKind::Horizontal));
+    }
+
+    /// The same letter is a rectangle in a sketch and a revolve outside one. The mode is
+    /// part of the binding, so both are true at once without either knowing about the
+    /// other.
+    #[test]
+    fn a_letter_means_different_things_in_the_two_modes() {
+        let mut h = Harness::new();
+        h.type_key("r");
+        assert_eq!(
+            h.editor.tool.as_ref().map(|t| t.kind),
+            Some(ToolKind::Revolve)
+        );
+        h.key(NamedKey::Escape);
+
+        h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+        h.type_key("r");
+        assert_eq!(tool(&h), SketchTool::Rectangle);
+    }
+
+    #[test]
+    fn the_modelling_tools_have_keys() {
+        for (key, shift, expected) in [
+            ("s", false, ToolKind::Sketch),
+            ("e", false, ToolKind::Extrude),
+            ("w", false, ToolKind::Sweep),
+            ("l", false, ToolKind::Loft),
+            ("f", true, ToolKind::Fillet),
+            ("c", true, ToolKind::Chamfer),
+            ("b", false, ToolKind::Combine),
+            ("m", false, ToolKind::Move),
+            ("p", false, ToolKind::OffsetPlane),
+        ] {
+            let mut h = Harness::new();
+            if shift {
+                shift_key(&mut h, key);
+            } else {
+                h.type_key(key);
+            }
+            assert_eq!(
+                h.editor.tool.as_ref().map(|t| t.kind),
+                Some(expected),
+                "{key} did not open {expected:?}"
+            );
+        }
+    }
+
+    /// A digit typed into a size entry box is a size, not a selection filter. The entry
+    /// is modal over the keyboard in a way a binding cannot express, so it is the one
+    /// thing that comes before the table.
+    #[test]
+    fn a_number_typed_while_drawing_still_goes_into_the_entry_box() {
+        let mut h = sketching();
+        h.type_key("r");
+        let (camera, window) = (h.editor.camera, h.editor.window_px);
+        let Mode::Sketch(s) = &mut h.editor.mode else {
+            unreachable!()
+        };
+        let at = Vec2::new(0.0, 0.0);
+        s.pointer_moved(&click_at(at.x, at.y), &camera, window, false);
+        s.pointer_up(&click_at(at.x, at.y), &camera, window, true, false);
+        h.type_key("2");
+        let Mode::Sketch(s) = &h.editor.mode else {
+            unreachable!()
+        };
+        assert_eq!(s.pick, crate::editor::sketch_mode::SketchPick::ALL[0]);
+        assert!(
+            s.entries.iter().any(|e| e.text.contains('2')),
+            "the 2 landed in an entry box"
+        );
+    }
+
+    /// `?` lists what is live here. In a sketch that is the sketch tools; outside one it
+    /// is the modelling tools, and neither list mentions the other's keys.
+    #[test]
+    fn the_overlay_lists_what_this_mode_can_do() {
+        let mut h = Harness::new();
+        shift_key(&mut h, "?");
+        assert!(h.editor.show_shortcuts);
+        h.frame();
+        let frame = h.frame();
+        assert!(frame.has_text("Extrude"), "{:?}", frame.text());
+        assert!(!frame.has_text("Concentric"), "{:?}", frame.text());
+
+        h.editor.show_shortcuts = false;
+        h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+        h.key(NamedKey::F1);
+        h.frame();
+        let frame = h.frame();
+        assert!(frame.has_text("Concentric"), "{:?}", frame.text());
+        assert!(!frame.has_text("Plane at Angle"), "{:?}", frame.text());
+    }
+
+    #[test]
+    fn the_overlay_closes_on_the_key_that_opened_it() {
+        let mut h = Harness::new();
+        h.key(NamedKey::F1);
+        assert!(h.editor.show_shortcuts);
+        h.key(NamedKey::F1);
+        assert!(!h.editor.show_shortcuts);
+    }
+
+    /// Escape takes the overlay away and leaves what is underneath alone, rather than
+    /// cancelling a tool the user only wanted to read the keys for.
+    #[test]
+    fn escape_closes_the_overlay_before_it_cancels_anything() {
+        let mut h = Harness::new();
+        h.type_key("e");
+        assert!(h.editor.tool.is_some());
+        h.key(NamedKey::F1);
+        h.key(NamedKey::Escape);
+        assert!(!h.editor.show_shortcuts);
+        assert!(h.editor.tool.is_some(), "Extrude was left running");
+        h.key(NamedKey::Escape);
+        assert!(h.editor.tool.is_none());
+    }
+
+    /// The palette searches the same table, so what it finds is what the key would have
+    /// done — including for commands that have no key at all.
+    #[test]
+    fn the_palette_finds_a_command_by_what_it_is_called() {
+        let h = Harness::new();
+        let hits = commands::search(&h.editor, "extr");
+        assert_eq!(hits.first().map(|b| b.id), Some("create.extrude"));
+
+        let hits = commands::search(&h.editor, "3mf");
+        assert_eq!(hits.first().map(|b| b.id), Some("file.export_3mf"));
+    }
+
+    #[test]
+    fn the_palette_only_offers_what_this_mode_can_do() {
+        let mut h = Harness::new();
+        assert!(
+            commands::search(&h.editor, "concentric").is_empty(),
+            "a sketch constraint is not a modelling command"
+        );
+        h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+        assert_eq!(
+            commands::search(&h.editor, "concentric")
+                .first()
+                .map(|b| b.id),
+            Some("constrain.concentric")
+        );
+    }
+
+    /// Ctrl+P opens it, typing narrows it and Enter runs what is highlighted.
+    #[test]
+    fn the_palette_runs_the_command_it_is_pointed_at() {
+        let mut h = Harness::new();
+        h.ctrl_key("p");
+        assert!(h.editor.palette.is_some(), "Ctrl+P opened the palette");
+        h.frame();
+        if let Some(p) = h.editor.palette.as_mut() {
+            p.query = "revolve".into();
+        }
+        h.frame();
+        h.frame_with(vec![egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        }]);
+        assert!(h.editor.palette.is_none(), "it closed on the choice");
+        assert_eq!(
+            h.editor.tool.as_ref().map(|t| t.kind),
+            Some(ToolKind::Revolve)
+        );
+    }
+
+    /// Escape puts the palette down without running anything.
+    #[test]
+    fn escape_closes_the_palette() {
+        let mut h = Harness::new();
+        h.ctrl_key("p");
+        h.frame();
+        h.frame_with(vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        }]);
+        assert!(h.editor.palette.is_none());
+        assert!(h.editor.tool.is_none());
+    }
+
+    /// The sketch toolbar wraps, and every row it gains is a row taken off the palette
+    /// beside it — which is where the degrees of freedom, the redundant constraints and
+    /// the conflicting ones are reported. Printing a key inside a button's name rather
+    /// than in its tooltip cost exactly one row, and pushed the redundant-constraint
+    /// section under the fold. Three rows is what it fits in on the harness window.
+    #[test]
+    fn the_sketch_toolbar_does_not_grow_a_row_to_print_a_key() {
+        let mut h = sketching();
+        h.rectangle(Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+        h.frame();
+        let frame = h.frame();
+        let last = frame
+            .rect_of("\u{2714} Finish Sketch")
+            .unwrap_or_else(|| panic!("the toolbar's last button: {:?}", frame.text()));
+        assert!(
+            last.max.y < 120.0,
+            "the toolbar wrapped onto a fourth row: {last:?}"
+        );
+    }
+
+    /// The menus and buttons print their key rather than carrying one in the label, so
+    /// a re-binding shows up everywhere at once.
+    #[test]
+    fn the_buttons_say_which_key_runs_them() {
+        assert_eq!(commands::hint("file.save"), " (Ctrl+S)");
+        assert_eq!(commands::hint("view.fit"), " (F)");
+        assert_eq!(commands::tool_hint(ToolKind::Fillet), " (Shift+F)");
+        assert_eq!(
+            commands::constraint_hint(ConstraintKind::Tangent),
+            " (Shift+T)"
+        );
+        // A command with no key prints nothing rather than an empty pair of brackets.
+        assert_eq!(commands::hint("sketch.finish"), "");
+    }
+}
+
+/// Inference, through the editor rather than the ranking: the middle of a line is a
+/// place a click can land, the marker on the crosshair says which place it was, and the
+/// point clicked a moment ago is what the next one lines up with. This is the whole of
+/// what "it reads my mind" means in a sketcher, and none of it is reachable by the grid.
+#[test]
+fn drawing_lands_on_the_places_the_drawing_names() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(100.0, 60.0));
+    let camera = editor.camera;
+    let window = editor.window_px;
+    let s = sketch(&mut editor);
+    s.set_tool(SketchTool::Line);
+
+    // Just above the middle of the bottom edge. The curve is nearer the pointer than
+    // its midpoint is, and the midpoint still wins: it is the stronger kind.
+    s.pointer_moved(&click_at(50.5, 1.0), &camera, window, false);
+    assert_eq!(s.cursor, Some(Vec2::new(50.0, 0.0)), "the midpoint");
+    let marks = |s: &mut super::SketchEditor| {
+        let mut lines = Vec::new();
+        s.draw(&mut lines, &mut Vec::new(), &mut Vec::new());
+        let count = |color| {
+            lines
+                .iter()
+                .filter(|l| l.color == color)
+                .map(|l| l.segments.len())
+                .sum::<usize>()
+        };
+        (
+            count(sketch_mode::SNAP_MARKER_COLOR),
+            count(sketch_mode::SNAP_GUIDE_COLOR),
+        )
+    };
+    let (glyph, guides) = marks(s);
+    assert!(glyph > 0, "a glyph says what caught the pointer");
+    assert_eq!(guides, 0, "and nothing was inferred from a guide");
+
+    // Place it, then aim well above: the click is remembered and the point above it
+    // lines up with it, with the dashed guide drawn back to where it comes from.
+    s.pointer_up(&click_at(50.5, 1.0), &camera, window, true, false);
+    s.pointer_moved(&click_at(50.3, 31.7), &camera, window, false);
+    let cursor = s.cursor.expect("aiming");
+    assert!(
+        (cursor.x - 50.0).abs() < 1e-9 && (cursor.y - 31.7).abs() < 1e-9,
+        "directly above the point just placed: {cursor:?}"
+    );
+    let (glyph, guides) = marks(s);
+    assert!(glyph > 0 && guides > 0, "the guide is drawn, dashed");
+
+    // Shift lets go of the inference, exactly as it lets go of the grid.
+    s.set_free_snap(true);
+    s.pointer_moved(&click_at(50.3, 31.7), &camera, window, false);
+    assert_eq!(s.cursor, Some(Vec2::new(50.3, 31.7)), "free of the guide");
+    // But not of the joins: an existing corner is still picked up, because that is how
+    // geometry gets attached rather than drawn to look attached.
+    s.pointer_moved(&click_at(99.5, 59.5), &camera, window, false);
+    assert_eq!(s.cursor, Some(Vec2::new(100.0, 60.0)), "the corner");
+    assert!(s.cursor_snapped, "and the click will share its point");
+}
+
+/// The hold, through the editor: a snap acquired keeps the crosshair still while the
+/// pointer jitters around it, instead of the preview flicking between two answers.
+#[test]
+fn an_acquired_snap_does_not_flicker_as_the_pointer_jitters() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(100.0, 60.0));
+    let camera = editor.camera;
+    let window = editor.window_px;
+    let s = sketch(&mut editor);
+    s.set_tool(SketchTool::Line);
+    s.pointer_moved(&click_at(99.6, 59.6), &camera, window, false);
+    assert_eq!(s.cursor, Some(Vec2::new(100.0, 60.0)), "the corner");
+    // A hand resting on the mouse: a pixel here and there around where it landed.
+    for jitter in [
+        Vec2::new(0.4, -0.3),
+        Vec2::new(-0.5, 0.4),
+        Vec2::new(0.6, 0.5),
+        Vec2::new(-0.2, -0.6),
+    ] {
+        let p = Vec2::new(99.6, 59.6) + jitter;
+        s.pointer_moved(&click_at(p.x, p.y), &camera, window, false);
+        assert_eq!(
+            s.cursor,
+            Some(Vec2::new(100.0, 60.0)),
+            "still the corner at {p:?}"
+        );
+    }
+    // Walking away from it does let go.
+    s.pointer_moved(&click_at(85.0, 45.0), &camera, window, false);
+    assert_ne!(s.cursor, Some(Vec2::new(100.0, 60.0)));
+}
+
+/// Document parameters, which is the whole reason the table was lifted out of the
+/// sketch: one name drives a feature and a drawing at once, and moving it moves both.
+mod parameters {
+    use super::*;
+    use crate::editor::commands::Command;
+    use crate::editor::harness::Harness;
+    use crate::editor::panels;
+    use basset_core::{FeatureId, NumericField};
+
+    /// A 20×10 rectangle on XY, extruded by whatever `text` says. Returns the sketch and
+    /// the extrude.
+    fn driven_extrude(h: &mut Harness, text: &str) -> (FeatureId, FeatureId) {
+        h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+        h.rectangle(Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+        h.finish_sketch(true);
+        let sketch = h.last_feature();
+        h.start_tool(ToolKind::Extrude);
+        h.select_region(sketch, Vec2::new(10.0, 5.0));
+        h.sync_tool();
+        assert!(
+            tools::type_expression(&mut h.editor, NumericField::Distance, text),
+            "{text} was refused"
+        );
+        let extrude = h
+            .editor
+            .tool
+            .as_ref()
+            .and_then(|t| t.feature)
+            .expect("the extrude previews a feature");
+        h.confirm_tool();
+        (sketch, extrude)
+    }
+
+    #[test]
+    fn a_document_parameter_drives_an_extrude_through_the_editor() {
+        let mut h = Harness::new();
+        h.editor.set_document_parameter("thickness", "4");
+        assert!(h.editor.params_panel.error.is_none());
+        let (_, extrude) = driven_extrude(&mut h, "thickness * 2");
+
+        let body = BodyRef(extrude);
+        assert!((h.volume(body) - 1600.0).abs() < 1e-6, "{}", h.volume(body));
+        assert_eq!(
+            h.editor.doc.feature_expr(extrude, NumericField::Distance),
+            Some("thickness * 2"),
+            "the expression, not the 8 it works out to, is what the feature keeps"
+        );
+
+        // The point of the whole feature: the table moves and the body follows.
+        h.editor.set_document_parameter("thickness", "5");
+        assert!((h.volume(body) - 2000.0).abs() < 1e-6, "{}", h.volume(body));
+    }
+
+    #[test]
+    fn editing_a_driven_feature_re_opens_with_its_expression() {
+        let mut h = Harness::new();
+        h.editor.set_document_parameter("wall", "3");
+        let (_, extrude) = driven_extrude(&mut h, "wall * 2");
+        h.editor.edit_feature(extrude);
+        assert_eq!(
+            h.editor
+                .tool
+                .as_ref()
+                .expect("the extrude dialog re-opened")
+                .exprs
+                .get(NumericField::Distance),
+            Some("wall * 2"),
+            "re-editing showed the 6 rather than what states it"
+        );
+        h.cancel_tool();
+        assert_eq!(
+            h.editor.doc.feature_expr(extrude, NumericField::Distance),
+            Some("wall * 2"),
+            "cancelling the re-edit left the feature as it was"
+        );
+    }
+
+    #[test]
+    fn a_sketch_dimension_is_driven_by_a_document_parameter() {
+        let mut h = Harness::new();
+        h.editor.set_document_parameter("bore", "20");
+        h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+        h.rectangle(Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+        let (dim, _) = h.dimension(Vec2::new(10.0, 0.0), Vec2::new(10.0, -6.0));
+        h.sketch()
+            .bind_dimension(dim, "bore / 2")
+            .expect("a document name resolves from inside a sketch");
+        let length = h
+            .sketch()
+            .sketch
+            .constraint(dim)
+            .and_then(|c| c.dimension_value())
+            .expect("a dimension has a value");
+        assert!((length - 10.0).abs() < 1e-9, "{length}");
+    }
+
+    /// Renaming is the reason the operation exists at all: references are by name inside
+    /// expression text, so it has to reach a feature and a sketch alike.
+    #[test]
+    fn a_rename_follows_into_a_feature_and_a_sketch() {
+        let mut h = Harness::new();
+        h.editor.set_document_parameter("thickness", "4");
+        h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+        h.rectangle(Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+        let (dim, _) = h.dimension(Vec2::new(10.0, 0.0), Vec2::new(10.0, -6.0));
+        h.sketch().bind_dimension(dim, "thickness * 5").unwrap();
+        h.editor.commit_sketch();
+        h.finish_sketch(true);
+        let sketch = h.last_feature();
+
+        h.start_tool(ToolKind::Extrude);
+        h.select_region(sketch, Vec2::new(10.0, 5.0));
+        h.sync_tool();
+        assert!(tools::type_expression(
+            &mut h.editor,
+            NumericField::Distance,
+            "thickness"
+        ));
+        let extrude = h.editor.tool.as_ref().and_then(|t| t.feature).unwrap();
+        h.confirm_tool();
+        let before = h.volume(BodyRef(extrude));
+
+        h.editor.rename_document_parameter("thickness", "wall");
+        assert!(h.editor.params_panel.error.is_none());
+        assert_eq!(
+            h.editor.doc.feature_expr(extrude, NumericField::Distance),
+            Some("wall")
+        );
+        let expression = match &h.editor.doc.timeline().get(sketch).unwrap().kind {
+            FeatureKind::Sketch { sketch, .. } => sketch.dimension_expr(dim).map(str::to_string),
+            _ => None,
+        };
+        assert_eq!(expression.as_deref(), Some("wall * 5"));
+        assert!(
+            (h.volume(BodyRef(extrude)) - before).abs() < 1e-9,
+            "a rename is not a change of shape"
+        );
+    }
+
+    /// A sketch parameter of the same name means the sketch's own, and the panel says so
+    /// on both sides: silent shadowing is the one genuinely confusing thing here.
+    #[test]
+    fn a_sketch_parameter_that_shadows_a_document_one_is_flagged_on_both_sides() {
+        let mut h = Harness::new();
+        h.editor.set_document_parameter("width", "50");
+        h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+        h.sketch().set_parameter("width", "12").unwrap();
+        h.editor.commit_sketch();
+        assert!(h.sketch().shadows("width"));
+        assert_eq!(
+            h.editor.doc.sketches_shadowing("width").len(),
+            1,
+            "the document knows which sketches mean their own"
+        );
+        // The sketch resolves its own row, not the document's.
+        let outer = h.editor.doc.parameters().clone();
+        let lookup = outer.lookup();
+        let value = match &mut h.editor.mode {
+            Mode::Sketch(s) => s.sketch.parameter_value_with("width", &lookup),
+            Mode::Model => unreachable!(),
+        };
+        assert_eq!(value.unwrap(), 12.0);
+    }
+
+    /// The panel queues its edits and the editor applies them afterwards, so an edit the
+    /// user had half made when they reached for a tool arrives *after* the tool has
+    /// opened the document's transaction. Folded into it, it would record no undo entry
+    /// and be rolled back by a Cancel that has nothing to do with it.
+    #[test]
+    fn a_parameter_edit_pending_when_a_tool_opens_is_refused_rather_than_folded_into_it() {
+        let mut h = Harness::new();
+        h.editor.set_document_parameter("thickness", "4");
+        h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+        h.rectangle(Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+        h.finish_sketch(true);
+        let sketch = h.last_feature();
+        h.select_region(sketch, Vec2::new(10.0, 5.0));
+
+        // Exactly the order a frame produces: the toolbar is drawn before the browser,
+        // so the tool command is queued first and the panel's edit second.
+        panels::run(&mut h.editor, Command::Tool(ToolKind::Extrude));
+        assert!(
+            h.editor.doc.in_transaction(),
+            "the extrude is previewing inside a transaction"
+        );
+        panels::run(
+            &mut h.editor,
+            Command::SetParameter("thickness".into(), "6".into()),
+        );
+        assert_eq!(
+            h.editor.doc.parameters().value("thickness").unwrap(),
+            4.0,
+            "the edit went in under the tool"
+        );
+        assert!(
+            h.editor
+                .params_panel
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("still in the box")),
+            "{:?}",
+            h.editor.params_panel.error
+        );
+
+        // Cancelling the tool must not have taken a parameter edit with it, and the same
+        // edit goes through the moment the tool is out of the way.
+        h.cancel_tool();
+        assert_eq!(h.editor.doc.parameters().value("thickness").unwrap(), 4.0);
+        h.editor.set_document_parameter("thickness", "6");
+        assert_eq!(h.editor.doc.parameters().value("thickness").unwrap(), 6.0);
+    }
+
+    /// The same gate covers a delete: a warning latched before the tool opened must not
+    /// stay clickable through it.
+    #[test]
+    fn a_delete_warned_about_before_a_tool_opened_cannot_be_pressed_through_it() {
+        let mut h = Harness::new();
+        h.editor.set_document_parameter("thickness", "4");
+        h.editor.set_document_parameter("plate", "thickness * 3");
+        h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+        h.rectangle(Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+        h.finish_sketch(true);
+        let sketch = h.last_feature();
+        h.select_region(sketch, Vec2::new(10.0, 5.0));
+        h.editor.params_panel.confirm_delete = Some("thickness".into());
+        panels::run(&mut h.editor, Command::Tool(ToolKind::Extrude));
+
+        panels::run(&mut h.editor, Command::RemoveParameter("thickness".into()));
+        assert!(
+            h.editor.doc.parameters().get("thickness").is_some(),
+            "the delete ran inside the extrude's transaction"
+        );
+        assert!(
+            h.editor.params_panel.confirm_delete.is_none(),
+            "and the warning it belonged to is no longer on screen"
+        );
+        h.cancel_tool();
+        assert!(h.editor.doc.parameters().get("thickness").is_some());
+    }
+
+    #[test]
+    fn a_bad_expression_is_refused_with_the_reason_and_nothing_is_committed() {
+        let mut h = Harness::new();
+        h.editor.set_document_parameter("wall", "3");
+        h.editor.set_document_parameter("bad", "nope * 2");
+        assert!(
+            h.editor
+                .params_panel
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("nope")),
+            "{:?}",
+            h.editor.params_panel.error
+        );
+        assert!(h.editor.doc.parameters().get("bad").is_none());
+
+        let (_, extrude) = driven_extrude(&mut h, "wall * 2");
+        let before = h.volume(BodyRef(extrude));
+        h.editor.edit_feature(extrude);
+        assert!(!tools::type_expression(
+            &mut h.editor,
+            NumericField::Distance,
+            "wall * missing"
+        ));
+        assert_eq!(
+            h.editor.doc.feature_expr(extrude, NumericField::Distance),
+            Some("wall * 2"),
+            "a refused expression left the working one alone"
+        );
+        h.cancel_tool();
+        assert!((h.volume(BodyRef(extrude)) - before).abs() < 1e-9);
     }
 }
