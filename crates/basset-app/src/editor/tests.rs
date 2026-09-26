@@ -4191,13 +4191,18 @@ fn drawing_lands_on_the_places_the_drawing_names() {
     assert_eq!(guides, 0, "and nothing was inferred from a guide");
 
     // Place it, then aim well above: the click is remembered and the point above it
-    // lines up with it, with the dashed guide drawn back to where it comes from.
+    // lines up with it, with the dashed guide drawn back to where it comes from. The
+    // guide holds only the axis it names; the other one is still the grid's, so the
+    // point lands a round distance up rather than at the pointer's raw height.
     s.pointer_up(&click_at(50.5, 1.0), &camera, window, true, false);
     s.pointer_moved(&click_at(50.3, 31.7), &camera, window, false);
     let cursor = s.cursor.expect("aiming");
+    let step = s.grid_step;
     assert!(
-        (cursor.x - 50.0).abs() < 1e-9 && (cursor.y - 31.7).abs() < 1e-9,
-        "directly above the point just placed: {cursor:?}"
+        (cursor.x - 50.0).abs() < 1e-9
+            && (cursor.y / step).fract().abs() < 1e-9
+            && (cursor.y - 31.7).abs() <= step / 2.0 + 1e-9,
+        "directly above the point just placed, a round distance up: {cursor:?} (grid {step})"
     );
     let (glyph, guides) = marks(s);
     assert!(glyph > 0 && guides > 0, "the guide is drawn, dashed");
