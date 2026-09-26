@@ -362,6 +362,9 @@ pub fn pick(
     if filter.faces || filter.edges || filter.vertices {
         let mut face_hit: Option<Pick> = None;
         let mut edge_hit: Option<Pick> = None;
+        // Whether a line is drawn along the edge in `edge_hit`, which decides below
+        // whether it may take a click a face is also claiming.
+        let mut edge_drawn = true;
         let mut vertex_hit: Option<Pick> = None;
         for (id, hidden) in &state_bodies {
             if *hidden {
@@ -392,6 +395,11 @@ pub fn pick(
                     && let Some(e) = pick_edge(&mesh.edges, ray, tol)
                     && edge_hit.as_ref().is_none_or(|p| e.t < p.t())
                 {
+                    edge_drawn = mesh
+                        .edges
+                        .iter()
+                        .find(|k| k.key == e.key)
+                        .is_some_and(|k| k.drawn);
                     edge_hit = Some(Pick::Edge(
                         EdgeRef {
                             body: *id,
@@ -415,12 +423,24 @@ pub fn pick(
             }
         }
         // A corner beats an edge beats a face when several are within tolerance: the
-        // smaller target is always the one the user was aiming at.
+        // smaller target is always the one the user was aiming at. The exception is an
+        // edge nothing is drawn along — a fillet's boundary, tangent to the face it runs
+        // out into — because nobody aims at a line they cannot see, and letting it win
+        // here would put an invisible dead stripe for face clicks along every blend.
+        // The boundary is still where one face stops and the next starts, so it stays
+        // reachable whenever edges are what the click is *for*: an edge-only filter has
+        // no face in the running, and a blend tool or a measure (`wide`) says edges are
+        // wanted even where a face is under the pointer too.
         match (vertex_hit.or(edge_hit), face_hit) {
             (Some(thin), Some(f)) => {
                 let tol =
                     editor.camera.pixel_size_at(ray.at(f.t()), editor.window_px) * thin_px * 2.0;
-                consider(if thin.t() <= f.t() + tol { thin } else { f });
+                let aimable = wide || edge_drawn || !matches!(thin, Pick::Edge(..));
+                consider(if aimable && thin.t() <= f.t() + tol {
+                    thin
+                } else {
+                    f
+                });
             }
             (Some(thin), None) => consider(thin),
             (None, Some(f)) => consider(f),

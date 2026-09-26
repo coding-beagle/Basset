@@ -89,6 +89,53 @@ fn clicking_a_body_in_the_viewport_selects_the_face_under_the_pointer() {
     assert!(h.editor.selection.faces.is_empty());
 }
 
+/// The regression this guards: a fillet's tangent boundary stopped being drawn but
+/// stayed pickable, and picking lets an edge beat the face behind it. Together those
+/// gave every blend an invisible stripe, a click's tolerance wide, where clicking what
+/// looks like bare face selected an edge the user could not see — with the default
+/// `Any` filter, "clicking a face no longer selects it".
+#[test]
+fn a_click_beside_a_blends_run_out_selects_the_face_the_user_sees() {
+    use basset_core::{EdgeKey, EdgeRef, FaceKey, FaceRole, FeatureKind};
+    use basset_kernel::OpId;
+    let mut h = Harness::new();
+    let body = h.block();
+    // Round the top-back edge, so the top face gains an undrawn tangent boundary along
+    // y = 9 where the blend runs out into it.
+    let key = EdgeKey::new(
+        FaceKey::new(OpId::new(body.0.0), FaceRole::EndCap),
+        FaceKey::new(OpId::new(body.0.0), FaceRole::Side(7)),
+    );
+    h.editor.doc.add_feature(FeatureKind::Fillet {
+        edges: vec![EdgeRef { body, key }],
+        radius: 1.0,
+    });
+    h.editor.refresh_cache();
+    h.editor.zoom_to_fit();
+    assert_eq!(h.editor.select_mode, SelectMode::Any);
+
+    // A click on the face just inside the run-out, within picking tolerance of the
+    // invisible boundary: the face wins, because it is what the user can see there.
+    h.click_world(Vec3::new(5.0, 8.8, 2.0));
+    assert_eq!(
+        h.editor.selection.faces,
+        vec![super::harness::top_face(body)],
+        "{:?}",
+        h.editor.selection
+    );
+
+    // Asking for edges is a different conversation: the tangent boundary is still where
+    // the top face stops and the blend starts, and the Edge filter still reaches it.
+    h.editor.set_select_mode(SelectMode::Edges);
+    h.click_world(Vec3::new(5.0, 9.0, 2.0));
+    assert_eq!(
+        h.editor.selection.edges.len(),
+        1,
+        "{:?}",
+        h.editor.selection
+    );
+}
+
 #[test]
 fn the_pointer_navigates_the_camera() {
     let mut h = Harness::new();

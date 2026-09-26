@@ -354,6 +354,17 @@ pub struct Edge {
     /// starts, and the user has to be able to click them. Answering both with one test
     /// made a tangent boundary unpickable as the price of not drawing it.
     pub smooth: bool,
+    /// Whether the viewer is shown a line along any piece of this edge — the same
+    /// [`Solid::flush`] verdict [`Solid::display_edges`] draws by. A fold is `drawn`;
+    /// a fillet's tangent boundary is `!smooth` (selectable — it is where one face
+    /// stops and another starts) but `!drawn` (no line, because nothing folds there).
+    ///
+    /// Picking reads this when a face and an edge compete for one click: an edge the
+    /// user cannot see must never steal a click from the face they can. It does not
+    /// gate whether the edge exists as a target at all — an edge-only filter, or a
+    /// tool that asks for edges, has no face in the running and reaches a tangent
+    /// boundary exactly as before.
+    pub drawn: bool,
 }
 
 impl Edge {
@@ -845,10 +856,10 @@ impl Solid {
     /// returns a `Solid` guarantees this).
     pub fn edges(&self) -> Vec<Edge> {
         let (index, shared) = self.shared_polygon_edges();
-        // Segments carry whether they are smooth, decided from the face *indices* here.
-        // Looking the faces up again by key would not do: a union can leave two faces
-        // under one key, and then the key names the wrong one.
-        let mut edges: HashMap<EdgeKey, Vec<(EdgeSegment, bool)>> = HashMap::new();
+        // Segments carry whether they are smooth and whether they are flush, decided from
+        // the face *indices* here. Looking the faces up again by key would not do: a
+        // union can leave two faces under one key, and then the key names the wrong one.
+        let mut edges: HashMap<EdgeKey, Vec<(EdgeSegment, bool, bool)>> = HashMap::new();
         for ((ia, ib), users) in shared {
             // Interior to one face: both sides belong to the same face. Not an edge.
             let Some(&(f0, fwd0, n0)) = users.first() else {
@@ -878,6 +889,7 @@ impl Solid {
                     normal_b: nb,
                 },
                 self.continuous((fa, na), (fb, nb)),
+                self.flush((fa, na), (fb, nb)),
             ));
         }
         // Hash-map order would make the chain start point (and so blend tool geometry)
@@ -893,8 +905,9 @@ impl Solid {
                 });
                 Edge {
                     key,
-                    smooth: pieces.iter().all(|(_, smooth)| *smooth),
-                    segments: pieces.into_iter().map(|(s, _)| s).collect(),
+                    smooth: pieces.iter().all(|(_, smooth, _)| *smooth),
+                    drawn: pieces.iter().any(|(_, _, flush)| !flush),
+                    segments: pieces.into_iter().map(|(s, _, _)| s).collect(),
                 }
             })
             .collect();
@@ -1612,6 +1625,19 @@ mod tests {
                 .filter(|e| e.smooth)
                 .map(|e| e.key)
                 .collect::<Vec<_>>()
+        );
+        // Each edge also says which answer it got from the *other* question, so picking
+        // can keep an invisible edge from stealing a click a visible face is claiming:
+        // the two tangent run-outs are selectable but drawn nowhere, and the two short
+        // ends where the blend dies into the cube's side faces are real folds.
+        let drawn = touching.iter().filter(|e| e.drawn).count();
+        assert_eq!((drawn, touching.len() - drawn), (2, 2), "{touching:#?}");
+        // And every ordinary edge of the cube is both: a fold is selectable and shown.
+        assert!(
+            r.edges()
+                .iter()
+                .filter(|e| !e.key.touches(blend))
+                .all(|e| e.drawn && !e.smooth)
         );
     }
 
