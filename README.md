@@ -34,11 +34,14 @@ cargo clippy --workspace --all-targets -- -D warnings
 ## Using the application
 
 * **Navigate**: right-drag orbits, middle-drag pans (shift+middle orbits), wheel zooms,
-  `F` fits the model. The View menu has the standard presets and an orthographic toggle.
+  `Home` fits the model. The View menu has the standard presets and an orthographic toggle.
   The navigation cube in the top right shows the current orientation: click a face, edge
   or corner of it for that view, drag it to orbit, or press its ⌂ for isometric.
 * **Sketch**: Create → Sketch, click an origin plane (enable them in the browser) or a
-  planar face of a body. The sketch tools sit in the toolbar at the top as icons; a
+  planar face of a body. A sketch on a face opens with the face's outline already in it,
+  pinned in place, so its corners and edges are there to snap to and dimension from and
+  its region (holes and all) is there to extrude again. The sketch tools sit in the
+  toolbar at the top as icons; a
   shape with several ways to draw it (rectangle, circle, arc, slot) has one button that
   shows the kind used last, and holding it or right-clicking lists the others. Click
   points; clicks snap to existing points, which is how loops close. Right-click or Esc
@@ -204,17 +207,20 @@ key from it rather than carrying one in the label; and `?` or `F1` lists it, fil
 the mode you are in. `Ctrl+P` opens a command palette over the same table — a fuzzy
 search that reaches everything, including the commands that have no key at all.
 
-The letters follow Fusion where Fusion has one and it is free here. Two do not, and both
-are keys Basset already had: `F` fits the view and `D` walks the display modes, so Fillet
-takes `Shift+F` and Dimension — Fusion's `D` — takes `Shift+D`. Constraints take shift
-and a letter of their own name.
+The letters follow Fusion where Fusion has one and it is free here. One does not: `D` has
+walked the display modes since before the tools had keys, so Dimension — Fusion's `D` —
+takes `Shift+D`. Constraints take shift and a letter of their own name.
 
 | Anywhere | |
 | --- | --- |
 | `Esc` | Cancel, or put the tool down |
 | `Enter` | Confirm |
 | `Del` | Delete the selection |
-| `F` / `D` | Fit the view / next display mode |
+| `Home` / `D` | Fit the view / next display mode |
+| `Ctrl+0` | Isometric view |
+| `Ctrl+1` `Ctrl+2` `Ctrl+3` | Top, front, right view |
+| `Shift+V` | Toggle orthographic |
+| `G` / `N` / `Shift+O` | Show grid / snap to grid / show origin planes and axes |
 | `Ctrl+N` `Ctrl+O` `Ctrl+S` `Ctrl+Shift+S` | New, open, save, save as |
 | `Ctrl+Z` / `Ctrl+Shift+Z`, `Ctrl+Y` | Undo / redo |
 | `?` or `F1` | Keyboard shortcuts |
@@ -224,7 +230,7 @@ and a letter of their own name.
 | --- | --- |
 | `1`–`5` | What a click may take: anything, faces, edges, vertices, sketch geometry |
 | `S` `E` `R` `W` `L` | Sketch, Extrude, Revolve, Sweep, Loft |
-| `Shift+F` `Shift+C` `B` `M` | Fillet, Chamfer, Combine, Move |
+| `F` `Shift+C` `B` `M` | Fillet, Chamfer, Combine, Move |
 | `P` / `Shift+P` | Offset Plane / Plane at Angle |
 | `Shift+N` | New Component |
 | `I` | Measure |

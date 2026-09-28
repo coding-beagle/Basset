@@ -20,6 +20,7 @@ pub mod file;
 pub mod ids;
 pub mod model;
 pub mod parameters;
+pub mod project;
 pub mod refs;
 pub mod regen;
 pub mod timeline;
@@ -29,6 +30,7 @@ pub use feature::{BodyOp, CombineOp, Extent, Feature, FeatureKind, NumericField}
 pub use ids::{ComponentId, FeatureId};
 pub use model::{Body, Component, FeatureStatus, ModelState, SolvedSketch};
 pub use parameters::Parameters;
+pub use project::project_face;
 pub use refs::{
     AxisRef, BodyRef, EdgeRef, FaceRef, OriginAxis, OriginPlane, PathRef, PlaneRef, ProfileRef,
     RegionRef,

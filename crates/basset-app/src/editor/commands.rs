@@ -245,6 +245,7 @@ fn named_label(key: NamedKey) -> &'static str {
         NamedKey::Delete => "Del",
         NamedKey::Backspace => "Backspace",
         NamedKey::F1 => "F1",
+        NamedKey::Home => "Home",
         // Nothing else is bound to a named key; a new one shows as its debug name rather
         // than as a lie.
         _ => "(key)",
@@ -362,9 +363,16 @@ const HAS_SKETCH_SELECTION: fn(&Editor) -> bool = |e| match &e.mode {
 ///
 /// Keys follow Fusion where Fusion has one and it is free here: `L` line, `R` rectangle,
 /// `C` circle, `A` arc, `T` trim, `X` construction, `M` move, `O` offset, `E` extrude,
-/// `I` measure. `F` has fitted the view and `D` walked the display modes since before
-/// any of the tools had keys, so Fillet takes `Shift+F` and Dimension — Fusion's `D` —
-/// takes `Shift+D`. Constraints take `Shift` and a letter of their own name.
+/// `F` fillet, `I` measure. `D` has walked the display modes since before any of the
+/// tools had keys, so Dimension — Fusion's `D` — takes `Shift+D`. Constraints take
+/// `Shift` and a letter of their own name.
+///
+/// The view has keys Fusion does not: `Home` fits the model (the frame-all key most
+/// viewers share; `Shift+F` is the Fix constraint, so Fit could not shadow Fillet the way
+/// Dimension shadows the display modes), `Ctrl+0` is the isometric view and
+/// `Ctrl+1`/`2`/`3` are top, front and right, `Shift+V` toggles the projection, `G` the
+/// grid, `N` snapping and `Shift+O` the origin planes and axes. They are live in both
+/// modes, so orbiting away from a sketch and coming back costs one key either way.
 pub(crate) const BINDINGS: &[Binding] = &[
     // --- File ---
     Binding {
@@ -494,7 +502,7 @@ pub(crate) const BINDINGS: &[Binding] = &[
         id: "view.fit",
         label: "Fit the model in the view",
         group: Group::View,
-        chords: &[Chord::plain('f')],
+        chords: &[Chord::named(NamedKey::Home)],
         live: LiveIn::Both,
         make: || Command::Fit,
         enabled: ALWAYS,
@@ -512,7 +520,7 @@ pub(crate) const BINDINGS: &[Binding] = &[
         id: "view.isometric",
         label: "Isometric view",
         group: Group::View,
-        chords: &[],
+        chords: &[Chord::ctrl('0')],
         live: LiveIn::Both,
         make: || Command::View(ViewPreset::Isometric),
         enabled: ALWAYS,
@@ -521,7 +529,7 @@ pub(crate) const BINDINGS: &[Binding] = &[
         id: "view.top",
         label: "Top view",
         group: Group::View,
-        chords: &[],
+        chords: &[Chord::ctrl('1')],
         live: LiveIn::Both,
         make: || Command::View(ViewPreset::Top),
         enabled: ALWAYS,
@@ -530,7 +538,7 @@ pub(crate) const BINDINGS: &[Binding] = &[
         id: "view.front",
         label: "Front view",
         group: Group::View,
-        chords: &[],
+        chords: &[Chord::ctrl('2')],
         live: LiveIn::Both,
         make: || Command::View(ViewPreset::Front),
         enabled: ALWAYS,
@@ -539,7 +547,7 @@ pub(crate) const BINDINGS: &[Binding] = &[
         id: "view.right",
         label: "Right view",
         group: Group::View,
-        chords: &[],
+        chords: &[Chord::ctrl('3')],
         live: LiveIn::Both,
         make: || Command::View(ViewPreset::Right),
         enabled: ALWAYS,
@@ -548,7 +556,7 @@ pub(crate) const BINDINGS: &[Binding] = &[
         id: "view.projection",
         label: "Toggle orthographic",
         group: Group::View,
-        chords: &[],
+        chords: &[Chord::shifted('v')],
         live: LiveIn::Both,
         make: || Command::ToggleProjection,
         enabled: ALWAYS,
@@ -557,7 +565,7 @@ pub(crate) const BINDINGS: &[Binding] = &[
         id: "view.grid",
         label: "Show grid",
         group: Group::View,
-        chords: &[],
+        chords: &[Chord::plain('g')],
         live: LiveIn::Both,
         make: || Command::ToggleGrid,
         enabled: ALWAYS,
@@ -566,7 +574,7 @@ pub(crate) const BINDINGS: &[Binding] = &[
         id: "view.snap",
         label: "Snap to grid",
         group: Group::View,
-        chords: &[],
+        chords: &[Chord::plain('n')],
         live: LiveIn::Both,
         make: || Command::ToggleSnap,
         enabled: ALWAYS,
@@ -575,7 +583,7 @@ pub(crate) const BINDINGS: &[Binding] = &[
         id: "view.origin",
         label: "Show origin planes and axes",
         group: Group::View,
-        chords: &[],
+        chords: &[Chord::shifted('o')],
         live: LiveIn::Both,
         make: || Command::ToggleOrigin,
         enabled: ALWAYS,
@@ -740,7 +748,7 @@ pub(crate) const BINDINGS: &[Binding] = &[
         id: "modify.fillet",
         label: "Fillet",
         group: Group::Modify,
-        chords: &[Chord::shifted('f')],
+        chords: &[Chord::plain('f')],
         live: LiveIn::Model,
         make: || Command::Tool(ToolKind::Fillet),
         enabled: IDLE,

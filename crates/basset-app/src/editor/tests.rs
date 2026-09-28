@@ -959,6 +959,79 @@ fn sketch_tool_starts_on_a_picked_face() {
     ));
 }
 
+/// A sketch on a face opens with the face already in it: its edges as pinned lines in
+/// the face's own frame, meeting at shared corners, enclosing the face's region.
+#[test]
+fn a_sketch_on_a_face_opens_with_the_face_copied_in() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    let body = block(&mut editor);
+    sketch_mode::enter_new(&mut editor, PlaneRef::Face(top_face(body)));
+    let Mode::Sketch(s) = &editor.mode else {
+        panic!("not sketching")
+    };
+    let lines: Vec<_> = s
+        .sketch
+        .entities()
+        .filter(|(_, e)| e.entity.is_line() && !e.construction)
+        .collect();
+    assert_eq!(lines.len(), 4, "one line per edge of the top face");
+    let points: Vec<_> = s
+        .sketch
+        .entities()
+        .filter(|(_, e)| e.entity.is_point())
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(
+        points.len(),
+        4,
+        "corners are shared between their two edges"
+    );
+    for p in &points {
+        assert!(
+            s.sketch
+                .constraints()
+                .any(|(_, c)| matches!(c, Constraint::Fix(f) if f == p)),
+            "corner {p:?} is pinned"
+        );
+        // The face frame sits at the face centroid, so the 10×10 top's corners land at
+        // ±5 in sketch coordinates.
+        let pos = s.sketch.point_pos(*p).unwrap();
+        assert!(
+            (pos.x.abs() - 5.0).abs() < 1e-6 && (pos.y.abs() - 5.0).abs() < 1e-6,
+            "{pos:?}"
+        );
+    }
+    let profiles = s.sketch.profiles(&basset_sketch::Tessellation::default());
+    assert_eq!(profiles.len(), 1);
+    assert!((profiles[0].area() - 100.0).abs() < 1e-6);
+
+    // The copy is in the document's feature too, not only on screen, and it is fully
+    // pinned so the timeline does not warn about a loose sketch.
+    sketch_mode::finish(&mut editor, true);
+    let id = editor.doc.timeline().features().last().unwrap().id;
+    let state = editor.doc.state();
+    assert!(
+        state
+            .sketches
+            .get(&id)
+            .is_some_and(|s| s.profiles.len() == 1)
+    );
+    assert!(
+        matches!(state.status(id), Some(basset_core::FeatureStatus::Ok)),
+        "{:?}",
+        state.status(id)
+    );
+
+    // A sketch on an origin plane still opens empty.
+    let mut editor = Editor::new(None);
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(basset_core::OriginPlane::XY));
+    let Mode::Sketch(s) = &editor.mode else {
+        panic!("not sketching")
+    };
+    assert_eq!(s.sketch.entities().count(), 0);
+}
+
 /// Fillet: picking a face takes every edge around it, picking it again lets them all
 /// go, and the edges offered while the preview shows are those of the body before the
 /// fillet, so a second pick near the first edge is a real edge, not the preview's.
@@ -3782,7 +3855,7 @@ mod measure {
 /// button does, and what is listed is what is bound.
 mod shortcuts {
     use basset_core::{OriginPlane, PlaneRef};
-    use basset_math::Vec2;
+    use basset_math::{Vec2, Vec3};
     use winit::keyboard::NamedKey;
 
     use crate::editor::Mode;
@@ -3844,6 +3917,64 @@ mod shortcuts {
             for b in &commands::BINDINGS[i + 1..] {
                 assert_ne!(a.id, b.id, "two commands called {}", a.id);
             }
+        }
+    }
+
+    /// The view has keys of its own, live whether or not a sketch is open: a preset
+    /// turns the camera, and the toggles flip what they name.
+    #[test]
+    fn view_keys_turn_the_camera_and_flip_the_toggles() {
+        for in_sketch in [false, true] {
+            let mut h = if in_sketch {
+                sketching()
+            } else {
+                Harness::new()
+            };
+            h.ctrl_key("0");
+            let iso = h.editor.camera.eye() - h.editor.camera.target;
+            assert!(
+                iso.x.abs() > 1e-6 && iso.y.abs() > 1e-6 && iso.z > 1e-6,
+                "{iso:?}"
+            );
+            // Home fits: the camera moves in on a model it had backed away from.
+            h.editor.camera.zoom(10.0);
+            let far = (h.editor.camera.eye() - h.editor.camera.target).length();
+            h.key(NamedKey::Home);
+            assert!(
+                (h.editor.camera.eye() - h.editor.camera.target).length() < far,
+                "Home fitted the model"
+            );
+            for (key, up) in [("1", Vec3::Z), ("2", -Vec3::Y), ("3", Vec3::X)] {
+                h.ctrl_key(key);
+                let from = (h.editor.camera.eye() - h.editor.camera.target).normalize();
+                assert!(
+                    from.dot(up) > 0.999,
+                    "Ctrl+{key} looks from {from:?}, not {up:?}"
+                );
+            }
+
+            let grid = h.editor.show_grid;
+            h.type_key("g");
+            assert_ne!(h.editor.show_grid, grid, "G toggles the grid");
+            let snap = h.editor.snapping.to_grid;
+            h.type_key("n");
+            assert_ne!(h.editor.snapping.to_grid, snap, "N toggles snapping");
+            let origin = h.editor.show_origin;
+            shift_key(&mut h, "o");
+            assert_ne!(h.editor.show_origin, origin, "Shift+O toggles the origin");
+            let ortho = matches!(
+                h.editor.camera.projection,
+                basset_viewport::Projection::Orthographic { .. }
+            );
+            shift_key(&mut h, "v");
+            assert_ne!(
+                matches!(
+                    h.editor.camera.projection,
+                    basset_viewport::Projection::Orthographic { .. }
+                ),
+                ortho,
+                "Shift+V toggles the projection"
+            );
         }
     }
 
@@ -3957,7 +4088,7 @@ mod shortcuts {
             ("e", false, ToolKind::Extrude),
             ("w", false, ToolKind::Sweep),
             ("l", false, ToolKind::Loft),
-            ("f", true, ToolKind::Fillet),
+            ("f", false, ToolKind::Fillet),
             ("c", true, ToolKind::Chamfer),
             ("b", false, ToolKind::Combine),
             ("m", false, ToolKind::Move),
@@ -4142,8 +4273,8 @@ mod shortcuts {
     #[test]
     fn the_buttons_say_which_key_runs_them() {
         assert_eq!(commands::hint("file.save"), " (Ctrl+S)");
-        assert_eq!(commands::hint("view.fit"), " (F)");
-        assert_eq!(commands::tool_hint(ToolKind::Fillet), " (Shift+F)");
+        assert_eq!(commands::hint("view.fit"), " (Home)");
+        assert_eq!(commands::tool_hint(ToolKind::Fillet), " (F)");
         assert_eq!(
             commands::constraint_hint(ConstraintKind::Tangent),
             " (Shift+T)"

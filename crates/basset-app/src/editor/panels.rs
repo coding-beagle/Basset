@@ -441,21 +441,27 @@ fn menu_bar(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
             {
                 commands.push(Command::Fit);
             }
-            for (name, p) in [
-                ("Isometric", ViewPreset::Isometric),
-                ("Top", ViewPreset::Top),
-                ("Front", ViewPreset::Front),
-                ("Right", ViewPreset::Right),
-                ("Bottom", ViewPreset::Bottom),
-                ("Back", ViewPreset::Back),
-                ("Left", ViewPreset::Left),
+            for (name, id, p) in [
+                ("Isometric", "view.isometric", ViewPreset::Isometric),
+                ("Top", "view.top", ViewPreset::Top),
+                ("Front", "view.front", ViewPreset::Front),
+                ("Right", "view.right", ViewPreset::Right),
+                ("Bottom", "view.bottom", ViewPreset::Bottom),
+                ("Back", "view.back", ViewPreset::Back),
+                ("Left", "view.left", ViewPreset::Left),
             ] {
-                if ui.button(name).clicked() {
+                if ui.button(format!("{name}{}", commands::hint(id))).clicked() {
                     commands.push(Command::View(p));
                 }
             }
             ui.separator();
-            if ui.button("Toggle orthographic").clicked() {
+            if ui
+                .button(format!(
+                    "Toggle orthographic{}",
+                    commands::hint("view.projection")
+                ))
+                .clicked()
+            {
                 commands.push(Command::ToggleProjection);
             }
             ui.separator();
@@ -474,20 +480,38 @@ fn menu_bar(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
             // Selectable labels rather than checkboxes: the menu only has `&Editor`, and
             // a checkbox would need somewhere to write the new value before the command
             // that actually applies it runs.
-            if ui.selectable_label(editor.show_grid, "Show grid").clicked() {
+            if ui
+                .selectable_label(
+                    editor.show_grid,
+                    format!("Show grid{}", commands::hint("view.grid")),
+                )
+                .clicked()
+            {
                 commands.push(Command::ToggleGrid);
             }
             // The master switch, reachable without opening a sketch: the modelling
             // handles snap too, and a user who wants them free needs somewhere to say so
             // that is not the sketch palette. Shift remains the way to free one drag.
             if ui
-                .selectable_label(editor.snapping.to_grid, "Snap to grid (shift to override)")
+                .selectable_label(
+                    editor.snapping.to_grid,
+                    format!(
+                        "Snap to grid (shift to override){}",
+                        commands::hint("view.snap")
+                    ),
+                )
                 .clicked()
             {
                 commands.push(Command::ToggleSnap);
             }
             if ui
-                .selectable_label(editor.show_origin, "Show origin planes and axes")
+                .selectable_label(
+                    editor.show_origin,
+                    format!(
+                        "Show origin planes and axes{}",
+                        commands::hint("view.origin")
+                    ),
+                )
                 .clicked()
             {
                 commands.push(Command::ToggleOrigin);
@@ -588,7 +612,14 @@ fn toolbar(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
             commands.push(Command::Measure(!measuring));
         }
         ui.separator();
-        if ui.button("Fit").clicked() {
+        if ui
+            .button("Fit")
+            .on_hover_text(format!(
+                "Fit the model in the view{}",
+                commands::hint("view.fit")
+            ))
+            .clicked()
+        {
             commands.push(Command::Fit);
         }
         ui.separator();

@@ -43,7 +43,12 @@ feature that produced it. Faces are identified by a `FaceKey { op: OpId, role }`
 `Fillet(n)`, `Chamfer(n)`). Booleans preserve `FaceKey`s of surviving face fragments.
 Edges are identified by the unordered pair of `FaceKey`s they separate (`EdgeKey`).
 Sketch profiles are referenced by a sample point inside the region, and planar faces used
-as sketch planes get a frame anchored at the face centroid. A generator's inputs are
+as sketch planes get a frame anchored at the face centroid. A sketch started on a face
+also opens with the face's outline copied in (`core::project_face`): the kernel's
+`face_profile` is turned back into lines, arcs and circles — a run of boundary pieces
+bordering one neighbour is one curve — with every point fixed and a circle's diameter
+written, so the face is a reference the sketch can dimension from, snap to and extrude,
+and not a loose drawing the timeline would warn about. A generator's inputs are
 `RegionRef`s, so the same feature takes either a sketch region or a planar face; a face
 used as a region tags each stretch of its outline with a hash of the face it borders, so
 the lateral faces the generator grows there keep their keys when the body below changes.

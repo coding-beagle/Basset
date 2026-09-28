@@ -253,7 +253,10 @@ pub fn show(editor: &mut Editor, ctx: &egui::Context, free: egui::Rect) {
             ui.horizontal(|ui| {
                 home = ui
                     .small_button("⌂")
-                    .on_hover_text("Isometric view")
+                    .on_hover_text(format!(
+                        "Isometric view{}",
+                        super::commands::hint("view.isometric")
+                    ))
                     .clicked();
                 ui.label(egui::RichText::new(label).small().weak());
             });

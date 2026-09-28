@@ -5055,14 +5055,38 @@ pub fn enter_new(editor: &mut Editor, plane: PlaneRef) {
         editor.report_error("that plane cannot be sketched on (it is not planar)");
         return;
     };
+    let mut sketch = Sketch::new();
+    // A sketch on a face opens with the face's outline already drawn and pinned, so its
+    // corners and edges are there to dimension from and its region is there to extrude,
+    // as in Fusion. A face whose outline cannot be traced still gets its sketch — the
+    // plane is fine even when the copy is not — and says why the copy is missing.
+    if let PlaneRef::Face(face) = &plane {
+        let outline = editor
+            .doc
+            .state()
+            .body(face.body)
+            .map(|b| b.solid.face_profile(face.key));
+        match outline {
+            Some(Ok(profile)) => {
+                if let Err(e) = basset_core::project_face(&mut sketch, &profile) {
+                    editor.report_error(format!("the face's outline was not copied in: {e}"));
+                    sketch = Sketch::new();
+                }
+            }
+            Some(Err(e)) => {
+                editor.report_error(format!("the face's outline was not copied in: {e}"));
+            }
+            None => {}
+        }
+    }
     editor.doc.begin_transaction();
     let component = editor.active_component;
     let id = editor.doc.add_feature(FeatureKind::Sketch {
         plane,
         component,
-        sketch: Sketch::new(),
+        sketch: sketch.clone(),
     });
-    start(editor, id, frame, Sketch::new(), None);
+    start(editor, id, frame, sketch, None);
 }
 
 pub fn enter_existing(editor: &mut Editor, id: FeatureId, previous_cursor: usize) {
