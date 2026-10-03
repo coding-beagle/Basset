@@ -237,6 +237,66 @@ impl Sketch {
         self.labels.remove(id);
     }
 
+    /// Adds constraints the editor inferred from where a click landed — a corner put on
+    /// an existing point, an end put on a line — keeping only those that already hold
+    /// and say something the sketch does not, and returns the ones kept.
+    ///
+    /// A constraint the user asked for is written whatever it does; an inferred one is a
+    /// guess about intent, and a guess must never move geometry the user has just
+    /// placed. Each candidate is therefore tried on a copy: it is dropped if the copy
+    /// fails to solve, if the solver calls it redundant, or if solving with it moves
+    /// anything further than solving without it. Shapes whose sides already line up
+    /// with what they snapped to get exactly the ties that hold them there and no more.
+    ///
+    /// When the sketch cannot solve even without them there is nothing to measure
+    /// against, so nothing is added: a missing tie is a click away, a deformed drawing
+    /// is not.
+    pub fn add_inferred_constraints(
+        &mut self,
+        candidates: impl IntoIterator<Item = Constraint>,
+    ) -> Vec<ConstraintId> {
+        let mut reference = self.clone();
+        if crate::solver::solve(&mut reference).is_err() {
+            return Vec::new();
+        }
+        let mut kept = Vec::new();
+        for c in candidates {
+            let Ok(id) = self.add_constraint(c) else {
+                continue;
+            };
+            let mut trial = self.clone();
+            let holds = match crate::solver::solve(&mut trial) {
+                Ok(report) => {
+                    !report.redundant.contains(&id) && trial.drift(&reference) <= JOIN_TOL
+                }
+                Err(_) => false,
+            };
+            if holds {
+                kept.push(id);
+            } else {
+                self.remove_constraint(id);
+            }
+        }
+        kept
+    }
+
+    /// How far the solved geometry of `self` sits from `other`'s: the largest distance
+    /// any point or radius differs by. Entities only one of them has do not count.
+    fn drift(&self, other: &Sketch) -> f64 {
+        self.entities
+            .iter()
+            .filter_map(
+                |(id, data)| match (&data.entity, &other.entities.get(id)?.entity) {
+                    (Entity::Point { pos: a }, Entity::Point { pos: b }) => Some(a.distance(*b)),
+                    (Entity::Circle { radius: a, .. }, Entity::Circle { radius: b, .. }) => {
+                        Some((a - b).abs())
+                    }
+                    _ => None,
+                },
+            )
+            .fold(0.0, f64::max)
+    }
+
     pub fn constraint(&self, id: ConstraintId) -> Option<&Constraint> {
         self.constraints.get(id)
     }

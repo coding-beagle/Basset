@@ -19,7 +19,7 @@ use basset_core::{FeatureId, FeatureKind, Parameters, PlaneRef, ProfileRef};
 use basset_math::{Frame, Ray, Vec2, Vec3};
 pub use basset_sketch::offset::Corner;
 use basset_sketch::{
-    Constraint, ConstraintId, Entity, EntityId, Profile, Sketch, SketchError, SolveError,
+    Constraint, ConstraintId, Entity, EntityId, JOIN_TOL, Profile, Sketch, SketchError, SolveError,
     SolveReport, Tessellation, edit, fillet, offset, pattern, shapes,
 };
 use basset_viewport::{Camera, LineBatch, PointBatch, TriBatch, grid};
@@ -4698,18 +4698,20 @@ fn build_shape(
     let mut dims: Vec<Constraint> = Vec::new();
     match tool {
         SketchTool::Rectangle | SketchTool::CenterRectangle => {
-            let r = if tool == SketchTool::Rectangle {
-                let r = shapes::rectangle_two_point(s, p(0), p(1));
-                tie.push((r.corners[0], 0));
-                tie.push((r.corners[2], 1));
-                r
+            let (r, corner_clicks) = if tool == SketchTool::Rectangle {
+                (shapes::rectangle_two_point(s, p(0), p(1)), 0..2)
             } else {
                 let r = shapes::rectangle_center(s, p(0), p(1));
                 if let Some(center) = r.center {
                     tie.push((center, 0));
                 }
-                r
+                (r, 1..2)
             };
+            for click in corner_clicks {
+                if let Some(corner) = made_at(s, &r.corners, p(click)) {
+                    tie.push((corner, click));
+                }
+            }
             // Corners run counter-clockwise from the minimum corner, so the first edge
             // is the bottom (width) and the second the right side (height).
             if let Some(width) = params.typed(Dim::Width) {
@@ -4748,8 +4750,11 @@ fn build_shape(
         }
         SketchTool::Arc3Point => {
             let a = shapes::arc_three_point(s, p(0), p(1), p(2))?;
-            tie.push((a.start, 0));
-            tie.push((a.end, 2));
+            for click in [0, 2] {
+                if let Some(end) = made_at(s, &[a.start, a.end], p(click)) {
+                    tie.push((end, click));
+                }
+            }
         }
         SketchTool::ArcCenter => {
             let a = shapes::arc_center(s, p(0), p(1), p(2));
@@ -4847,22 +4852,42 @@ fn build_shape(
         | SketchTool::Fillet
         | SketchTool::Constrain(_) => {}
     }
-    for (created, click) in tie {
-        // A click on a curve ties the same way a click on a point does; the solver takes
-        // `Coincident` against a line or circle as "on it", not "at its centre".
-        if let Some(target) = c[click].snapped.or(c[click].on_curve)
-            && target != created
-        {
-            s.add_constraint(Constraint::Coincident {
+    // A click on a curve ties the same way a click on a point does; the solver takes
+    // `Coincident` against a line or circle as "on it", not "at its centre". The ties
+    // are inferred rather than asked for, so the sketch keeps only those that already
+    // hold and are not implied by the shape's own constraints: a shape must appear
+    // exactly where it was previewed, not wherever a tie would rather drag it.
+    let ties: Vec<Constraint> = tie
+        .into_iter()
+        .filter_map(|(created, click)| {
+            let target = c[click].snapped.or(c[click].on_curve)?;
+            (target != created).then_some(Constraint::Coincident {
                 point: created,
                 target,
-            })?;
-        }
-    }
+            })
+        })
+        .collect();
+    s.add_inferred_constraints(ties);
     for d in dims {
         s.add_constraint(d)?;
     }
     Ok(())
+}
+
+/// Which of the points a builder made sits on a click.
+///
+/// Builders normalise what they are given — a rectangle's corners always run from its
+/// lowest one, an arc always runs anticlockwise — so the point made at a click is found
+/// by where it is rather than by its place in the list. Taking it by place tied the
+/// wrong corner of any rectangle drawn other than bottom-left to top-right, and the
+/// solve then folded the rectangle onto what the click had snapped to.
+fn made_at(s: &Sketch, points: &[EntityId], at: Vec2) -> Option<EntityId> {
+    points
+        .iter()
+        .filter_map(|id| Some((*id, s.point_pos(*id)?.distance(at))))
+        .filter(|(_, d)| *d <= JOIN_TOL)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(id, _)| id)
 }
 
 /// Dimensions for a line the user typed sizes for. A typed angle only becomes a

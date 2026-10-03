@@ -978,6 +978,49 @@ fn a_centre_rectangle_has_no_redundant_constraint() {
     assert_eq!(report.degrees_of_freedom, 6);
 }
 
+/// Constraints inferred from where a click landed are only written when they hold
+/// already and say something the sketch does not: anything else either moves geometry
+/// the user just placed or is a redundant constraint drawn orange for no reason.
+#[test]
+fn inferred_constraints_are_kept_only_when_they_hold_and_add_something() {
+    let mut s = Sketch::new();
+    let (base, a, _) = line(&mut s, v(0.0, 0.0), v(10.0, 0.0));
+    s.add_constraint(Constraint::Horizontal(base)).unwrap();
+    let on = s.add_point(v(4.0, 0.0));
+    let near = s.add_point(v(6.0, 0.5));
+    let kept = s.add_inferred_constraints([
+        Constraint::Coincident {
+            point: on,
+            target: base,
+        },
+        // Half a millimetre off the line: tying it on would pull it there.
+        Constraint::Coincident {
+            point: near,
+            target: base,
+        },
+    ]);
+    assert_eq!(kept.len(), 1, "only the point already on the line is tied");
+    near_eq(&s, near, v(6.0, 0.5));
+
+    // A second identical tie says nothing the first does not.
+    let again = s.add_inferred_constraints([Constraint::Coincident {
+        point: on,
+        target: base,
+    }]);
+    assert!(again.is_empty(), "a duplicate tie is redundant");
+
+    // And the sketch is left exactly as it was drawn.
+    let report = s.solve().unwrap();
+    assert!(report.redundant.is_empty());
+    near_eq(&s, a, v(0.0, 0.0));
+    near_eq(&s, on, v(4.0, 0.0));
+    near_eq(&s, near, v(6.0, 0.5));
+}
+
+fn near_eq(s: &Sketch, id: EntityId, at: Vec2) {
+    near(pos(s, id), at);
+}
+
 #[test]
 fn circle_builders() {
     let mut s = Sketch::new();
