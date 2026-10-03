@@ -691,8 +691,9 @@ fn choose_plane(polygons: &[CsgPolygon]) -> SplitPlane {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::{FaceRole, OpId};
-    use crate::primitives::cuboid;
+    use crate::geometry::Tessellation;
+    use crate::ids::{FaceKey, FaceRole, OpId};
+    use crate::primitives::{cuboid, cylinder};
     use approx::assert_relative_eq;
     use basset_math::Vec3;
 
@@ -899,5 +900,105 @@ mod tests {
         let d = boolean(&a, &b, BoolOp::Subtract).unwrap();
         assert_relative_eq!(d.volume(), 7.0, epsilon = 1e-9);
         assert!(d.is_closed(), "{:?}", d.validate());
+    }
+
+    /// A 20 × 20 × 10 block with round holes cut straight through it, as a cut-extrude of
+    /// circles sketched on its top makes them. Each hole's tool has op `2 + i`.
+    fn block_with_holes(holes: &[(f64, f64, f64)]) -> (Solid, Vec<Solid>) {
+        let tess = Tessellation::default();
+        let block = cuboid(OpId::new(1), Vec3::ZERO, Vec3::new(20.0, 20.0, 10.0));
+        let tools: Vec<Solid> = holes
+            .iter()
+            .enumerate()
+            .map(|(i, &(x, y, r))| {
+                cylinder(
+                    OpId::new(2 + i as u64),
+                    Vec3::new(x, y, 0.0),
+                    Vec3::Z,
+                    r,
+                    10.0,
+                    &tess,
+                )
+            })
+            .collect();
+        let solid = tools.iter().fold(block, |acc, tool| {
+            boolean(&acc, tool, BoolOp::Subtract).expect("a hole through a block")
+        });
+        (solid, tools)
+    }
+
+    /// Whether `p` lies on segment `[a, b]`, to display precision.
+    fn on_segment(p: Vec3, [a, b]: [Vec3; 2]) -> bool {
+        let ab = b - a;
+        let t = (p - a).dot(ab) / ab.length_squared();
+        (-1e-7..=1.0 + 1e-7).contains(&t) && (a + ab * t).distance(p) < 1e-6
+    }
+
+    /// Asserts that what the viewer is told to draw for a holed block is the block's
+    /// twelve edges and every hole's two rims, each covered once, and nothing else.
+    ///
+    /// Counted by length, not by segment: a rim edge of the block is legitimately split
+    /// wherever a cap fragment ends against it, so the number of segments is a fact about
+    /// the BSP and not about the body. What must hold is that every segment lies on a
+    /// real edge and that, together, they cover the real edges exactly — a stray line
+    /// across a cap fails the first, a doubled or missing rim piece fails the second.
+    fn assert_only_real_edges_drawn(solid: &Solid, tools: &[Solid]) {
+        let mut real: Vec<[Vec3; 2]> = Vec::new();
+        for e in cuboid(OpId::new(1), Vec3::ZERO, Vec3::new(20.0, 20.0, 10.0)).edges() {
+            real.extend(e.segments.iter().map(|s| [s.start, s.end]));
+        }
+        for tool in tools {
+            // The wall's horizontal polygon edges are the rims.
+            let wall = tool
+                .face(FaceKey::new(tool.faces[0].key.op, FaceRole::Side(0)))
+                .expect("a cylinder's wall is Side(0)");
+            for p in &wall.polygons {
+                for (i, &a) in p.vertices.iter().enumerate() {
+                    let b = p.vertices[(i + 1) % p.vertices.len()];
+                    if (a.z - b.z).abs() < 1e-9 {
+                        real.push([a, b]);
+                    }
+                }
+            }
+        }
+        let drawn = solid.display_edges();
+        for seg in &drawn {
+            assert!(
+                real.iter()
+                    .any(|r| on_segment(seg[0], *r) && on_segment(seg[1], *r)),
+                "drawn segment {seg:?} lies on no edge the body has"
+            );
+        }
+        let length = |segs: &[[Vec3; 2]]| segs.iter().map(|[a, b]| a.distance(*b)).sum::<f64>();
+        assert_relative_eq!(length(&drawn), length(&real), epsilon = 1e-6);
+        assert!(solid.is_closed(), "{:?}", solid.validate());
+    }
+
+    /// The caps of a holed block come out of the boolean as dozens of fragments, many
+    /// with collinear vertices and some of them very thin; the drawn edges must still be
+    /// the block's and the hole's alone, with no seam of the fragmentation showing.
+    #[test]
+    fn a_through_hole_draws_only_its_rims_and_the_blocks_edges() {
+        let (solid, tools) = block_with_holes(&[(10.0, 10.0, 3.0)]);
+        assert_relative_eq!(solid.volume(), 4000.0 - tools[0].volume(), epsilon = 1e-6);
+        assert_only_real_edges_drawn(&solid, &tools);
+    }
+
+    /// Two holes cut one after the other: the second boolean re-fragments the first's
+    /// cap pieces, and the first hole's wall meets fragments made by the second.
+    #[test]
+    fn two_through_holes_draw_only_their_rims_and_the_blocks_edges() {
+        let (solid, tools) = block_with_holes(&[(6.0, 10.0, 2.5), (14.0, 10.0, 2.5)]);
+        assert_eq!(solid.faces.len(), 8, "six block faces and two walls");
+        assert_only_real_edges_drawn(&solid, &tools);
+    }
+
+    /// A hole whose rim passes a micron short of the block's side: its tessellation
+    /// vertices land within a hair of the side face, where a split that landed on the
+    /// wrong side of the tolerance would leave a sliver between rim and side.
+    #[test]
+    fn a_hole_grazing_the_blocks_side_draws_only_real_edges() {
+        let (solid, tools) = block_with_holes(&[(10.0, 3.001, 3.0)]);
+        assert_only_real_edges_drawn(&solid, &tools);
     }
 }
