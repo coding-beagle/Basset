@@ -399,6 +399,24 @@ impl Edge {
         self.segments.iter().map(|s| s.start.distance(s.end)).sum()
     }
 
+    /// Whether a fillet or chamfer can be built along this edge: it is not smooth, and
+    /// every piece of it folds by more than the 20° the kernel calls tangent.
+    ///
+    /// Looser than `!smooth`, which is what makes an edge *selectable*. A fillet's
+    /// run-out is a boundary between two different surfaces and so not smooth — the user
+    /// has to be able to click it to measure it — but it folds by half a facet, and a
+    /// blend tool built in that sliver of a dihedral has planes within rounding of the
+    /// body's own. [`blend`](crate::blend) refuses such an edge by name; the editor's
+    /// face pick and tangent chain read this to leave it out of a group in the first
+    /// place, so one run-out on a face does not fail the round of the whole face.
+    pub fn blendable(&self) -> bool {
+        !self.smooth
+            && self
+                .segments
+                .iter()
+                .all(|s| s.normal_a.dot(s.normal_b) < TANGENT_EDGE_COS)
+    }
+
     /// Orders the segments into connected polylines. A key normally yields one chain, but
     /// a boolean can leave two faces touching along separate stretches.
     pub fn chains(&self) -> Vec<Vec<EdgeSegment>> {

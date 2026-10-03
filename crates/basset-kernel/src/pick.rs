@@ -175,7 +175,10 @@ const TANGENT_COS: f64 = 0.966; // 15°
 /// vertex has no single answer, and blending an edge the user did not mean is worse than
 /// making them pick it.
 ///
-/// Smooth edges are skipped for the same reason [`pick_edge`] will not aim at one.
+/// Smooth edges are skipped for the same reason [`pick_edge`] will not aim at one, and so
+/// is anything else a blend cannot be built on ([`Edge::blendable`]): the run-out of an
+/// earlier fillet continues a top edge's line exactly, and walking onto it would hand the
+/// blend an edge it has to refuse.
 pub fn tangent_chain(edges: &[Edge], seed: EdgeKey) -> Vec<EdgeKey> {
     let ends = chain_ends(edges);
     let mut chain = vec![seed];
@@ -213,7 +216,7 @@ struct ChainEnd {
 /// none, which is right: it is already the whole chain.
 fn chain_ends(edges: &[Edge]) -> Vec<ChainEnd> {
     let mut out = Vec::new();
-    for e in edges.iter().filter(|e| !e.smooth) {
+    for e in edges.iter().filter(|e| e.blendable()) {
         for chain in e.chains() {
             let (first, last) = (chain[0], *chain.last().expect("a chain has a segment"));
             if first.start.distance(last.end) <= MERGE_TOL {

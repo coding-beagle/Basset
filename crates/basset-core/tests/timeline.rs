@@ -1322,3 +1322,186 @@ fn body_names_and_components_from_bodies_round_trip_through_bass() {
     assert_eq!(body_component(&mut loaded, ex), cid);
     assert_eq!(loaded.state().components[&cid].name, "Bracket");
 }
+
+// --- Blends on compound bodies ---------------------------------------------------------
+
+/// A rectangle between two corners, fixed in place.
+fn rect_between(min: Vec2, max: Vec2) -> Sketch {
+    let mut s = Sketch::new();
+    let r = shapes::rectangle_two_point(&mut s, min, max);
+    s.add_constraint(Constraint::Fix(r.corners[0])).unwrap();
+    s
+}
+
+/// Every selectable edge of `body` bordering `face_key`, as the editor's face pick
+/// gathers them, with the ones `keep` rejects left out.
+fn face_edges(
+    doc: &mut Document,
+    body: FeatureId,
+    face_key: FaceKey,
+    keep: impl Fn(&basset_kernel::Edge) -> bool,
+) -> Vec<EdgeRef> {
+    doc.state()
+        .body(BodyRef(body))
+        .unwrap()
+        .solid
+        .edges()
+        .into_iter()
+        .filter(|e| e.blendable() && e.key.touches(face_key) && keep(e))
+        .map(|e| EdgeRef {
+            body: BodyRef(body),
+            key: e.key,
+        })
+        .collect()
+}
+
+/// A boss extruded from a block's top face, then its concave foot and convex rim rounded
+/// in one feature: one tool is added and one subtracted, the edges cross the join's
+/// seam, and the names survive the booleans.
+#[test]
+fn a_boss_foot_and_rim_round_together_through_the_document() {
+    let mut doc = Document::new("boss");
+    let (sketch, _) = rect_sketch(20.0, 20.0);
+    let sk = sketch_on(&mut doc, PlaneRef::Origin(OriginPlane::XY), sketch);
+    let block = extrude(&mut doc, sk, Vec2::new(1.0, 1.0), 10.0, BodyOp::NewBody);
+    let top = PlaneRef::Face(FaceRef {
+        body: BodyRef(block),
+        key: face(block, FaceRole::EndCap),
+    });
+    let boss = {
+        let mut s = Sketch::new();
+        shapes::circle_center(&mut s, Vec2::ZERO, 5.0);
+        s
+    };
+    let sk2 = sketch_on(&mut doc, top, boss);
+    let boss = extrude(
+        &mut doc,
+        sk2,
+        Vec2::ZERO,
+        5.0,
+        BodyOp::Join(vec![BodyRef(block)]),
+    );
+    let v0 = volume(&mut doc, block);
+    assert_relative_eq!(v0, 4000.0 + PI * 25.0 * 5.0, epsilon = 2.0);
+    // The foot is the ring where the block's top meets the boss's side; the rim is where
+    // the boss's side meets its own top.
+    let mut edges = face_edges(&mut doc, block, face(block, FaceRole::EndCap), |e| {
+        e.key.a.op == OpId::new(boss.0) || e.key.b.op == OpId::new(boss.0)
+    });
+    edges.extend(face_edges(
+        &mut doc,
+        block,
+        face(boss, FaceRole::EndCap),
+        |_| true,
+    ));
+    assert_eq!(edges.len(), 2, "{edges:?}");
+    let fi = doc.add_feature(FeatureKind::Fillet { edges, radius: 1.0 });
+    let state = doc.state();
+    assert_eq!(
+        state.status(fi),
+        Some(&FeatureStatus::Ok),
+        "{:?}",
+        state.status(fi)
+    );
+    let solid = &state.body(BodyRef(block)).unwrap().solid;
+    assert!(solid.is_closed(), "{:?}", solid.validate());
+    // Pappus: the bead adds a ring outside radius 5, the round takes one off inside it;
+    // the section is the r × r square less the quarter disc, its centroid 0.2234 r from
+    // the edge.
+    let area = 1.0 - PI / 4.0;
+    let offset = (5.0 / 6.0 - PI / 4.0) / area;
+    let expected = v0 + 2.0 * PI * (5.0 + offset) * area - 2.0 * PI * (5.0 - offset) * area;
+    assert_relative_eq!(solid.volume(), expected, epsilon = 0.3);
+    assert!(
+        solid
+            .face(FaceKey::new(OpId::new(fi.0), FaceRole::Fillet(0)))
+            .is_some()
+            && solid
+                .face(FaceKey::new(OpId::new(fi.0), FaceRole::Fillet(1)))
+                .is_some()
+    );
+    assert_relative_eq!(solid.aabb().max.z, 15.0, epsilon = 1e-6);
+}
+
+/// Two blocks joined into a T. Rounding the whole top outline — seven edges through two
+/// inside corners, one of them a key the join cut into two pieces — is one feature; adding
+/// the inside vertical edge to it is refused with the kernel's message, and the timeline
+/// carries on.
+#[test]
+fn the_top_loop_of_a_t_rounds_and_a_bead_meeting_it_is_refused() {
+    let mut doc = Document::new("tee");
+    let (bar, _) = rect_sketch(20.0, 10.0);
+    let sk = sketch_on(&mut doc, PlaneRef::Origin(OriginPlane::XY), bar);
+    let body = extrude(&mut doc, sk, Vec2::new(1.0, 1.0), 10.0, BodyOp::NewBody);
+    let stem = rect_between(Vec2::new(5.0, 5.0), Vec2::new(15.0, 20.0));
+    let sk2 = sketch_on(&mut doc, PlaneRef::Origin(OriginPlane::XY), stem);
+    let _ = extrude(
+        &mut doc,
+        sk2,
+        Vec2::new(10.0, 12.0),
+        10.0,
+        BodyOp::Join(vec![BodyRef(body)]),
+    );
+    assert_relative_eq!(volume(&mut doc, body), 3000.0, epsilon = 1e-6);
+    let top = face_edges(&mut doc, body, face(body, FaceRole::EndCap), |_| true);
+    assert_eq!(top.len(), 7, "{top:?}");
+    let fi = doc.add_feature(FeatureKind::Fillet {
+        edges: top.clone(),
+        radius: 1.0,
+    });
+    {
+        let state = doc.state();
+        assert_eq!(
+            state.status(fi),
+            Some(&FeatureStatus::Ok),
+            "{:?}",
+            state.status(fi)
+        );
+        let solid = &state.body(BodyRef(body)).unwrap().solid;
+        assert!(solid.is_closed(), "{:?}", solid.validate());
+        let area = 1.0 - PI / 4.0;
+        assert!(solid.volume() > 3000.0 - 80.0 * area - 0.05);
+        assert!(solid.volume() < 3000.0 - 80.0 * area + 6.0 * area + 0.05);
+    }
+    // The inside vertical edge at (15, 10) runs into the top loop's corner. Taken from
+    // the body as it was before the fillet, which is what the feature's edges name.
+    doc.set_cursor(doc.timeline().index_of(fi).unwrap());
+    let inner = doc
+        .state()
+        .body(BodyRef(body))
+        .unwrap()
+        .solid
+        .edges()
+        .into_iter()
+        .find(|e| {
+            e.blendable()
+                && e.segments.iter().all(|s| {
+                    [s.start, s.end]
+                        .iter()
+                        .all(|p| (p.x - 15.0).abs() < 1e-6 && (p.y - 10.0).abs() < 1e-6)
+                })
+        })
+        .map(|e| EdgeRef {
+            body: BodyRef(body),
+            key: e.key,
+        })
+        .expect("the inside edge");
+    doc.set_cursor(doc.timeline().len());
+    doc.edit_feature_kind(fi, |k| {
+        if let FeatureKind::Fillet { edges, .. } = k {
+            edges.push(inner);
+        }
+    })
+    .unwrap();
+    let state = doc.state();
+    let Some(FeatureStatus::Failed(message)) = state.status(fi) else {
+        panic!("{:?}", state.status(fi));
+    };
+    assert!(message.contains("concave"), "{message}");
+    // The body before the fillet is still there to work with.
+    assert_relative_eq!(
+        state.body(BodyRef(body)).unwrap().solid.volume(),
+        3000.0,
+        epsilon = 1e-6
+    );
+}

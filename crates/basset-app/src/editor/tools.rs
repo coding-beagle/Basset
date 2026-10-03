@@ -1533,13 +1533,15 @@ fn extrude_lands_on(editor: &Editor) -> Vec<BodyRef> {
 ///
 /// Smooth edges are left out: where the face simply carries on into its neighbour there
 /// is nothing drawn to round, and a blend tool built along one has no dihedral to fill.
+/// So is the run-out of an earlier fillet, which folds by half a facet: the kernel would
+/// refuse it, and one such boundary must not fail the round of a whole face.
 pub fn edges_of_face(editor: &Editor, face: &basset_core::FaceRef) -> Vec<basset_core::EdgeRef> {
     let Some(body) = editor.pick_body(face.body) else {
         return Vec::new();
     };
     body.edges
         .iter()
-        .filter(|e| !e.smooth && e.key.touches(face.key))
+        .filter(|e| e.blendable() && e.key.touches(face.key))
         .map(|e| basset_core::EdgeRef {
             body: face.body,
             key: e.key,

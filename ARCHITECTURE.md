@@ -104,6 +104,20 @@ Details worth knowing:
   a concave one. It is the same handle dragged the other way, as in Fusion's Press/Pull.
   A chamfer has no inverted form: the triangle it takes off already has its apex on the
   edge, so it stays unsigned.
+* On compound bodies the chain does the work. Selected edges that continue one another
+  tangentially — a straight edge a boolean seam split into two keys, the straights and
+  arcs of a slot — become one tool mitred through the joins, each edge keeping its own
+  blend face. A tool runs a hair past a chain end that opens into air and stops a hair
+  short of one that does not (the inside corner of a T, the top face a bead climbs to),
+  so it never notches a face it was not asked to touch; the price is that much of the
+  edge left sharp, below anything drawn. Beads are applied before rounds whatever the
+  pick order. Three shapes are refused with a typed error rather than built leaking: an
+  edge folding by less than the 20° tangent threshold (a fillet's own run-out), an edge
+  whose dihedral angle varies along it (a cylinder cut off askew — the section rotates
+  against the facet seams), and a round whose end meets a bead in one feature (it would
+  need a corner blend). Along a chain that turns, the arc is drawn no finer than 10° per
+  facet: the boolean cuts the body's faces along the arc's tangent facets, and finer
+  tangent facets on a curved chain disagree about where the face ends.
 * A BSP tree over a convex body is a list — the solid is the intersection of its face
   half-spaces, so every face plane has the rest behind it — and a boolean is quadratic
   in the facets of such a body. A fillet tool swept round a rim is one, and so is the
