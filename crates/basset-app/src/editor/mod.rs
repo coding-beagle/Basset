@@ -507,6 +507,30 @@ impl Editor {
         self.repaint = true;
     }
 
+    /// Turns the picture a quarter turn about the view axis.
+    pub fn roll_view(&mut self, clockwise: bool) {
+        self.camera.roll_quarter_turn(clockwise);
+        self.set_status(if clockwise {
+            "View rotated 90° clockwise"
+        } else {
+            "View rotated 90° counter-clockwise"
+        });
+        self.repaint = true;
+    }
+
+    /// Whether the camera looks square on to a world plane, or to the sketch plane while
+    /// sketching: the views the view cube offers its quarter-turn arrows for, since turning
+    /// those gives another tidy view rather than an arbitrary tilt.
+    pub fn view_is_square_on(&self) -> bool {
+        if self.camera.is_axis_aligned() {
+            return true;
+        }
+        match &self.mode {
+            Mode::Sketch(s) => s.frame.z.dot(self.camera.forward()).abs() > 1.0 - 1e-9,
+            Mode::Model => false,
+        }
+    }
+
     pub fn toggle_projection(&mut self) {
         if matches!(self.camera.projection, Projection::Perspective { .. }) {
             self.camera.set_orthographic();

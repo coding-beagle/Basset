@@ -6,6 +6,11 @@
 //! corner an isometric view. Dragging it orbits, which is what makes it feel attached to
 //! the model rather than a row of buttons.
 //!
+//! A click turns the view as though the cube itself had been rolled over to show the side
+//! clicked, so the orientation on screen carries over instead of snapping back to +Z up;
+//! see [`Camera::turn_to_direction`]. While the view is square on, two curved arrows at the
+//! cube's upper corners turn it a quarter turn about the view axis, as in Fusion.
+//!
 //! Which part was clicked is decided by casting the pointer into the unit cube and looking
 //! at where it lands, so the hit regions are exactly the shapes that were drawn, and the
 //! same classification works at any orientation without a table of 26 screen positions.
@@ -27,6 +32,15 @@ const FACE_FILL: egui::Color32 = egui::Color32::from_rgb(70, 78, 92);
 const FACE_LIT: egui::Color32 = egui::Color32::from_rgb(92, 102, 120);
 const OUTLINE: egui::Color32 = egui::Color32::from_rgb(150, 160, 180);
 const HOTSPOT: egui::Color32 = egui::Color32::from_rgb(90, 160, 255);
+
+/// Side of the quarter-turn arrow buttons, in logical pixels. A square-on cube spans only
+/// the middle 58% of the gizmo, so buttons this size in its corners never cover the cube.
+const ARROW_SIZE: f32 = 20.0;
+
+/// The labels of the quarter-turn buttons: the counter-clockwise and clockwise gapped
+/// circle arrows, which egui's bundled icon font carries.
+pub(crate) const ROLL_CCW_LABEL: &str = "\u{27F2}";
+pub(crate) const ROLL_CW_LABEL: &str = "\u{27F3}";
 
 /// Names of the six faces, indexed by axis and sign. "Front" is the face the camera looks
 /// at in the Front view, which is the one facing −Y, matching the camera's presets.
@@ -179,6 +193,8 @@ pub fn show(editor: &mut Editor, ctx: &egui::Context, free: egui::Rect) {
     let mut chosen: Option<Vec3> = None;
     let mut orbit = egui::Vec2::ZERO;
     let mut home = false;
+    let mut roll: Option<bool> = None;
+    let square_on = editor.view_is_square_on();
 
     egui::Area::new(egui::Id::new("view-cube"))
         .fixed_pos(pos)
@@ -249,6 +265,42 @@ pub fn show(editor: &mut Editor, ctx: &egui::Context, free: egui::Rect) {
                 painter.circle_filled(at, 4.0, HOTSPOT);
             }
 
+            // Placed after the cube so they sit above it for the pointer. Shown only square on,
+            // where a quarter turn lands on another tidy view; from an oblique view it would
+            // only tilt the picture, and orbiting would straighten it again at once.
+            if square_on {
+                for (corner, clockwise) in [(rect.left_top(), false), (rect.right_top(), true)] {
+                    let x = if clockwise { -ARROW_SIZE } else { 0.0 };
+                    let at = egui::Rect::from_min_size(
+                        corner + egui::vec2(x, 0.0),
+                        egui::vec2(ARROW_SIZE, ARROW_SIZE),
+                    );
+                    let (label, id) = if clockwise {
+                        (ROLL_CW_LABEL, "view.roll_cw")
+                    } else {
+                        (ROLL_CCW_LABEL, "view.roll_ccw")
+                    };
+                    let direction = if clockwise {
+                        "clockwise"
+                    } else {
+                        "counter-clockwise"
+                    };
+                    let button = egui::Button::new(egui::RichText::new(label).size(14.0))
+                        .frame(false)
+                        .small();
+                    if ui
+                        .put(at, button)
+                        .on_hover_text(format!(
+                            "Rotate view 90° {direction}{}",
+                            super::commands::hint(id)
+                        ))
+                        .clicked()
+                    {
+                        roll = Some(clockwise);
+                    }
+                }
+            }
+
             let label = hovered.map(hotspot_name).unwrap_or_default();
             ui.horizontal(|ui| {
                 home = ui
@@ -271,8 +323,13 @@ pub fn show(editor: &mut Editor, ctx: &egui::Context, free: egui::Rect) {
     if home {
         editor.look_from(basset_viewport::ViewPreset::Isometric);
     }
-    if let Some(d) = chosen {
-        editor.camera.look_from_direction(d);
+    if let Some(clockwise) = roll {
+        editor.roll_view(clockwise);
+    }
+    if let Some(d) = chosen
+        && roll.is_none()
+    {
+        editor.camera.turn_to_direction(d);
         editor.set_status(format!("{} view", hotspot_name(d)));
         editor.request_repaint();
     }
@@ -332,6 +389,20 @@ mod tests {
         assert_eq!(
             hotspot_at(&c, egui::vec2(0.5 * scale, 0.3 * scale), scale),
             Some(-Vec3::Y)
+        );
+    }
+
+    #[test]
+    fn a_turned_view_picks_what_is_drawn_where_it_is_drawn() {
+        // Front turned clockwise puts the Top face (+Z) on the right of the screen, so the
+        // right-hand edge of the cube is now the top-front edge.
+        let mut c = camera(ViewPreset::Front);
+        c.roll_quarter_turn(true);
+        let scale = 30.0;
+        assert_eq!(hotspot_at(&c, egui::Vec2::ZERO, scale), Some(-Vec3::Y));
+        assert_eq!(
+            hotspot_at(&c, egui::vec2(0.95 * scale, 0.0), scale),
+            Some(Vec3::new(0.0, -1.0, 1.0))
         );
     }
 
