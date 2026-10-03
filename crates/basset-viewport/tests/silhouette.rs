@@ -194,12 +194,14 @@ fn a_lofted_ball_is_outlined_by_a_ring() {
     );
 }
 
-/// A blend must not sprout a line where it runs into its neighbour. Seen from a direction
-/// that has both the top face and the side face turned towards it, every facet of the
-/// blend between them faces the camera too, so there is no sign change anywhere on it —
-/// and the kernel draws nothing along a tangent boundary either.
+/// The silhouette must not sprout a line where a blend runs into its neighbour. Seen from
+/// a direction that has both the top face and the side face turned towards it, every
+/// facet of the blend between them faces the camera too, so there is no sign change
+/// anywhere on it. The line the user does see there is the kernel's: a blend's outline is
+/// a feature edge, drawn by [`Solid::display_edges`] from the topology, and the silhouette
+/// has no business duplicating it.
 #[test]
-fn a_blend_sprouts_no_line_where_it_meets_its_neighbour() {
+fn a_blend_sprouts_no_silhouette_where_it_meets_its_neighbour() {
     let solid = filleted_box();
     let mesh = mesh_of(&solid);
     let view = ViewPoint::Direction(Vec3::new(0.0, 1.0, -1.0).normalize());
@@ -211,11 +213,11 @@ fn a_blend_sprouts_no_line_where_it_meets_its_neighbour() {
         "the silhouette ran along the blend's tangent boundary"
     );
     assert!(
-        !solid
+        solid
             .display_edges()
             .iter()
             .any(|[a, b]| on_a_tangent_line(*a) && on_a_tangent_line(*b)),
-        "a feature edge was drawn along the blend's tangent boundary"
+        "the blend's outline is a feature edge, drawn by the kernel"
     );
 }
 

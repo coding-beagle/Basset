@@ -441,13 +441,16 @@ pub fn pick(
         }
         // A corner beats an edge beats a face when several are within tolerance: the
         // smaller target is always the one the user was aiming at. The exception is an
-        // edge nothing is drawn along — a fillet's boundary, tangent to the face it runs
-        // out into — because nobody aims at a line they cannot see, and letting it win
-        // here would put an invisible dead stripe for face clicks along every blend.
-        // The boundary is still where one face stops and the next starts, so it stays
-        // reachable whenever edges are what the click is *for*: an edge-only filter has
-        // no face in the running, and a blend tool or a measure (`wide`) says edges are
-        // wanted even where a face is under the pointer too.
+        // edge nothing is drawn along — two ordinary faces meeting tangentially, a swept
+        // wall carrying on into a cylinder — because nobody aims at a line they cannot
+        // see, and letting it win here would put an invisible dead stripe for face clicks
+        // along it. (A fillet's run-outs used to be the case: tangent, so undrawn, and
+        // every blend had that stripe. The kernel now draws a blend's outline, so those
+        // edges are aimable like any other.) The boundary is still where one face stops
+        // and the next starts, so it stays reachable whenever edges are what the click is
+        // *for*: an edge-only filter has no face in the running, and a blend tool or a
+        // measure (`wide`) says edges are wanted even where a face is under the pointer
+        // too.
         match (vertex_hit.or(edge_hit), face_hit) {
             (Some(thin), Some(f)) => {
                 let tol =

@@ -164,19 +164,22 @@ fn clicking_a_body_in_the_viewport_selects_the_face_under_the_pointer() {
     assert!(h.editor.selection.faces.is_empty());
 }
 
-/// The regression this guards: a fillet's tangent boundary stopped being drawn but
-/// stayed pickable, and picking lets an edge beat the face behind it. Together those
-/// gave every blend an invisible stripe, a click's tolerance wide, where clicking what
-/// looks like bare face selected an edge the user could not see — with the default
-/// `Any` filter, "clicking a face no longer selects it".
+/// A fillet's run-out into the face it blends into is tangent, so nothing folds there,
+/// but the kernel draws it all the same as the outline of the round. Picking has to agree
+/// with what is drawn: the line the user sees is an edge they can click with the default
+/// `Any` filter, exactly like any other edge, and a click clear of it is the face.
+///
+/// The regression this once guarded ran the other way — the boundary was undrawn but
+/// pickable, which gave every blend an invisible stripe where clicking bare face selected
+/// an edge nobody could see. What matters is that drawing and picking never disagree.
 #[test]
-fn a_click_beside_a_blends_run_out_selects_the_face_the_user_sees() {
+fn a_blends_run_out_is_clickable_where_it_is_drawn_and_the_face_beside_it() {
     use basset_core::{EdgeKey, EdgeRef, FaceKey, FaceRole, FeatureKind};
     use basset_kernel::OpId;
     let mut h = Harness::new();
     let body = h.block();
-    // Round the top-back edge, so the top face gains an undrawn tangent boundary along
-    // y = 9 where the blend runs out into it.
+    // Round the top-back edge, so the top face gains a tangent boundary along y = 9
+    // where the blend runs out into it.
     let key = EdgeKey::new(
         FaceKey::new(OpId::new(body.0.0), FaceRole::EndCap),
         FaceKey::new(OpId::new(body.0.0), FaceRole::Side(7)),
@@ -189,9 +192,39 @@ fn a_click_beside_a_blends_run_out_selects_the_face_the_user_sees() {
     h.editor.zoom_to_fit();
     assert_eq!(h.editor.select_mode, SelectMode::Any);
 
-    // A click on the face just inside the run-out, within picking tolerance of the
-    // invisible boundary: the face wins, because it is what the user can see there.
-    h.click_world(Vec3::new(5.0, 8.8, 2.0));
+    // The body's edges, as drawn, include the run-out: that is the line the user sees.
+    let on_the_run_out = |p: &Vec3| (p.y - 9.0).abs() < 1e-6 && (p.z - 2.0).abs() < 1e-6;
+    let drawn = h
+        .editor
+        .doc
+        .state()
+        .body(body)
+        .expect("the block is in the model")
+        .solid
+        .display_edges();
+    assert!(
+        drawn
+            .iter()
+            .any(|[a, b]| on_the_run_out(a) && on_the_run_out(b)),
+        "the fillet's run-out into the top face is drawn"
+    );
+
+    // A click on that line selects the edge it is, as with any drawn edge.
+    h.click_world(Vec3::new(5.0, 9.0, 2.0));
+    assert_eq!(
+        h.editor.selection.edges.len(),
+        1,
+        "{:?}",
+        h.editor.selection
+    );
+    assert!(
+        h.editor.selection.faces.is_empty(),
+        "{:?}",
+        h.editor.selection
+    );
+
+    // A click on the face well clear of the line is the face.
+    h.click_world(Vec3::new(5.0, 5.0, 2.0));
     assert_eq!(
         h.editor.selection.faces,
         vec![super::harness::top_face(body)],
@@ -199,8 +232,7 @@ fn a_click_beside_a_blends_run_out_selects_the_face_the_user_sees() {
         h.editor.selection
     );
 
-    // Asking for edges is a different conversation: the tangent boundary is still where
-    // the top face stops and the blend starts, and the Edge filter still reaches it.
+    // And the Edge filter reaches the boundary as it always did.
     h.editor.set_select_mode(SelectMode::Edges);
     h.click_world(Vec3::new(5.0, 9.0, 2.0));
     assert_eq!(
