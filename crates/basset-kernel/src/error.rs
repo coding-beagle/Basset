@@ -39,6 +39,14 @@ pub enum KernelError {
     #[error("edge {0:?} lies between tangent faces and cannot be blended")]
     TangentEdge(EdgeKey),
     #[error(
+        "the angle between the faces of edge {0:?} changes along it (a curved face cut askew); this kernel cannot blend such an edge yet"
+    )]
+    VaryingDihedral(EdgeKey),
+    #[error(
+        "edges {convex:?} (convex) and {concave:?} (concave) meet at a vertex, where the round would have to roll onto the bead; this kernel does not build that corner — blend them in separate features"
+    )]
+    ConvexMeetsConcave { convex: EdgeKey, concave: EdgeKey },
+    #[error(
         "blend would need {needed} facets, over the budget of {budget}: coarsen the body's tessellation, or blend fewer edges at once"
     )]
     BlendTooDense { needed: usize, budget: usize },

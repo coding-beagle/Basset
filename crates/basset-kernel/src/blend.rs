@@ -6,11 +6,29 @@
 //! everyone expects, negative is the *inverted* round — the complementary quarter-disc,
 //! centred on the edge rather than tangent to the faces — which cuts a cove into a convex
 //! edge and lays a bead into a concave one. The same handle dragged the other way, as
-//! Fusion's Press/Pull does it; see [`section`] for the geometry. The cross-section is exact in the plane perpendicular to
-//! the edge; along curved edges the prism is mitred at every polyline joint so
-//! consecutive pieces meet on the bisecting plane. Corners where several filleted edges
-//! meet are simply the intersection of their tools, which is a crease rather than the
-//! spherical patch a full-featured kernel would make — an accepted MVP limitation.
+//! Fusion's Press/Pull does it; see [`section`] for the geometry. The cross-section is
+//! exact in the plane perpendicular to the edge; along curved edges the prism is mitred
+//! at every polyline joint so consecutive pieces meet on the bisecting plane. Corners
+//! where several filleted edges meet are simply the intersection of their tools, which is
+//! a crease rather than the spherical patch a full-featured kernel would make — an
+//! accepted MVP limitation.
+//!
+//! Compound bodies — a boss joined onto a face, a hole cut through, blocks unioned into a
+//! T — are where the edges stop being simple, and the chain is shaped for them. A run of
+//! selected edges that continue one another tangentially (a straight edge a seam cut into
+//! two keys, a slot's straights and arcs) is one chain and one tool, mitred through the
+//! joins, each edge keeping its own blend face ([`join_tangent_runs`]). Where a chain
+//! ends decides how its tool ends: it runs a clearance past an end that opens into air
+//! (a cube's corner) and stops a clearance short of one that does not — the foot of a
+//! wall at the inside corner of the T, the top face a concave edge climbs to — so no
+//! tool notches a face it was not asked to touch ([`ChainEnd`]). The tools of one
+//! feature are applied beads first, then rounds, whatever order the edges were picked
+//! in. Three shapes are refused by name rather than built badly: an edge whose faces
+//! fold by less than the kernel's tangent threshold (a fillet's own run-out, which the
+//! editor can select but nothing can round), an edge whose dihedral angle changes along
+//! it (a cylinder cut off askew), and a round whose end meets a bead in the same feature,
+//! which wants the corner blend this kernel does not have. The arc along a chain that
+//! turns is drawn no finer than [`MIN_CURVED_FACET_ANGLE`], for the boolean's sake.
 //!
 //! What a blend costs is decided here rather than in the boolean. The tools of one
 //! feature are folded into as few solids as they can be before any of them meets the
@@ -70,6 +88,24 @@ const MAX_FEATURE_POLYGONS: usize = 7_000;
 /// to carry both tangent points and at least one point between them.
 const MIN_ARC_SEGMENTS: usize = 2;
 
+/// Finest arc a fillet draws along a chain that *turns*: no facet narrower than this.
+///
+/// A fillet's end facets are tangent to the faces they blend into, so each lies within
+/// half a facet's angle of the face plane, and the boolean has to cut the face along it.
+/// Along a straight edge every ring puts that facet in one and the same plane and the
+/// cut is one clean line. Along a curved edge each pair of rings has its own, and planes
+/// a degree or two off the face classify a strip of it some ten-thousandths wide as
+/// coplanar (the BSP's tolerance over the sine of the tilt); neighbouring strips do not
+/// agree about where the face ends, and the shell comes back with slivers it cannot pair
+/// up. Measured on the arc where a round meets an end face: 22 facets to the quarter
+/// circle (a 4° end facet) close, 30 (3°) leak; a hole's rim is touchier (see below).
+/// The floor keeps the end facet 5° off the face, and a nine-facet quarter round shaded
+/// smoothly still reads as a round. Ten degrees, not nine: nine arc facets to the quarter
+/// close on a hole's rim at every drill tessellation tried (36 to 180 facets), ten leak
+/// on two of them, and the default tessellation draws 10° facets anyway, so nothing a
+/// user sees by default changes.
+const MIN_CURVED_FACET_ANGLE: f64 = 10.0 * std::f64::consts::PI / 180.0;
+
 /// Facets of the swept tool: one ring of section vertices per chain segment. A section
 /// carries the arc's points, its two tangent points and three scaffolding corners. An
 /// open chain's end caps are fans over one ring each, so they are counted as two more.
@@ -77,20 +113,69 @@ fn tool_polygons(rings: usize, arc_segments: usize) -> usize {
     rings * (arc_segments + 4)
 }
 
+/// One straight piece of a chain, with the selected edge it belongs to: `index` is that
+/// edge's position in the feature's list and names the blend face the piece ends up on.
+///
+/// A chain is a connected run of these. It usually comes from one edge, but a run that
+/// continues tangentially from one selected edge onto the next — a straight edge a seam
+/// has cut into two keys, the straights and arcs of a slot's outline — is one chain too,
+/// so the tool is mitred through the join rather than two tools overhanging each other
+/// there ([`join_tangent_runs`]).
+#[derive(Clone, Copy)]
+struct Link {
+    seg: EdgeSegment,
+    index: u32,
+    key: EdgeKey,
+}
+
 /// Whether a chain closes on itself: its end caps are then unnecessary and not built.
-fn is_closed(chain: &[EdgeSegment]) -> bool {
+fn is_closed(chain: &[Link]) -> bool {
     chain.len() > 1
-        && chain[0].start.distance_squared(chain.last().unwrap().end) < MERGE_TOL * MERGE_TOL
+        && chain[0]
+            .seg
+            .start
+            .distance_squared(chain.last().unwrap().seg.end)
+            < MERGE_TOL * MERGE_TOL
 }
 
 /// Rings a chain's tool is built from, caps included.
-fn ring_count(chain: &[EdgeSegment]) -> usize {
+fn ring_count(chain: &[Link]) -> usize {
     if is_closed(chain) {
         chain.len()
     } else {
         chain.len() + 2
     }
 }
+
+/// How the tool finishes at an end of an open chain.
+///
+/// The tool's own end cap must not lie in a face of the body: a coplanar face is what the
+/// boolean is worst at, and the cap of a tool stopped exactly where its edge stops lies
+/// in whatever face the edge stops against. So the tool either runs past the end or
+/// stops short of it, by [`CLEARANCE`], and which is right depends on what is there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChainEnd {
+    /// The run-on changes nothing: a subtracted tool reaching into the air beyond the
+    /// face the edge leaves through, an added one reaching into the wall it ends against.
+    /// This also closes the hairline gap where a chain ends flush with another face.
+    Overhang,
+    /// The run-on would cut a notch into material or stand a sliver of material in the
+    /// air: a convex edge ending at the foot of a wall (the inside corner of a T, a boss
+    /// standing on a face), a concave edge ending at the face it climbs to, or an edge
+    /// that runs tangentially on into one the user did not pick. The tool stops
+    /// [`SHORT`] before the end instead, leaving that much of the edge as it was.
+    Short,
+}
+
+/// How far a [`ChainEnd::Short`] tool stops before its edge's end. Twice [`CLEARANCE`],
+/// and not once, because of the tool that may be waiting there: at the inside corner of a
+/// T both top edges stop short of the same vertex, and each tool's scaffolding runs a
+/// clearance *past* its own faces — into the very space the other tool's end cap would
+/// occupy if it stopped a clearance short. The two were then coplanar there, cap against
+/// scaffold, and the boolean folding the tools together doubled the polygons. At two
+/// clearances the caps clear the scaffolds with a clearance to spare, so two short-ended
+/// tools meeting at a corner share no point at all and are folded by concatenation.
+const SHORT: f64 = 2.0 * CLEARANCE;
 
 #[derive(Clone, Copy)]
 enum Blend {
@@ -158,7 +243,15 @@ fn apply(
     blend: Blend,
     tess: &Tessellation,
 ) -> Result<Solid, KernelError> {
-    let tools = tools_for(op, solid, keys, blend, tess)?;
+    let mut tools = tools_for(op, solid, keys, blend, tess)?;
+    // Added material first, then the cuts, whatever order the edges were picked in. Where
+    // a bead and a round touch — a concave edge climbing to a face whose edge is rounded
+    // in the same feature — the two tools overlap by their clearances, and the order
+    // decides what is left there: a round cut through the bead's clearance sliver takes
+    // it away, a bead laid after the round leaves that sliver standing as a fin on the
+    // new surface. Same op either way, so one order serves and the result does not
+    // depend on how the user clicked.
+    tools.sort_by_key(|(_, bool_op)| *bool_op != BoolOp::Union);
     let mut result = solid.clone();
     for (tool, bool_op) in merge_tools(tools, solid.polygon_count()) {
         result = boolean(&result, &tool, bool_op)?;
@@ -166,7 +259,7 @@ fn apply(
     Ok(result)
 }
 
-/// One tool per chain of every selected edge, with the operation that applies it.
+/// One tool per chain of the selected edges, with the operation that applies it.
 fn tools_for(
     op: OpId,
     solid: &Solid,
@@ -181,13 +274,79 @@ fn tools_for(
     // Tools are built from the original edges, before any of them is blended away, so
     // the result does not depend on the order edges were selected in.
     let all_edges = solid.edges();
-    let mut chains = Vec::new();
+    let mut chains: Vec<Vec<Link>> = Vec::new();
     for (i, key) in keys.iter().enumerate() {
         let edge = all_edges
             .iter()
             .find(|e| e.key == *key)
             .ok_or(KernelError::MissingEdge(*key))?;
-        chains.extend(edge.chains().into_iter().map(|c| (i as u32, *key, c)));
+        for chain in edge.chains() {
+            // A piece that does not fold has no corner to fill, and a section built on
+            // it is a sliver whose planes lie within rounding of the body's own. The run-
+            // out of an earlier fillet is the usual way one arrives here: it is a face
+            // boundary the user can click, half a facet from flat.
+            if chain
+                .iter()
+                .any(|s| s.normal_a.dot(s.normal_b) >= TANGENT_EDGE_COS)
+            {
+                return Err(KernelError::TangentEdge(*key));
+            }
+            // The section is drawn per segment from that segment's two facet normals,
+            // and a joint ring is the incoming section carried onto the bisecting plane.
+            // While the dihedral is constant the tangent points of consecutive rings on a
+            // faceted face lie on that face's seams, and the band runs cleanly from
+            // facet to facet. When it is not — a cylinder cut off askew, whose rim meets
+            // the cut at 70° on one side and 110° on the other — the in-face direction
+            // leans across the seams, each ring's tangent point lands in its own facet's
+            // plane a step off the seam, and the band's edge zigzags through the body's
+            // facets. Every density tried leaked. A joint section built from the seam
+            // itself would fix it; until then the edge is refused by name.
+            let (lo, hi) = chain.iter().fold((f64::INFINITY, 0.0f64), |(lo, hi), s| {
+                let phi = dihedral(s).3;
+                (lo.min(phi), hi.max(phi))
+            });
+            if hi - lo > DIHEDRAL_DRIFT {
+                return Err(KernelError::VaryingDihedral(*key));
+            }
+            // One tool is one operation, so a chain is split wherever its convexity
+            // changes. Between two smooth faces that cannot happen without passing
+            // through tangency, which was refused above; it is here for the faceted
+            // surface whose neighbouring facets fold the other way.
+            let mut run: Vec<Link> = Vec::new();
+            for seg in chain {
+                if run
+                    .last()
+                    .is_some_and(|prev| is_convex(&prev.seg) != is_convex(&seg))
+                {
+                    chains.push(std::mem::take(&mut run));
+                }
+                run.push(Link {
+                    seg,
+                    index: i as u32,
+                    key: *key,
+                });
+            }
+            chains.push(run);
+        }
+    }
+    let chains = join_tangent_runs(chains);
+    // A round and a bead that meet want a corner blend between them — the round rolling
+    // onto the bead's cylinder — and this kernel builds none: it would stop each tool a
+    // clearance short of the vertex, and the other tool's faces, a clearance away, then
+    // slice that end cap into fragments finer than the healer can pair. Refused by name
+    // instead of returning a shell with a hole in it.
+    for (i, a) in chains.iter().enumerate() {
+        for b in &chains[i + 1..] {
+            let (ca, cb) = (is_convex(&a[0].seg), is_convex(&b[0].seg));
+            if ca == cb || !chains_touch(a, b) {
+                continue;
+            }
+            let (convex, concave) = if ca == Some(true) { (a, b) } else { (b, a) };
+            return Err(KernelError::ConvexMeetsConcave {
+                convex: convex[0].key,
+                concave: concave[0].key,
+            });
+        }
     }
     // Whether there is material for it at all, checked after the edges are known to exist
     // so a stale reference is still reported as the stale reference it is.
@@ -204,7 +363,7 @@ fn tools_for(
     let body = solid.polygon_count();
     let coarsest: usize = chains
         .iter()
-        .map(|(_, _, c)| tool_polygons(ring_count(c), MIN_ARC_SEGMENTS))
+        .map(|c| tool_polygons(ring_count(c), MIN_ARC_SEGMENTS))
         .sum();
     if body + coarsest > MAX_FEATURE_POLYGONS {
         return Err(KernelError::BlendTooDense {
@@ -216,12 +375,193 @@ fn tools_for(
     // long chain beside a short one is not starved by an even split of the whole.
     let slack = (MAX_FEATURE_POLYGONS - body - coarsest) / chains.len().max(1);
     let mut tools = Vec::with_capacity(chains.len());
-    for (i, key, chain) in &chains {
+    for chain in &chains {
         let budget =
             (tool_polygons(ring_count(chain), MIN_ARC_SEGMENTS) + slack).min(MAX_TOOL_POLYGONS);
-        tools.push(tool_for_chain(op, *i, *key, chain, blend, tess, budget)?);
+        let ends = chain_ends(chain, &all_edges);
+        tools.push(tool_for_chain(op, chain, ends, blend, tess, budget)?);
     }
     Ok(tools)
+}
+
+/// How much the dihedral angle may vary along one edge before it is refused: two
+/// degrees, well inside what a tessellated rim perpendicular to its axis shows (none) and
+/// well outside rounding.
+const DIHEDRAL_DRIFT: f64 = 2.0 * std::f64::consts::PI / 180.0;
+
+/// Whether two chains share a point: a vertex of either lies on a segment of the other.
+fn chains_touch(a: &[Link], b: &[Link]) -> bool {
+    let on = |chain: &[Link], p: Vec3| {
+        chain
+            .iter()
+            .any(|l| distance_to_segment(p, l.seg.start, l.seg.end) <= MERGE_TOL)
+    };
+    a.iter().any(|l| on(b, l.seg.start) || on(b, l.seg.end))
+        || b.iter().any(|l| on(a, l.seg.start) || on(a, l.seg.end))
+}
+
+/// Whether the material at a segment is convex there: the tool for it is subtracted.
+/// `None` where the faces do not fold at all.
+fn is_convex(seg: &EdgeSegment) -> Option<bool> {
+    let (_, _, db, _) = dihedral(seg);
+    let turn = seg.normal_a.dot(db);
+    (turn.abs() >= 1e-6).then_some(turn < 0.0)
+}
+
+/// How far two chain directions may disagree at a shared vertex and still be one run:
+/// the same 15° the editor's tangent chain walks by ([`crate::pick::tangent_chain`]), so
+/// what one click selects is what one tool is built for. A tessellated arc's end chord
+/// leaves the true tangent by half a facet, at most 5°.
+const JOIN_COS: f64 = 0.966;
+
+/// Joins chains that continue one another tangentially into single chains.
+///
+/// Two selected edges that meet without a corner — one straight edge a boolean seam has
+/// cut into two keys, or the straight and the arc of a slot's outline — are one run of
+/// edge to the user, and are one tool here, mitred through the join like any other
+/// polyline joint. Built separately they overhang each other: each tool's end cap stands a
+/// clearance inside the other's start, a facet's angle off its first ring, and the
+/// boolean between the two leaves slivers it cannot heal. Only runs of one convexity are
+/// joined (a tool is one operation), and a vertex where more than one selected chain
+/// could continue is left alone, as the editor's chain pick leaves a fork alone.
+///
+/// Sharp turns are *not* joined, though a mitre would be exact for equal radii: two
+/// tools built separately keep their own faces and meet in the crease the module
+/// documents, and a mitre at a corner whose two edges have different dihedral angles
+/// would twist the band between them.
+fn join_tangent_runs(mut chains: Vec<Vec<Link>>) -> Vec<Vec<Link>> {
+    let start_of = |c: &[Link]| c[0].seg.start;
+    let end_of = |c: &[Link]| c.last().unwrap().seg.end;
+    let dir_in = |c: &[Link]| (c[0].seg.end - c[0].seg.start).normalize();
+    let dir_out = |c: &[Link]| {
+        let l = c.last().unwrap().seg;
+        (l.end - l.start).normalize()
+    };
+    let touching = |a: Vec3, b: Vec3| a.distance_squared(b) < MERGE_TOL * MERGE_TOL;
+    loop {
+        // The first pair of open chains whose ends meet tangentially, with no third
+        // chain's end at that vertex. Chains are few, so this is cheap enough to restart
+        // after every join.
+        let mut found: Option<(usize, usize, bool)> = None;
+        'outer: for i in 0..chains.len() {
+            if is_closed(&chains[i]) {
+                continue;
+            }
+            let (v, t, convex) = (
+                end_of(&chains[i]),
+                dir_out(&chains[i]),
+                is_convex(&chains[i][0].seg),
+            );
+            // Other chains with an end at `v`, and whether it is their start (joined as
+            // they are) or their end (joined reversed).
+            let mut candidates = Vec::new();
+            for (j, other) in chains.iter().enumerate() {
+                if j == i || is_closed(other) || is_convex(&other[0].seg) != convex {
+                    continue;
+                }
+                if touching(start_of(other), v) {
+                    candidates.push((j, false, dir_in(other)));
+                }
+                if touching(end_of(other), v) {
+                    candidates.push((j, true, -dir_out(other)));
+                }
+            }
+            if let [(j, reversed, dir)] = candidates[..]
+                && t.dot(dir) >= JOIN_COS
+            {
+                found = Some((i, j, reversed));
+                break 'outer;
+            }
+        }
+        let Some((i, j, reversed)) = found else {
+            return chains;
+        };
+        let mut other = chains.remove(j);
+        if reversed {
+            other = reverse_chain(other);
+        }
+        // `i` may have moved down by one when `j` was removed ahead of it.
+        let i = if j < i { i - 1 } else { i };
+        chains[i].extend(other);
+    }
+}
+
+/// The same chain walked the other way. A segment runs along face `a`'s winding, so
+/// turning it round swaps the roles of the two faces as well as the two ends; the
+/// dihedral it describes is unchanged.
+fn reverse_chain(chain: Vec<Link>) -> Vec<Link> {
+    chain
+        .into_iter()
+        .rev()
+        .map(|l| Link {
+            seg: EdgeSegment {
+                start: l.seg.end,
+                end: l.seg.start,
+                normal_a: l.seg.normal_b,
+                normal_b: l.seg.normal_a,
+            },
+            ..l
+        })
+        .collect()
+}
+
+/// A face at a chain's end counts as what the edge stops *against* only if it folds
+/// against the edge's direction by more than the kernel's tangent threshold, sin 20°; a
+/// face the edge runs along tangentially is one it continues past, not one it ends at.
+const END_FACE_SIN: f64 = 0.34;
+
+/// How the tool finishes at each end of `chain`: `[at its start, at its end]`. Both
+/// `Overhang` for a closed chain, which has no ends.
+fn chain_ends(chain: &[Link], all_edges: &[Edge]) -> [ChainEnd; 2] {
+    if is_closed(chain) {
+        return [ChainEnd::Overhang; 2];
+    }
+    let convex = is_convex(&chain[0].seg).unwrap_or(true);
+    let first = chain[0];
+    let last = *chain.last().unwrap();
+    let t_in = (first.seg.end - first.seg.start).normalize();
+    let t_out = (last.seg.end - last.seg.start).normalize();
+    [
+        end_style(first.seg.start, -t_in, convex, first.key, all_edges),
+        end_style(last.seg.end, t_out, convex, last.key, all_edges),
+    ]
+}
+
+/// What lies beyond the vertex `v` where a chain ends, leaving it along `t`.
+///
+/// The faces meeting at `v` other than the edge's own two are what the edge stops
+/// against. Take the one squarest to the edge: if the edge *leaves* through it (`t`
+/// along its outward normal) the space beyond is air, and if it *runs into* it (`t`
+/// against the normal) the space beyond is material. A subtracted tool may run on into
+/// air and an added one into material; either run on the other way would mark the body,
+/// so the tool stops short. No face squarer than the tangent threshold means the edge
+/// continues tangentially onto something the user did not pick, and the tool stops short
+/// of that too. Nothing at all beyond the edge's own faces — which a closed shell does
+/// not produce — keeps the overhang, as before.
+fn end_style(v: Vec3, t: Vec3, convex: bool, own: EdgeKey, all_edges: &[Edge]) -> ChainEnd {
+    let mut squarest: Option<f64> = None;
+    for edge in all_edges {
+        for seg in &edge.segments {
+            if distance_to_segment(v, seg.start, seg.end) > MERGE_TOL {
+                continue;
+            }
+            for (face, normal) in [(edge.key.a, seg.normal_a), (edge.key.b, seg.normal_b)] {
+                if face == own.a || face == own.b {
+                    continue;
+                }
+                let along = t.dot(normal);
+                if squarest.is_none_or(|s: f64| along.abs() > s.abs()) {
+                    squarest = Some(along);
+                }
+            }
+        }
+    }
+    match squarest {
+        None => ChainEnd::Overhang,
+        Some(along) if along.abs() < END_FACE_SIN => ChainEnd::Short,
+        Some(along) if (along > 0.0) == convex => ChainEnd::Overhang,
+        Some(_) => ChainEnd::Short,
+    }
 }
 
 // --- How large a blend may be ---------------------------------------------------------
@@ -265,7 +605,13 @@ impl BlendKind {
 /// Distance along a ray below which a crossing is the boundary the ray started from
 /// rather than one ahead of it: the segment being measured is part of the boundary the
 /// ray is cast into, and the ray leaves from a point on it.
-const OWN_BOUNDARY: f64 = 8.0 * MERGE_TOL;
+///
+/// Twice what a tool stopped [`SHORT`] of its edge's end leaves of that edge. A bead laid
+/// into the foot of a wall ends that much before the wall's end face, and the sliver of
+/// wall between is a face boundary like any other; measured as the room the next edge
+/// has, it bounded the round of that edge at two ten-thousandths. It is the corner the
+/// ray started from, not the far side of anything.
+const OWN_BOUNDARY: f64 = 2.0 * SHORT;
 
 /// How close a ray and a boundary segment come before they count as crossing. Inside a
 /// planar face the two are coplanar and the crossing is exact, so this only absorbs
@@ -387,7 +733,7 @@ fn size_limit(solid: &Solid, all_edges: &[Edge], keys: &[EdgeKey], kind: BlendKi
                 continue;
             }
             for from in sample_points(seg) {
-                for dir in interior_fan(seg.normal_a, seg.normal_b) {
+                for dir in interior_fan(seg) {
                     if let Some(depth) = ray_into_solid(solid, from, dir) {
                         limit = limit.min(depth / here);
                     }
@@ -412,14 +758,28 @@ fn sample_points(seg: &EdgeSegment) -> impl Iterator<Item = Vec3> + '_ {
         .map(|u| seg.start.lerp(seg.end, u))
 }
 
-/// Directions across the wedge of material at a convex edge, from one face's inward
-/// normal to the other's. Five is a compromise: a cavity corner can still slip between
-/// neighbouring rays, which the fan answers by bounding the whole cross-section by its
-/// widest reach (see the caller) rather than by each ray's own share of it.
-fn interior_fan(na: Vec3, nb: Vec3) -> impl Iterator<Item = Vec3> {
-    (0..5).filter_map(move |k| {
-        let w = k as f64 / 4.0;
-        (-(na * (1.0 - w) + nb * w)).try_normalize()
+/// Directions across the wedge of material at a convex edge, between the two in-face
+/// directions and strictly inside them. Five is a compromise: a cavity corner can still
+/// slip between neighbouring rays, which the fan answers by bounding the whole
+/// cross-section by its widest reach (see the caller) rather than by each ray's own
+/// share of it.
+///
+/// The wedge is spanned by the faces themselves, not by their inward normals: those
+/// coincide only at a right angle. On an acute edge — the high side of a cylinder cut
+/// off askew, where the cap meets the wall at 70° — the ray along the cap's inward normal
+/// leans 20° *outside* the wall and leaves the body through the next facet round, a
+/// fraction of a millimetre away, and that fraction became the limit on a rim with eight
+/// millimetres of wall under it. The rays divide the wedge in six and skip the two
+/// faces: a ray running in a face's own plane is skipped by [`ray_into_solid`] as
+/// coplanar with it, but on a faceted surface it drifts across the facet and meets the
+/// neighbouring facet's plane at the seam, and a ray only a degree or two inside a convex
+/// faceted face is overtaken by that plane a little further on. Eleven degrees off the
+/// face clears a 20° facet.
+fn interior_fan(seg: &EdgeSegment) -> impl Iterator<Item = Vec3> {
+    let (_, da, db, _) = dihedral(seg);
+    (1..6).filter_map(move |k| {
+        let w = k as f64 / 6.0;
+        (da * (1.0 - w) + db * w).try_normalize()
     })
 }
 
@@ -796,23 +1156,19 @@ fn section(seg: &EdgeSegment, blend: Blend, arc_segments: usize, convex: bool) -
 
 fn tool_for_chain(
     op: OpId,
-    index: u32,
-    key: EdgeKey,
-    chain: &[EdgeSegment],
+    chain: &[Link],
+    ends: [ChainEnd; 2],
     blend: Blend,
     tess: &Tessellation,
     budget: usize,
 ) -> Result<(Solid, BoolOp), KernelError> {
-    let first = &chain[0];
-    let (t0, _, db, _) = dihedral(first);
-    let turn = first.normal_a.dot(db);
-    if turn.abs() < 1e-6 {
-        // The faces do not fold here, so there is no dihedral to fill. This is the same
-        // condition `Edge::smooth` reports, which is why the editor never offers such an
-        // edge; a saved feature whose edge has since flattened arrives here instead.
-        return Err(KernelError::TangentEdge(key));
-    }
-    let convex = turn < 0.0;
+    let first = chain[0];
+    let key = first.key;
+    let (t0, _, _, _) = dihedral(&first.seg);
+    // The faces do not fold here, so there is no dihedral to fill. This is the same
+    // condition `Edge::smooth` reports, which is why the editor never offers such an
+    // edge; a saved feature whose edge has since flattened arrives here instead.
+    let convex = is_convex(&first.seg).ok_or(KernelError::TangentEdge(key))?;
     let bool_op = if convex {
         BoolOp::Subtract
     } else {
@@ -830,20 +1186,28 @@ fn tool_for_chain(
                 });
             }
             // The inverted arc sweeps the dihedral angle, the regular one its supplement.
-            let wanted = chain
-                .iter()
-                .map(|s| {
-                    let phi = dihedral(s).3;
-                    let sweep = if radius < 0.0 {
-                        phi
-                    } else {
-                        std::f64::consts::PI - phi
-                    };
-                    tess.segment_count(radius.abs(), sweep)
-                })
+            let sweeps = chain.iter().map(|l| {
+                let phi = dihedral(&l.seg).3;
+                if radius < 0.0 {
+                    phi
+                } else {
+                    std::f64::consts::PI - phi
+                }
+            });
+            let mut wanted = sweeps
+                .clone()
+                .map(|sweep| tess.segment_count(radius.abs(), sweep))
                 .max()
                 .unwrap_or(1)
                 .max(MIN_ARC_SEGMENTS);
+            let curved = chain
+                .iter()
+                .any(|l| (l.seg.end - l.seg.start).normalize().dot(t0) < 1.0 - 1e-9);
+            if curved {
+                let widest = sweeps.fold(0.0, f64::max);
+                let coarsest = (widest / MIN_CURVED_FACET_ANGLE).floor() as usize;
+                wanted = wanted.min(coarsest.max(MIN_ARC_SEGMENTS));
+            }
             if wanted > affordable {
                 log::warn!(
                     "blend on {key:?}: arc coarsened from {wanted} to {affordable} facets \
@@ -864,22 +1228,37 @@ fn tool_for_chain(
         }
     };
 
+    // Along the chain the tool runs a clearance past an open end or stops a clearance
+    // short of it, by what lies beyond ([`ChainEnd`]).
+    let run_on = |end: ChainEnd| match end {
+        ChainEnd::Overhang => CLEARANCE,
+        ChainEnd::Short => -SHORT,
+    };
+    let last = *chain.last().unwrap();
+    let t_end = (last.seg.end - last.seg.start).normalize();
+    let start_point = first.seg.start - t0 * run_on(ends[0]);
+    let end_point = last.seg.end + t_end * run_on(ends[1]);
+
     // One ring of section points per joint. Interior joints take the section of the
-    // incoming segment projected onto the bisecting plane; chain ends extend slightly.
+    // incoming segment projected onto the bisecting plane; chain ends are moved along the
+    // edge to where the tool finishes.
     let mut rings: Vec<Vec<Vec3>> = Vec::with_capacity(chain.len() + 1);
     let sections: Vec<Section> = chain
         .iter()
-        .map(|s| section(s, blend, arc_segments, convex))
+        .map(|l| section(&l.seg, blend, arc_segments, convex))
         .collect();
     let joint_count = if closed { chain.len() } else { chain.len() + 1 };
     for j in 0..joint_count {
         let (incoming, outgoing) = if closed {
             (
-                Some(&chain[(j + chain.len() - 1) % chain.len()]),
-                Some(&chain[j]),
+                Some(&chain[(j + chain.len() - 1) % chain.len()].seg),
+                Some(&chain[j].seg),
             )
         } else {
-            (if j > 0 { Some(&chain[j - 1]) } else { None }, chain.get(j))
+            (
+                if j > 0 { Some(&chain[j - 1].seg) } else { None },
+                chain.get(j).map(|l| &l.seg),
+            )
         };
         let ring = match (incoming, outgoing) {
             (Some(inc), Some(out)) => {
@@ -900,55 +1279,71 @@ fn tool_for_chain(
                     })
                     .collect()
             }
-            (None, Some(out)) => {
-                let t = (out.end - out.start).normalize();
-                sections[j]
-                    .offsets
-                    .iter()
-                    .map(|o| out.start + *o - t * CLEARANCE)
-                    .collect()
-            }
-            (Some(inc), None) => {
-                let t = (inc.end - inc.start).normalize();
-                sections[j - 1]
-                    .offsets
-                    .iter()
-                    .map(|o| inc.end + *o + t * CLEARANCE)
-                    .collect()
-            }
+            (None, Some(_)) => sections[j]
+                .offsets
+                .iter()
+                .map(|o| start_point + *o)
+                .collect(),
+            (Some(_), None) => sections[j - 1]
+                .offsets
+                .iter()
+                .map(|o| end_point + *o)
+                .collect(),
             (None, None) => unreachable!("a chain has at least one segment"),
         };
         rings.push(ring);
     }
 
-    let role = match blend {
+    // The blend face of each selected edge in the chain, with the surface it lies on. A
+    // run of collinear pieces — which is what every straight edge is once a boolean's
+    // healing has put vertices along it — is one cylinder, so it reports as one; a chain
+    // that turns is left freeform.
+    let role = |index: u32| match blend {
         Blend::Fillet { .. } => FaceRole::Fillet(index),
         Blend::Chamfer { .. } => FaceRole::Chamfer(index),
     };
-    let blend_key = FaceKey::new(op, role);
-    let surface = match (blend, chain.len()) {
-        (Blend::Fillet { radius }, 1) if radius < 0.0 => SurfaceKind::Cylindrical {
-            // The inverted arc is drawn about the edge itself.
-            origin: first.start,
-            axis: t0,
-            radius: -radius,
-        },
-        (Blend::Fillet { radius }, 1) => {
-            let sec = &sections[0];
-            let da = sec.offsets[0];
-            let db = sec.offsets[sec.blend_range.end - 1];
-            let phi = da.normalize().dot(db.normalize()).clamp(-1.0, 1.0).acos();
-            let centre = first.start + (da + db).normalize() * (radius / (phi / 2.0).sin());
-            SurfaceKind::Cylindrical {
-                origin: centre,
-                axis: t0,
-                radius,
-            }
+    let mut blend_faces: Vec<(u32, FaceKey, SurfaceKind)> = Vec::new();
+    for link in chain {
+        if blend_faces.iter().any(|(i, _, _)| *i == link.index) {
+            continue;
         }
-        (Blend::Chamfer { .. }, 1) => SurfaceKind::Planar { normal: Vec3::ZERO },
-        _ => SurfaceKind::Freeform,
+        let own: Vec<&Link> = chain.iter().filter(|l| l.index == link.index).collect();
+        let straight = own.iter().all(|l| {
+            let d = (l.seg.end - l.seg.start).normalize();
+            d.dot(t0) > 1.0 - 1e-9 && (l.seg.start - first.seg.start).cross(t0).length() < MERGE_TOL
+        });
+        let surface = match (blend, straight) {
+            (Blend::Fillet { radius }, true) if radius < 0.0 => SurfaceKind::Cylindrical {
+                // The inverted arc is drawn about the edge itself.
+                origin: first.seg.start,
+                axis: t0,
+                radius: -radius,
+            },
+            (Blend::Fillet { radius }, true) => {
+                let sec = &sections[0];
+                let da = sec.offsets[0];
+                let db = sec.offsets[sec.blend_range.end - 1];
+                let phi = da.normalize().dot(db.normalize()).clamp(-1.0, 1.0).acos();
+                let centre = first.seg.start + (da + db).normalize() * (radius / (phi / 2.0).sin());
+                SurfaceKind::Cylindrical {
+                    origin: centre,
+                    axis: t0,
+                    radius,
+                }
+            }
+            (Blend::Chamfer { .. }, true) => SurfaceKind::Planar { normal: Vec3::ZERO },
+            _ => SurfaceKind::Freeform,
+        };
+        blend_faces.push((link.index, FaceKey::new(op, role(link.index)), surface));
+    }
+    let blend_face = |index: u32| {
+        blend_faces
+            .iter()
+            .find(|(i, _, _)| *i == index)
+            .map(|(_, k, s)| (*k, *s))
+            .expect("every link's index was entered")
     };
-    let scaffold = |i: usize| FaceKey::new(op, FaceRole::Generic(index * 8 + i as u32));
+    let scaffold = |i: usize| FaceKey::new(op, FaceRole::Generic(first.index * 8 + i as u32));
 
     let mut b = SolidBuilder::default();
     let n = sections[0].offsets.len();
@@ -958,6 +1353,7 @@ fn tool_for_chain(
     let pair_count = if closed { rings.len() } else { rings.len() - 1 };
     for r in 0..pair_count {
         let (cur, next) = (&rings[r], &rings[(r + 1) % rings.len()]);
+        let (blend_key, surface) = blend_face(chain[r].index);
         for i in 0..n {
             let k = (i + 1) % n;
             let on_blend =
@@ -976,19 +1372,12 @@ fn tool_for_chain(
         }
     }
     if !closed {
-        let last = chain.last().unwrap();
-        let t_end = (last.end - last.start).normalize();
-        let ends = [
-            (&rings[0], first.start - t0 * CLEARANCE, -t0, 6u32),
-            (
-                rings.last().unwrap(),
-                last.end + t_end * CLEARANCE,
-                t_end,
-                7,
-            ),
+        let caps = [
+            (&rings[0], start_point, -t0, 6u32),
+            (rings.last().unwrap(), end_point, t_end, 7),
         ];
-        for (ring, centre, desired, i) in ends {
-            let cap_key = FaceKey::new(op, FaceRole::Generic(index * 8 + i));
+        for (ring, centre, desired, i) in caps {
+            let cap_key = FaceKey::new(op, FaceRole::Generic(first.index * 8 + i));
             for [p, q, r] in cap_triangles(ring, centre, &sections[0].blend_range) {
                 let poly = if (q - p).cross(r - p).dot(desired) >= 0.0 {
                     vec![p, q, r]
@@ -1472,11 +1861,16 @@ mod tests {
             .unwrap()
             .chains()
             .remove(0);
+        let links = |chain: Vec<EdgeSegment>, key: EdgeKey| -> Vec<Link> {
+            chain
+                .into_iter()
+                .map(|seg| Link { seg, index: 0, key })
+                .collect()
+        };
+        let open = links(open, edge_between(FaceRole::EndCap, FaceRole::Side(0)));
+        let closed = links(closed, rim(FaceRole::EndCap));
         assert!(!is_closed(&open) && is_closed(&closed), "the fixtures");
-        for (chain, key) in [
-            (&open, edge_between(FaceRole::EndCap, FaceRole::Side(0))),
-            (&closed, rim(FaceRole::EndCap)),
-        ] {
+        for chain in [&open, &closed] {
             for budget in [
                 tool_polygons(ring_count(chain), MIN_ARC_SEGMENTS),
                 tool_polygons(ring_count(chain), 7),
@@ -1484,9 +1878,8 @@ mod tests {
             ] {
                 let (tool, _) = tool_for_chain(
                     OpId::new(2),
-                    0,
-                    key,
                     chain,
+                    [ChainEnd::Overhang; 2],
                     Blend::Fillet { radius: 1.0 },
                     &fine(),
                     budget,
@@ -2035,13 +2428,13 @@ mod tests {
             "the cut leaves a pickable edge on the band"
         );
         let limit = max_fillet_radius(&half, &[key]).unwrap();
-        assert!(
-            limit < 1.0,
-            "a band one fillet-width wide cannot take {limit}"
-        );
+        // The interior rays leave the convex band within a couple of millimetres whatever
+        // direction they take, so the bound is a fraction of the 5 mm the band's box
+        // offered; what exactly depends on where the rays cross the band's facets.
+        assert!(limit < 3.0, "the rim's box is not the room: {limit}");
         assert!(limit > 0.02, "and the bound must not collapse: {limit}");
         assert!(matches!(
-            fillet(OpId::new(4), &half, &[key], 1.0, &Tessellation::default()).unwrap_err(),
+            fillet(OpId::new(4), &half, &[key], 5.0, &Tessellation::default()).unwrap_err(),
             KernelError::BlendTooLarge { .. }
         ));
         let r = fillet(OpId::new(4), &half, &[key], 0.05, &Tessellation::default()).unwrap();
@@ -2051,8 +2444,14 @@ mod tests {
 
     /// A cavity behind the faces bounds the blend, where the two adjacent faces alone
     /// see a solid 10 mm block. The interior rays fanned across the material's wedge
-    /// meet the cavity √2 mm from the edge along the diagonal, and the fillet sized to
-    /// that stays out of it: the same box without the cavity pins its limit at 10.
+    /// meet the cavity's ceiling and wall, and the fillet sized to what they find stays
+    /// out of it: the same box without the cavity pins its limit at 10.
+    ///
+    /// The exact bound is 2.5: the arc of a 2.5 round passes through the cavity's near
+    /// corner, 1 in and 0.5 down. No ray from the edge can find less than that corner's
+    /// distance, √5/2, and the fan is conservative — it asks for the setback along every
+    /// ray rather than the section's actual depth there, so that a corner between two
+    /// rays is still kept out — so the limit it reports lies between the two.
     #[test]
     fn a_cavity_behind_the_faces_bounds_the_fillet() {
         let hollow = boolean(
@@ -2069,7 +2468,10 @@ mod tests {
         assert_relative_eq!(hollow.volume(), 835.0, epsilon = 1e-6);
         let key = edge_between(FaceRole::EndCap, FaceRole::Side(0));
         let limit = max_fillet_radius(&hollow, &[key]).unwrap();
-        assert_relative_eq!(limit, 2f64.sqrt(), epsilon = 1e-6);
+        assert!(
+            limit >= 5f64.sqrt() / 2.0 - 1e-9 && limit <= 2.5 + 1e-9,
+            "{limit}"
+        );
         assert!(matches!(
             fillet(OpId::new(6), &hollow, &[key], 3.0, &fine()).unwrap_err(),
             KernelError::BlendTooLarge { .. }
