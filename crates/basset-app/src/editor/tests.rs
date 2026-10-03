@@ -5089,4 +5089,49 @@ mod bodies {
         h.editor.refresh_cache();
         assert!(h.editor.body_rename.is_none());
     }
+
+    /// A component's export takes what is shown of it, and of the components inside it,
+    /// and nothing of the components beside it.
+    #[test]
+    fn a_component_exports_its_visible_bodies_and_its_childrens() {
+        let mut h = Harness::new();
+        let a = h.block();
+        let b = h.block();
+        let loose = h.block();
+        h.editor.components_from_bodies(&[a, b]);
+        h.editor.refresh_cache();
+        let outer = component_of(&mut h, a);
+        // Made again, the component lands inside the one the body was in.
+        h.editor.components_from_bodies(&[a]);
+        h.editor.refresh_cache();
+        let inner = component_of(&mut h, a);
+        assert!(inner != outer);
+
+        assert_eq!(h.editor.component_export_bodies(outer), vec![a]);
+        assert_eq!(h.editor.component_export_bodies(inner), vec![a]);
+        let mut root = h.editor.component_export_bodies(ComponentId::ROOT);
+        root.sort();
+        assert_eq!(root, vec![a, b, loose]);
+
+        h.editor.hidden_bodies.insert(a);
+        assert!(h.editor.component_export_bodies(outer).is_empty());
+    }
+
+    /// The file holds the bodies asked for and no others.
+    #[test]
+    fn an_export_writes_only_the_bodies_given() {
+        let mut h = Harness::new();
+        let a = h.block();
+        h.block();
+        let dir = std::env::temp_dir().join(format!("basset-export-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("one.stl");
+        h.editor
+            .write_export(&path, &[a], crate::editor::files::MeshFormat::Stl);
+        assert!(h.editor.error.is_none(), "{:?}", h.editor.error);
+        let mesh = basset_io::stl::read(std::fs::File::open(&path).unwrap()).unwrap();
+        let volume = mesh.signed_volume().abs();
+        assert!((volume - h.volume(a).abs()).abs() < 1e-6, "{volume}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

@@ -13,6 +13,7 @@
 
 use winit::keyboard::{Key, NamedKey};
 
+use super::files::MeshFormat;
 use super::sketch_mode::{ConstraintKind, SketchPick, SketchTool, ToolGroup};
 use super::tools::ToolKind;
 use super::{DisplayMode, Editor, Mode, SelectMode};
@@ -31,6 +32,10 @@ pub(crate) enum Command {
     Save(bool),
     ExportStl,
     Export3mf,
+    /// Export these bodies, into a file named after the one body or after the document.
+    ExportBodies(Vec<basset_core::BodyRef>, MeshFormat),
+    /// Export a component's visible bodies, its sub-components' included.
+    ExportComponent(basset_core::ComponentId, MeshFormat),
     Quit,
     Undo,
     Redo,
