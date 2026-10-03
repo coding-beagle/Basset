@@ -2,3 +2,4 @@
 **/*.rs.bk
 *.bass.bak
 .DS_Store
+testcases/library/models/*
