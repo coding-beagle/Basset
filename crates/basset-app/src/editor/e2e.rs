@@ -178,6 +178,117 @@ fn the_any_filter_selects_a_sketch_left_on_screen() {
     assert!(h.editor.selection.curves.is_empty());
 }
 
+/// Sketches on the block's top face a 2..7 square, left on screen, with the camera on
+/// the block. Returns the body and the sketch. Without `keep_outline` the face's
+/// outline, which a sketch on a face opens with, is deleted first, so the square is
+/// the only region and the rest of the face is bare.
+fn block_with_a_square_on_its_top(
+    h: &mut Harness,
+    keep_outline: bool,
+) -> (basset_core::BodyRef, basset_core::FeatureId) {
+    let body = h.block();
+    h.editor.zoom_to_fit();
+    h.start_sketch(PlaneRef::Face(super::harness::top_face(body)));
+    if !keep_outline {
+        let s = h.sketch();
+        s.selected = s.sketch.entities().map(|(id, _)| id).collect();
+        s.delete_selected();
+    }
+    // The drawing rays come straight down the world z axis, so these are world x and y
+    // on the face, whatever axes the face's own frame happens to have.
+    h.rectangle(Vec2::new(2.0, 2.0), Vec2::new(7.0, 7.0));
+    h.finish_sketch(true);
+    let sketch = h.last_feature();
+    assert!(
+        h.editor
+            .visible_sketches()
+            .iter()
+            .any(|(id, _)| *id == sketch),
+        "the finished sketch stays on screen"
+    );
+    assert_eq!(h.editor.select_mode, SelectMode::Any);
+    (body, sketch)
+}
+
+/// A sketch drawn on a face is coplanar with it, so depth ties and used to hand the
+/// click to the face: the profile drawn on a body for extruding could not be clicked.
+/// The drawing is the more specific thing under the pointer, so it wins.
+#[test]
+fn a_click_inside_a_sketch_on_a_face_selects_the_region() {
+    let mut h = Harness::new();
+    let (body, sketch) = block_with_a_square_on_its_top(&mut h, true);
+
+    h.click_world(Vec3::new(4.5, 4.5, 2.0));
+    let profiles = &h.editor.selection.profiles;
+    assert_eq!(profiles.len(), 1, "{:?}", h.editor.selection);
+    assert_eq!(profiles[0].sketch, sketch);
+    assert!(h.editor.selection.faces.is_empty());
+
+    // Beside the square is sketch too: the face's copied outline closes a ring around
+    // it, and that ring is a region to extrude like any other.
+    h.click_world(Vec3::new(8.5, 8.5, 2.0));
+    let profiles = &h.editor.selection.profiles;
+    assert_eq!(profiles.len(), 1, "{:?}", h.editor.selection);
+    assert_eq!(profiles[0].sketch, sketch);
+
+    // The square's edge is a curve, not the region and not the face.
+    h.click_world(Vec3::new(4.5, 2.0, 2.0));
+    assert_eq!(
+        h.editor.selection.curves.len(),
+        1,
+        "{:?}",
+        h.editor.selection
+    );
+
+    // Asking for faces still gets the face, sketch or no sketch.
+    h.editor.set_select_mode(SelectMode::Faces);
+    h.click_world(Vec3::new(4.5, 4.5, 2.0));
+    assert_eq!(
+        h.editor.selection.faces,
+        vec![super::harness::top_face(body)],
+        "{:?}",
+        h.editor.selection
+    );
+    assert!(h.editor.selection.profiles.is_empty());
+
+    // And Extrude, which takes either, gets the region it was drawn for.
+    h.editor.set_select_mode(SelectMode::Any);
+    h.start_tool(ToolKind::Extrude);
+    h.click_world(Vec3::new(4.5, 4.5, 2.0));
+    assert_eq!(
+        h.editor.selection.profiles.len(),
+        1,
+        "{:?}",
+        h.editor.selection
+    );
+    assert!(h.editor.selection.faces.is_empty());
+}
+
+/// Face area the sketch does not cover is still the face — including where the
+/// block's own base sketch lies underneath, on the bottom, which the solid hides.
+#[test]
+fn a_click_on_a_face_beside_its_sketch_selects_the_face() {
+    let mut h = Harness::new();
+    let (body, _) = block_with_a_square_on_its_top(&mut h, false);
+    let base = h.editor.doc.timeline().features()[0].id;
+    assert!(
+        h.editor
+            .visible_sketches()
+            .iter()
+            .any(|(id, _)| *id == base),
+        "the base sketch is on screen too, under the block"
+    );
+
+    h.click_world(Vec3::new(8.5, 8.5, 2.0));
+    assert_eq!(
+        h.editor.selection.faces,
+        vec![super::harness::top_face(body)],
+        "{:?}",
+        h.editor.selection
+    );
+    assert!(h.editor.selection.profiles.is_empty());
+}
+
 #[test]
 fn the_pointer_navigates_the_camera() {
     let mut h = Harness::new();
