@@ -319,7 +319,12 @@ it had. The version was bumped all the same, because migration is only half of w
 version number is for. A file written now can carry parameters, and an older build reading
 it would drop them silently and save back a document whose extrude distances no longer say
 where they came from; refusing to open it, which the existing unsupported-version path
-already does for anything newer than the build knows, is much better than that. The
+already does for anything newer than the build knows, is much better than that. Version 6
+added `visibility` — the hidden bodies and sketches and whether the origin and grid are
+shown — for the same reason and with the same identity migration; an older file opens
+with the defaults a fresh editor shows. Visibility sits outside the undo snapshots, since
+hiding something is not an edit. The editor keeps its own working copy and syncs it into
+the document on save and back out on open. The
 document is the timeline plus that table plus metadata; geometry is never stored because it
 is fully regenerable. Old versions are migrated on load; newer versions are refused with a
 clear error. Saves go through a temporary file and rename so a crash never truncates the

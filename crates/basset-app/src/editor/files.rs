@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use basset_core::file;
+use basset_core::{Visibility, file};
 use basset_io::{ExportItem, Unit};
 
 use super::Editor;
@@ -16,8 +16,7 @@ impl Editor {
         self.doc.set_font(self.font.clone());
         self.path = None;
         self.selection.clear();
-        self.hidden_bodies.clear();
-        self.hidden_sketches.clear();
+        self.apply_visibility(&Visibility::default());
         self.active_component = basset_core::ComponentId::ROOT;
         self.title_dirty = true;
         self.set_status("New document");
@@ -44,8 +43,8 @@ impl Editor {
                 self.doc = doc;
                 self.path = Some(path.clone());
                 self.selection.clear();
-                self.hidden_bodies.clear();
-                self.hidden_sketches.clear();
+                let visibility = self.doc.visibility().clone();
+                self.apply_visibility(&visibility);
                 self.active_component = basset_core::ComponentId::ROOT;
                 self.title_dirty = true;
                 self.set_status(format!("Opened {}", path.display()));
@@ -70,6 +69,7 @@ impl Editor {
                 with_extension(p, file::EXTENSION)
             }
         };
+        self.doc.set_visibility(self.visibility());
         match file::save(&path, &self.doc) {
             Ok(()) => {
                 self.doc.name = path
@@ -82,6 +82,26 @@ impl Editor {
             }
             Err(e) => self.report_error(format!("could not save: {e}")),
         }
+    }
+
+    /// What is hidden, in the form the document saves. The editor keeps its own working
+    /// copy because every frame reads it and the panels toggle it in place; the document's
+    /// copy is brought up to date on save and read back on open, which are the only two
+    /// moments the file sees it.
+    pub fn visibility(&self) -> Visibility {
+        Visibility {
+            hidden_bodies: self.hidden_bodies.iter().copied().collect(),
+            hidden_sketches: self.hidden_sketches.iter().copied().collect(),
+            show_origin: self.show_origin,
+            show_grid: self.show_grid,
+        }
+    }
+
+    fn apply_visibility(&mut self, visibility: &Visibility) {
+        self.hidden_bodies = visibility.hidden_bodies.iter().copied().collect();
+        self.hidden_sketches = visibility.hidden_sketches.iter().copied().collect();
+        self.show_origin = visibility.show_origin;
+        self.show_grid = visibility.show_grid;
     }
 
     pub fn export_stl(&mut self) {

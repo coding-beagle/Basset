@@ -12,6 +12,7 @@
 //! * `timeline`    — ordering, rollback cursor, insertion at the cursor.
 //! * `regen`       — evaluating features into geometry, with per-feature caching.
 //! * `document`    — the user-facing aggregate with undo/redo.
+//! * `visibility`  — what the user has hidden, saved but outside the model.
 //! * `file`        — the versioned `.bass` on-disk format.
 
 pub mod document;
@@ -24,6 +25,7 @@ pub mod project;
 pub mod refs;
 pub mod regen;
 pub mod timeline;
+pub mod visibility;
 
 pub use document::{Document, DocumentError, Units};
 pub use feature::{BodyOp, CombineOp, Extent, Feature, FeatureKind, NumericField};
@@ -37,6 +39,7 @@ pub use refs::{
 };
 pub use regen::convert_profile;
 pub use timeline::Timeline;
+pub use visibility::Visibility;
 
 // Re-exported so application code only needs one dependency for the object model.
 pub use basset_kernel::{EdgeKey, FaceKey, FaceRole, Solid};
