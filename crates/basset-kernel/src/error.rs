@@ -26,7 +26,9 @@ pub enum KernelError {
     TooFewSections,
     #[error("loft sections must all have the same number of holes")]
     MismatchedHoles,
-    #[error("radius or distance must be positive")]
+    #[error(
+        "radius or distance must not be zero (a chamfer distance must be positive; a negative fillet radius inverts the round)"
+    )]
     NonPositiveBlend,
     #[error("edge {0:?} does not exist on this body")]
     MissingEdge(EdgeKey),

@@ -207,6 +207,10 @@ pub enum FeatureKind {
     },
     Fillet {
         edges: Vec<EdgeRef>,
+        /// Signed. Negative is the inverted round — a cove cut into a convex edge, a
+        /// bead laid into a concave one — which is the fillet handle dragged the other
+        /// way. Files written before the sign meant anything hold positive radii and
+        /// read back unchanged. The kernel refuses zero.
         radius: f64,
     },
     Chamfer {

@@ -2,7 +2,11 @@
 //!
 //! Both are built the same way: for every selected edge, construct a prismatic *tool*
 //! whose cross-section is the material to remove (convex edge) or add (concave edge),
-//! and apply it with a boolean. The cross-section is exact in the plane perpendicular to
+//! and apply it with a boolean. A fillet's radius is signed: positive is the round
+//! everyone expects, negative is the *inverted* round — the complementary quarter-disc,
+//! centred on the edge rather than tangent to the faces — which cuts a cove into a convex
+//! edge and lays a bead into a concave one. The same handle dragged the other way, as
+//! Fusion's Press/Pull does it; see [`section`] for the geometry. The cross-section is exact in the plane perpendicular to
 //! the edge; along curved edges the prism is mitred at every polyline joint so
 //! consecutive pieces meet on the bisecting plane. Corners where several filleted edges
 //! meet are simply the intersection of their tools, which is a crease rather than the
@@ -90,19 +94,38 @@ fn ring_count(chain: &[EdgeSegment]) -> usize {
 
 #[derive(Clone, Copy)]
 enum Blend {
+    /// Signed: negative is the inverted round, see the module docs.
     Fillet { radius: f64 },
+    /// Unsigned. The triangle a chamfer takes off an edge has its apex *on* the edge, so
+    /// the chamfer already is its own "inverted" form — mirroring the section about the
+    /// edge gives the same triangle back — and there is no complementary shape for a sign
+    /// to select. A negative distance is refused like a zero one.
     Chamfer { distance: f64 },
 }
 
 impl Blend {
     fn kind(self) -> BlendKind {
         match self {
+            Blend::Fillet { radius } if radius < 0.0 => BlendKind::InvertedFillet,
             Blend::Fillet { .. } => BlendKind::Fillet,
             Blend::Chamfer { .. } => BlendKind::Chamfer,
         }
     }
+
+    /// The blend's size without its sign: what is held against the material and what the
+    /// arc is drawn with. A chamfer's distance comes back as it is, sign and all, so a
+    /// negative one still fails the positivity check.
+    fn size(self) -> f64 {
+        match self {
+            Blend::Fillet { radius } => radius.abs(),
+            Blend::Chamfer { distance } => distance,
+        }
+    }
 }
 
+/// Rounds `edges` of `solid` with `radius`. Negative inverts the round: the section is
+/// the quarter-disc about the edge rather than the one tangent to the faces, so a convex
+/// edge gets a cove and a concave one a bead. Zero is refused.
 pub fn fillet(
     op: OpId,
     solid: &Solid,
@@ -151,10 +174,7 @@ fn tools_for(
     blend: Blend,
     tess: &Tessellation,
 ) -> Result<Vec<(Solid, BoolOp)>, KernelError> {
-    let size = match blend {
-        Blend::Fillet { radius } => radius,
-        Blend::Chamfer { distance } => distance,
-    };
+    let size = blend.size();
     if !size.is_finite() || size <= 0.0 {
         return Err(KernelError::NonPositiveBlend);
     }
@@ -220,6 +240,7 @@ fn tools_for(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BlendKind {
     Fillet,
+    InvertedFillet,
     Chamfer,
 }
 
@@ -230,11 +251,13 @@ impl BlendKind {
     /// touches each face where the perpendicular from that centre meets it, which is
     /// r/tan(phi/2) from the edge: the far leg of the right triangle whose near leg is r
     /// and whose angle at the edge is phi/2. It is the same `d` [`section`] lays its
-    /// cross-section out with. A chamfer's setback is its distance, by definition.
+    /// cross-section out with. A chamfer's setback is its distance, by definition, and
+    /// so is an inverted fillet's: its arc is centred on the edge and meets each face a
+    /// radius out along it, whatever the dihedral angle. At 90° all three agree.
     fn setback_per_size(self, phi: f64) -> f64 {
         match self {
             BlendKind::Fillet => 1.0 / (phi / 2.0).tan(),
-            BlendKind::Chamfer => 1.0,
+            BlendKind::InvertedFillet | BlendKind::Chamfer => 1.0,
         }
     }
 }
@@ -563,6 +586,15 @@ pub fn max_chamfer_distance(solid: &Solid, keys: &[EdgeKey]) -> Option<f64> {
     size_limit(solid, &solid.edges(), keys, BlendKind::Chamfer)
 }
 
+/// The largest *magnitude* an inverted (negative) fillet radius may have on the edges
+/// `keys` of `solid`. The editor clamps the handle's negative travel to this. It differs
+/// from [`max_fillet_radius`] away from 90°: an inverted round sits a radius out along
+/// each face where a regular one sits r/tan(phi/2) out, so on an obtuse edge the inverted
+/// form runs out of face first and on an acute one the regular form does.
+pub fn max_inverted_fillet_radius(solid: &Solid, keys: &[EdgeKey]) -> Option<f64> {
+    size_limit(solid, &solid.edges(), keys, BlendKind::InvertedFillet)
+}
+
 /// Folds the tools into as few as possible, so the body goes through one boolean rather
 /// than one per edge.
 ///
@@ -696,18 +728,39 @@ pub fn blend_direction(seg: &EdgeSegment) -> Option<Vec3> {
 /// `arc_segments` is fixed per chain: every ring must have the same vertex count for the
 /// quads between them to make sense, and rounding noise in the dihedral angle would
 /// otherwise let neighbouring segments round the count differently.
+///
+/// A regular fillet's section is the region between the two faces and an arc tangent to
+/// both, centred r/sin(phi/2) along the in-face bisector. An inverted fillet's is the
+/// sector of the disc of radius |r| *about the edge line*, cut off by the two face
+/// planes: it lands |r| out along each face and its arc bulges away from the edge,
+/// sweeping the dihedral angle phi itself rather than its supplement. That is the rule
+/// at every dihedral, not only 90°: the inverted section is always the set of points
+/// within |r| of the edge that lie between the two face planes, so an acute edge takes a
+/// narrow sector and an obtuse one a wide one, and its setback along each face is |r|
+/// exactly (which is why [`BlendKind::InvertedFillet`] bounds it like a chamfer). At 90°
+/// the two are complementary in the r × r square at the edge: the inverted section is
+/// that square less a copy of the regular section turned through 180°, so the cove is
+/// precisely the quarter-cylinder of material a regular round of the same radius leaves
+/// standing — the "press through to the other shape" reading the handle gives it. Either
+/// way the scaffolding past the faces is the same, so one tool builder serves both.
 fn section(seg: &EdgeSegment, blend: Blend, arc_segments: usize, convex: bool) -> Section {
     let (t, da, db, phi) = dihedral(seg);
     let (na, nb) = (seg.normal_a, seg.normal_b);
     let (ta, tb, arc) = match blend {
         Blend::Chamfer { distance } => (da * distance, db * distance, Vec::new()),
         Blend::Fillet { radius } => {
-            let d = radius / (phi / 2.0).tan();
-            let centre = (da + db).normalize() * (radius / (phi / 2.0).sin());
-            let ta = da * d;
-            let tb = db * d;
-            // The arc from ta to tb about `centre`, on the side nearest the edge.
-            let sweep = std::f64::consts::PI - phi;
+            let inverted = radius < 0.0;
+            let radius = radius.abs();
+            let (centre, ta, tb, sweep) = if inverted {
+                (Vec3::ZERO, da * radius, db * radius, phi)
+            } else {
+                let d = radius / (phi / 2.0).tan();
+                let centre = (da + db).normalize() * (radius / (phi / 2.0).sin());
+                (centre, da * d, db * d, std::f64::consts::PI - phi)
+            };
+            // The arc from ta to tb about `centre`: for a regular fillet on the side
+            // nearest the edge, for an inverted one through the bisector away from it.
+            // Both are the shorter way round from ta to tb, so one sweep rule serves.
             let n = arc_segments;
             let u = (ta - centre).normalize();
             let v = t.cross(u)
@@ -776,9 +829,18 @@ fn tool_for_chain(
                     budget,
                 });
             }
+            // The inverted arc sweeps the dihedral angle, the regular one its supplement.
             let wanted = chain
                 .iter()
-                .map(|s| tess.segment_count(radius, std::f64::consts::PI - dihedral(s).3))
+                .map(|s| {
+                    let phi = dihedral(s).3;
+                    let sweep = if radius < 0.0 {
+                        phi
+                    } else {
+                        std::f64::consts::PI - phi
+                    };
+                    tess.segment_count(radius.abs(), sweep)
+                })
                 .max()
                 .unwrap_or(1)
                 .max(MIN_ARC_SEGMENTS);
@@ -865,6 +927,12 @@ fn tool_for_chain(
     };
     let blend_key = FaceKey::new(op, role);
     let surface = match (blend, chain.len()) {
+        (Blend::Fillet { radius }, 1) if radius < 0.0 => SurfaceKind::Cylindrical {
+            // The inverted arc is drawn about the edge itself.
+            origin: first.start,
+            axis: t0,
+            radius: -radius,
+        },
         (Blend::Fillet { radius }, 1) => {
             let sec = &sections[0];
             let da = sec.offsets[0];
@@ -1059,6 +1127,190 @@ mod tests {
         let added = (4.0 - PI) * 10.0;
         assert_relative_eq!(r.volume(), 750.0 + added, epsilon = 0.05);
         assert!(r.is_closed(), "{:?}", r.validate());
+    }
+
+    /// A negative radius is the complementary round: on a convex edge it cuts the
+    /// quarter-cylinder about the edge away, a cove where a regular fillet leaves a
+    /// bulge. Regular and inverted together take exactly the r × r square at the edge.
+    #[test]
+    fn inverted_fillet_cuts_a_cove_into_a_convex_edge() {
+        let c = cube();
+        let key = edge_between(FaceRole::EndCap, FaceRole::Side(0));
+        let r = fillet(OpId::new(2), &c, &[key], -2.0, &fine()).unwrap();
+        assert_relative_eq!(r.volume(), 1000.0 - PI * 4.0 / 4.0 * 10.0, epsilon = 0.05);
+        assert!(r.is_closed(), "{:?}", r.validate());
+        let bb = r.aabb();
+        assert_relative_eq!(bb.min.length_squared(), 0.0, epsilon = 1e-9);
+        assert_relative_eq!(bb.max.length_squared(), 300.0, epsilon = 1e-6);
+        // The regular round on the same edge takes the rest of the 2 × 2 square.
+        let regular = fillet(OpId::new(2), &c, &[key], 2.0, &fine()).unwrap();
+        assert_relative_eq!(regular.volume(), 1000.0 - (4.0 - PI) * 10.0, epsilon = 0.05);
+        assert_relative_eq!(
+            (1000.0 - r.volume()) + (1000.0 - regular.volume()),
+            2.0 * 2.0 * 10.0,
+            epsilon = 0.1
+        );
+        // The new face keeps the fillet's key — flipping the sign must not orphan a
+        // later feature that names it — and is a cylinder about the edge of radius |r|.
+        let face = r
+            .face(FaceKey::new(OpId::new(2), FaceRole::Fillet(0)))
+            .unwrap();
+        match face.surface {
+            SurfaceKind::Cylindrical { origin, radius, .. } => {
+                assert_eq!(radius, 2.0);
+                assert_relative_eq!(origin.y, 0.0, epsilon = 1e-9);
+                assert_relative_eq!(origin.z, 10.0, epsilon = 1e-9);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_relative_eq!(face.area(), PI * 2.0 / 2.0 * 10.0, epsilon = 0.05);
+        // Each adjacent face loses a 2 mm strip, as it would to a chamfer.
+        let top = r
+            .face(FaceKey::new(OpId::new(1), FaceRole::EndCap))
+            .unwrap();
+        assert_relative_eq!(top.area(), 80.0, epsilon = 1e-2);
+    }
+
+    /// On a concave edge the inverted round adds the quarter-cylinder: a bead in the
+    /// corner rather than the regular fillet's cove-shaped infill.
+    #[test]
+    fn inverted_fillet_lays_a_bead_into_a_concave_edge() {
+        let (l, key) = l_block();
+        let r = fillet(OpId::new(3), &l, &[key], -2.0, &fine()).unwrap();
+        assert_relative_eq!(r.volume(), 750.0 + PI * 4.0 / 4.0 * 10.0, epsilon = 0.05);
+        assert!(r.is_closed(), "{:?}", r.validate());
+        // Nothing grows outside the block's envelope, bar the tool's end clearance,
+        // which a regular concave fillet leaves past the chain's ends as well.
+        let bb = r.aabb();
+        assert!(bb.min.min_element() > -2.0 * CLEARANCE, "{bb:?}");
+        assert!(bb.max.max_element() < 10.0 + 2.0 * CLEARANCE, "{bb:?}");
+    }
+
+    /// The inverted round is bounded by the faces it sits between, like the regular one:
+    /// at 90° by the same number, and zero is refused whichever way it is read.
+    #[test]
+    fn inverted_fillet_is_bounded_by_the_material_and_refuses_zero() {
+        let c = cube();
+        let key = edge_between(FaceRole::EndCap, FaceRole::Side(0));
+        let limit = max_inverted_fillet_radius(&c, &[key]).unwrap();
+        assert_relative_eq!(
+            limit,
+            max_fillet_radius(&c, &[key]).unwrap(),
+            epsilon = 1e-9
+        );
+        assert!(matches!(
+            fillet(OpId::new(2), &c, &[key], -(limit * 1.5), &fine()),
+            Err(KernelError::BlendTooLarge { .. })
+        ));
+        assert!(matches!(
+            fillet(OpId::new(2), &c, &[key], 0.0, &fine()),
+            Err(KernelError::NonPositiveBlend)
+        ));
+        // A chamfer has no inverted form, so a negative distance is still a refusal.
+        assert!(matches!(
+            chamfer(OpId::new(2), &c, &[key], -2.0),
+            Err(KernelError::NonPositiveBlend)
+        ));
+    }
+
+    /// Round a closed rim the inverted tool is a ring of quarter-discs about the rim, and
+    /// the sweep closes on itself the way the regular one does.
+    #[test]
+    fn inverted_fillet_round_a_cylinder_rim() {
+        let cyl = crate::primitives::cylinder(
+            OpId::new(1),
+            Vec3::ZERO,
+            Vec3::Z,
+            5.0,
+            10.0,
+            &Tessellation::default(),
+        );
+        let key = EdgeKey::new(
+            FaceKey::new(OpId::new(1), FaceRole::EndCap),
+            FaceKey::new(OpId::new(1), FaceRole::Side(0)),
+        );
+        let r = fillet(OpId::new(2), &cyl, &[key], -1.0, &Tessellation::default()).unwrap();
+        assert!(r.is_closed(), "{:?}", r.validate());
+        // Pappus: a quarter-disc of radius 1 (area π/4, centroid 4/(3π) in from the rim)
+        // swept round the rim.
+        let expected = cyl.volume() - PI / 4.0 * 2.0 * PI * (5.0 - 4.0 / (3.0 * PI));
+        assert_relative_eq!(r.volume(), expected, epsilon = 1.5);
+        assert!(r.aabb().max.z <= 10.0 + 1e-9);
+    }
+
+    /// Off 90° the inverted section is the sector of the dihedral angle, |r| out along
+    /// each face: a 45° wedge loses a 45° sector, an eighth of the disc.
+    #[test]
+    fn inverted_fillet_on_an_acute_edge_takes_the_sector_of_the_dihedral() {
+        let prism = wedge();
+        assert_relative_eq!(prism.volume(), 500.0, epsilon = 1e-6);
+        let edge = vertical_edge_at(&prism, 10.0, 0.0);
+        let r = fillet(OpId::new(2), &prism, &[edge], -2.0, &fine()).unwrap();
+        assert!(r.is_closed(), "{:?}", r.validate());
+        let sector = PI * 4.0 * (45.0 / 360.0);
+        assert_relative_eq!(r.volume(), 500.0 - sector * 10.0, epsilon = 0.05);
+        // A radius out along each face: the side along y = 0 ends 2 mm short of x = 10.
+        let side = r
+            .faces
+            .iter()
+            .find(|f| {
+                f.polygons
+                    .iter()
+                    .all(|p| p.vertices.iter().all(|v| v.y.abs() < 1e-9))
+            })
+            .expect("the side along y = 0");
+        let far_x = side
+            .polygons
+            .iter()
+            .flat_map(|p| p.vertices.iter().map(|v| v.x))
+            .fold(f64::MIN, f64::max);
+        assert_relative_eq!(far_x, 8.0, epsilon = 1e-6);
+        // On an acute edge the regular round lands further out (r/tan(22.5°) ≈ 2.41 r)
+        // than the inverted one (r), so it is the regular limit that is the tighter.
+        let (inverted, regular) = (
+            max_inverted_fillet_radius(&prism, &[edge]).unwrap(),
+            max_fillet_radius(&prism, &[edge]).unwrap(),
+        );
+        assert!(
+            inverted > regular,
+            "inverted {inverted} vs regular {regular}"
+        );
+    }
+
+    /// A right triangular prism, legs 10 along x and y, 10 tall: its two vertical edges
+    /// at the ends of the hypotenuse have 45° dihedrals.
+    fn wedge() -> Solid {
+        use basset_math::{Frame, Vec2};
+        // One curve tag per side, or the extrude folds the three into one face.
+        let profile = crate::Profile::new(
+            Frame::XY,
+            crate::Contour {
+                points: vec![
+                    Vec2::new(0.0, 0.0),
+                    Vec2::new(10.0, 0.0),
+                    Vec2::new(0.0, 10.0),
+                ],
+                segments: (0..3).map(crate::Segment::line).collect(),
+                closed: true,
+            },
+        );
+        crate::extrude(OpId::new(1), &profile, crate::Extent::OneSide(10.0)).unwrap()
+    }
+
+    /// The vertical edge of a prism standing at (x, y).
+    fn vertical_edge_at(solid: &Solid, x: f64, y: f64) -> EdgeKey {
+        solid
+            .edges()
+            .into_iter()
+            .find(|e| {
+                e.segments.iter().all(|s| {
+                    [s.start, s.end]
+                        .iter()
+                        .all(|p| (p.x - x).abs() < 1e-9 && (p.y - y).abs() < 1e-9)
+                })
+            })
+            .unwrap_or_else(|| panic!("no vertical edge at ({x}, {y})"))
+            .key
     }
 
     #[test]
@@ -1686,7 +1938,7 @@ mod tests {
     /// Extruded trapezoid, 10 mm tall: the top face is 10 mm deep behind the middle of
     /// its long side and 2.5 mm behind either end, where the slanted sides close in.
     fn trapezoid_block() -> Solid {
-        let mut outer = crate::geometry::Contour::polygon(
+        let mut outer = crate::Contour::polygon(
             vec![
                 basset_math::Vec2::ZERO,
                 basset_math::Vec2::new(10.0, 0.0),
@@ -1698,9 +1950,9 @@ mod tests {
         for (i, s) in outer.segments.iter_mut().enumerate() {
             s.curve = i as u32;
         }
-        crate::generate::extrude(
+        crate::extrude(
             OpId::new(1),
-            &crate::geometry::Profile::new(basset_math::Frame::XY, outer),
+            &crate::Profile::new(basset_math::Frame::XY, outer),
             crate::geometry::Extent::OneSide(10.0),
         )
         .unwrap()

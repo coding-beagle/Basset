@@ -97,7 +97,13 @@ Details worth knowing:
   polyline joint) and applied with a boolean: subtract for convex edges, union for
   concave ones. Where several blended edges meet the result is the intersection of their
   tools (a crease), not a spherical corner patch. Rolling over a face onto a neighbour
-  (a radius larger than the adjacent face) is not detected.
+  (a radius larger than the adjacent face) is not detected. A fillet radius is signed,
+  and the sign is the shape: positive is the round tangent to both faces, negative the
+  *inverted* round — the sector of the dihedral angle about the edge line itself, a
+  radius out along each face — which cuts a cove into a convex edge and lays a bead into
+  a concave one. It is the same handle dragged the other way, as in Fusion's Press/Pull.
+  A chamfer has no inverted form: the triangle it takes off already has its apex on the
+  edge, so it stays unsigned.
 * A BSP tree over a convex body is a list — the solid is the intersection of its face
   half-spaces, so every face plane has the rest behind it — and a boolean is quadratic
   in the facets of such a body. A fillet tool swept round a rim is one, and so is the

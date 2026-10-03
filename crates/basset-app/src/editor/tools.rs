@@ -246,7 +246,21 @@ pub struct Tool {
     /// selection it was worked out for. Asking the kernel costs a pass over the body's
     /// edges, which is nothing beside a boolean but too much to spend on every frame of
     /// a drag, so it is kept until the selection itself moves on.
-    limit: (Vec<EdgeRef>, Option<f64>),
+    limit: (Vec<EdgeRef>, BlendLimits),
+}
+
+/// How far a blend's handle may go each way on the selection it is running on.
+///
+/// A fillet's radius is signed — dragged through zero it becomes the inverted round —
+/// and the two forms run out of material at different sizes away from 90°, so each
+/// direction carries its own stop. A chamfer has one form and so one stop.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BlendLimits {
+    /// The largest regular fillet radius or chamfer distance.
+    pub regular: Option<f64>,
+    /// The largest magnitude an inverted fillet radius may have. `None` for a chamfer,
+    /// whose handle stops at zero.
+    pub inverted: Option<f64>,
 }
 
 impl Tool {
@@ -290,10 +304,21 @@ impl Tool {
             && self.params.to_face.is_none()
     }
 
-    /// The largest radius or distance this blend may be given, as last worked out for
-    /// the selection it is running on. `None` for a tool that is not a blend, and while
-    /// nothing is selected to measure.
+    /// The largest magnitude this blend may be given *in the direction it currently
+    /// points*, as last worked out for the selection it is running on: a negative fillet
+    /// radius is held against the inverted round's room. `None` for a tool that is not a
+    /// blend, and while nothing is selected to measure.
     pub fn blend_limit(&self) -> Option<f64> {
+        if self.kind == ToolKind::Fillet && self.params.radius < 0.0 {
+            self.limit.1.inverted
+        } else {
+            self.limit.1.regular
+        }
+    }
+
+    /// Both stops at once, for the handle, which can be dragged through zero from either
+    /// side and has to know where the far one is before it gets there.
+    pub fn blend_limits(&self) -> BlendLimits {
         self.limit.1
     }
 
@@ -465,7 +490,7 @@ pub fn start_tool(editor: &mut Editor, kind: ToolKind) {
         exprs: FieldExprs::default(),
         restore_cursor: None,
         op_chosen: false,
-        limit: (Vec::new(), None),
+        limit: (Vec::new(), BlendLimits::default()),
     }
     .filter();
     let mut sel = Selection::default();
@@ -503,7 +528,7 @@ pub fn start_tool(editor: &mut Editor, kind: ToolKind) {
         exprs: FieldExprs::default(),
         restore_cursor: None,
         op_chosen: false,
-        limit: (Vec::new(), None),
+        limit: (Vec::new(), BlendLimits::default()),
     });
     if kind == ToolKind::Component {
         editor.doc.begin_transaction();
@@ -644,7 +669,7 @@ pub fn edit_existing(editor: &mut Editor, id: FeatureId, previous_cursor: usize)
         restore_cursor,
         // An existing feature's operation was decided when it was made.
         op_chosen: true,
-        limit: (Vec::new(), None),
+        limit: (Vec::new(), BlendLimits::default()),
     });
     editor.set_status(format!("Editing {}", feature.name));
 }
@@ -810,17 +835,31 @@ fn refresh_blend_limit(editor: &mut Editor) {
             None => by_body.push((e.body, vec![e.key])),
         }
     }
-    let mut limit: Option<f64> = None;
+    let mut limit = BlendLimits::default();
+    let tighten = |slot: &mut Option<f64>, found: Option<f64>| {
+        if let Some(found) = found {
+            *slot = Some(slot.map_or(found, |l: f64| l.min(found)));
+        }
+    };
     for (body, keys) in by_body {
         let Some(solid) = editor.pick_body(body).map(|p| p.solid.clone()) else {
             continue;
         };
-        let found = match kind {
-            ToolKind::Chamfer => basset_kernel::blend::max_chamfer_distance(&solid, &keys),
-            _ => basset_kernel::blend::max_fillet_radius(&solid, &keys),
-        };
-        if let Some(found) = found {
-            limit = Some(limit.map_or(found, |l: f64| l.min(found)));
+        match kind {
+            ToolKind::Chamfer => tighten(
+                &mut limit.regular,
+                basset_kernel::blend::max_chamfer_distance(&solid, &keys),
+            ),
+            _ => {
+                tighten(
+                    &mut limit.regular,
+                    basset_kernel::blend::max_fillet_radius(&solid, &keys),
+                );
+                tighten(
+                    &mut limit.inverted,
+                    basset_kernel::blend::max_inverted_fillet_radius(&solid, &keys),
+                );
+            }
         }
     }
     if let Some(tool) = editor.tool.as_mut() {
@@ -1007,12 +1046,25 @@ pub fn dialog(editor: &mut Editor, ctx: &egui::Context) {
                         _ => ("Distance", NumericField::Distance),
                     };
                     changed |= drag(ui, ex, &parameters, field, label, &mut p.radius, 0.1, "mm");
+                    if kind == ToolKind::Fillet {
+                        // The sign is the shape, and nothing else in the dialog says so.
+                        ui.label(
+                            egui::RichText::new(if p.radius < 0.0 {
+                                "inverted: a quarter-round about the edge, cut from a \
+                                 convex edge or added into a concave one"
+                            } else {
+                                "negative inverts the round"
+                            })
+                            .weak(),
+                        );
+                    }
                     // What the material allows. The handle in the viewport stops there of
                     // its own accord, so this is for the box, which does not: a number
                     // typed past it is still sent to the kernel and still refused, and
-                    // the user should be able to see why before that happens.
+                    // the user should be able to see why before that happens. The limit
+                    // is a magnitude and is read for whichever way the radius points.
                     if let Some(max) = blend_limit {
-                        let over = p.radius > max;
+                        let over = p.radius.abs() > max;
                         let text = egui::RichText::new(format!(
                             "{} {max:.2} mm fits between these edges and the faces they \
                              sit on",
@@ -1338,7 +1390,7 @@ fn handle_drag(editor: &mut Editor, ctx: &egui::Context) -> bool {
         return false;
     };
     let drag = &mut editor.drags.slide;
-    let limit = tool.blend_limit();
+    let limits = tool.blend_limits();
     let p = &mut tool.params;
     let value = match tool.kind {
         ToolKind::Extrude => {
@@ -1370,8 +1422,25 @@ fn handle_drag(editor: &mut Editor, ctx: &egui::Context) -> bool {
             // a blend dragged out of range would take the shell off the screen and
             // leave the user pulling back through a preview that is not there. The
             // handle simply stops, which is the same thing the geometry does.
-            let ceiling = limit.unwrap_or(f64::INFINITY).max(0.01);
-            p.radius = drag.advance_within(p.radius, world, snap, 0.01, ceiling);
+            let ceiling = limits.regular.unwrap_or(f64::INFINITY).max(0.01);
+            p.radius = if tool.kind == ToolKind::Fillet {
+                // A fillet's arrow goes both ways, like Fusion's Press/Pull: pulled back
+                // through the edge it becomes the inverted round, and the far stop is
+                // that form's own room. It cannot pause at zero on the way — the kernel
+                // refuses a zero radius and a drag resting there would leave a dead
+                // preview — so, as the extrude does, the size holds one increment short
+                // on whichever side it was on until the drag carries it across.
+                let floor = -limits.inverted.unwrap_or(f64::INFINITY).max(0.01);
+                let at = drag.advance_within(p.radius, world, snap, floor, ceiling);
+                if at == 0.0 {
+                    let short = snap.step().unwrap_or(0.01);
+                    if p.radius < 0.0 { -short } else { short }
+                } else {
+                    at
+                }
+            } else {
+                drag.advance_within(p.radius, world, snap, 0.01, ceiling)
+            };
             p.radius
         }
         ToolKind::OffsetPlane => {
@@ -1748,6 +1817,7 @@ mod tests {
     use crate::editor::sketch_mode::SketchTool;
     use basset_core::OriginPlane;
     use basset_math::Vec2;
+    use std::f64::consts::PI;
 
     /// A 20×4 slot 3 mm thick: the rim of its top face is two straight edges and two
     /// half-round ones, which is the geometry a tangent chain exists for.
@@ -1924,6 +1994,105 @@ mod tests {
         let inside = |v: f64| (0.0..=10.0).contains(&v);
         assert!(inside(h.tip.x) && inside(h.tip.y), "{:?}", h.tip);
         assert!(matches!(editor.mode, Mode::Model));
+    }
+
+    /// Pulled back through the edge, the radius arrow goes negative and the preview
+    /// becomes the inverted round: a cove about the edge, which takes a quarter-disc's
+    /// worth of material off rather than the corner outside a tangent arc. No frame of
+    /// the drag rests at zero, which the kernel would refuse.
+    #[test]
+    fn the_fillet_handle_drags_through_zero_into_the_inverted_round() {
+        let mut h = Harness::new();
+        let body = h.block();
+        h.start_tool(ToolKind::Fillet);
+        let ring = edges_of_face(&h.editor, &top_face(body));
+        h.editor.selection.edges.push(ring[0]);
+        h.sync_tool();
+        h.frame();
+        let radius = |h: &Harness| h.editor.tool.as_ref().expect("running").params.radius;
+        let before = radius(&h);
+        assert!(before > 0.0, "{before}");
+        // The preview is tessellated at the editor's default density, so the arcs are
+        // coarser than the kernel tests' and the tolerance is wider; the two shapes are
+        // still several mm³ apart at any radius the drag reaches.
+        let regular = 200.0 - (before * before - PI * before * before / 4.0) * 10.0;
+        assert!(
+            (h.volume(body) - regular).abs() < 0.5,
+            "the regular round first: {} vs {regular}",
+            h.volume(body)
+        );
+
+        let step = HANDLE_STEP;
+        let ppp = h.points_per_pixel();
+        let arrow = handle(&h.editor).expect("the fillet has an arrow");
+        let from = h.at_world(arrow.tip, ppp).expect("on screen");
+        // Back through the edge by rather more than a step beyond it, delivered in
+        // slices small enough that some frame's running total must round to zero. The
+        // target is laid out the way the handle reads a drag — along the arrow's screen
+        // direction, at the pixel size of its tip — because the arrow is foreshortened
+        // in this view and a point projected from world space would fall short.
+        let travel = before + step * 1.2;
+        let back = h.at_world(arrow.tip - arrow.dir, ppp).expect("on screen");
+        let screen_dir = (back - from).normalized();
+        let points =
+            travel / h.editor.camera.pixel_size_at(arrow.tip, h.editor.window_px) / f64::from(ppp);
+        let to = from + screen_dir * points as f32;
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let moves = (travel / (step * 0.25)).ceil() as usize;
+        h.frame_with(vec![egui::Event::PointerMoved(from)]);
+        h.frame_with(vec![button(from, true)]);
+        for i in 1..=moves {
+            let at = from + (to - from) * (i as f32 / moves as f32);
+            h.frame_with(vec![egui::Event::PointerMoved(at)]);
+            assert_ne!(radius(&h), 0.0, "no frame of the drag rested at zero");
+        }
+        h.frame_with(vec![button(to, false)]);
+        let after = radius(&h);
+        assert!(after < 0.0, "the drag crossed to the other side: {after}");
+        assert!(
+            (after / step).fract().abs() < 1e-9,
+            "onto the grid ({step}): {after}"
+        );
+
+        // The preview is the inverted round: a quarter-cylinder of radius |r| about the
+        // 10 mm edge is gone, and the feature is sound.
+        let feature = h.editor.tool.as_ref().unwrap().feature.unwrap();
+        assert_eq!(
+            h.editor.doc.state().status(feature),
+            Some(&FeatureStatus::Ok)
+        );
+        let expected = 200.0 - PI * after * after / 4.0 * 10.0;
+        assert!(
+            (h.volume(body) - expected).abs() < 0.5,
+            "{} vs {expected}",
+            h.volume(body)
+        );
+        // The arrow now points the other way out of the edge, and the dialog's limit
+        // reads as a magnitude.
+        let arrow = handle(&h.editor).expect("still running");
+        assert!((arrow.tip.distance(arrow.origin) + after).abs() < 1e-9);
+        assert!(arrow.tip.z > arrow.origin.z, "{:?}", arrow.tip);
+        let limit = h
+            .editor
+            .tool
+            .as_ref()
+            .unwrap()
+            .blend_limit()
+            .expect("a limit");
+        assert!(limit > 0.0);
+        h.frame();
+        assert!(
+            h.frame().has_text(&format!("up to {limit:.2} mm fits")),
+            "{:?}",
+            h.frame().text()
+        );
+        h.confirm_tool();
+        assert!((h.volume(body) - expected).abs() < 0.5);
     }
 
     /// The block is 10 mm across and 2 mm thick, so a fillet round the rim of its top
