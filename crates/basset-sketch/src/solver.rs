@@ -144,6 +144,13 @@ enum Formula {
         r1: RadiusSource,
         r2: RadiusSource,
     },
+    /// r1 − r2 − value: a concentric offset's radius, `value` (signed) out from its
+    /// source's.
+    RadiusOffset {
+        r1: RadiusSource,
+        r2: RadiusSource,
+        value: f64,
+    },
     /// Signed distance of centre c to line ab minus `sign · r`.
     LineCircleTangent {
         a: usize,
@@ -292,6 +299,9 @@ impl Formula {
                 Residuals::one((pt(x, b) - pt(x, a)).length() - (pt(x, d) - pt(x, c)).length())
             }
             Formula::EqualRadius { r1, r2 } => Residuals::one(radius(x, r1) - radius(x, r2)),
+            Formula::RadiusOffset { r1, r2, value } => {
+                Residuals::one(radius(x, r1) - radius(x, r2) - value)
+            }
             Formula::LineCircleTangent { a, b, c, r, sign } => Residuals::one(
                 signed_line_distance(pt(x, c), pt(x, a), pt(x, b)) - radius(x, r) * sign,
             ),
@@ -682,6 +692,55 @@ impl System {
         }
     }
 
+    /// One pair of an offset dimension. Like a point–line distance, the distance is
+    /// unsigned and keeps the side the result is on now, so editing it never flips the
+    /// offset across its source. A line needs only one of its endpoints measured, because
+    /// the offset also wrote it parallel; a circle or arc needs only its radius, because
+    /// it was written concentric.
+    fn compile_offset_pair(&mut self, sketch: &Sketch, pair: crate::OffsetPair, value: f64) {
+        let mut l = Locals::new();
+        if let (Some((s0, s1)), Some((r0, _))) = (
+            Self::line_points(sketch, pair.source),
+            Self::line_points(sketch, pair.result),
+        ) {
+            let sign = self.side_sign(r0, s0, s1);
+            let p = self.point(&mut l, r0);
+            let a = self.point(&mut l, s0);
+            let b = self.point(&mut l, s1);
+            self.push(
+                l,
+                Formula::PointLine {
+                    p,
+                    a,
+                    b,
+                    sign,
+                    value,
+                },
+                true,
+            );
+            return;
+        }
+        let grows =
+            self.current_radius(sketch, pair.result) >= self.current_radius(sketch, pair.source);
+        let sign = if grows { 1.0 } else { -1.0 };
+        if let (Some((_, r1)), Some((_, r2))) = (
+            self.circular(&mut l, sketch, pair.result),
+            self.circular(&mut l, sketch, pair.source),
+        ) {
+            self.push(
+                l,
+                Formula::RadiusOffset {
+                    r1,
+                    r2,
+                    value: sign * value,
+                },
+                true,
+            );
+        } else {
+            log::warn!("offset dimension references a missing or mismatched curve");
+        }
+    }
+
     /// Constraints are validated when added, so unexpected kinds here mean a stale
     /// reference; such constraints are skipped rather than crashing the solve.
     fn compile_constraint(&mut self, sketch: &Sketch, c: &Constraint) {
@@ -890,6 +949,11 @@ impl System {
                 };
                 if let Some((_, r)) = self.circular(&mut l, sketch, curve) {
                     self.push(l, Formula::Radius { r, value }, true);
+                }
+            }
+            Constraint::Offset { ref pairs, value } => {
+                for pair in pairs {
+                    self.compile_offset_pair(sketch, *pair, value);
                 }
             }
             Constraint::Angle {

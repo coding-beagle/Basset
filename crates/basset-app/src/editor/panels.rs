@@ -3102,6 +3102,7 @@ fn constraint_name(c: &basset_sketch::Constraint) -> &'static str {
         C::Radius { .. } => "Radius",
         C::Diameter { .. } => "Diameter",
         C::Angle { .. } => "Angle",
+        C::Offset { .. } => "Offset",
     }
 }
 

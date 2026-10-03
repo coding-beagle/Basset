@@ -194,7 +194,8 @@ impl Sketch {
     }
 
     /// Removes an entity together with everything that depends on it: curves built on a
-    /// removed point, and constraints mentioning any removed entity.
+    /// removed point, and constraints mentioning any removed entity — except that an
+    /// offset dimension only loses the pairs that mention one.
     pub fn remove_entity(&mut self, id: EntityId) {
         if !self.entities.contains_key(id) {
             return;
@@ -212,9 +213,8 @@ impl Sketch {
         }
         let dead_constraints: Vec<ConstraintId> = self
             .constraints
-            .iter()
-            .filter(|(_, c)| c.references().iter().any(|r| doomed.contains(r)))
-            .map(|(cid, _)| cid)
+            .iter_mut()
+            .filter_map(|(cid, c)| (!c.survives_without(&doomed)).then_some(cid))
             .collect();
         for cid in dead_constraints {
             self.constraints.remove(cid);

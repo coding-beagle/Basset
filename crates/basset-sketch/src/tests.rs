@@ -2375,3 +2375,333 @@ fn a_filleted_corner_stays_tangent_after_a_re_solve() {
         );
     }
 }
+
+// ----- offset dimension -------------------------------------------------------------------
+
+/// A closed polygon of lines through `corners`, every corner pinned, so that whatever
+/// freedom a solve reports afterwards belongs to the offset alone.
+fn pinned_polygon(s: &mut Sketch, corners: &[Vec2]) -> Vec<EntityId> {
+    let points: Vec<EntityId> = corners.iter().map(|c| s.add_point(*c)).collect();
+    for p in &points {
+        s.add_constraint(Constraint::Fix(*p)).unwrap();
+    }
+    (0..points.len())
+        .map(|i| {
+            s.add_line(points[i], points[(i + 1) % points.len()])
+                .unwrap()
+        })
+        .collect()
+}
+
+const RECTANGLE: [Vec2; 4] = [
+    Vec2::new(0.0, 0.0),
+    Vec2::new(40.0, 0.0),
+    Vec2::new(40.0, 20.0),
+    Vec2::new(0.0, 20.0),
+];
+
+/// A 40 × 20 rectangle with its corners rounded to radius 4, pinned: lines and arcs
+/// meeting tangentially, which is the case the offset carries its distance along.
+fn pinned_rounded_rectangle(s: &mut Sketch) -> Vec<EntityId> {
+    let (w, h, r) = (40.0, 20.0, 4.0);
+    let fixed = |s: &mut Sketch, p: Vec2| {
+        let id = s.add_point(p);
+        s.add_constraint(Constraint::Fix(id)).unwrap();
+        id
+    };
+    // Tangent points, counter-clockwise from the bottom edge's start.
+    let t = [
+        fixed(s, v(r, 0.0)),
+        fixed(s, v(w - r, 0.0)),
+        fixed(s, v(w, r)),
+        fixed(s, v(w, h - r)),
+        fixed(s, v(w - r, h)),
+        fixed(s, v(r, h)),
+        fixed(s, v(0.0, h - r)),
+        fixed(s, v(0.0, r)),
+    ];
+    let c = [
+        fixed(s, v(w - r, r)),
+        fixed(s, v(w - r, h - r)),
+        fixed(s, v(r, h - r)),
+        fixed(s, v(r, r)),
+    ];
+    vec![
+        s.add_line(t[0], t[1]).unwrap(),
+        s.add_arc(c[0], t[1], t[2]).unwrap(),
+        s.add_line(t[2], t[3]).unwrap(),
+        s.add_arc(c[1], t[3], t[4]).unwrap(),
+        s.add_line(t[4], t[5]).unwrap(),
+        s.add_arc(c[2], t[5], t[6]).unwrap(),
+        s.add_line(t[6], t[7]).unwrap(),
+        s.add_arc(c[3], t[7], t[0]).unwrap(),
+    ]
+}
+
+fn offset_dimension(s: &Sketch) -> crate::ConstraintId {
+    s.constraints()
+        .find(|(_, c)| matches!(c, Constraint::Offset { .. }))
+        .map(|(id, _)| id)
+        .expect("the offset wrote its distance down")
+}
+
+/// How far the line `id` lies from the line through `a` and `b`.
+fn line_gap(s: &Sketch, id: EntityId, a: Vec2, b: Vec2) -> f64 {
+    let (p, q) = s.curve_endpoints(id).expect("a line");
+    let d = (b - a).normalize();
+    let gap = d.perp_dot(p - a).abs();
+    assert_relative_eq!(gap, d.perp_dot(q - a).abs(), epsilon = 1e-6);
+    gap
+}
+
+/// The offset is driven by its dimension and by nothing else: no freedom left, and
+/// nothing said twice.
+fn assert_exactly_held(s: &mut Sketch) {
+    let report = s.solve().expect("solves");
+    assert_eq!(
+        report.degrees_of_freedom, 0,
+        "loose: {:?}",
+        report.under_constrained
+    );
+    assert!(
+        report.redundant.is_empty(),
+        "said twice: {:?}",
+        report
+            .redundant
+            .iter()
+            .map(|c| s.constraint(*c))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn an_offset_writes_one_dimension_that_holds_it_exactly() {
+    use crate::offset::{Corner, offset};
+    for corner in [Corner::Miter, Corner::Round] {
+        let mut s = Sketch::new();
+        let seed = pinned_polygon(&mut s, &RECTANGLE);
+        offset(&mut s, &seed, 5.0, corner).expect("offsets");
+        let dims: Vec<_> = s.constraints().filter(|(_, c)| c.is_dimension()).collect();
+        assert_eq!(dims.len(), 1, "{corner:?}");
+        assert_eq!(dims[0].1.dimension_value(), Some(5.0));
+        assert_exactly_held(&mut s);
+    }
+}
+
+#[test]
+fn a_smooth_offset_is_held_by_one_measured_pair() {
+    use crate::offset::{Corner, offset};
+    let mut s = Sketch::new();
+    let seed = pinned_rounded_rectangle(&mut s);
+    offset(&mut s, &seed, 3.0, Corner::Round).expect("offsets");
+    let Some(Constraint::Offset { pairs, .. }) = s.constraint(offset_dimension(&s)) else {
+        panic!("an offset dimension");
+    };
+    assert_eq!(
+        pairs.len(),
+        1,
+        "every joint is smooth, so one pair carries it"
+    );
+    assert_exactly_held(&mut s);
+    check_jacobian(&s);
+}
+
+#[test]
+fn editing_a_mitred_offset_moves_every_edge_to_the_new_distance() {
+    use crate::offset::{Corner, offset};
+    let mut s = Sketch::new();
+    let seed = pinned_polygon(&mut s, &RECTANGLE);
+    let made = offset(&mut s, &seed, 5.0, Corner::Miter).expect("offsets");
+    s.set_dimension_value(offset_dimension(&s), 8.0).unwrap();
+    s.solve().expect("solves at the new distance");
+    for (k, id) in made.iter().enumerate() {
+        // Each edge is the offset of the source edge it was made from, in order.
+        let gap = line_gap(&s, *id, RECTANGLE[k], RECTANGLE[(k + 1) % 4]);
+        assert_relative_eq!(gap, 8.0, epsilon = 1e-6);
+    }
+    // Outward it stays: the bottom edge moved down, not up.
+    let (min, _) = s.entity_bounds(made[0]).unwrap();
+    assert_relative_eq!(min.y, -8.0, epsilon = 1e-6);
+}
+
+#[test]
+fn editing_an_inward_offset_keeps_it_inside() {
+    use crate::offset::{Corner, offset};
+    let mut s = Sketch::new();
+    let seed = pinned_polygon(&mut s, &RECTANGLE);
+    let made = offset(&mut s, &seed, -4.0, Corner::Miter).expect("offsets");
+    let dim = offset_dimension(&s);
+    // The dimension is the distance; the side is where the result already is.
+    assert_eq!(
+        s.constraint(dim).and_then(Constraint::dimension_value),
+        Some(4.0)
+    );
+    s.set_dimension_value(dim, 6.0).unwrap();
+    s.solve().expect("solves");
+    let (min, max) = s.entity_bounds(made[0]).unwrap();
+    assert_relative_eq!(min.y, 6.0, epsilon = 1e-6);
+    assert_relative_eq!(max.y, 6.0, epsilon = 1e-6);
+}
+
+#[test]
+fn editing_a_rounded_offset_regrows_its_corners() {
+    use crate::offset::{Corner, offset};
+    let mut s = Sketch::new();
+    let seed = pinned_polygon(&mut s, &RECTANGLE);
+    let made = offset(&mut s, &seed, 5.0, Corner::Round).expect("offsets");
+    s.set_dimension_value(offset_dimension(&s), 2.5).unwrap();
+    assert_exactly_held(&mut s);
+    let mut arcs = 0;
+    for id in &made {
+        if let Entity::Arc { .. } = s.entity(*id).unwrap().entity {
+            assert_relative_eq!(radius_of(&s, *id), 2.5, epsilon = 1e-6);
+            arcs += 1;
+        }
+    }
+    assert_eq!(arcs, 4);
+    assert_relative_eq!(
+        line_gap(&s, made[0], RECTANGLE[0], RECTANGLE[1]),
+        2.5,
+        epsilon = 1e-6
+    );
+}
+
+#[test]
+fn editing_the_offset_of_a_circle_follows_the_number() {
+    use crate::offset::{Corner, offset};
+    let mut s = Sketch::new();
+    let center = s.add_point(v(3.0, 4.0));
+    s.add_constraint(Constraint::Fix(center)).unwrap();
+    let circle = s.add_circle(center, 10.0).unwrap();
+    s.add_constraint(Constraint::Radius {
+        curve: circle,
+        value: 10.0,
+    })
+    .unwrap();
+    let made = offset(&mut s, &[circle], -2.0, Corner::Round).expect("offsets");
+    assert_exactly_held(&mut s);
+    check_jacobian(&s);
+    s.set_dimension_value(offset_dimension(&s), 3.5).unwrap();
+    s.solve().unwrap();
+    assert_relative_eq!(radius_of(&s, made[0]), 6.5, epsilon = 1e-6);
+}
+
+#[test]
+fn editing_the_offset_of_a_smooth_outline_moves_all_of_it() {
+    use crate::offset::{Corner, offset};
+    let mut s = Sketch::new();
+    let seed = pinned_rounded_rectangle(&mut s);
+    let made = offset(&mut s, &seed, 3.0, Corner::Round).expect("offsets");
+    s.set_dimension_value(offset_dimension(&s), 1.0).unwrap();
+    assert_exactly_held(&mut s);
+    // The corner arcs grew from radius 4 by the distance; every edge sits 1 out.
+    for (k, id) in made.iter().enumerate() {
+        if k % 2 == 1 {
+            assert_relative_eq!(radius_of(&s, *id), 5.0, epsilon = 1e-6);
+        }
+    }
+    assert_relative_eq!(
+        line_gap(&s, made[0], v(0.0, 0.0), v(1.0, 0.0)),
+        1.0,
+        epsilon = 1e-6
+    );
+    assert_relative_eq!(
+        line_gap(&s, made[4], v(0.0, 20.0), v(1.0, 20.0)),
+        1.0,
+        epsilon = 1e-6
+    );
+}
+
+#[test]
+fn an_offset_distance_can_be_driven_by_a_parameter() {
+    use crate::offset::{Corner, offset};
+    let mut s = Sketch::new();
+    let seed = pinned_polygon(&mut s, &RECTANGLE);
+    let made = offset(&mut s, &seed, 5.0, Corner::Miter).expect("offsets");
+    s.set_parameter("wall", "2").unwrap();
+    s.bind_dimension(offset_dimension(&s), "wall * 1.5")
+        .unwrap();
+    s.solve().unwrap();
+    assert_relative_eq!(
+        line_gap(&s, made[1], RECTANGLE[1], RECTANGLE[2]),
+        3.0,
+        epsilon = 1e-6
+    );
+    s.set_parameter("wall", "4").unwrap();
+    s.solve().unwrap();
+    assert_relative_eq!(
+        line_gap(&s, made[1], RECTANGLE[1], RECTANGLE[2]),
+        6.0,
+        epsilon = 1e-6
+    );
+}
+
+#[test]
+fn deleting_one_offset_edge_keeps_the_dimension_on_the_rest() {
+    use crate::offset::{Corner, offset};
+    let mut s = Sketch::new();
+    let seed = pinned_polygon(&mut s, &RECTANGLE);
+    let made = offset(&mut s, &seed, 5.0, Corner::Miter).expect("offsets");
+    s.remove_entity(made[0]);
+    let Some(Constraint::Offset { pairs, .. }) = s.constraint(offset_dimension(&s)) else {
+        panic!("still an offset dimension");
+    };
+    assert_eq!(pairs.len(), 3);
+    s.set_dimension_value(offset_dimension(&s), 7.0).unwrap();
+    s.solve().unwrap();
+    assert_relative_eq!(
+        line_gap(&s, made[2], RECTANGLE[2], RECTANGLE[3]),
+        7.0,
+        epsilon = 1e-6
+    );
+    // Deleting what it measures from leaves nothing for it to measure.
+    for id in seed {
+        s.remove_entity(id);
+    }
+    assert!(
+        !s.constraints()
+            .any(|(_, c)| matches!(c, Constraint::Offset { .. }))
+    );
+}
+
+#[test]
+fn an_offset_dimension_survives_a_round_trip() {
+    use crate::offset::{Corner, offset};
+    let mut s = Sketch::new();
+    let seed = pinned_polygon(&mut s, &RECTANGLE);
+    let made = offset(&mut s, &seed, 5.0, Corner::Miter).expect("offsets");
+    let json = serde_json::to_string(&s).unwrap();
+    let mut back: Sketch = serde_json::from_str(&json).unwrap();
+    let dim = offset_dimension(&back);
+    back.set_dimension_value(dim, 9.0).unwrap();
+    back.solve().unwrap();
+    assert_relative_eq!(
+        line_gap(&back, made[0], RECTANGLE[0], RECTANGLE[1]),
+        9.0,
+        epsilon = 1e-6
+    );
+}
+
+#[test]
+fn an_offset_dimension_refuses_mismatched_curves() {
+    let mut s = Sketch::new();
+    let (l, _, _) = line(&mut s, v(0.0, 0.0), v(10.0, 0.0));
+    let c = s.add_point(v(0.0, 5.0));
+    let circle = s.add_circle(c, 2.0).unwrap();
+    let mismatched = Constraint::Offset {
+        pairs: vec![crate::OffsetPair {
+            source: l,
+            result: circle,
+        }],
+        value: 1.0,
+    };
+    assert!(matches!(
+        s.add_constraint(mismatched),
+        Err(SketchError::WrongEntityKind { .. })
+    ));
+    let empty = Constraint::Offset {
+        pairs: Vec::new(),
+        value: 1.0,
+    };
+    assert!(s.add_constraint(empty).is_err());
+}

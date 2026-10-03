@@ -195,8 +195,17 @@ meeting point of a sharp enough corner runs away to infinity, and a cusp — whe
 chain doubles back and the turn direction cannot be read off a cross product that is zero
 — is named as a gap outright rather than left to the rounding. The result carries the constraints that
 are true of it by construction — parallel, concentric, coincident corner centres, tangent
-where the source was smooth — but is not linked back to its source, for the same reason a
-pattern's copies are not.
+where the source was smooth — and one driving dimension, `Constraint::Offset`, holding it
+at the distance. That is what makes an offset's size editable afterwards: it is clicked,
+typed over and bound to a parameter like any other dimension, and a moved source takes
+its offset along. The dimension measures one pair (source, result) per run of the result
+joined smoothly, because along such a run the tangencies already carry the distance from
+piece to piece and a pair for every piece would be reported redundant; a cut corner
+carries nothing, so a mitred rectangle has four pairs and a rounded one has one. The
+price of a solver-held offset is that its topology is fixed at creation: a new distance
+that would swallow a curve or open a trimmed corner has no shape in the solver and fails
+like any over-ambitious dimension, where offsetting afresh would work the corners out
+again.
 
 A sketch also carries a table of named parameters and a binding from dimensions to
 expressions. Solving evaluates the bindings first, so changing one parameter re-drives

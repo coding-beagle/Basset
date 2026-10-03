@@ -64,6 +64,26 @@ pub enum Constraint {
         b: EntityId,
         value: f64,
     },
+    /// How far an offset lies from what it was offset from: each pair's result is
+    /// `value` from its source, on the side it is on now. One dimension for the whole
+    /// offset, so changing the distance is editing one number rather than redrawing.
+    ///
+    /// It names only one pair per run of the result whose pieces meet smoothly, because
+    /// the tangencies and shared joints the offset writes down already carry the
+    /// distance along such a run; naming every piece would say the same thing twice and
+    /// every extra pair would show as redundant. See [`crate::offset`].
+    Offset {
+        pairs: Vec<OffsetPair>,
+        value: f64,
+    },
+}
+
+/// One curve of an offset and the curve it is the offset of: two lines, or two
+/// circles/arcs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OffsetPair {
+    pub source: EntityId,
+    pub result: EntityId,
 }
 
 impl Constraint {
@@ -78,7 +98,8 @@ impl Constraint {
             | Constraint::VerticalDistance { value, .. }
             | Constraint::Radius { value, .. }
             | Constraint::Diameter { value, .. }
-            | Constraint::Angle { value, .. } => Some(value),
+            | Constraint::Angle { value, .. }
+            | Constraint::Offset { value, .. } => Some(value),
             _ => None,
         }
     }
@@ -91,7 +112,8 @@ impl Constraint {
             | Constraint::VerticalDistance { value, .. }
             | Constraint::Radius { value, .. }
             | Constraint::Diameter { value, .. }
-            | Constraint::Angle { value, .. } => {
+            | Constraint::Angle { value, .. }
+            | Constraint::Offset { value, .. } => {
                 *value = new_value;
                 true
             }
@@ -116,6 +138,24 @@ impl Constraint {
             | Constraint::VerticalDistance { a, b, .. }
             | Constraint::Angle { a, b, .. } => vec![a, b],
             Constraint::Radius { curve, .. } | Constraint::Diameter { curve, .. } => vec![curve],
+            Constraint::Offset { ref pairs, .. } => {
+                pairs.iter().flat_map(|p| [p.source, p.result]).collect()
+            }
+        }
+    }
+
+    /// Drops every offset pair that mentions one of `gone`, and says whether anything of
+    /// the constraint is left. An offset losing one of its curves still holds the rest
+    /// at the distance, so deleting one edge of an offset rectangle should not throw the
+    /// dimension of the other three away with it. Every other constraint is all or
+    /// nothing.
+    pub(crate) fn survives_without(&mut self, gone: &[EntityId]) -> bool {
+        match self {
+            Constraint::Offset { pairs, .. } => {
+                pairs.retain(|p| !gone.contains(&p.source) && !gone.contains(&p.result));
+                !pairs.is_empty()
+            }
+            other => !other.references().iter().any(|r| gone.contains(r)),
         }
     }
 
@@ -159,6 +199,12 @@ impl Constraint {
                 swap(b);
             }
             Constraint::Radius { curve, .. } | Constraint::Diameter { curve, .. } => swap(curve),
+            Constraint::Offset { pairs, .. } => {
+                for p in pairs {
+                    swap(&mut p.source);
+                    swap(&mut p.result);
+                }
+            }
         }
     }
 
@@ -275,6 +321,22 @@ impl Constraint {
             }
             Constraint::Radius { curve, .. } | Constraint::Diameter { curve, .. } => {
                 circular(curve)
+            }
+            Constraint::Offset { ref pairs, .. } => {
+                if pairs.is_empty() {
+                    return Err(SketchError::InvalidArgument(
+                        "an offset dimension needs at least one curve to measure".into(),
+                    ));
+                }
+                for p in pairs {
+                    if kind(p.source)?.is_line() {
+                        line(p.result)?;
+                    } else {
+                        circular(p.source)?;
+                        circular(p.result)?;
+                    }
+                }
+                Ok(())
             }
         }
     }

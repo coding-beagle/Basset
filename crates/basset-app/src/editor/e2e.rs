@@ -1782,3 +1782,117 @@ fn an_extrude_cut_through_a_stack_targets_every_plate_it_passes() {
     assert!((reopened.volume(lower) - 192.0).abs() < 1e-9);
     assert!((reopened.volume(upper) - 200.0).abs() < 1e-9);
 }
+
+/// How far each offset line sits from the source line it runs beside: the gap measured
+/// from both of its ends to the nearest parallel line of the source rectangle.
+fn offset_gaps(s: &super::SketchEditor, source: &[basset_sketch::EntityId]) -> Vec<f64> {
+    let mut gaps = Vec::new();
+    for (id, data) in s.sketch.entities() {
+        if !data.entity.is_line() || source.contains(&id) {
+            continue;
+        }
+        let (a, b) = s.sketch.curve_endpoints(id).expect("a line");
+        let dir = (b - a).normalize();
+        let gap = source
+            .iter()
+            .filter_map(|l| s.sketch.curve_endpoints(*l))
+            .filter(|(p, q)| (*q - *p).normalize().perp_dot(dir).abs() < 1e-6)
+            .map(|(p, _)| dir.perp_dot(p - a).abs())
+            .fold(f64::INFINITY, f64::min);
+        gaps.push(gap);
+    }
+    gaps
+}
+
+/// An offset's distance is a dimension on the drawing: click its number, type another,
+/// and every edge moves to it — and the dimension is still there to edit after a save
+/// and reopen, and one undo puts the old distance back.
+#[test]
+fn an_offset_distance_is_edited_afterwards_through_its_dimension() {
+    let tmp = TempDir::new("offset-dimension");
+    let path = tmp.join("offset.bass");
+    let mut h = Harness::new();
+    h.editor.set_window_size([800, 600]);
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    h.rectangle(Vec2::new(0.0, 0.0), Vec2::new(40.0, 20.0));
+    let source: Vec<_> = {
+        let s = h.sketch();
+        s.set_tool(SketchTool::Select);
+        s.selected = s
+            .sketch
+            .entities()
+            .filter(|(_, d)| d.entity.is_curve())
+            .map(|(id, _)| id)
+            .collect();
+        s.offset.distance = 5.0;
+        s.selected.clone()
+    };
+    h.frame();
+    h.frame();
+    assert!(h.click_ui("Offset"), "{:?}", h.frame().text());
+    h.frame();
+    assert!(h.click_ui("Square corners"));
+    h.frame();
+    assert!(h.click_ui("OK"), "{:?}", h.frame().text());
+    h.frame();
+    h.frame();
+
+    let gaps = offset_gaps(h.sketch(), &source);
+    assert_eq!(gaps.len(), 4);
+    assert!(gaps.iter().all(|g| (g - 5.0).abs() < 1e-6), "{gaps:?}");
+
+    // The distance is on the drawing as a number like any other dimension's.
+    assert!(
+        h.click_ui("5.000"),
+        "the offset shows its distance: {:?}",
+        h.frame().text()
+    );
+    let (cid, text) = h.sketch().dim_edit.clone().expect("the edit box opened");
+    assert_eq!(text, "5.000");
+    assert!(matches!(
+        h.sketch().sketch.constraint(cid),
+        Some(basset_sketch::Constraint::Offset { .. })
+    ));
+    h.sketch().dim_edit = Some((cid, "8".into()));
+    h.frame();
+    assert!(h.click_ui("OK"), "{:?}", h.frame().text());
+    let gaps = offset_gaps(h.sketch(), &source);
+    assert!(gaps.iter().all(|g| (g - 8.0).abs() < 1e-6), "{gaps:?}");
+
+    // One step of undo is the whole edit.
+    assert!(h.sketch().undo());
+    let gaps = offset_gaps(h.sketch(), &source);
+    assert!(gaps.iter().all(|g| (g - 5.0).abs() < 1e-6), "{gaps:?}");
+    assert!(h.sketch().redo());
+
+    h.finish_sketch(true);
+    let sketch_id = h.last_feature();
+    let mut reopened = h.round_trip(&path);
+    reopened.edit_sketch(sketch_id);
+    let cid = reopened
+        .sketch()
+        .sketch
+        .constraints()
+        .find(|(_, c)| matches!(c, basset_sketch::Constraint::Offset { .. }))
+        .map(|(id, _)| id)
+        .expect("the offset dimension was saved");
+    assert_eq!(
+        reopened
+            .sketch()
+            .sketch
+            .constraint(cid)
+            .and_then(|c| c.dimension_value()),
+        Some(8.0)
+    );
+    // And it still drives the offset, from a parameter this time.
+    reopened
+        .sketch()
+        .set_parameter("gap", "3")
+        .expect("a parameter");
+    reopened
+        .sketch()
+        .bind_dimension(cid, "gap / 2")
+        .expect("binds");
+    let gaps = offset_gaps(reopened.sketch(), &source);
+    assert!(gaps.iter().all(|g| (g - 1.5).abs() < 1e-6), "{gaps:?}");
+}

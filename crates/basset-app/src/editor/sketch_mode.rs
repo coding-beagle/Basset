@@ -4123,6 +4123,43 @@ impl SketchEditor {
                 }
                 label
             }
+            Constraint::Offset { pairs, .. } => {
+                // The gap between the first measured curve and its source, drawn across
+                // it square to both; every other pair is that same gap elsewhere.
+                let pair = pairs.first()?;
+                let circle = |id: EntityId| match self.sketch.entity(id).map(|e| &e.entity)? {
+                    Entity::Circle { center, radius } => Some((pos(*center)?, *radius)),
+                    Entity::Arc { center, start, .. } => {
+                        let c = pos(*center)?;
+                        Some((c, c.distance(pos(*start)?)))
+                    }
+                    _ => None,
+                };
+                match (circle(pair.source), circle(pair.result)) {
+                    (Some((center, from)), Some((_, to))) => {
+                        let default_dir = Vec2::from_angle(std::f64::consts::FRAC_PI_4);
+                        let label = placed.unwrap_or(center + default_dir * (from.max(to) + gap));
+                        let dir = (label - center).normalize_or(default_dir);
+                        let (a, b) = (center + dir * from, center + dir * to);
+                        segments.push([a, b]);
+                        arrowheads(&mut segments, a, b, arrow);
+                        let outer = if from > to { a } else { b };
+                        segments.push([outer, label]);
+                        label
+                    }
+                    _ => {
+                        let (ra, rb) = self.sketch.curve_endpoints(pair.result)?;
+                        let (sa, sb) = self.sketch.curve_endpoints(pair.source)?;
+                        let dir = (sb - sa).normalize_or(Vec2::X);
+                        let mid = (ra + rb) * 0.5;
+                        let foot = sa + dir * dir.dot(mid - sa);
+                        let label = placed.unwrap_or((mid + foot) * 0.5 + dir * gap);
+                        let slide = (label - mid).dot(dir);
+                        distance_lines(&mut segments, mid, foot, dir, slide, arrow);
+                        label
+                    }
+                }
+            }
             _ => return None,
         };
         Some(DimGraphic {

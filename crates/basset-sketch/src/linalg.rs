@@ -189,9 +189,13 @@ impl Mat {
                     norm0 == 0.0 || norm(&reduce(row, &basis[..before])) <= rel_tol * norm0;
             }
             for r in group.clone().filter(|r| !dependent[*r]) {
-                let mut row = reduce(&m.data[r * m.cols..(r + 1) * m.cols], &basis);
+                let original = &m.data[r * m.cols..(r + 1) * m.cols];
+                let mut row = reduce(original, &basis);
                 let left = norm(&row);
-                if left == 0.0 {
+                // What is left of a row that repeats one of its own group is rounding
+                // noise. Normalised, it would become a direction the group never spanned
+                // and would make whatever a later constraint says along it look implied.
+                if left <= rel_tol * norm(original) {
                     continue;
                 }
                 for a in row.iter_mut() {

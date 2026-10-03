@@ -4657,3 +4657,52 @@ mod parameters {
         assert!((h.volume(BodyRef(extrude)) - before).abs() < 1e-9);
     }
 }
+
+/// A kept offset leaves its distance on the drawing as a dimension, and editing that
+/// dimension is how its size changes afterwards: one undoable step, like any other.
+#[test]
+fn a_kept_offset_is_resized_through_its_dimension() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    let s = sketch(&mut editor);
+    let center = s.sketch.add_point(Vec2::new(5.0, 5.0));
+    let circle = s.sketch.add_circle(center, 10.0).unwrap();
+    s.selected = vec![circle];
+    s.offset.distance = 3.0;
+    assert!(s.begin_offset());
+    s.finish_offset(true);
+    let radius_of_offset = |s: &sketch_mode::SketchEditor| {
+        s.sketch
+            .entities()
+            .find_map(|(id, d)| match d.entity {
+                Entity::Circle { radius, .. } if id != circle => Some(radius),
+                _ => None,
+            })
+            .expect("the offset circle")
+    };
+    assert!((radius_of_offset(s) - 13.0).abs() < 1e-9);
+
+    let graphics = s.dimension_graphics();
+    let g = graphics
+        .iter()
+        .find(|g| matches!(s.sketch.constraint(g.id), Some(Constraint::Offset { .. })))
+        .expect("the offset's distance is drawn");
+    assert_eq!(g.text, "3.000");
+    assert!(
+        !g.segments.is_empty(),
+        "with a dimension line across the gap"
+    );
+    let cid = g.id;
+
+    s.set_dimension(cid, 4.5);
+    // The source has no dimension of its own here, so the solver is free to share the
+    // change between the two circles; the gap between them is what the number says.
+    let source_radius = match s.sketch.entity(circle).unwrap().entity {
+        Entity::Circle { radius, .. } => radius,
+        _ => unreachable!(),
+    };
+    assert!((radius_of_offset(s) - source_radius - 4.5).abs() < 1e-6);
+    assert!(s.undo());
+    assert!((radius_of_offset(s) - 13.0).abs() < 1e-9);
+}

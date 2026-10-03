@@ -18,13 +18,17 @@
 //! own. A branch — three curves meeting at a point — has no one answer, so it is
 //! refused rather than guessed at.
 //!
-//! **What the result is tied to.** The offset is new geometry, not a linked copy: we
-//! have no offset constraint to re-generate it from, and a copy that silently stopped
-//! following its source would be worse than one that plainly never did. What it does
-//! carry are the statements that are true of it by construction — each offset line is
-//! parallel to its source, each offset arc concentric with its source, each rounded
-//! corner centred on the corner it rounds, and joints that were smooth stay tangent —
-//! so the result is driven rather than a loose pile of blue.
+//! **What the result is tied to.** The offset is new geometry, but it is held to its
+//! source by what is true of it by construction — each offset line is parallel to its
+//! source, each offset arc concentric with its source, each rounded corner centred on
+//! the corner it rounds, and joints that were smooth stay tangent — and by one
+//! [`Constraint::Offset`] dimension carrying the distance. That dimension is what makes
+//! the distance editable afterwards: it is a driving dimension like any other, so typing
+//! a new number, or binding it to a parameter, re-solves the offset at that distance and
+//! a moved source takes its offset with it. What it cannot do is change the offset's
+//! topology: a distance that would swallow a curve or turn a trimmed corner into a gap
+//! is one the solver has no shape for, and fails like any other over-ambitious
+//! dimension, where offsetting afresh would have worked out the new corners.
 
 use std::f64::consts::{PI, TAU};
 
@@ -106,7 +110,7 @@ pub fn offset(
     let offsets = chain.offsets(left);
     let joined = chain.join(&offsets, left, corner)?;
     crossing_free(&joined.pieces, chain.closed)?;
-    emit(sketch, &chain, &joined)
+    emit(sketch, &chain, &joined, distance.abs())
 }
 
 /// The one circle of a seed that is one circle and nothing else. A circle alongside
@@ -218,6 +222,16 @@ fn offset_circle(
     let new = sketch.add_circle(new_center, radius)?;
     sketch.set_construction(new, construction)?;
     keep(sketch, Constraint::Concentric(new, circle));
+    keep(
+        sketch,
+        Constraint::Offset {
+            pairs: vec![crate::OffsetPair {
+                source: circle,
+                result: new,
+            }],
+            value: distance.abs(),
+        },
+    );
     Ok(vec![new])
 }
 
@@ -911,7 +925,12 @@ fn end_point(sketch: &Sketch, id: EntityId, forward: bool) -> Result<EntityId, S
 
 // ----- writing it down --------------------------------------------------------------
 
-fn emit(sketch: &mut Sketch, chain: &Chain, joined: &Joined) -> Result<Vec<EntityId>, SketchError> {
+fn emit(
+    sketch: &mut Sketch,
+    chain: &Chain,
+    joined: &Joined,
+    distance: f64,
+) -> Result<Vec<EntityId>, SketchError> {
     let Joined {
         pieces,
         sources,
@@ -1004,7 +1023,58 @@ fn emit(sketch: &mut Sketch, chain: &Chain, joined: &Joined) -> Result<Vec<Entit
             keep(sketch, Constraint::Tangent(created[k], created[j]));
         }
     }
+    let pairs = distance_pairs(chain.closed, sources, smooth, &created);
+    keep(
+        sketch,
+        Constraint::Offset {
+            pairs,
+            value: distance,
+        },
+    );
     Ok(created)
+}
+
+/// The pieces the offset dimension has to measure: one per run of pieces joined
+/// smoothly, since along such a run the distance is already carried from piece to piece.
+/// A line parallel to its source and sharing a point with the next piece, which is
+/// tangent to it and concentric with (or centred on the corner of) its own source, can
+/// only be at the distance its neighbour is. A cut corner carries nothing — the mitred
+/// edges of a rectangle are each free to sit at any distance — so it starts a new run.
+///
+/// A rounded corner centred on no source point (one left where the offset swallowed a
+/// curve) carries nothing either: its centre is free, so the edges either side of it are
+/// not tied to each other through it.
+fn distance_pairs(
+    closed: bool,
+    sources: &[Source],
+    smooth: &[usize],
+    created: &[EntityId],
+) -> Vec<crate::OffsetPair> {
+    let n = created.len();
+    let anchored = |k: usize| !matches!(sources[k], Source::Corner(None));
+    let carries = |k: usize| smooth.contains(&k) && anchored(k) && anchored((k + 1) % n);
+    // A closed run starts just after a joint that carries nothing, so that no run is
+    // split in two by where the chain happened to begin.
+    let first = match (0..n).find(|&k| closed && !carries(k)) {
+        Some(k) => (k + 1) % n,
+        None => 0,
+    };
+    let mut pairs = Vec::new();
+    let mut need = true;
+    for step in 0..n {
+        let k = (first + step) % n;
+        if need && let Source::Curve(source) = sources[k] {
+            pairs.push(crate::OffsetPair {
+                source,
+                result: created[k],
+            });
+            need = false;
+        }
+        if !carries(k) {
+            need = true;
+        }
+    }
+    pairs
 }
 
 #[cfg(test)]
