@@ -6,6 +6,7 @@
 
 use basset_core::{OriginPlane, PlaneRef};
 use basset_math::{Vec2, Vec3};
+use basset_sketch::{Constraint, Entity};
 use winit::event::{ElementState, MouseButton};
 use winit::keyboard::NamedKey;
 
@@ -1707,4 +1708,72 @@ fn an_extrude_cut_through_a_stack_targets_every_plate_it_passes() {
     let mut reopened = h.round_trip(&dir.join("stack.bass"));
     assert!((reopened.volume(lower) - 192.0).abs() < 1e-9);
     assert!((reopened.volume(upper) - 200.0).abs() < 1e-9);
+}
+
+/// A second centre rectangle on the first one's centre, drawn through the pointer with
+/// no modifier held. The press on the centre has to reach the sketch rather than an
+/// overlay, snap to the existing centre, and leave a sketch the solver has nothing to
+/// complain about: each centre rectangle used to carry a second midpoint constraint the
+/// solver could only call redundant, so two of them sharing a centre lit up orange.
+#[test]
+fn a_second_centre_rectangle_starts_on_the_first_ones_centre() {
+    let mut h = Harness::new();
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    let centre = Vec3::new(10.0, 10.0, 0.0);
+    h.move_world(centre);
+    h.scroll(8.0);
+    h.sketch().set_tool(SketchTool::CenterRectangle);
+    h.click_world(centre);
+    h.click_world(Vec3::new(30.0, 20.0, 0.0));
+    // Back to the centre the way a hand goes, a frame at a time, so the snap hold sees
+    // the same approach a real pointer gives it.
+    for i in 0..=10 {
+        let t = f64::from(i) / 10.0;
+        h.move_world(Vec3::new(30.0 - 20.0 * t, 20.0 - 10.0 * t, 0.0));
+        h.frame();
+    }
+    let at = h.screen_of(centre);
+    assert!(
+        !h.ui_takes_press_at(at),
+        "nothing drawn over the centre swallows the press"
+    );
+    h.move_world(centre);
+    assert!(
+        h.sketch().cursor_snapped,
+        "the pointer is on the first centre"
+    );
+    h.click_world(centre);
+    h.click_world(Vec3::new(20.0, 30.0, 0.0));
+
+    let s = h.sketch();
+    let sides = s
+        .sketch
+        .entities()
+        .filter(|(_, e)| !e.construction && matches!(e.entity, Entity::Line { .. }))
+        .count();
+    assert_eq!(sides, 8, "both rectangles were drawn");
+    for c in [
+        Vec2::new(-10.0, 0.0),
+        Vec2::new(30.0, 20.0),
+        Vec2::new(0.0, -10.0),
+        Vec2::new(20.0, 30.0),
+    ] {
+        assert!(
+            s.sketch
+                .entities()
+                .any(|(_, e)| matches!(e.entity, Entity::Point { pos } if pos.distance(c) < 1e-6)),
+            "a corner sits at {c}"
+        );
+    }
+    let report = match &s.report {
+        Some(Ok(r)) => r.clone(),
+        other => panic!("the sketch solves: {other:?}"),
+    };
+    assert!(report.redundant.is_empty(), "{:?}", report.redundant);
+    let ties = s
+        .sketch
+        .constraints()
+        .filter(|(_, c)| matches!(c, Constraint::Coincident { .. }))
+        .count();
+    assert_eq!(ties, 1, "the second centre is tied to the first");
 }

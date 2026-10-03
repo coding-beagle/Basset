@@ -271,6 +271,17 @@ impl Harness {
         ))
     }
 
+    /// Whether a press at this pixel would be taken by egui rather than reach the
+    /// editor. The window loop asks egui-winit the same question for every button event
+    /// and hands the editor only the ones egui says it does not want, so an overlay
+    /// drawn on top of the geometry silently swallows clicks aimed at what is under it.
+    pub fn ui_takes_press_at(&mut self, px: [f64; 2]) -> bool {
+        let ppp = f64::from(self.egui.pixels_per_point());
+        let pos = egui::pos2((px[0] / ppp) as f32, (px[1] / ppp) as f32);
+        self.frame_with(vec![egui::Event::PointerMoved(pos)]);
+        self.egui.egui_wants_pointer_input()
+    }
+
     pub fn points_per_pixel(&self) -> f32 {
         self.egui.pixels_per_point()
     }

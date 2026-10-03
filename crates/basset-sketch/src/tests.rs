@@ -929,7 +929,11 @@ fn rectangle_builders() {
     let mut s = Sketch::new();
     let r = shapes::rectangle_center(&mut s, v(5.0, 5.0), v(8.0, 7.0));
     assert_eq!(s.entities().count(), 11, "8 + centre + 2 diagonals");
-    assert_eq!(s.constraints().count(), 6);
+    assert_eq!(
+        s.constraints().count(),
+        5,
+        "four sides and one centre midpoint"
+    );
     assert_eq!(pos(&s, r.corners[0]), v(2.0, 3.0));
     assert_eq!(pos(&s, r.corners[2]), v(8.0, 7.0));
     let c = r.center.unwrap();
@@ -945,6 +949,33 @@ fn rectangle_builders() {
         1,
         "construction diagonals ignored"
     );
+}
+
+/// A rectangle's diagonals bisect each other whatever its size, so a centre held at the
+/// middle of one diagonal is already at the middle of the other. Writing both used to
+/// leave every centre rectangle with a constraint the solver flagged as redundant, drawn
+/// orange from the moment it was placed.
+#[test]
+fn a_centre_rectangle_has_no_redundant_constraint() {
+    let mut s = Sketch::new();
+    let r = shapes::rectangle_center(&mut s, v(5.0, 5.0), v(8.0, 7.0));
+    let report = s.solve().unwrap();
+    assert!(report.redundant.is_empty(), "{:?}", report.redundant);
+    // Four corners and a centre, held rectangular and centred: width, height and where
+    // the centre is are all that is left to choose.
+    assert_eq!(report.degrees_of_freedom, 4);
+
+    // Two of them sharing a centre are still clean: the tie between the centres is the
+    // only thing joining them, and it is not implied by anything else.
+    let second = shapes::rectangle_center(&mut s, v(5.0, 5.0), v(6.0, 9.0));
+    s.add_constraint(Constraint::Coincident {
+        point: second.center.unwrap(),
+        target: r.center.unwrap(),
+    })
+    .unwrap();
+    let report = s.solve().unwrap();
+    assert!(report.redundant.is_empty(), "{:?}", report.redundant);
+    assert_eq!(report.degrees_of_freedom, 6);
 }
 
 #[test]
