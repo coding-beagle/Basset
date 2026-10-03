@@ -173,6 +173,8 @@ pub struct Scene<'a> {
     pub tris: Vec<TriBatch>,
     /// Draw the adaptive construction grid with the frame's x axis red and y axis green.
     pub show_grid: bool,
+    /// Draw the grid's two coloured axes. Without them the grid is plain lines throughout.
+    pub show_grid_axes: bool,
     /// Plane the grid lies on. Sketch mode puts it on the sketch plane so the lines the
     /// user snaps to are the lines they can see.
     pub grid_frame: Frame,
@@ -190,6 +192,7 @@ impl<'a> Scene<'a> {
             points: Vec::new(),
             tris: Vec::new(),
             show_grid: true,
+            show_grid_axes: true,
             grid_frame: Frame::XY,
         }
     }

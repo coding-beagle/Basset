@@ -50,6 +50,7 @@ pub(crate) enum Command {
     ToggleGrid,
     ToggleSnap,
     ToggleOrigin,
+    ToggleAxes,
     /// Escape: put down whatever is running, or clear the selection.
     Cancel,
     /// Enter: keep whatever is running.
@@ -631,6 +632,15 @@ pub(crate) const BINDINGS: &[Binding] = &[
         chords: &[Chord::shifted('o')],
         live: LiveIn::Both,
         make: || Command::ToggleOrigin,
+        enabled: ALWAYS,
+    },
+    Binding {
+        id: "view.axes",
+        label: "Show grid axes",
+        group: Group::View,
+        chords: &[],
+        live: LiveIn::Both,
+        make: || Command::ToggleAxes,
         enabled: ALWAYS,
     },
     // --- Selection filters. Two sets on the same digits, because a sketch and a model

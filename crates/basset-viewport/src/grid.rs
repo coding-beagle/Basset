@@ -71,9 +71,9 @@ pub fn snap_to(p: Vec2, step: f64) -> Vec2 {
     Vec2::new((p.x / step).round() * step, (p.y / step).round() * step)
 }
 
-/// Builds the grid on `frame` for the current view: minor lines, major lines, then the two
-/// in-plane axes so the most important lines draw last.
-pub fn build(camera: &Camera, viewport: [u32; 2], frame: &Frame) -> Vec<LineBatch> {
+/// Builds the grid on `frame` for the current view: minor lines, major lines, then — when
+/// `axes` asks for them — the two in-plane axes, so the most important lines draw last.
+pub fn build(camera: &Camera, viewport: [u32; 2], frame: &Frame, axes: bool) -> Vec<LineBatch> {
     let spacing = spacing_for(camera.pixel_size_at(camera.target, viewport));
     let GridSpacing { minor, major } = spacing;
 
@@ -104,8 +104,8 @@ pub fn build(camera: &Camera, viewport: [u32; 2], frame: &Frame) -> Vec<LineBatc
         let x = centre_x + i as f64 * minor;
         let y = centre_y + i as f64 * minor;
         // The axes are drawn separately in colour, so leave a gap for them.
-        let on_x_axis = y.abs() < minor * 0.5;
-        let on_y_axis = x.abs() < minor * 0.5;
+        let on_x_axis = axes && y.abs() < minor * 0.5;
+        let on_y_axis = axes && x.abs() < minor * 0.5;
         let batch = if is_major {
             &mut major_batch
         } else {
@@ -120,6 +120,9 @@ pub fn build(camera: &Camera, viewport: [u32; 2], frame: &Frame) -> Vec<LineBatc
     }
 
     let mut batches = vec![minor_batch, major_batch];
+    if !axes {
+        return batches;
+    }
     if (y0..=y1).contains(&0.0) {
         let mut x_axis = LineBatch {
             width_px: 1.5,
@@ -205,7 +208,7 @@ mod tests {
     #[test]
     fn build_contains_axes_and_lies_on_xy_plane() {
         let camera = Camera::new_default();
-        let batches = build(&camera, [800, 600], &Frame::XY);
+        let batches = build(&camera, [800, 600], &Frame::XY, true);
         assert_eq!(batches.len(), 4, "minor, major, x axis, y axis");
         for batch in &batches {
             assert!(!batch.segments.is_empty());
@@ -224,10 +227,24 @@ mod tests {
     }
 
     #[test]
+    fn build_omits_axes_when_asked_and_closes_the_gap_they_left() {
+        let camera = Camera::new_default();
+        let with = build(&camera, [800, 600], &Frame::XY, true);
+        let without = build(&camera, [800, 600], &Frame::XY, false);
+        assert_eq!(without.len(), 2, "minor and major lines only");
+        let lines = |b: &[LineBatch]| b[..2].iter().map(|l| l.segments.len()).sum::<usize>();
+        assert_eq!(
+            lines(&without),
+            lines(&with) + 2,
+            "the axes' own grid lines are back"
+        );
+    }
+
+    #[test]
     fn build_omits_axes_when_far_away() {
         let mut camera = Camera::new_default();
         camera.target = Vec3::new(1e6, 1e6, 0.0);
-        let batches = build(&camera, [800, 600], &Frame::XY);
+        let batches = build(&camera, [800, 600], &Frame::XY, true);
         assert_eq!(batches.len(), 2);
     }
 
@@ -235,7 +252,7 @@ mod tests {
     fn build_lies_in_the_given_frame() {
         let camera = Camera::new_default();
         let frame = Frame::from_normal(Vec3::new(0.0, 0.0, 7.0), Vec3::Z);
-        for [a, b] in build(&camera, [800, 600], &frame)
+        for [a, b] in build(&camera, [800, 600], &frame, true)
             .iter()
             .flat_map(|batch| &batch.segments)
         {
@@ -245,7 +262,7 @@ mod tests {
         // An off-plane camera target still centres the grid under the view.
         let mut camera = Camera::new_default();
         camera.target = Vec3::new(500.0, 0.0, 300.0);
-        let batches = build(&camera, [800, 600], &Frame::XY);
+        let batches = build(&camera, [800, 600], &Frame::XY, true);
         let max_x = batches
             .iter()
             .flat_map(|b| &b.segments)

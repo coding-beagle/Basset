@@ -368,7 +368,7 @@ impl Renderer {
 
         // The grid goes first so model lines drawn later paint over it where they coincide.
         let grid_batches = if scene.show_grid {
-            grid::build(scene.camera, size, &scene.grid_frame)
+            grid::build(scene.camera, size, &scene.grid_frame, scene.show_grid_axes)
         } else {
             Vec::new()
         };

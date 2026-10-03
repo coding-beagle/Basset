@@ -8,6 +8,7 @@ fn tidied() -> Visibility {
         hidden_sketches: [FeatureId(1)].into(),
         show_origin: true,
         show_grid: false,
+        show_axes: false,
     }
 }
 
@@ -26,7 +27,7 @@ fn a_new_document_hides_nothing_but_the_origin() {
     let doc = Document::new("fresh");
     let v = doc.visibility();
     assert!(v.hidden_bodies.is_empty() && v.hidden_sketches.is_empty());
-    assert!(!v.show_origin && v.show_grid);
+    assert!(!v.show_origin && v.show_grid && v.show_axes);
 }
 
 #[test]

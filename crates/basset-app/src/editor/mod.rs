@@ -189,6 +189,7 @@ pub struct Editor {
     pub hidden_sketches: HashSet<FeatureId>,
     pub show_origin: bool,
     pub show_grid: bool,
+    pub show_axes: bool,
     /// How every drag in the viewport meets the grid: the master toggle and whether
     /// shift is letting go of it right now. One copy for the whole editor, so the sketch
     /// palette's checkbox governs the modelling handles too.
@@ -258,6 +259,7 @@ impl Editor {
             hidden_sketches: HashSet::new(),
             show_origin: false,
             show_grid: true,
+            show_axes: true,
             snapping: snap::Snapping::default(),
             drags: ModelDrags::default(),
             snap_hint: None,

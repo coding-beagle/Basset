@@ -94,6 +94,7 @@ impl Editor {
             hidden_sketches: self.hidden_sketches.iter().copied().collect(),
             show_origin: self.show_origin,
             show_grid: self.show_grid,
+            show_axes: self.show_axes,
         }
     }
 
@@ -102,6 +103,7 @@ impl Editor {
         self.hidden_sketches = visibility.hidden_sketches.iter().copied().collect();
         self.show_origin = visibility.show_origin;
         self.show_grid = visibility.show_grid;
+        self.show_axes = visibility.show_axes;
     }
 
     pub fn export_stl(&mut self) {

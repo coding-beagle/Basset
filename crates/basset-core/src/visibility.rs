@@ -24,6 +24,8 @@ pub struct Visibility {
     /// The three origin planes and axes.
     pub show_origin: bool,
     pub show_grid: bool,
+    /// The grid's coloured axes, which a sketch shows on its own plane.
+    pub show_axes: bool,
 }
 
 impl Default for Visibility {
@@ -33,6 +35,7 @@ impl Default for Visibility {
             hidden_sketches: BTreeSet::new(),
             show_origin: false,
             show_grid: true,
+            show_axes: true,
         }
     }
 }

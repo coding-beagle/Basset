@@ -35,6 +35,7 @@ const SNAP_MARK_PX: f64 = 26.0;
 pub fn build(editor: &Editor) -> Scene<'_> {
     let mut scene = Scene::new(&editor.camera);
     scene.show_grid = editor.show_grid;
+    scene.show_grid_axes = editor.show_axes;
 
     // Bodies with face highlights.
     for (id, mesh) in editor.meshes_iter() {
@@ -564,6 +565,10 @@ mod tests {
         editor.window_px = [800, 600];
         editor.refresh_cache();
         assert!(build(&editor).show_grid);
+        assert!(build(&editor).show_grid_axes);
+
+        editor.show_axes = false;
+        assert!(!build(&editor).show_grid_axes);
 
         editor.show_grid = false;
         let plain = build(&editor);

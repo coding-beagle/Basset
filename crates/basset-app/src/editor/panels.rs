@@ -142,6 +142,7 @@ pub(super) fn run(editor: &mut Editor, c: Command) {
         Command::ToggleGrid => editor.show_grid = !editor.show_grid,
         Command::ToggleSnap => editor.set_snapping(!editor.snapping.to_grid),
         Command::ToggleOrigin => editor.show_origin = !editor.show_origin,
+        Command::ToggleAxes => editor.show_axes = !editor.show_axes,
         Command::SetCursor(c) => editor.set_cursor(c),
         Command::Edit(id) => editor.edit_feature(id),
         Command::Suppress(id, on) => {
@@ -532,6 +533,15 @@ fn menu_bar(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
                 .clicked()
             {
                 commands.push(Command::ToggleOrigin);
+            }
+            if ui
+                .selectable_label(
+                    editor.show_axes,
+                    format!("Show grid axes{}", commands::hint("view.axes")),
+                )
+                .clicked()
+            {
+                commands.push(Command::ToggleAxes);
             }
         });
         ui.menu_button("Create", |ui| {
@@ -1594,6 +1604,7 @@ fn browser(editor: &mut Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) 
         ui.collapsing("Origin", |ui| {
             ui.checkbox(&mut editor.show_origin, "Show origin planes and axes");
             ui.checkbox(&mut editor.show_grid, "Show grid");
+            ui.checkbox(&mut editor.show_axes, "Show grid axes");
         });
         // Salted, because the count is part of the header text and a section keyed on its
         // own label would shut itself the moment a parameter was added to it.
@@ -2244,6 +2255,7 @@ fn sketch_palette_body(editor: &mut Editor, ui: &mut egui::Ui, commands: &mut Ve
         ui.heading("Sketch");
         ui.label(egui::RichText::new("Click points; snap to existing points to join").weak());
         ui.separator();
+        ui.checkbox(&mut editor.show_axes, "Show grid axes");
         ui.horizontal(|ui| {
             ui.checkbox(&mut s.snap_to_grid, "Snap to grid");
             if s.snap_to_grid {
