@@ -6,8 +6,8 @@ use std::f64::consts::PI;
 use approx::assert_relative_eq;
 use basset_core::{
     AxisRef, BodyOp, BodyRef, CombineOp, ComponentId, Document, EdgeRef, Extent, FaceKey, FaceRef,
-    FaceRole, FeatureId, FeatureKind, FeatureStatus, OriginAxis, OriginPlane, PathRef, PlaneRef,
-    ProfileRef, RegionRef, Sketch,
+    FaceRole, FeatureId, FeatureKind, FeatureStatus, NumericField, OriginAxis, OriginPlane,
+    PathRef, PlaneRef, ProfileRef, RegionRef, Sketch,
 };
 use basset_kernel::{EdgeKey, OpId};
 use basset_math::{Affine3, Vec2, Vec3};
@@ -328,6 +328,48 @@ fn document_round_trips_through_bass() {
     let mut from_disk = basset_core::file::load(&path).unwrap();
     assert_relative_eq!(volume(&mut from_disk, ex), before, epsilon = 1e-9);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A fillet's radius is signed — negative is the inverted round — and the sign is part
+/// of the document: it is saved, read back, and the reloaded feature builds the same
+/// cove. The face it makes keeps the fillet's key either way.
+#[test]
+fn a_negative_fillet_radius_round_trips_through_bass() {
+    let (mut doc, _, ex, fi, _) = block_with_fillet();
+    doc.edit_feature_kind(fi, |kind| {
+        assert!(
+            kind.set_numeric_field(NumericField::Radius, -1.0),
+            "the sign passes through the field"
+        );
+    })
+    .unwrap();
+    let stored = |doc: &Document| {
+        doc.timeline()
+            .get(fi)
+            .unwrap()
+            .kind
+            .numeric_field(NumericField::Radius)
+    };
+    assert_eq!(stored(&doc), Some(-1.0));
+    let before = volume(&mut doc, ex);
+    // A 10 × 5 × 4 block with a quarter-cylinder of radius 1 cut along a 10 mm edge.
+    assert_relative_eq!(before, 200.0 - PI / 4.0 * 10.0, epsilon = 0.05);
+    let mut bytes = Vec::new();
+    basset_core::file::write(&mut bytes, &doc).unwrap();
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    assert!(text.contains("\"radius\": -1.0"), "{text}");
+    let mut loaded = basset_core::file::read(bytes.as_slice()).unwrap();
+    assert_eq!(stored(&loaded), Some(-1.0));
+    assert_relative_eq!(volume(&mut loaded, ex), before, epsilon = 1e-9);
+    assert!(
+        loaded
+            .state()
+            .body(BodyRef(ex))
+            .unwrap()
+            .solid
+            .face(FaceKey::new(OpId::new(fi.0), FaceRole::Fillet(0)))
+            .is_some()
+    );
 }
 
 /// A version 1 file names an extrude's inputs `profiles`; loading one must produce a

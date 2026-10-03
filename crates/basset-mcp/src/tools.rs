@@ -144,7 +144,11 @@ pub fn tool_definitions() -> Vec<Value> {
             "fillet",
             "Round edges of a body. Edge keys come from body_info.",
             obj(
-                json!({ "body": { "type": "integer" }, "edges": { "type": "array", "items": { "type": "string" } }, "radius": { "type": "number" }, "name": { "type": "string" } }),
+                json!({
+                    "body": { "type": "integer" }, "edges": { "type": "array", "items": { "type": "string" } },
+                    "radius": { "type": "number", "description": "Signed, mm. Positive is the usual round, tangent to both faces. Negative inverts it: the quarter-cylinder of that radius about the edge itself is cut out of a convex edge (a cove) or added into a concave one (a bead). Zero is refused." },
+                    "name": { "type": "string" },
+                }),
                 &["body", "edges", "radius"],
             ),
         ),
