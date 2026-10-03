@@ -1708,3 +1708,154 @@ fn an_extrude_cut_through_a_stack_targets_every_plate_it_passes() {
     assert!((reopened.volume(lower) - 192.0).abs() < 1e-9);
     assert!((reopened.volume(upper) - 200.0).abs() < 1e-9);
 }
+
+/// The name a body goes by in the model at the cursor.
+fn body_name_in(h: &mut Harness, body: basset_core::BodyRef) -> String {
+    h.editor
+        .doc
+        .state()
+        .body(body)
+        .expect("the body is in the model")
+        .name
+        .clone()
+}
+
+/// Double-clicking a body's row opens its name as a box, and Enter keeps what is typed:
+/// the browser shows it, and so does a file saved afterwards.
+#[test]
+fn a_body_is_renamed_in_the_browser_by_double_click_and_enter() {
+    let mut h = Harness::new();
+    let body = h.block();
+    let old = format!("Body{}", body.0.0);
+    assert!(h.frame().has_text(&old), "the browser lists the body");
+
+    assert!(h.double_click_ui(&old));
+    let rename = h
+        .editor
+        .body_rename
+        .as_mut()
+        .expect("the double-click opened the name box");
+    assert_eq!(rename.body, body);
+    assert_eq!(rename.draft, old, "the box starts from the current name");
+    rename.draft = "Bracket".into();
+    h.frame();
+    h.ui_key(egui::Key::Enter);
+
+    assert!(h.editor.body_rename.is_none(), "Enter closed the box");
+    assert_eq!(body_name_in(&mut h, body), "Bracket");
+    let frame = h.frame();
+    assert!(frame.has_text("Bracket"), "{:?}", frame.text());
+    assert!(
+        !frame.has_text(&old),
+        "the old name is gone from the browser"
+    );
+
+    let dir = TempDir::new("body-name");
+    let mut reopened = h.round_trip(&dir.join("named.bass"));
+    assert_eq!(body_name_in(&mut reopened, body), "Bracket");
+    assert!(reopened.frame().has_text("Bracket"));
+
+    // One undo step, which puts the old name back.
+    h.editor.undo();
+    h.editor.refresh_cache();
+    assert_eq!(body_name_in(&mut h, body), old);
+}
+
+/// Escape leaves the box with the body's name untouched, whatever was typed.
+#[test]
+fn escape_in_a_body_name_box_keeps_the_old_name() {
+    let mut h = Harness::new();
+    let body = h.block();
+    let old = format!("Body{}", body.0.0);
+    h.frame();
+    assert!(h.double_click_ui(&old));
+    h.editor.body_rename.as_mut().expect("box open").draft = "Nope".into();
+    h.frame();
+    h.ui_key(egui::Key::Escape);
+    assert!(h.editor.body_rename.is_none(), "Escape closed the box");
+    assert_eq!(body_name_in(&mut h, body), old);
+    // Nothing was recorded: the last undo entry is still the block's extrude.
+    h.editor.doc.undo();
+    assert_eq!(h.editor.doc.timeline().len(), 1);
+    assert!(h.editor.tool.is_none() && h.editor.error.is_none());
+}
+
+/// Clicking somewhere else keeps the name, as Fusion does: only Escape abandons it.
+#[test]
+fn clicking_away_from_a_body_name_box_keeps_the_name() {
+    let mut h = Harness::new();
+    let body = h.block();
+    h.frame();
+    assert!(h.double_click_ui(&format!("Body{}", body.0.0)));
+    h.editor.body_rename.as_mut().expect("box open").draft = "Plate".into();
+    h.frame();
+    assert!(h.click_ui("Origin"));
+    assert!(h.editor.body_rename.is_none());
+    assert_eq!(body_name_in(&mut h, body), "Plate");
+}
+
+/// The body's context menu has Rename, which opens the same box.
+#[test]
+fn a_body_context_menu_offers_rename() {
+    let mut h = Harness::new();
+    let body = h.block();
+    let row = h
+        .frame()
+        .rect_of(&format!("Body{}", body.0.0))
+        .expect("the browser lists the body");
+    h.right_click_ui(row.center());
+    assert!(h.click_ui("Rename"), "the menu offers Rename");
+    assert_eq!(h.editor.body_rename.as_ref().map(|r| r.body), Some(body));
+}
+
+/// Create Components from Bodies, from the body's context menu: a component named after
+/// the body appears in the browser with the body inside it, the step is one undo, and
+/// the file keeps it.
+#[test]
+fn a_body_becomes_a_component_from_its_context_menu() {
+    let mut h = Harness::new();
+    let body = h.block();
+    h.editor.doc.rename_body(body, "Bracket").unwrap();
+    let row = h
+        .frame()
+        .rect_of("Bracket")
+        .expect("the browser lists the body");
+    h.right_click_ui(row.center());
+    assert!(h.click_ui("Create Components from Bodies"));
+    settle(&mut h);
+
+    let state = h.editor.doc.state();
+    let component = state.body(body).expect("the body survives").component;
+    assert_ne!(component, basset_core::ComponentId::ROOT, "the body moved");
+    assert_eq!(state.components[&component].name, "Bracket");
+    assert_eq!(
+        state.components[&component].parent,
+        Some(basset_core::ComponentId::ROOT)
+    );
+    let frame = h.frame();
+    // The component's header and the body's row inside it both say Bracket.
+    assert_eq!(
+        frame
+            .text()
+            .iter()
+            .filter(|t| t.trim() == "Bracket")
+            .count(),
+        2,
+        "{:?}",
+        frame.text()
+    );
+
+    let dir = TempDir::new("component-from-body");
+    let mut reopened = h.round_trip(&dir.join("components.bass"));
+    let state = reopened.editor.doc.state();
+    assert_eq!(state.body(body).unwrap().component, component);
+    assert_eq!(state.components[&component].name, "Bracket");
+
+    h.editor.undo();
+    h.editor.refresh_cache();
+    assert_eq!(
+        h.editor.doc.state().body(body).unwrap().component,
+        basset_core::ComponentId::ROOT,
+        "one undo puts the body back"
+    );
+}

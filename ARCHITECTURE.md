@@ -300,6 +300,17 @@ turning it into a cycle where the sketch's own row is what mentioned the old nam
 Neither table can see that alone — capture is a collision between two scopes — and the
 document is the only place that holds both.
 
+A body is named by the feature that made it (`BodyRef`), so the name the user gives it
+in the browser is kept on that feature (`Feature::body_name`): it is deleted, reordered
+and undone with the feature, and no table has to be pruned. A rename moves no geometry,
+so the regenerator writes it into its cached states rather than replaying. Making a
+component of a body (Fusion's "Create Components from Bodies") is a timeline step,
+`ComponentFromBody`, that creates the component inside the one the body is in and moves
+the body there from that point of the history on. The feature that made the body keeps
+the component it said; a boolean, fillet or move edits a body in place and never
+reassigns its component, so nothing downstream has to be rewritten, and rolling back past
+the step puts the body back.
+
 ## Timeline
 
 `Timeline` is an ordered list of `Feature`s plus a rollback cursor. Regeneration replays
@@ -319,8 +330,10 @@ it had. The version was bumped all the same, because migration is only half of w
 version number is for. A file written now can carry parameters, and an older build reading
 it would drop them silently and save back a document whose extrude distances no longer say
 where they came from; refusing to open it, which the existing unsupported-version path
-already does for anything newer than the build knows, is much better than that. The
-document is the timeline plus that table plus metadata; geometry is never stored because it
+already does for anything newer than the build knows, is much better than that. Version 6
+added body names and the component-from-body step on the same terms: both additive, an
+identity migration, bumped so an older build refuses the file instead of dropping a
+body's name. The document is the timeline plus that table plus metadata; geometry is never stored because it
 is fully regenerable. Old versions are migrated on load; newer versions are refused with a
 clear error. Saves go through a temporary file and rename so a crash never truncates the
 previous copy.

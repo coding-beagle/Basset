@@ -12,9 +12,10 @@ use basset_sketch::{Font, SketchError, expr};
 use serde::{Deserialize, Serialize};
 
 use crate::feature::{Feature, FeatureKind, NumericField};
-use crate::ids::FeatureId;
+use crate::ids::{ComponentId, FeatureId};
 use crate::model::ModelState;
 use crate::parameters::Parameters;
+use crate::refs::BodyRef;
 use crate::regen::Regenerator;
 use crate::timeline::{ReorderError, Timeline};
 
@@ -48,6 +49,16 @@ pub enum DocumentError {
     /// document and the sketch are each perfectly legal on their own.
     #[error("sketch {0} defines {1:?} itself, so renaming would capture its references")]
     ParameterCaptured(FeatureId, String),
+    /// No feature in the timeline creates this body.
+    #[error("no feature creates body {0:?}")]
+    UnknownBody(BodyRef),
+    /// The body's feature exists, but the body is not in the model at the timeline
+    /// cursor — rolled past, suppressed, failed or combined away — so there is nothing
+    /// there to move into a component.
+    #[error("body {0:?} is not in the model at the timeline cursor")]
+    BodyNotPresent(BodyRef),
+    #[error("a name cannot be empty")]
+    EmptyName,
     #[error(transparent)]
     Reorder(#[from] ReorderError),
     #[error(transparent)]
@@ -243,6 +254,55 @@ impl Document {
             .edit(id, |f| f.name = name)
             .ok_or(DocumentError::UnknownFeature(id))?;
         Ok(())
+    }
+
+    /// Renames a body, as the browser does. Surrounding whitespace is dropped.
+    ///
+    /// Recorded for undo but not replayed: the name is kept on the feature that creates
+    /// the body and patched into the cached states, since no geometry depends on it.
+    /// Refused, recording nothing, when no feature creates the body or the name is blank —
+    /// a body with no name would be a row in the browser with nothing to click.
+    pub fn rename_body(&mut self, body: BodyRef, name: &str) -> Result<(), DocumentError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(DocumentError::EmptyName);
+        }
+        let current = match self.timeline.get(body.0) {
+            Some(f) if f.kind.creates_body() => f.body_name(),
+            _ => return Err(DocumentError::UnknownBody(body)),
+        };
+        // Committing the name it already has is what leaving the box untouched does; an
+        // undo entry for it would be a step that changes nothing and clears redo.
+        if current == name {
+            return Ok(());
+        }
+        self.record_undo();
+        self.timeline
+            .edit(body.0, |f| f.body_name = Some(name.to_string()))
+            .ok_or(DocumentError::UnknownBody(body))?;
+        self.regen.rename_body(body, name);
+        Ok(())
+    }
+
+    /// Fusion's "Create Components from Bodies" for one body: adds a timeline step, at
+    /// the cursor, that makes a component named after the body inside the component the
+    /// body is in, and moves the body into it. Returns the new component.
+    ///
+    /// One undo step, like any added feature. See [`FeatureKind::ComponentFromBody`] for
+    /// why this is a step of its own rather than an edit of the feature that made the
+    /// body. Refused, recording nothing, unless the body exists at the cursor: a step that
+    /// failed on its first replay would only be a broken entry to delete.
+    pub fn component_from_body(&mut self, body: BodyRef) -> Result<ComponentId, DocumentError> {
+        if self.timeline.get(body.0).is_none() {
+            return Err(DocumentError::UnknownBody(body));
+        }
+        let name = self
+            .state()
+            .body(body)
+            .map(|b| b.name.clone())
+            .ok_or(DocumentError::BodyNotPresent(body))?;
+        let id = self.add_feature(FeatureKind::ComponentFromBody { body, name });
+        Ok(ComponentId::from_feature(id))
     }
 
     pub fn remove_feature(&mut self, id: FeatureId) -> Result<Feature, DocumentError> {

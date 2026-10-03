@@ -211,6 +211,47 @@ impl Harness {
         self.press_ui(pos, egui::PointerButton::Primary);
     }
 
+    /// Double-clicks the widget whose label contains `label`, and returns whether one was
+    /// found. Both clicks land in one frame: egui counts a double-click by the time
+    /// between presses, and one frame is no time at all.
+    pub fn double_click_ui(&mut self, label: &str) -> bool {
+        if self.last.is_none() {
+            self.frame();
+        }
+        let Some(rect) = self.last.as_ref().and_then(|f| f.rect_of(label)) else {
+            return false;
+        };
+        let pos = rect.center();
+        self.frame_with(vec![egui::Event::PointerMoved(pos)]);
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        self.frame_with(vec![
+            button(true),
+            button(false),
+            button(true),
+            button(false),
+        ]);
+        self.frame();
+        true
+    }
+
+    /// Presses a key in egui, for the widgets that read the keyboard themselves — a text
+    /// box, the palette — rather than through [`Editor::on_key`].
+    pub fn ui_key(&mut self, key: egui::Key) {
+        self.frame_with(vec![egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        }]);
+        self.frame();
+    }
+
     /// Right-clicks a widget by its label, which is how the variant menus are opened.
     pub fn right_click_ui(&mut self, pos: egui::Pos2) {
         self.press_ui(pos, egui::PointerButton::Secondary);

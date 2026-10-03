@@ -4657,3 +4657,135 @@ mod parameters {
         assert!((h.volume(BodyRef(extrude)) - before).abs() < 1e-9);
     }
 }
+
+mod bodies {
+    use super::*;
+    use crate::editor::commands::{self, Command};
+    use crate::editor::harness::Harness;
+    use crate::editor::panels;
+    use basset_core::ComponentId;
+
+    fn component_of(h: &mut Harness, body: BodyRef) -> ComponentId {
+        h.editor
+            .doc
+            .state()
+            .body(body)
+            .expect("body exists")
+            .component
+    }
+
+    fn name_of(h: &mut Harness, body: BodyRef) -> String {
+        h.editor
+            .doc
+            .state()
+            .body(body)
+            .expect("body exists")
+            .name
+            .clone()
+    }
+
+    /// Two bodies selected, one command: a component each, and one undo for the lot.
+    #[test]
+    fn components_from_selected_bodies_are_one_undo_step() {
+        let mut h = Harness::new();
+        let a = h.block();
+        let b = h.block();
+        h.editor.selection.bodies = vec![a, b];
+        let hits = commands::search(&h.editor, "components from bodies");
+        let binding = hits.first().expect("the palette offers the command");
+        assert_eq!(binding.id, "create.components_from_bodies");
+        assert!((binding.enabled)(&h.editor));
+        panels::run(&mut h.editor, (binding.make)());
+
+        let (ca, cb) = (component_of(&mut h, a), component_of(&mut h, b));
+        assert!(ca != ComponentId::ROOT && cb != ComponentId::ROOT && ca != cb);
+        let len = h.editor.doc.timeline().len();
+        h.editor.undo();
+        assert_eq!(h.editor.doc.timeline().len(), len - 2, "both steps went");
+        assert_eq!(component_of(&mut h, a), ComponentId::ROOT);
+        assert_eq!(component_of(&mut h, b), ComponentId::ROOT);
+    }
+
+    #[test]
+    fn the_command_needs_a_selected_body() {
+        let mut h = Harness::new();
+        h.block();
+        let binding = commands::search(&h.editor, "components from bodies")
+            .into_iter()
+            .next()
+            .expect("listed even when it cannot run");
+        assert!(!(binding.enabled)(&h.editor), "nothing is selected");
+        let len = h.editor.doc.timeline().len();
+        panels::run(&mut h.editor, Command::ComponentsFromSelectedBodies);
+        assert_eq!(h.editor.doc.timeline().len(), len);
+    }
+
+    /// If one body of a selection cannot be converted, none is: half a selection turned
+    /// into components is not what was asked for.
+    #[test]
+    fn a_selection_converts_all_or_nothing() {
+        let mut h = Harness::new();
+        let a = h.block();
+        let len = h.editor.doc.timeline().len();
+        let gone = BodyRef(basset_core::FeatureId(99));
+        panels::run(&mut h.editor, Command::ComponentsFromBodies(vec![a, gone]));
+        assert!(h.editor.error.is_some(), "the refusal is reported");
+        assert_eq!(h.editor.doc.timeline().len(), len);
+        assert_eq!(component_of(&mut h, a), ComponentId::ROOT);
+        assert!(!h.editor.doc.in_transaction());
+    }
+
+    /// With a tool open the document is inside its transaction, and a rename or a new
+    /// component made then would be rolled back by the tool's Cancel. Both are refused
+    /// instead; a name box already open keeps what was typed.
+    #[test]
+    fn the_browser_waits_for_a_running_tool() {
+        let mut h = Harness::new();
+        let body = h.block();
+        h.editor.begin_body_rename(body);
+        h.editor.body_rename.as_mut().expect("box open").draft = "Later".into();
+        h.start_tool(ToolKind::Extrude);
+
+        h.editor.rename_body(body, "Later");
+        assert_eq!(
+            h.editor.body_rename.as_ref().map(|r| r.draft.as_str()),
+            Some("Later"),
+            "the typed name waits in the box"
+        );
+        let len = h.editor.doc.timeline().len();
+        h.editor.components_from_bodies(&[body]);
+        assert_eq!(h.editor.doc.timeline().len(), len);
+        h.cancel_tool();
+
+        assert_eq!(name_of(&mut h, body), format!("Body{}", body.0.0));
+        h.editor.rename_body(body, "Later");
+        assert_eq!(name_of(&mut h, body), "Later");
+    }
+
+    /// Leaving the box empty is changing one's mind, not an error to put up a dialog for.
+    #[test]
+    fn an_emptied_name_box_keeps_the_old_name_quietly() {
+        let mut h = Harness::new();
+        let body = h.block();
+        h.editor.begin_body_rename(body);
+        h.editor.rename_body(body, "  ");
+        assert!(h.editor.error.is_none());
+        assert!(h.editor.body_rename.is_none());
+        assert_eq!(name_of(&mut h, body), format!("Body{}", body.0.0));
+    }
+
+    /// A box open on a body that undo takes away closes, rather than springing back open
+    /// when redo returns the body.
+    #[test]
+    fn a_name_box_closes_when_its_body_goes() {
+        let mut h = Harness::new();
+        let body = h.block();
+        h.editor.begin_body_rename(body);
+        h.editor.undo();
+        h.editor.refresh_cache();
+        assert!(h.editor.body_rename.is_none());
+        h.editor.redo();
+        h.editor.refresh_cache();
+        assert!(h.editor.body_rename.is_none());
+    }
+}

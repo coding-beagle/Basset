@@ -76,6 +76,7 @@ impl Timeline {
                 suppressed: false,
                 kind,
                 exprs: Default::default(),
+                body_name: None,
             },
         );
         self.cursor += 1;

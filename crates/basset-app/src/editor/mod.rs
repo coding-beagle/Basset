@@ -29,7 +29,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use basset_core::{
-    BodyRef, ComponentId, Document, FeatureId, FeatureKind, FeatureStatus, SolvedSketch,
+    BodyRef, ComponentId, Document, DocumentError, FeatureId, FeatureKind, FeatureStatus,
+    SolvedSketch,
 };
 use basset_kernel::{Edge, Solid, Tessellated};
 use basset_math::{Aabb, Frame, Vec3};
@@ -198,6 +199,8 @@ pub struct Editor {
     /// as what the document has accepted. See [`panels::ParametersUi`].
     pub(crate) params_panel: panels::ParametersUi,
     rename: Option<(FeatureId, String)>,
+    /// The body whose browser row is an open name box, and what is typed in it.
+    pub(crate) body_rename: Option<panels::BodyRename>,
     meshes: HashMap<BodyRef, BodyMesh>,
     /// Bodies as picking sees them, see [`PickBody`]. Refreshed with the cache.
     pick_bodies: HashMap<BodyRef, PickBody>,
@@ -250,6 +253,7 @@ impl Editor {
             palette: None,
             params_panel: panels::ParametersUi::default(),
             rename: None,
+            body_rename: None,
             meshes: HashMap::new(),
             pick_bodies: HashMap::new(),
             cached_planes: Vec::new(),
@@ -351,6 +355,15 @@ impl Editor {
             .map(|b| (b.id, b.name.clone()))
             .collect();
         self.cached_body_components = state.bodies.values().map(|b| (b.id, b.component)).collect();
+        // A box left open on a body that has gone — undone, rolled past, combined away —
+        // has no row to sit in, and must not spring back open if the body returns.
+        if self
+            .body_rename
+            .as_ref()
+            .is_some_and(|r| !state.bodies.contains_key(&r.body))
+        {
+            self.body_rename = None;
+        }
         self.cached_components = state
             .components
             .values()
@@ -944,7 +957,9 @@ impl Editor {
         let Some(feature) = self.doc.timeline().get(id) else {
             return;
         };
-        if let FeatureKind::NewComponent { .. } = &feature.kind {
+        if let FeatureKind::NewComponent { .. } | FeatureKind::ComponentFromBody { .. } =
+            &feature.kind
+        {
             self.rename = Some((id, feature.name.clone()));
             return;
         }
@@ -961,6 +976,87 @@ impl Editor {
         } else {
             tools::edit_existing(self, id, previous_cursor);
         }
+        self.repaint = true;
+    }
+
+    // --- Bodies in the browser --------------------------------------------------------
+
+    /// Whether the browser may change the document now. Renaming a body and making a
+    /// component of one are both document edits, and with a tool or a sketch holding the
+    /// transaction open they would be undone by a Cancel that has nothing to do with them
+    /// — the same hazard [`Self::parameters_held`] explains, and refused the same way:
+    /// as the edit is applied, with a message, rather than only by greying out the row.
+    fn browser_held(&mut self) -> bool {
+        if !self.doc.in_transaction() && self.tool.is_none() && !self.is_sketching() {
+            return false;
+        }
+        self.set_status(
+            "Finish or cancel the sketch or tool first: a change made now would be undone \
+             along with it",
+        );
+        self.repaint = true;
+        true
+    }
+
+    /// Opens the body's browser row as a name box holding its current name.
+    pub(crate) fn begin_body_rename(&mut self, body: BodyRef) {
+        if self.browser_held() {
+            return;
+        }
+        let draft = self.body_name(body);
+        self.body_rename = Some(panels::BodyRename {
+            body,
+            draft,
+            focus: true,
+        });
+        self.repaint = true;
+    }
+
+    /// Commits a name typed into a body's row.
+    ///
+    /// A box emptied and left is read as changing one's mind, Fusion's behaviour, rather
+    /// than as an error worth a dialog: the old name stays. If the edit has to wait for a
+    /// tool, the box stays open with the text in it, so nothing typed is lost.
+    pub(crate) fn rename_body(&mut self, body: BodyRef, name: &str) {
+        if self.browser_held() {
+            return;
+        }
+        self.body_rename = None;
+        match self.doc.rename_body(body, name) {
+            Ok(()) => self.set_status(format!("Renamed body to {}", name.trim())),
+            Err(DocumentError::EmptyName) => {
+                self.set_status("A body needs a name; kept the one it had")
+            }
+            Err(e) => self.report_error(e),
+        }
+        self.repaint = true;
+    }
+
+    /// Fusion's "Create Components from Bodies": one new component per body, each named
+    /// after its body and holding it, all as one undo step.
+    pub(crate) fn components_from_bodies(&mut self, bodies: &[BodyRef]) {
+        if bodies.is_empty() {
+            self.set_status("Select one or more bodies to make components from");
+            return;
+        }
+        if self.browser_held() {
+            return;
+        }
+        measure::stop(self);
+        self.doc.begin_transaction();
+        for &body in bodies {
+            if let Err(e) = self.doc.component_from_body(body) {
+                // All or nothing: half the selection converted is not what was asked for.
+                self.doc.rollback_transaction();
+                self.report_error(e);
+                return;
+            }
+        }
+        self.doc.commit_transaction();
+        self.set_status(match bodies {
+            [one] => format!("Made a component of {}", self.body_name(*one)),
+            many => format!("Made {} components from bodies", many.len()),
+        });
         self.repaint = true;
     }
 

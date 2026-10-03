@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::document::Document;
 
-pub const FORMAT_VERSION: u32 = 5;
+pub const FORMAT_VERSION: u32 = 6;
 pub const EXTENSION: &str = "bass";
 
 #[derive(Serialize, Deserialize)]
@@ -89,8 +89,19 @@ fn migrate_step(mut value: serde_json::Value, version: u32) -> serde_json::Value
             migrate_v4_single_targets(&mut value);
             value
         }
+        5 => migrate_v5_body_names(value),
         _ => value,
     }
+}
+
+/// Version 6 added body names the user chose and the component-from-body step.
+///
+/// Both additive, so a version 5 document loads as it is: no body has a name of its own,
+/// and no such step exists. The bump is for the older build. It would silently drop a
+/// body's name — a field it does not know — and refuse the new step only as a "malformed
+/// document", so "this file is newer than your build" is the honest message for both.
+fn migrate_v5_body_names(value: serde_json::Value) -> serde_json::Value {
+    value
 }
 
 /// Version 5 let a boolean feature name several target bodies, so the `Join`, `Cut` and
@@ -332,6 +343,51 @@ mod tests {
         let mut reread = read(again.as_slice()).unwrap();
         let volume = reread.state().body(BodyRef(base)).unwrap().solid.volume();
         assert!((volume - expected).abs() < 1e-12);
+    }
+
+    /// A version 5 file knows nothing of body names, so its features carry no such field
+    /// and its bodies load under their default names.
+    #[test]
+    fn a_version_5_file_loads_with_default_body_names() {
+        use basset_math::Vec2;
+        use basset_sketch::{Sketch, shapes};
+
+        use crate::feature::{BodyOp, Extent, FeatureKind};
+        use crate::ids::ComponentId;
+        use crate::refs::{BodyRef, OriginPlane, PlaneRef, ProfileRef, RegionRef};
+
+        let mut doc = Document::new("old names");
+        let mut sketch = Sketch::new();
+        shapes::rectangle_two_point(&mut sketch, Vec2::ZERO, Vec2::new(10.0, 10.0));
+        let sk = doc.add_feature(FeatureKind::Sketch {
+            plane: PlaneRef::Origin(OriginPlane::XY),
+            component: ComponentId::ROOT,
+            sketch,
+        });
+        let body = doc.add_feature(FeatureKind::Extrude {
+            regions: vec![RegionRef::Profile(ProfileRef {
+                sketch: sk,
+                sample: Vec2::new(1.0, 1.0),
+            })],
+            extent: Extent::OneSide(2.0),
+            operation: BodyOp::NewBody,
+            component: ComponentId::ROOT,
+        });
+        let mut bytes = Vec::new();
+        write(&mut bytes, &doc).unwrap();
+        let mut file: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        file["format_version"] = serde_json::json!(5);
+        assert!(
+            file["document"]["timeline"]["features"][1]
+                .get("body_name")
+                .is_none(),
+            "an unrenamed body writes no name, which is the version 5 shape"
+        );
+
+        let text = serde_json::to_string(&file).unwrap();
+        let mut loaded = read(text.as_bytes()).expect("a version 5 file still loads");
+        let name = &loaded.state().body(BodyRef(body)).unwrap().name;
+        assert_eq!(*name, format!("Body{}", body.0));
     }
 
     #[test]

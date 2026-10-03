@@ -58,6 +58,14 @@ pub(crate) enum Command {
     Rename(basset_core::FeatureId),
     SelectFeature(basset_core::FeatureId),
     ToggleBody(basset_core::BodyRef),
+    /// Open a body's browser row as a name box.
+    BeginBodyRename(basset_core::BodyRef),
+    /// Give a body the name typed into its row.
+    RenameBody(basset_core::BodyRef, String),
+    /// Make a component of each body, named after it and holding it.
+    ComponentsFromBodies(Vec<basset_core::BodyRef>),
+    /// The same, for the bodies selected: what the palette and the menu run.
+    ComponentsFromSelectedBodies,
     ToggleSketch(basset_core::FeatureId),
     Activate(basset_core::ComponentId),
     FinishSketch(bool),
@@ -743,6 +751,15 @@ pub(crate) const BINDINGS: &[Binding] = &[
         live: LiveIn::Model,
         make: || Command::Tool(ToolKind::Component),
         enabled: IDLE,
+    },
+    Binding {
+        id: "create.components_from_bodies",
+        label: "Create Components from Bodies",
+        group: Group::Create,
+        chords: &[],
+        live: LiveIn::Model,
+        make: || Command::ComponentsFromSelectedBodies,
+        enabled: |e| e.tool.is_none() && !e.selection.bodies.is_empty(),
     },
     Binding {
         id: "modify.fillet",
