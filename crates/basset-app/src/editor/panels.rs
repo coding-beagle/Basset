@@ -8,6 +8,7 @@ use basset_core::{BodyRef, ComponentId, FeatureId, FeatureKind, FeatureStatus, P
 use basset_viewport::ViewPreset;
 
 use super::commands::{self, Command};
+use super::files::MeshFormat;
 use super::sketch_mode::{self, SketchTool, ToolGroup, edit_text, parse_value};
 use super::tools::{self, ToolKind};
 use super::{DisplayMode, Editor, Mode, SelectMode};
@@ -98,6 +99,14 @@ pub(super) fn run(editor: &mut Editor, c: Command) {
         Command::Save(as_new) => editor.save(as_new),
         Command::ExportStl => editor.export_stl(),
         Command::Export3mf => editor.export_3mf(),
+        Command::ExportBodies(bodies, format) => {
+            let name = match bodies.as_slice() {
+                [one] => editor.body_name(*one),
+                _ => editor.doc.name.clone(),
+            };
+            editor.export_bodies(&bodies, format, &name);
+        }
+        Command::ExportComponent(id, format) => editor.export_component(id, format),
         Command::Quit => editor.quit(),
         Command::Undo => editor.undo(),
         Command::Redo => editor.redo(),
@@ -1913,7 +1922,7 @@ fn component_tree(
     } else {
         name.clone()
     };
-    egui::CollapsingHeader::new(header)
+    let response = egui::CollapsingHeader::new(header)
         .id_salt(("component", id.0))
         .default_open(true)
         .show(ui, |ui| {
@@ -1974,6 +1983,16 @@ fn component_tree(
                 component_tree(editor, ui, child, components, commands);
             }
         });
+    response.header_response.context_menu(|ui| {
+        ui.label(&name);
+        ui.separator();
+        for format in [MeshFormat::Stl, MeshFormat::ThreeMf] {
+            if ui.button(format.label()).clicked() {
+                commands.push(Command::ExportComponent(id, format));
+                ui.close();
+            }
+        }
+    });
 }
 
 /// A body's name box in the browser, while the user is renaming it.
@@ -1990,9 +2009,9 @@ pub(crate) struct BodyRename {
 ///
 /// Renaming follows Fusion: a double-click or the context menu's Rename opens the box,
 /// Enter or clicking elsewhere keeps what was typed, Escape puts the old name back. The
-/// context menu also offers Create Components from Bodies, which takes every selected
-/// body when the row is one of them — a right-click on a selection acts on the
-/// selection — and only this row's body otherwise.
+/// context menu also offers Create Components from Bodies and the mesh exports, which
+/// take every selected body when the row is one of them — a right-click on a selection
+/// acts on the selection — and only this row's body otherwise.
 fn body_row(
     editor: &mut Editor,
     ui: &mut egui::Ui,
@@ -2050,8 +2069,15 @@ fn body_row(
             .add_enabled(!locked, egui::Button::new("Create Components from Bodies"))
             .clicked()
         {
-            commands.push(Command::ComponentsFromBodies(bodies));
+            commands.push(Command::ComponentsFromBodies(bodies.clone()));
             ui.close();
+        }
+        ui.separator();
+        for format in [MeshFormat::Stl, MeshFormat::ThreeMf] {
+            if ui.button(format.label()).clicked() {
+                commands.push(Command::ExportBodies(bodies.clone(), format));
+                ui.close();
+            }
         }
     });
 }

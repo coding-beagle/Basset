@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use basset_core::{Visibility, file};
+use basset_core::{BodyRef, ComponentId, Visibility, file};
 use basset_io::{ExportItem, Unit};
 
 use super::Editor;
@@ -105,32 +105,92 @@ impl Editor {
     }
 
     pub fn export_stl(&mut self) {
-        self.export("stl");
+        self.export(MeshFormat::Stl);
     }
 
     pub fn export_3mf(&mut self) {
-        self.export("3mf");
+        self.export(MeshFormat::ThreeMf);
     }
 
     /// Exports the selected bodies, or every visible body when nothing is selected, so
     /// "export the whole component" is the zero-click default.
-    fn export(&mut self, ext: &str) {
-        let items = self.export_items();
-        if items.is_empty() {
+    fn export(&mut self, format: MeshFormat) {
+        let bodies = if self.selection.bodies.is_empty() {
+            self.cached_bodies
+                .iter()
+                .map(|(b, _)| *b)
+                .filter(|b| !self.hidden_bodies.contains(b))
+                .collect()
+        } else {
+            self.selection.bodies.clone()
+        };
+        let name = self.doc.name.clone();
+        self.export_bodies(&bodies, format, &name);
+    }
+
+    /// Exports the visible bodies of a component and of the components inside it, into
+    /// a file named after it: what the component's row in the browser offers.
+    pub(crate) fn export_component(&mut self, id: ComponentId, format: MeshFormat) {
+        let bodies = self.component_export_bodies(id);
+        let name = self
+            .cached_components
+            .iter()
+            .find(|(c, _, _)| *c == id)
+            .map_or_else(|| self.doc.name.clone(), |(_, n, _)| n.clone());
+        self.export_bodies(&bodies, format, &name);
+    }
+
+    /// The visible bodies of a component and of every component under it.
+    pub(crate) fn component_export_bodies(&self, id: ComponentId) -> Vec<BodyRef> {
+        let mut tree = vec![id];
+        let mut i = 0;
+        while let Some(&c) = tree.get(i) {
+            tree.extend(
+                self.cached_components
+                    .iter()
+                    .filter(|(_, _, p)| *p == Some(c))
+                    .map(|(child, _, _)| *child),
+            );
+            i += 1;
+        }
+        self.cached_bodies
+            .iter()
+            .map(|(b, _)| *b)
+            .filter(|b| {
+                !self.hidden_bodies.contains(b)
+                    && self
+                        .cached_body_components
+                        .get(b)
+                        .is_some_and(|c| tree.contains(c))
+            })
+            .collect()
+    }
+
+    /// Asks where to write `bodies` and writes them there, suggesting `name` for the file.
+    pub(crate) fn export_bodies(&mut self, bodies: &[BodyRef], format: MeshFormat, name: &str) {
+        if bodies.is_empty() {
             self.report_error("nothing to export: create or show a body first");
             return;
         }
+        let ext = format.extension();
         let Some(path) = rfd::FileDialog::new()
             .add_filter(ext.to_uppercase(), &[ext])
-            .set_file_name(format!("{}.{ext}", self.doc.name))
+            .set_file_name(format!("{name}.{ext}"))
             .save_file()
         else {
             return;
         };
-        let path = with_extension(path, ext);
-        let result = match ext {
-            "stl" => basset_io::convenience::export_stl_file(&path, &items),
-            _ => basset_io::convenience::export_3mf_file(&path, &items, Unit::Millimeter),
+        self.write_export(&with_extension(path, ext), bodies, format);
+    }
+
+    /// The half of an export after the dialog, apart so a test can give it a path.
+    pub(crate) fn write_export(&mut self, path: &Path, bodies: &[BodyRef], format: MeshFormat) {
+        let items = self.export_items(bodies);
+        let result = match format {
+            MeshFormat::Stl => basset_io::convenience::export_stl_file(path, &items),
+            MeshFormat::ThreeMf => {
+                basset_io::convenience::export_3mf_file(path, &items, Unit::Millimeter)
+            }
         };
         match result {
             Ok(()) => self.set_status(format!(
@@ -143,20 +203,12 @@ impl Editor {
         }
     }
 
-    fn export_items(&mut self) -> Vec<ExportItem> {
-        let selected = self.selection.bodies.clone();
-        let hidden = self.hidden_bodies.clone();
+    fn export_items(&mut self, bodies: &[BodyRef]) -> Vec<ExportItem> {
         let state = self.doc.state();
         state
             .bodies
             .values()
-            .filter(|b| {
-                if selected.is_empty() {
-                    !hidden.contains(&b.id)
-                } else {
-                    selected.contains(&b.id)
-                }
-            })
+            .filter(|b| bodies.contains(&b.id))
             .map(|b| ExportItem::new(b.name.clone(), b.solid.tessellate().mesh))
             .collect()
     }
@@ -174,5 +226,28 @@ fn with_extension(path: PathBuf, ext: &str) -> PathBuf {
         path
     } else {
         Path::new(&path).with_extension(ext)
+    }
+}
+
+/// The mesh formats a body can be exported to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MeshFormat {
+    Stl,
+    ThreeMf,
+}
+
+impl MeshFormat {
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Stl => "stl",
+            Self::ThreeMf => "3mf",
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Stl => "Export STL…",
+            Self::ThreeMf => "Export 3MF…",
+        }
     }
 }
