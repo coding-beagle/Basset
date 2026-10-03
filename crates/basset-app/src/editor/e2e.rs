@@ -386,6 +386,64 @@ fn the_pointer_navigates_the_camera() {
 }
 
 #[test]
+fn the_view_cube_arrows_turn_a_square_on_view_a_quarter_at_a_time() {
+    use super::viewcube::{ROLL_CCW_LABEL, ROLL_CW_LABEL};
+    let mut h = Harness::new();
+    assert!(
+        !h.frame().has_text(ROLL_CW_LABEL),
+        "the isometric view has no quarter turns to offer"
+    );
+
+    h.ctrl_key("2");
+    let ccw = h.frame().rect_of(ROLL_CCW_LABEL).expect("arrows square on");
+    let cw = h.frame().rect_of(ROLL_CW_LABEL).expect("arrows square on");
+    assert!(h.click_ui(ROLL_CW_LABEL));
+    let camera = h.editor.camera;
+    assert!(
+        (camera.forward() - Vec3::Y).length() < 1e-9,
+        "still the Front view"
+    );
+    assert!(
+        (camera.right() - Vec3::Z).length() < 1e-9,
+        "turned clockwise: Z, which was up, now points right"
+    );
+
+    // Clicking the face already shown must not throw the turn away. The cube's centre is
+    // found from the arrows sitting in its upper corners.
+    let centre = egui::pos2(
+        (ccw.center().x + cw.center().x) * 0.5,
+        ccw.center().y + 52.0 - 10.0,
+    );
+    h.click_at_ui(centre);
+    h.frame();
+    assert_eq!(h.editor.status, "Front view");
+    assert!((h.editor.camera.right() - Vec3::Z).length() < 1e-9);
+
+    // Shift+← turns it back.
+    h.set_modifiers(true, false);
+    h.key(NamedKey::ArrowLeft);
+    h.set_modifiers(false, false);
+    assert!((h.editor.camera.up() - Vec3::Z).length() < 1e-9);
+    assert!(!h.editor.camera.is_rolled());
+}
+
+#[test]
+fn a_sketch_view_turns_a_quarter_at_a_time() {
+    let mut h = Harness::new();
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XZ));
+    assert!(h.editor.view_is_square_on());
+    let up = h.editor.camera.up();
+    h.set_modifiers(true, false);
+    h.key(NamedKey::ArrowRight);
+    h.set_modifiers(false, false);
+    assert!(
+        (h.editor.camera.right() - up).length() < 1e-9,
+        "Shift+→ turns the sketch clockwise"
+    );
+    assert!(h.editor.view_is_square_on());
+}
+
+#[test]
 fn keyboard_shortcuts_reach_the_editor() {
     let mut h = Harness::new();
     h.type_key("2");

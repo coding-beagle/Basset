@@ -91,6 +91,7 @@ fn side_on(distance: f64) -> Camera {
         distance,
         yaw: 0.0,
         pitch: 0.0,
+        roll: 0.0,
         projection: Projection::Perspective { fov_y: 0.7 },
     }
 }

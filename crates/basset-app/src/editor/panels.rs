@@ -103,6 +103,7 @@ pub(super) fn run(editor: &mut Editor, c: Command) {
         Command::Redo => editor.redo(),
         Command::Fit => editor.zoom_to_fit(),
         Command::View(p) => editor.look_from(p),
+        Command::RollView(clockwise) => editor.roll_view(clockwise),
         Command::ToggleProjection => editor.toggle_projection(),
         Command::Display(m) => editor.set_display_mode(m),
         Command::CycleDisplay => editor.cycle_display_mode(),

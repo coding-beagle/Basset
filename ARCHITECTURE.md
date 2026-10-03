@@ -468,7 +468,11 @@ reproduce.
 
 The navigation cube is drawn from the camera's own basis and hit-tested by casting the
 pointer into a unit cube, so its 26 click targets are exactly the shapes drawn and need no
-table of screen positions.
+table of screen positions. A click turns the camera as if the cube had been rolled to show
+that side, carrying the current orientation along rather than resetting to +Z up; the
+camera's `roll` angle about the view axis is what lets a square-on view be turned a quarter
+at a time (the cube's curved arrows, `Shift+←`/`Shift+→`). Orbiting stands the view back
+upright, since yaw and pitch are measured against world +Z.
 
 Panels never hold `&mut Editor` while borrowing document state: they queue commands that
 run after the frame's UI closure returns.

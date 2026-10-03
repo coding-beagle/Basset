@@ -4,8 +4,14 @@
 //! an eye position and orientation. Orbit, pan and zoom then become one-line updates that
 //! cannot drift the view off its target, and every named view is just a pair of angles.
 //! All maths stays in `f64`; the renderer converts to `f32` at the last moment.
+//!
+//! A third angle, `roll`, turns the picture about the view axis. It is what lets a square-on
+//! view be turned a quarter at a time (the Front view with Z pointing sideways), which no
+//! pair of yaw and pitch can express for a side view. Orbiting drops it again: dragging is
+//! defined against world +Z, and keeping a roll through it would make a horizontal drag spin
+//! the model about an axis the user cannot see.
 
-use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI};
+use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI, TAU};
 
 use basset_math::{Aabb, Mat3, Mat4, Ray, Vec3};
 
@@ -44,6 +50,11 @@ pub struct Camera {
     pub yaw: f64,
     /// Elevation of the eye above the XY plane, clamped to `[-π/2, π/2]`.
     pub pitch: f64,
+    /// Turn of the picture about the view axis, in `(-π, π]`; positive turns the model
+    /// clockwise on screen. Kept at zero when looking straight down or up, where a roll is
+    /// the same picture as a change of yaw and is stored as one, so "is the view rolled"
+    /// has a single answer.
+    pub roll: f64,
     pub projection: Projection,
 }
 
@@ -76,6 +87,7 @@ impl Camera {
             distance: 500.0,
             yaw: 0.0,
             pitch: 0.0,
+            roll: 0.0,
             projection: Projection::Perspective {
                 fov_y: DEFAULT_FOV_Y,
             },
@@ -100,16 +112,68 @@ impl Camera {
         -self.eye_direction()
     }
 
-    /// Screen-right in world space. Derived from yaw alone so it stays well defined when
+    /// Screen-right before the roll. Derived from yaw alone so it stays well defined when
     /// looking straight down or up, where a `look_at` with a fixed +Z up vector degenerates.
-    pub fn right(&self) -> Vec3 {
+    fn unrolled_right(&self) -> Vec3 {
         let (sy, cy) = self.yaw.sin_cos();
         Vec3::new(-sy, cy, 0.0)
     }
 
+    fn unrolled_up(&self) -> Vec3 {
+        self.unrolled_right().cross(self.forward())
+    }
+
+    /// Screen-right in world space.
+    pub fn right(&self) -> Vec3 {
+        let (s, c) = self.roll.sin_cos();
+        self.unrolled_right() * c + self.unrolled_up() * s
+    }
+
     /// Screen-up in world space.
     pub fn up(&self) -> Vec3 {
-        self.right().cross(self.forward())
+        let (s, c) = self.roll.sin_cos();
+        self.unrolled_up() * c - self.unrolled_right() * s
+    }
+
+    /// Whether the view has been turned about its axis away from world +Z being up.
+    /// Looking straight down or up this is always false: the turn is held as yaw.
+    pub fn is_rolled(&self) -> bool {
+        self.roll.abs() > ANGLE_EPSILON
+    }
+
+    /// Whether the camera looks straight along one of the world axes: the views a quarter
+    /// turn about the view axis is offered for, because their turns are views too.
+    pub fn is_axis_aligned(&self) -> bool {
+        is_axis(self.forward())
+    }
+
+    /// Turns the picture a quarter turn about the view axis, keeping the target in place.
+    pub fn roll_quarter_turn(&mut self, clockwise: bool) {
+        let step = if clockwise { FRAC_PI_2 } else { -FRAC_PI_2 };
+        self.roll = tidy_angle(self.roll + step);
+        self.fold_roll_into_yaw();
+    }
+
+    /// Looking straight down or up, a roll is a turn about world Z, which is what yaw is.
+    /// Storing it there keeps `roll` zero for those views, so orbiting away from a turned
+    /// Top view continues from the picture on screen rather than jumping back upright.
+    fn fold_roll_into_yaw(&mut self) {
+        if (self.pitch.abs() - FRAC_PI_2).abs() < ANGLE_EPSILON {
+            self.yaw = tidy_angle(self.yaw + self.roll * self.pitch.signum()).rem_euclid(TAU);
+            self.roll = 0.0;
+        }
+    }
+
+    /// Rolls the camera so `up` (projected square to the view axis) points up the screen.
+    /// Leaves the roll alone when `up` lies along the view axis and so says nothing.
+    fn roll_to_up(&mut self, up: Vec3) {
+        let wanted_right = self.forward().cross(up);
+        if wanted_right.length() < ANGLE_EPSILON {
+            return;
+        }
+        let (r0, u0) = (self.unrolled_right(), self.unrolled_up());
+        self.roll = tidy_angle(wanted_right.dot(u0).atan2(wanted_right.dot(r0)));
+        self.fold_roll_into_yaw();
     }
 
     pub fn is_orthographic(&self) -> bool {
@@ -144,7 +208,11 @@ impl Camera {
     }
 
     pub fn orbit(&mut self, delta_yaw: f64, delta_pitch: f64) {
-        self.yaw = (self.yaw + delta_yaw).rem_euclid(2.0 * PI);
+        // Orbiting is about world +Z, so a turned side view is stood upright first. Looking
+        // straight down or up that costs nothing, because the turn is already held as yaw.
+        self.fold_roll_into_yaw();
+        self.roll = 0.0;
+        self.yaw = (self.yaw + delta_yaw).rem_euclid(TAU);
         // Stopping exactly at the poles avoids the view flipping over the top; the basis
         // vectors are still well defined there because `right` depends only on yaw.
         self.pitch = (self.pitch + delta_pitch).clamp(-FRAC_PI_2, FRAC_PI_2);
@@ -188,13 +256,15 @@ impl Camera {
     }
 
     /// Points the camera along an arbitrary direction, given as the vector from the target
-    /// towards the eye. The view cube needs the 26 face/edge/corner directions and sketch
-    /// mode needs "square on to this plane", neither of which is a named preset.
+    /// towards the eye, with world +Z up the screen (and the presets' orientation when
+    /// looking straight down or up). Sketch mode needs "square on to this plane", which is
+    /// not a named preset.
     pub fn look_from_direction(&mut self, eye_direction: Vec3) {
         let d = eye_direction.normalize_or_zero();
         if d == Vec3::ZERO {
             return;
         }
+        self.roll = 0.0;
         self.pitch = d.z.clamp(-1.0, 1.0).asin();
         // Looking straight down or up leaves yaw undetermined. Choosing the same value the
         // Top/Bottom presets use keeps the view cube and the View menu in agreement.
@@ -203,6 +273,42 @@ impl Camera {
         } else {
             d.y.atan2(d.x)
         };
+    }
+
+    /// Turns to look from `eye_direction` the way the view cube does: as if the cube on
+    /// screen had been rolled over to show that side, so the picture's orientation is
+    /// carried along from the current one instead of reset. Clicking the face already being
+    /// looked at therefore keeps its quarter turn, and going from the Right view to the Top
+    /// view puts the Right face at the bottom of the screen, as in Fusion.
+    ///
+    /// Two exceptions keep the cube from leaving views tipped over that the user never
+    /// asked for. Until the user has turned a side view themselves, side views stay upright
+    /// (Top to Right gives Z up, not the Top view's Y), and so do the oblique edge and
+    /// corner views. And a square-on view always lands with a world axis up the screen, so
+    /// a cube click straightens a view orbited slightly off square rather than keeping its
+    /// tilt.
+    pub fn turn_to_direction(&mut self, eye_direction: Vec3) {
+        let d = eye_direction.normalize_or_zero();
+        if d == Vec3::ZERO {
+            return;
+        }
+        let carried_up = carry_along(self.up(), self.forward(), -d);
+        let turned_by_user = self.is_rolled();
+
+        self.look_from_direction(d);
+        let upright_up = self.up();
+        let up = if is_axis(d) {
+            if !turned_by_user && d.z.abs() < 0.5 {
+                upright_up
+            } else {
+                nearest_axis_square_to(d, carried_up, upright_up)
+            }
+        } else if turned_by_user {
+            carried_up
+        } else {
+            upright_up
+        };
+        self.roll_to_up(up);
     }
 
     pub fn look_from(&mut self, preset: ViewPreset) {
@@ -218,6 +324,7 @@ impl Camera {
         };
         self.yaw = yaw;
         self.pitch = pitch;
+        self.roll = 0.0;
     }
 
     fn near_far(&self) -> (f64, f64) {
@@ -317,6 +424,64 @@ impl Camera {
     pub fn field_of_view(&self) -> f64 {
         self.fov_y()
     }
+}
+
+/// Below this two view angles are the same view: far above the rounding a few quarter
+/// turns accumulate, far below anything a user could set by dragging.
+const ANGLE_EPSILON: f64 = 1e-9;
+
+/// An angle wrapped into `(-π, π]`, with quarter turns made exact so that turning four
+/// times returns to precisely where the view started rather than to within rounding of it.
+fn tidy_angle(a: f64) -> f64 {
+    let quarters = a / FRAC_PI_2;
+    let a = if (quarters - quarters.round()).abs() < ANGLE_EPSILON {
+        quarters.round() * FRAC_PI_2
+    } else {
+        a
+    };
+    let wrapped = (a + PI).rem_euclid(TAU) - PI;
+    if wrapped <= -PI + ANGLE_EPSILON {
+        PI
+    } else {
+        wrapped
+    }
+}
+
+/// Whether a unit vector lies along a world axis.
+fn is_axis(v: Vec3) -> bool {
+    v.abs().max_element() > 1.0 - ANGLE_EPSILON
+}
+
+/// `up` turned by the smallest rotation that takes `from` onto `to` (all unit vectors): what
+/// happens to the top of the screen when a cube is rolled over to show another side.
+/// Turning right round to the opposite side has no smallest rotation; it is taken about
+/// `up` itself, so up stays up.
+fn carry_along(up: Vec3, from: Vec3, to: Vec3) -> Vec3 {
+    let axis = from.cross(to);
+    let sin = axis.length();
+    if sin < ANGLE_EPSILON {
+        return up;
+    }
+    let cos = from.dot(to);
+    let k = axis / sin;
+    // Rodrigues' rotation formula.
+    up * cos + k.cross(up) * sin + k * k.dot(up) * (1.0 - cos)
+}
+
+/// Of the world axes square to `view_axis`, the one nearest `up`. A tie (up exactly between
+/// two axes, as when coming from the isometric view) goes to `preferred`, the orientation the
+/// view would have with nothing carried, so the answer never hangs on rounding.
+fn nearest_axis_square_to(view_axis: Vec3, up: Vec3, preferred: Vec3) -> Vec3 {
+    let mut best = preferred;
+    let mut best_score = up.dot(preferred);
+    for axis in [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z] {
+        let score = up.dot(axis);
+        if axis.dot(view_axis).abs() < 0.5 && score > best_score + 1e-6 {
+            best = axis;
+            best_score = score;
+        }
+    }
+    best
 }
 
 /// Right-handed perspective projection with wgpu's `[0, 1]` depth range (glam's own helper
@@ -592,5 +757,216 @@ mod tests {
             size,
             epsilon = 1e-9
         );
+    }
+
+    fn rolled(preset: ViewPreset, quarter_turns_clockwise: usize) -> Camera {
+        let mut camera = Camera::new_default();
+        camera.look_from(preset);
+        for _ in 0..quarter_turns_clockwise {
+            camera.roll_quarter_turn(true);
+        }
+        camera
+    }
+
+    #[test]
+    fn a_clockwise_quarter_turn_moves_the_top_of_the_screen_to_the_right() {
+        // Front view: X right, Z up. Turning the picture clockwise carries what was at the
+        // top of the screen (Z) round to the right-hand side.
+        let camera = rolled(ViewPreset::Front, 1);
+        assert_vec_eq(camera.forward(), Vec3::Y);
+        assert_vec_eq(camera.right(), Vec3::Z);
+        assert_vec_eq(camera.up(), -Vec3::X);
+        let mut back = camera;
+        back.roll_quarter_turn(false);
+        assert_vec_eq(back.right(), Vec3::X);
+        assert_vec_eq(back.up(), Vec3::Z);
+        assert!(!back.is_rolled());
+    }
+
+    #[test]
+    fn four_quarter_turns_return_exactly_to_the_start() {
+        for preset in [ViewPreset::Front, ViewPreset::Top, ViewPreset::Bottom] {
+            let start = rolled(preset, 0);
+            let mut camera = rolled(preset, 4);
+            // Exact, not approximate: drift here would make "is this view rolled" flicker.
+            assert_eq!(camera.roll, 0.0, "{preset:?}");
+            camera.yaw = camera.yaw.rem_euclid(TAU);
+            assert_relative_eq!(camera.yaw, start.yaw.rem_euclid(TAU), epsilon = 1e-12);
+        }
+    }
+
+    #[test]
+    fn rolled_basis_stays_orthonormal_and_projects_consistently() {
+        let mut camera = Camera::new_default();
+        camera.orbit(0.4, -0.3);
+        camera.roll = 0.7;
+        let (r, u, f) = (camera.right(), camera.up(), camera.forward());
+        assert_relative_eq!(r.length(), 1.0, epsilon = 1e-12);
+        assert_relative_eq!(u.length(), 1.0, epsilon = 1e-12);
+        assert_relative_eq!(r.dot(u), 0.0, epsilon = 1e-12);
+        assert_relative_eq!(r.dot(f), 0.0, epsilon = 1e-12);
+        assert_relative_eq!(r.cross(u).dot(-f), 1.0, epsilon = 1e-12);
+        // Screen-right in world space really is to the right on screen.
+        let centre = camera.world_to_screen(camera.target, VIEWPORT).unwrap();
+        let right = camera.world_to_screen(camera.target + r, VIEWPORT).unwrap();
+        assert!(right[0] > centre[0]);
+        assert_relative_eq!(right[1], centre[1], epsilon = 1e-6);
+    }
+
+    #[test]
+    fn looking_straight_down_a_roll_is_held_as_yaw() {
+        for preset in [ViewPreset::Top, ViewPreset::Bottom] {
+            let camera = rolled(preset, 1);
+            assert!(!camera.is_rolled(), "{preset:?}");
+            let upright = rolled(preset, 0);
+            // The picture still turned clockwise: old up is now right.
+            assert_vec_eq(camera.right(), upright.up());
+        }
+    }
+
+    #[test]
+    fn pan_follows_the_cursor_in_a_rolled_view() {
+        let mut camera = rolled(ViewPreset::Front, 1);
+        let target = camera.target;
+        let before = camera.world_to_screen(target, VIEWPORT).unwrap();
+        camera.pan(30.0, 10.0, VIEWPORT);
+        let after = camera.world_to_screen(target, VIEWPORT).unwrap();
+        assert_relative_eq!(after[0] - before[0], 30.0, epsilon = 1e-6);
+        assert_relative_eq!(after[1] - before[1], 10.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn orbit_stands_a_rolled_side_view_upright() {
+        let mut camera = rolled(ViewPreset::Front, 1);
+        camera.orbit(0.0, 0.0);
+        assert!(!camera.is_rolled());
+        assert_vec_eq(camera.forward(), Vec3::Y);
+        assert_vec_eq(camera.up(), Vec3::Z);
+    }
+
+    #[test]
+    fn orbit_from_a_turned_top_view_starts_from_the_picture_on_screen() {
+        let mut camera = rolled(ViewPreset::Top, 1);
+        let right = camera.right();
+        camera.orbit(0.0, 0.0);
+        assert_vec_eq(camera.right(), right);
+    }
+
+    #[test]
+    fn zoom_and_projection_toggle_keep_the_roll() {
+        let mut camera = rolled(ViewPreset::Right, 3);
+        let up = camera.up();
+        camera.zoom(0.5);
+        camera.set_orthographic();
+        camera.zoom_to_fit(&Aabb {
+            min: Vec3::splat(-1.0),
+            max: Vec3::splat(1.0),
+        });
+        camera.set_perspective();
+        assert_vec_eq(camera.up(), up);
+    }
+
+    #[test]
+    fn named_views_and_square_on_views_reset_the_roll() {
+        let mut camera = rolled(ViewPreset::Front, 1);
+        camera.look_from(ViewPreset::Front);
+        assert_vec_eq(camera.up(), Vec3::Z);
+        let mut camera = rolled(ViewPreset::Front, 1);
+        camera.look_from_direction(-Vec3::Y);
+        assert_vec_eq(camera.up(), Vec3::Z);
+    }
+
+    #[test]
+    fn turning_to_the_face_already_shown_keeps_its_quarter_turn() {
+        for preset in [ViewPreset::Front, ViewPreset::Top, ViewPreset::Left] {
+            let mut camera = rolled(preset, 1);
+            let (right, up) = (camera.right(), camera.up());
+            camera.turn_to_direction(-camera.forward());
+            assert_vec_eq(camera.right(), right);
+            assert_vec_eq(camera.up(), up);
+        }
+    }
+
+    #[test]
+    fn turning_to_a_face_from_upright_matches_the_named_views_for_side_faces() {
+        // Nobody has turned anything: Top to Right must stay the plain Right view.
+        let mut camera = rolled(ViewPreset::Top, 0);
+        camera.turn_to_direction(Vec3::X);
+        assert_vec_eq(camera.forward(), -Vec3::X);
+        assert_vec_eq(camera.up(), Vec3::Z);
+        // Front to Top rolls the cube over its top edge, which is the Top preset.
+        let mut camera = rolled(ViewPreset::Front, 0);
+        camera.turn_to_direction(Vec3::Z);
+        assert_vec_eq(camera.up(), Vec3::Y);
+        // From isometric the carried up sits exactly between two axes; the preset wins.
+        let mut camera = Camera::new_default();
+        camera.turn_to_direction(Vec3::Z);
+        assert_vec_eq(camera.up(), Vec3::Y);
+    }
+
+    #[test]
+    fn turning_to_the_top_carries_the_side_the_view_came_from() {
+        // As in Fusion: from the Right view, rolling the cube to its top leaves the Right
+        // face at the bottom of the screen, so screen-up is −X.
+        let mut camera = rolled(ViewPreset::Right, 0);
+        camera.turn_to_direction(Vec3::Z);
+        assert_vec_eq(camera.forward(), -Vec3::Z);
+        assert_vec_eq(camera.up(), -Vec3::X);
+    }
+
+    #[test]
+    fn turning_from_a_rolled_side_view_carries_the_roll_round() {
+        // Front turned clockwise: Z points right. Rolling the cube to the Left face (on the
+        // screen's top, since up is −X) tips the view over its top edge, so what was the
+        // view direction (+Y) ends up at the top of the screen.
+        let mut camera = rolled(ViewPreset::Front, 1);
+        camera.turn_to_direction(-Vec3::X);
+        assert_vec_eq(camera.forward(), Vec3::X);
+        assert_vec_eq(camera.up(), Vec3::Y);
+        assert!(camera.is_rolled());
+        // The right-hand face (+Z) is reached by a turn about screen-up, which keeps it.
+        let mut camera = rolled(ViewPreset::Front, 1);
+        camera.turn_to_direction(Vec3::Z);
+        assert_vec_eq(camera.forward(), -Vec3::Z);
+        assert_vec_eq(camera.up(), -Vec3::X);
+    }
+
+    #[test]
+    fn turning_to_an_oblique_view_stays_upright_unless_the_view_was_rolled() {
+        let corner = Vec3::new(1.0, -1.0, 1.0);
+        let mut camera = rolled(ViewPreset::Front, 0);
+        camera.turn_to_direction(corner);
+        let mut upright = Camera::new_default();
+        upright.look_from_direction(corner);
+        assert_vec_eq(camera.up(), upright.up());
+
+        let mut camera = rolled(ViewPreset::Front, 1);
+        camera.turn_to_direction(corner);
+        assert_vec_eq(camera.forward(), -corner.normalize());
+        assert!(camera.is_rolled());
+    }
+
+    #[test]
+    fn turning_to_a_face_straightens_a_slightly_orbited_view() {
+        let mut camera = rolled(ViewPreset::Top, 0);
+        camera.orbit(0.2, 0.0);
+        camera.turn_to_direction(Vec3::Z);
+        assert!(camera.is_axis_aligned());
+        assert_vec_eq(camera.up(), Vec3::Y);
+    }
+
+    #[test]
+    fn turning_ignores_a_degenerate_direction() {
+        let mut camera = rolled(ViewPreset::Front, 1);
+        let before = camera;
+        camera.turn_to_direction(Vec3::ZERO);
+        assert_eq!(camera, before);
+    }
+
+    #[test]
+    fn axis_alignment_is_about_the_view_direction_only() {
+        assert!(rolled(ViewPreset::Front, 1).is_axis_aligned());
+        assert!(rolled(ViewPreset::Bottom, 3).is_axis_aligned());
+        assert!(!Camera::new_default().is_axis_aligned());
     }
 }

@@ -36,6 +36,8 @@ pub(crate) enum Command {
     Redo,
     Fit,
     View(ViewPreset),
+    /// Turn the picture a quarter turn about the view axis: clockwise when `true`.
+    RollView(bool),
     ToggleProjection,
     Display(DisplayMode),
     /// Walk the display modes, as `D` and the View menu's list do.
@@ -197,6 +199,14 @@ impl Chord {
         }
     }
 
+    const fn shifted_named(key: NamedKey) -> Self {
+        Chord {
+            stroke: Stroke::Named(key),
+            ctrl: false,
+            shift: Shift::Down,
+        }
+    }
+
     /// Whether the key winit reported, with these modifiers, is this chord.
     pub fn matches(&self, key: &Key, ctrl: bool, shift: bool) -> bool {
         if self.ctrl != ctrl {
@@ -246,6 +256,8 @@ fn named_label(key: NamedKey) -> &'static str {
         NamedKey::Backspace => "Backspace",
         NamedKey::F1 => "F1",
         NamedKey::Home => "Home",
+        NamedKey::ArrowLeft => "←",
+        NamedKey::ArrowRight => "→",
         // Nothing else is bound to a named key; a new one shows as its debug name rather
         // than as a lie.
         _ => "(key)",
@@ -370,9 +382,11 @@ const HAS_SKETCH_SELECTION: fn(&Editor) -> bool = |e| match &e.mode {
 /// The view has keys Fusion does not: `Home` fits the model (the frame-all key most
 /// viewers share; `Shift+F` is the Fix constraint, so Fit could not shadow Fillet the way
 /// Dimension shadows the display modes), `Ctrl+0` is the isometric view and
-/// `Ctrl+1`/`2`/`3` are top, front and right, `Shift+V` toggles the projection, `G` the
-/// grid, `N` snapping and `Shift+O` the origin planes and axes. They are live in both
-/// modes, so orbiting away from a sketch and coming back costs one key either way.
+/// `Ctrl+1`/`2`/`3` are top, front and right, `Shift+←`/`Shift+→` turn the view a quarter
+/// turn about its axis (Fusion has the turn only as the curved arrows by the view cube),
+/// `Shift+V` toggles the projection, `G` the grid, `N` snapping and `Shift+O` the origin
+/// planes and axes. They are live in both modes, so orbiting away from a sketch and coming
+/// back costs one key either way.
 pub(crate) const BINDINGS: &[Binding] = &[
     // --- File ---
     Binding {
@@ -550,6 +564,24 @@ pub(crate) const BINDINGS: &[Binding] = &[
         chords: &[Chord::ctrl('3')],
         live: LiveIn::Both,
         make: || Command::View(ViewPreset::Right),
+        enabled: ALWAYS,
+    },
+    Binding {
+        id: "view.roll_ccw",
+        label: "Rotate view 90° counter-clockwise",
+        group: Group::View,
+        chords: &[Chord::shifted_named(NamedKey::ArrowLeft)],
+        live: LiveIn::Both,
+        make: || Command::RollView(false),
+        enabled: ALWAYS,
+    },
+    Binding {
+        id: "view.roll_cw",
+        label: "Rotate view 90° clockwise",
+        group: Group::View,
+        chords: &[Chord::shifted_named(NamedKey::ArrowRight)],
+        live: LiveIn::Both,
+        make: || Command::RollView(true),
         enabled: ALWAYS,
     },
     Binding {
