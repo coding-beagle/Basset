@@ -36,6 +36,31 @@ pub struct Feature {
     /// expression put it there.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub exprs: BTreeMap<NumericField, String>,
+    /// What the user renamed the body this feature creates to, if they have.
+    ///
+    /// On the creating feature rather than in a table of the document's because a body is
+    /// named by that feature ([`BodyRef`]) and lives and dies with it: deleting or
+    /// reordering the feature takes the name along, undo already snapshots it, and there
+    /// is no table to prune. It is not a step of the history either — a rename moves no
+    /// geometry, so the regenerator patches it into its cached states instead of
+    /// replaying (see `Regenerator::rename_body`). Meaningless on a feature that creates
+    /// no body, which `Document::rename_body` refuses to write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_name: Option<String>,
+}
+
+impl Feature {
+    /// The name the body this feature creates goes by: the user's, or the default one.
+    pub fn body_name(&self) -> String {
+        self.body_name
+            .clone()
+            .unwrap_or_else(|| default_body_name(self.id))
+    }
+}
+
+/// What a body is called until the user renames it.
+pub fn default_body_name(id: FeatureId) -> String {
+    format!("Body{}", id.0)
 }
 
 /// A number inside a [`FeatureKind`] that an expression can drive.
@@ -123,6 +148,25 @@ pub enum FeatureKind {
         name: String,
         parent: ComponentId,
     },
+    /// Fusion's "Create Components from Bodies", for one body: a new component, made a
+    /// child of the component the body is in, with the body moved into it.
+    ///
+    /// A step of the timeline rather than an edit of the feature that made the body,
+    /// because that feature's `component` says where its output *landed* and every
+    /// later feature that joins, cuts or fillets the body found it there. Moving the body
+    /// from this point on leaves all of them untouched: a boolean or a fillet edits a
+    /// body in place and never reassigns its component, so the body stays wherever it
+    /// was last put, and a later feature that makes a *new* body still lands where it
+    /// said. Rolling back past this step puts the body back where it was, as Fusion does.
+    ///
+    /// The parent is read off the body at replay rather than stored, so it is always the
+    /// component the body is actually in at this point of the history. The name is
+    /// stored: the component is named after the body when it is made, and is its own
+    /// thing from then on.
+    ComponentFromBody {
+        body: BodyRef,
+        name: String,
+    },
     Sketch {
         plane: PlaneRef,
         component: ComponentId,
@@ -186,6 +230,7 @@ impl FeatureKind {
     pub fn default_name(&self) -> &'static str {
         match self {
             FeatureKind::NewComponent { .. } => "Component",
+            FeatureKind::ComponentFromBody { .. } => "Component from Body",
             FeatureKind::Sketch { .. } => "Sketch",
             FeatureKind::OffsetPlane { .. } => "Offset Plane",
             FeatureKind::AngledPlane { .. } => "Angled Plane",
@@ -326,6 +371,7 @@ impl FeatureKind {
                     out.push(FeatureId(parent.0));
                 }
             }
+            FeatureKind::ComponentFromBody { body, .. } => out.push(body.0),
             FeatureKind::Sketch { plane: p, .. } => plane(p),
             FeatureKind::OffsetPlane { base, .. } => plane(base),
             FeatureKind::AngledPlane { base, axis, .. } => {

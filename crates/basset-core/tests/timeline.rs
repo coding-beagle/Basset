@@ -1025,3 +1025,243 @@ fn a_boolean_with_no_targets_fails_the_feature_with_a_message() {
         other => panic!("an empty target list came back {other:?}"),
     }
 }
+
+// ----- body names and components from bodies ---------------------------------------------
+
+/// A 10×5×4 block in the root component, and the sketch it was extruded from.
+fn block() -> (Document, FeatureId, FeatureId) {
+    let mut doc = Document::new("test");
+    let (sketch, _) = rect_sketch(10.0, 5.0);
+    let sk = sketch_on(&mut doc, PlaneRef::Origin(OriginPlane::XY), sketch);
+    let ex = extrude(&mut doc, sk, Vec2::new(1.0, 1.0), 4.0, BodyOp::NewBody);
+    (doc, sk, ex)
+}
+
+fn body_name(doc: &mut Document, body: FeatureId) -> String {
+    doc.state()
+        .body(BodyRef(body))
+        .expect("body exists")
+        .name
+        .clone()
+}
+
+fn body_component(doc: &mut Document, body: FeatureId) -> ComponentId {
+    doc.state()
+        .body(BodyRef(body))
+        .expect("body exists")
+        .component
+}
+
+/// A 2×2 sketch on the block's top face, for features that build onto it.
+fn sketch_on_top(doc: &mut Document, body: FeatureId) -> FeatureId {
+    sketch_on(
+        doc,
+        PlaneRef::Face(FaceRef {
+            body: BodyRef(body),
+            key: face(body, FaceRole::EndCap),
+        }),
+        rect_sketch(2.0, 2.0).0,
+    )
+}
+
+#[test]
+fn a_renamed_body_keeps_its_name_through_replay_and_undo() {
+    let (mut doc, sk, ex) = block();
+    assert_eq!(body_name(&mut doc, ex), format!("Body{}", ex.0));
+    let solid = doc.state().body(BodyRef(ex)).unwrap().solid.clone();
+
+    doc.rename_body(BodyRef(ex), "  Bracket ").unwrap();
+    assert_eq!(
+        body_name(&mut doc, ex),
+        "Bracket",
+        "trimmed, and visible at once"
+    );
+    assert!(
+        std::sync::Arc::ptr_eq(&doc.state().body(BodyRef(ex)).unwrap().solid, &solid),
+        "a rename moves no geometry, so nothing was replayed"
+    );
+
+    // A replay from before the body reads the name back off its feature.
+    doc.edit_feature(sk, |_| {}).unwrap();
+    assert_eq!(body_name(&mut doc, ex), "Bracket");
+    // As does a feature that edits the body in place.
+    let top = sketch_on_top(&mut doc, ex);
+    extrude(
+        &mut doc,
+        top,
+        Vec2::new(0.5, 0.5),
+        1.0,
+        BodyOp::Join(vec![BodyRef(ex)]),
+    );
+    assert_eq!(body_name(&mut doc, ex), "Bracket");
+
+    // The rename, the sketch edit, the sketch and the join.
+    for _ in 0..4 {
+        assert!(doc.undo());
+    }
+    assert_eq!(body_name(&mut doc, ex), format!("Body{}", ex.0));
+    for _ in 0..4 {
+        assert!(doc.redo());
+    }
+    assert_eq!(body_name(&mut doc, ex), "Bracket");
+}
+
+#[test]
+fn renaming_a_body_to_the_name_it_has_records_nothing() {
+    let (mut doc, _, ex) = block();
+    doc.rename_body(BodyRef(ex), "Plate").unwrap();
+    doc.undo();
+    assert!(doc.can_redo());
+    doc.rename_body(BodyRef(ex), &format!("Body{}", ex.0))
+        .unwrap();
+    assert!(
+        doc.can_redo(),
+        "an unchanged name is not an edit, so it must not clear redo"
+    );
+}
+
+#[test]
+fn a_body_rename_is_refused_for_no_body_or_no_name() {
+    let (mut doc, sk, ex) = block();
+    assert!(matches!(
+        doc.rename_body(BodyRef(FeatureId(99)), "x"),
+        Err(basset_core::DocumentError::UnknownBody(_))
+    ));
+    assert!(
+        matches!(
+            doc.rename_body(BodyRef(sk), "x"),
+            Err(basset_core::DocumentError::UnknownBody(_))
+        ),
+        "a sketch makes no body to name"
+    );
+    assert!(matches!(
+        doc.rename_body(BodyRef(ex), "   "),
+        Err(basset_core::DocumentError::EmptyName)
+    ));
+    assert_eq!(body_name(&mut doc, ex), format!("Body{}", ex.0));
+    // Two features added, nothing else: the refusals recorded no undo entry.
+    assert!(doc.undo() && doc.undo() && !doc.undo());
+}
+
+#[test]
+fn a_component_from_a_body_is_named_after_it_and_holds_it() {
+    let (mut doc, _, ex) = block();
+    doc.rename_body(BodyRef(ex), "Bracket").unwrap();
+    let cid = doc.component_from_body(BodyRef(ex)).unwrap();
+
+    let state = doc.state();
+    let component = state.components.get(&cid).expect("the component exists");
+    assert_eq!(component.name, "Bracket");
+    assert_eq!(component.parent, Some(ComponentId::ROOT));
+    let body = state.body(BodyRef(ex)).unwrap();
+    assert_eq!(body.component, cid);
+    assert_eq!(body.name, "Bracket", "the body keeps its own name");
+    assert_eq!(state.bodies_in(cid).len(), 1);
+    assert_eq!(
+        state.bodies_in(ComponentId::ROOT).len(),
+        1,
+        "the root still contains it, one level down"
+    );
+    assert_relative_eq!(volume(&mut doc, ex), 200.0, epsilon = 1e-9);
+}
+
+/// The moved body stays moved through everything later features do to it, and a later
+/// feature that makes a new body still puts it where it said.
+#[test]
+fn later_features_leave_a_moved_body_in_its_new_component() {
+    let (mut doc, _, ex) = block();
+    let cid = doc.component_from_body(BodyRef(ex)).unwrap();
+    let top = sketch_on_top(&mut doc, ex);
+    let join = extrude(
+        &mut doc,
+        top,
+        Vec2::new(0.5, 0.5),
+        1.0,
+        BodyOp::Join(vec![BodyRef(ex)]),
+    );
+    let other = extrude(&mut doc, top, Vec2::new(0.5, 0.5), 3.0, BodyOp::NewBody);
+    assert_eq!(doc.state().status(join), Some(&FeatureStatus::Ok));
+    assert_relative_eq!(volume(&mut doc, ex), 204.0, epsilon = 1e-6);
+    assert_eq!(body_component(&mut doc, ex), cid);
+    assert_eq!(body_component(&mut doc, other), ComponentId::ROOT);
+}
+
+#[test]
+fn rolling_back_past_the_step_puts_the_body_back() {
+    let (mut doc, _, ex) = block();
+    let cid = doc.component_from_body(BodyRef(ex)).unwrap();
+    doc.set_cursor(2);
+    assert_eq!(body_component(&mut doc, ex), ComponentId::ROOT);
+    assert!(!doc.state().components.contains_key(&cid));
+    doc.set_cursor(3);
+    assert_eq!(body_component(&mut doc, ex), cid);
+}
+
+#[test]
+fn a_component_from_a_body_is_one_undo_step() {
+    let (mut doc, _, ex) = block();
+    let cid = doc.component_from_body(BodyRef(ex)).unwrap();
+    assert!(doc.undo());
+    assert_eq!(doc.timeline().len(), 2);
+    assert_eq!(body_component(&mut doc, ex), ComponentId::ROOT);
+    assert!(!doc.state().components.contains_key(&cid));
+    assert!(doc.redo());
+    assert_eq!(body_component(&mut doc, ex), cid);
+}
+
+#[test]
+fn a_component_from_a_body_needs_the_body_at_the_cursor() {
+    let (mut doc, _, ex) = block();
+    assert!(matches!(
+        doc.component_from_body(BodyRef(FeatureId(99))),
+        Err(basset_core::DocumentError::UnknownBody(_))
+    ));
+    doc.set_cursor(1);
+    assert!(matches!(
+        doc.component_from_body(BodyRef(ex)),
+        Err(basset_core::DocumentError::BodyNotPresent(_))
+    ));
+    assert_eq!(doc.timeline().len(), 2, "nothing was added");
+}
+
+/// Converting a body that is already in a component nests the new one inside it, as
+/// Fusion does; the parent is whatever the body is in at that point of the history.
+#[test]
+fn converting_a_body_twice_nests_the_components() {
+    let (mut doc, _, ex) = block();
+    let outer = doc.component_from_body(BodyRef(ex)).unwrap();
+    let inner = doc.component_from_body(BodyRef(ex)).unwrap();
+    let state = doc.state();
+    assert_eq!(state.components[&inner].parent, Some(outer));
+    assert_eq!(state.body(BodyRef(ex)).unwrap().component, inner);
+}
+
+#[test]
+fn the_step_depends_on_the_body_it_moves() {
+    let (mut doc, _, ex) = block();
+    let cid = doc.component_from_body(BodyRef(ex)).unwrap();
+    let step = FeatureId(cid.0);
+    assert!(
+        doc.reorder_feature(step, 0).is_err(),
+        "the step cannot move before the body exists"
+    );
+    // Deleting the body's feature leaves the step failed, not the replay aborted.
+    doc.remove_feature(ex).unwrap();
+    assert!(matches!(
+        doc.state().status(step),
+        Some(FeatureStatus::Failed(_))
+    ));
+}
+
+#[test]
+fn body_names_and_components_from_bodies_round_trip_through_bass() {
+    let (mut doc, _, ex) = block();
+    doc.rename_body(BodyRef(ex), "Bracket").unwrap();
+    let cid = doc.component_from_body(BodyRef(ex)).unwrap();
+    let mut bytes = Vec::new();
+    basset_core::file::write(&mut bytes, &doc).unwrap();
+    let mut loaded = basset_core::file::read(bytes.as_slice()).unwrap();
+    assert_eq!(body_name(&mut loaded, ex), "Bracket");
+    assert_eq!(body_component(&mut loaded, ex), cid);
+    assert_eq!(loaded.state().components[&cid].name, "Bracket");
+}

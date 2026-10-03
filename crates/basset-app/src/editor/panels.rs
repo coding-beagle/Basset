@@ -163,6 +163,13 @@ pub(super) fn run(editor: &mut Editor, c: Command) {
             }
         }
         Command::Activate(c) => editor.active_component = c,
+        Command::BeginBodyRename(b) => editor.begin_body_rename(b),
+        Command::RenameBody(b, name) => editor.rename_body(b, &name),
+        Command::ComponentsFromBodies(bodies) => editor.components_from_bodies(&bodies),
+        Command::ComponentsFromSelectedBodies => {
+            let bodies = editor.selection.bodies.clone();
+            editor.components_from_bodies(&bodies);
+        }
         Command::FinishSketch(keep) => sketch_mode::finish(editor, keep),
         // Arming a constraint tool applies it straight away to a selection that already
         // suits it, so selecting first and selecting after are the same command.
@@ -534,6 +541,15 @@ fn menu_bar(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
                 ],
                 commands,
             );
+            let can = editor.tool.is_none() && !editor.selection.bodies.is_empty();
+            if ui
+                .add_enabled(can, egui::Button::new("Create Components from Bodies"))
+                .on_disabled_hover_text("Select one or more bodies first")
+                .clicked()
+            {
+                commands.push(Command::ComponentsFromSelectedBodies);
+                ui.close();
+            }
         });
         ui.menu_button("Modify", |ui| {
             tool_menu(
@@ -1918,12 +1934,7 @@ fn component_tree(
                         if ui.checkbox(&mut visible, "").changed() {
                             commands.push(Command::ToggleBody(b));
                         }
-                        let selected = editor.selection.bodies.contains(&b);
-                        if ui.selectable_label(selected, bname).clicked() {
-                            editor.selection.clear();
-                            editor.selection.bodies.push(b);
-                            commands.push(Command::SelectFeature(b.0));
-                        }
+                        body_row(editor, ui, b, bname, commands);
                     });
                 }
             }
@@ -1963,6 +1974,86 @@ fn component_tree(
                 component_tree(editor, ui, child, components, commands);
             }
         });
+}
+
+/// A body's name box in the browser, while the user is renaming it.
+pub(crate) struct BodyRename {
+    pub body: BodyRef,
+    pub draft: String,
+    /// Set when the box opens and cleared once it has taken the keyboard. Asked for only
+    /// once, because a box that grabbed focus every frame could never be clicked away
+    /// from — and clicking away is one of the ways a rename is kept.
+    pub focus: bool,
+}
+
+/// A body's name in the browser: a label to select it by, or the box renaming it.
+///
+/// Renaming follows Fusion: a double-click or the context menu's Rename opens the box,
+/// Enter or clicking elsewhere keeps what was typed, Escape puts the old name back. The
+/// context menu also offers Create Components from Bodies, which takes every selected
+/// body when the row is one of them — a right-click on a selection acts on the
+/// selection — and only this row's body otherwise.
+fn body_row(
+    editor: &mut Editor,
+    ui: &mut egui::Ui,
+    b: BodyRef,
+    name: String,
+    commands: &mut Vec<Command>,
+) {
+    if let Some(rename) = editor.body_rename.as_mut().filter(|r| r.body == b) {
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut rename.draft)
+                .id_salt(("body-rename", b.0.0))
+                .desired_width(140.0),
+        );
+        if std::mem::take(&mut rename.focus) {
+            response.request_focus();
+        }
+        // Escape also takes the focus away, so it has to be told apart from the ways
+        // of leaving the box that keep the name.
+        if response.lost_focus() {
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                editor.body_rename = None;
+            } else {
+                commands.push(Command::RenameBody(b, rename.draft.clone()));
+            }
+        }
+        return;
+    }
+    let locked = editor.tool.is_some() || editor.is_sketching();
+    let selected = editor.selection.bodies.contains(&b);
+    let response = ui.selectable_label(selected, &name);
+    if response.clicked() {
+        editor.selection.clear();
+        editor.selection.bodies.push(b);
+        commands.push(Command::SelectFeature(b.0));
+    }
+    if response.double_clicked() && !locked {
+        commands.push(Command::BeginBodyRename(b));
+    }
+    response.context_menu(|ui| {
+        ui.label(&name);
+        ui.separator();
+        if ui
+            .add_enabled(!locked, egui::Button::new("Rename"))
+            .clicked()
+        {
+            commands.push(Command::BeginBodyRename(b));
+            ui.close();
+        }
+        let bodies = if selected {
+            editor.selection.bodies.clone()
+        } else {
+            vec![b]
+        };
+        if ui
+            .add_enabled(!locked, egui::Button::new("Create Components from Bodies"))
+            .clicked()
+        {
+            commands.push(Command::ComponentsFromBodies(bodies));
+            ui.close();
+        }
+    });
 }
 
 fn timeline(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
@@ -2088,7 +2179,7 @@ fn cursor_marker(ui: &mut egui::Ui, _active: bool) {
 
 fn abbreviation(kind: &FeatureKind) -> &'static str {
     match kind {
-        FeatureKind::NewComponent { .. } => "Cmp",
+        FeatureKind::NewComponent { .. } | FeatureKind::ComponentFromBody { .. } => "Cmp",
         FeatureKind::Sketch { .. } => "Sk",
         FeatureKind::OffsetPlane { .. } => "Pl+",
         FeatureKind::AngledPlane { .. } => "Pl∠",

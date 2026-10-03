@@ -309,6 +309,17 @@ turning it into a cycle where the sketch's own row is what mentioned the old nam
 Neither table can see that alone — capture is a collision between two scopes — and the
 document is the only place that holds both.
 
+A body is named by the feature that made it (`BodyRef`), so the name the user gives it
+in the browser is kept on that feature (`Feature::body_name`): it is deleted, reordered
+and undone with the feature, and no table has to be pruned. A rename moves no geometry,
+so the regenerator writes it into its cached states rather than replaying. Making a
+component of a body (Fusion's "Create Components from Bodies") is a timeline step,
+`ComponentFromBody`, that creates the component inside the one the body is in and moves
+the body there from that point of the history on. The feature that made the body keeps
+the component it said; a boolean, fillet or move edits a body in place and never
+reassigns its component, so nothing downstream has to be rewritten, and rolling back past
+the step puts the body back.
+
 ## Timeline
 
 `Timeline` is an ordered list of `Feature`s plus a rollback cursor. Regeneration replays
@@ -333,8 +344,10 @@ added `visibility` — the hidden bodies and sketches and whether the origin and
 shown — for the same reason and with the same identity migration; an older file opens
 with the defaults a fresh editor shows. Visibility sits outside the undo snapshots, since
 hiding something is not an edit. The editor keeps its own working copy and syncs it into
-the document on save and back out on open. The
-document is the timeline plus that table plus metadata; geometry is never stored because it
+the document on save and back out on open. Version 8 added body names and the
+component-from-body step on the same terms: both additive, an identity migration, bumped
+so an older build refuses the file instead of dropping a body's name. The document is the
+timeline plus that table plus metadata; geometry is never stored because it
 is fully regenerable. Old versions are migrated on load; newer versions are refused with a
 clear error. Saves go through a temporary file and rename so a crash never truncates the
 previous copy.

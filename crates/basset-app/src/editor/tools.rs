@@ -623,7 +623,11 @@ pub fn edit_existing(editor: &mut Editor, id: FeatureId, previous_cursor: usize)
             params.angle_deg = angle.to_degrees();
             ToolKind::AngledPlane
         }
-        FeatureKind::Sketch { .. } | FeatureKind::NewComponent { .. } => return,
+        // Nothing to set in a dialog: a component step's only choices were made in the
+        // browser, by picking the body (or parent) and the name.
+        FeatureKind::Sketch { .. }
+        | FeatureKind::NewComponent { .. }
+        | FeatureKind::ComponentFromBody { .. } => return,
     };
     let restore_cursor = Some(previous_cursor);
     // A driven feature re-opens showing what drives it, not the number it works out to:

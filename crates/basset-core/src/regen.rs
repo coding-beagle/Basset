@@ -88,6 +88,20 @@ impl Regenerator {
         self.snapshots.truncate(index);
     }
 
+    /// Writes a body's new name into every cached state that holds the body.
+    ///
+    /// A name is not an input to any geometry, so throwing the cache away and replaying
+    /// from the creating feature — which can be most of the model — would buy nothing.
+    /// The next replay reads the same name off the feature, so a patched snapshot and a
+    /// replayed one agree.
+    pub fn rename_body(&mut self, body: BodyRef, name: &str) {
+        for state in &mut self.snapshots {
+            if let Some(b) = state.bodies.get_mut(&body) {
+                b.name = name.to_string();
+            }
+        }
+    }
+
     pub fn evaluate(&mut self, timeline: &Timeline) -> &ModelState {
         let count = timeline.active().len();
         self.evaluate_prefix(timeline, count)
@@ -185,6 +199,23 @@ impl Regenerator {
                     },
                 );
             }
+            FeatureKind::ComponentFromBody { body, name } => {
+                let moved = state
+                    .bodies
+                    .get_mut(body)
+                    .ok_or(RegenError::MissingBody(body.0))?;
+                let parent = moved.component;
+                let cid = ComponentId::from_feature(id);
+                moved.component = cid;
+                state.components.insert(
+                    cid,
+                    Component {
+                        id: cid,
+                        name: name.clone(),
+                        parent: Some(parent),
+                    },
+                );
+            }
             FeatureKind::Sketch {
                 plane,
                 component,
@@ -259,7 +290,7 @@ impl Regenerator {
                         )?),
                     }
                 }))?;
-                self.finish_body(state, id, *component, solid, operation)?;
+                self.finish_body(state, feature, *component, solid, operation)?;
             }
             FeatureKind::Revolve {
                 regions,
@@ -279,7 +310,7 @@ impl Regenerator {
                         &self.kernel_tessellation,
                     )?)
                 }))?;
-                self.finish_body(state, id, *component, solid, operation)?;
+                self.finish_body(state, feature, *component, solid, operation)?;
             }
             FeatureKind::Sweep {
                 regions,
@@ -292,7 +323,7 @@ impl Regenerator {
                     let profile = resolve_region(state, p)?;
                     Ok(kernel::sweep(op_id(id, k), &profile, &path)?)
                 }))?;
-                self.finish_body(state, id, *component, solid, operation)?;
+                self.finish_body(state, feature, *component, solid, operation)?;
             }
             FeatureKind::Loft {
                 regions,
@@ -304,7 +335,7 @@ impl Regenerator {
                     .map(|p| resolve_region(state, p))
                     .collect::<Result<Vec<_>, _>>()?;
                 let solid = kernel::loft(op_id(id, 0), &sections)?;
-                self.finish_body(state, id, *component, solid, operation)?;
+                self.finish_body(state, feature, *component, solid, operation)?;
             }
             FeatureKind::Fillet { edges, radius } => {
                 for (body_ref, keys) in group_edges(edges) {
@@ -381,11 +412,12 @@ impl Regenerator {
     fn finish_body(
         &self,
         state: &mut ModelState,
-        id: FeatureId,
+        feature: &Feature,
         component: ComponentId,
         solid: Solid,
         operation: &BodyOp,
     ) -> Result<(), RegenError> {
+        let id = feature.id;
         if !state.components.contains_key(&component) {
             return Err(RegenError::MissingComponent(component));
         }
@@ -396,7 +428,7 @@ impl Regenerator {
                     body_ref,
                     Body {
                         id: body_ref,
-                        name: format!("Body{}", id.0),
+                        name: feature.body_name(),
                         component,
                         solid: Arc::new(solid),
                     },
