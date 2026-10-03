@@ -1676,6 +1676,211 @@ fn drawing_onto_a_curve_constrains_the_point_to_it() {
     }
 }
 
+/// Draws a shape with `tool`, one click per point, through the same snapping a pointer
+/// gets, and commits it.
+fn draw_with(editor: &mut Editor, tool: SketchTool, clicks: &[Vec2]) {
+    let camera = editor.camera;
+    let window = editor.window_px;
+    let s = sketch(editor);
+    s.set_tool(tool);
+    for p in clicks {
+        s.pointer_moved(&click_at(p.x, p.y), &camera, window, false);
+        s.pointer_up(&click_at(p.x, p.y), &camera, window, true, false);
+    }
+    editor.commit_sketch();
+}
+
+/// The solve after the last edit, which must have succeeded with nothing redundant:
+/// a shape the user just drew is never over-constrained by what the editor inferred.
+fn clean_solve(s: &sketch_mode::SketchEditor) {
+    match &s.report {
+        Some(Ok(r)) => assert!(r.redundant.is_empty(), "redundant: {:?}", r.redundant),
+        other => panic!("the sketch did not solve: {other:?}"),
+    }
+}
+
+/// How many `Coincident` ties land on `target`.
+fn ties_onto(s: &sketch_mode::SketchEditor, target: EntityId) -> usize {
+    s.sketch
+        .constraints()
+        .filter(|(_, c)| matches!(c, Constraint::Coincident { target: t, .. } if *t == target))
+        .count()
+}
+
+/// A rectangle drawn from any corner lands where it was clicked, and the clicks that
+/// snapped tie the corners that were *made* there.
+///
+/// The builder always numbers corners from the lowest one, and the ties assumed the
+/// first click made that corner and the second the highest. Drawn from top-left to
+/// bottom-right, the tie meant for the top-left corner went onto the bottom-left one,
+/// so the rectangle was pulled flat onto whatever the first click had snapped to the
+/// moment it was placed.
+#[test]
+fn a_rectangle_snapped_at_both_corners_lands_where_it_was_clicked_in_every_direction() {
+    let (lo, hi) = (Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+    let corners = [lo, Vec2::new(hi.x, lo.y), hi, Vec2::new(lo.x, hi.y)];
+    for (from, to) in [(0, 2), (2, 0), (3, 1), (1, 3)] {
+        let (from, to) = (corners[from], corners[to]);
+        let mut editor = Editor::new(None);
+        editor.window_px = [800, 600];
+        sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+        // A line ending at each click, slanted so neither runs along a side.
+        draw_line(&mut editor, from + Vec2::new(-10.0, 30.0), from);
+        draw_line(&mut editor, to + Vec2::new(-10.0, -30.0), to);
+        let anchors = [from, to].map(|p| point_at(sketch(&mut editor), p));
+        draw_with(&mut editor, SketchTool::Rectangle, &[from, to]);
+
+        let s = sketch(&mut editor);
+        clean_solve(s);
+        for c in corners {
+            assert!(
+                s.sketch
+                    .entities()
+                    .filter(
+                        |(_, e)| matches!(e.entity, Entity::Point { pos } if pos.distance(c) < 1e-6)
+                    )
+                    .count()
+                    >= 1,
+                "{from} to {to}: no corner at {c}"
+            );
+        }
+        for anchor in anchors {
+            assert_eq!(
+                ties_onto(s, anchor),
+                1,
+                "{from} to {to}: each click is tied"
+            );
+        }
+    }
+}
+
+/// A rectangle whose side runs along a line it was snapped onto keeps its shape.
+///
+/// This is the case that was reported: the second click lands on a line the bottom side
+/// will lie along, and the tie went onto the top corner instead of the bottom one, so
+/// the rectangle folded to nothing on the line.
+#[test]
+fn a_rectangle_snapped_onto_a_line_its_side_runs_along_keeps_its_shape() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_line(&mut editor, Vec2::new(-40.0, 0.0), Vec2::new(60.0, 0.0));
+    let base = {
+        let s = sketch(&mut editor);
+        s.sketch
+            .entities()
+            .find(|(_, e)| matches!(e.entity, Entity::Line { .. }))
+            .map(|(id, _)| id)
+            .expect("the line")
+    };
+    draw_with(
+        &mut editor,
+        SketchTool::Rectangle,
+        &[Vec2::new(5.0, 10.0), Vec2::new(25.0, 0.0)],
+    );
+
+    let s = sketch(&mut editor);
+    clean_solve(s);
+    for c in [
+        Vec2::new(5.0, 0.0),
+        Vec2::new(25.0, 0.0),
+        Vec2::new(25.0, 10.0),
+        Vec2::new(5.0, 10.0),
+    ] {
+        point_at(s, c);
+    }
+    assert_eq!(
+        ties_onto(s, base),
+        1,
+        "the bottom corner is held on the line"
+    );
+    let profiles = s.sketch.profiles(&Default::default());
+    assert!(
+        profiles.iter().any(|p| (p.area() - 200.0).abs() < 1e-6),
+        "the rectangle still encloses its area"
+    );
+}
+
+/// Drawn against an existing rectangle — starting on its corner, sides carrying on along
+/// its sides — the new one stays where it was put and the old one does not move.
+#[test]
+fn a_rectangle_drawn_off_another_ones_corner_moves_neither() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(60.0, 10.0));
+    // From the top-right corner down and to the right: the top sides are collinear and
+    // the new left side lies along the old right side.
+    draw_with(
+        &mut editor,
+        SketchTool::Rectangle,
+        &[Vec2::new(60.0, 10.0), Vec2::new(80.0, 0.0)],
+    );
+    // And a centre rectangle whose corner lands on the first one's top side.
+    draw_with(
+        &mut editor,
+        SketchTool::CenterRectangle,
+        &[Vec2::new(25.0, 30.0), Vec2::new(40.0, 10.0)],
+    );
+
+    let s = sketch(&mut editor);
+    clean_solve(s);
+    for c in [
+        Vec2::new(0.0, 0.0),
+        Vec2::new(60.0, 0.0),
+        Vec2::new(60.0, 10.0),
+        Vec2::new(0.0, 10.0),
+        Vec2::new(80.0, 0.0),
+        Vec2::new(80.0, 10.0),
+        Vec2::new(10.0, 10.0),
+        Vec2::new(40.0, 10.0),
+        Vec2::new(40.0, 50.0),
+    ] {
+        point_at(s, c);
+    }
+    // Both new shapes are tied to the first: the corner rectangle at the corner it
+    // started from, the centre one by its corner onto the top side.
+    let ties = s
+        .sketch
+        .constraints()
+        .filter(|(_, c)| matches!(c, Constraint::Coincident { .. }))
+        .count();
+    assert_eq!(ties, 2);
+}
+
+/// An arc drawn clockwise is stored anticlockwise, with its ends swapped, and its ties
+/// made the same assumption the rectangle's did: the end made at the first click was
+/// tied to whatever the *last* click snapped to.
+#[test]
+fn a_clockwise_arc_keeps_its_ends_where_they_were_clicked() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    let (start, end) = (Vec2::new(0.0, 0.0), Vec2::new(20.0, 0.0));
+    draw_line(&mut editor, Vec2::new(-10.0, -20.0), start);
+    let anchor = point_at(sketch(&mut editor), start);
+    // Over the top from left to right is clockwise.
+    draw_with(
+        &mut editor,
+        SketchTool::Arc3Point,
+        &[start, Vec2::new(10.0, 10.0), end],
+    );
+
+    let s = sketch(&mut editor);
+    clean_solve(s);
+    assert_eq!(
+        ties_onto(s, anchor),
+        1,
+        "the start is tied where it was drawn"
+    );
+    point_at(s, end);
+    assert_eq!(
+        s.sketch.point_pos(anchor),
+        Some(start),
+        "the line it started from did not move"
+    );
+}
+
 /// Geometric constraints are drawn on the geometry, not left invisible.
 ///
 /// Only the six dimension kinds used to produce a graphic; Horizontal, Vertical,

@@ -929,7 +929,11 @@ fn rectangle_builders() {
     let mut s = Sketch::new();
     let r = shapes::rectangle_center(&mut s, v(5.0, 5.0), v(8.0, 7.0));
     assert_eq!(s.entities().count(), 11, "8 + centre + 2 diagonals");
-    assert_eq!(s.constraints().count(), 6);
+    assert_eq!(
+        s.constraints().count(),
+        5,
+        "four sides and one centre midpoint"
+    );
     assert_eq!(pos(&s, r.corners[0]), v(2.0, 3.0));
     assert_eq!(pos(&s, r.corners[2]), v(8.0, 7.0));
     let c = r.center.unwrap();
@@ -945,6 +949,76 @@ fn rectangle_builders() {
         1,
         "construction diagonals ignored"
     );
+}
+
+/// A rectangle's diagonals bisect each other whatever its size, so a centre held at the
+/// middle of one diagonal is already at the middle of the other. Writing both used to
+/// leave every centre rectangle with a constraint the solver flagged as redundant, drawn
+/// orange from the moment it was placed.
+#[test]
+fn a_centre_rectangle_has_no_redundant_constraint() {
+    let mut s = Sketch::new();
+    let r = shapes::rectangle_center(&mut s, v(5.0, 5.0), v(8.0, 7.0));
+    let report = s.solve().unwrap();
+    assert!(report.redundant.is_empty(), "{:?}", report.redundant);
+    // Four corners and a centre, held rectangular and centred: width, height and where
+    // the centre is are all that is left to choose.
+    assert_eq!(report.degrees_of_freedom, 4);
+
+    // Two of them sharing a centre are still clean: the tie between the centres is the
+    // only thing joining them, and it is not implied by anything else.
+    let second = shapes::rectangle_center(&mut s, v(5.0, 5.0), v(6.0, 9.0));
+    s.add_constraint(Constraint::Coincident {
+        point: second.center.unwrap(),
+        target: r.center.unwrap(),
+    })
+    .unwrap();
+    let report = s.solve().unwrap();
+    assert!(report.redundant.is_empty(), "{:?}", report.redundant);
+    assert_eq!(report.degrees_of_freedom, 6);
+}
+
+/// Constraints inferred from where a click landed are only written when they hold
+/// already and say something the sketch does not: anything else either moves geometry
+/// the user just placed or is a redundant constraint drawn orange for no reason.
+#[test]
+fn inferred_constraints_are_kept_only_when_they_hold_and_add_something() {
+    let mut s = Sketch::new();
+    let (base, a, _) = line(&mut s, v(0.0, 0.0), v(10.0, 0.0));
+    s.add_constraint(Constraint::Horizontal(base)).unwrap();
+    let on = s.add_point(v(4.0, 0.0));
+    let near = s.add_point(v(6.0, 0.5));
+    let kept = s.add_inferred_constraints([
+        Constraint::Coincident {
+            point: on,
+            target: base,
+        },
+        // Half a millimetre off the line: tying it on would pull it there.
+        Constraint::Coincident {
+            point: near,
+            target: base,
+        },
+    ]);
+    assert_eq!(kept.len(), 1, "only the point already on the line is tied");
+    near_eq(&s, near, v(6.0, 0.5));
+
+    // A second identical tie says nothing the first does not.
+    let again = s.add_inferred_constraints([Constraint::Coincident {
+        point: on,
+        target: base,
+    }]);
+    assert!(again.is_empty(), "a duplicate tie is redundant");
+
+    // And the sketch is left exactly as it was drawn.
+    let report = s.solve().unwrap();
+    assert!(report.redundant.is_empty());
+    near_eq(&s, a, v(0.0, 0.0));
+    near_eq(&s, on, v(4.0, 0.0));
+    near_eq(&s, near, v(6.0, 0.5));
+}
+
+fn near_eq(s: &Sketch, id: EntityId, at: Vec2) {
+    near(pos(s, id), at);
 }
 
 #[test]

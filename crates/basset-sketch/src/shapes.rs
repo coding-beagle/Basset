@@ -91,22 +91,28 @@ pub fn rectangle_two_point(s: &mut Sketch, a: Vec2, b: Vec2) -> Rectangle {
     rectangle_from_corners(s, a, b)
 }
 
-/// Rectangle defined by its centre and one corner. Two construction diagonals with the
-/// centre at their midpoints keep the centre point meaningful when a corner is dragged.
+/// Rectangle defined by its centre and one corner. Two construction diagonals are drawn,
+/// as Fusion draws them, and the centre is held at the middle of the first so it stays
+/// the centre when a corner is dragged.
+///
+/// Only the first: a rectangle's diagonals bisect each other, so the centre is the
+/// middle of the second one already, and a midpoint written there too is a constraint
+/// the solver can only report as redundant.
 pub fn rectangle_center(s: &mut Sketch, center: Vec2, corner: Vec2) -> Rectangle {
     let opposite = center * 2.0 - corner;
     let mut rect = rectangle_from_corners(s, corner, opposite);
     let c = s.add_point(center);
     must(s.set_construction(c, true));
-    for (i, j) in [(0, 2), (1, 3)] {
+    let diagonals = [(0, 2), (1, 3)].map(|(i, j)| {
         let diagonal = must(s.add_line(rect.corners[i], rect.corners[j]));
         must(s.set_construction(diagonal, true));
-        rect.constraints
-            .push(must(s.add_constraint(Constraint::Midpoint {
-                point: c,
-                line: diagonal,
-            })));
-    }
+        diagonal
+    });
+    rect.constraints
+        .push(must(s.add_constraint(Constraint::Midpoint {
+            point: c,
+            line: diagonals[0],
+        })));
     rect.center = Some(c);
     rect
 }
