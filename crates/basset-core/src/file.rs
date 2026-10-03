@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::document::Document;
 
-pub const FORMAT_VERSION: u32 = 5;
+pub const FORMAT_VERSION: u32 = 6;
 pub const EXTENSION: &str = "bass";
 
 #[derive(Serialize, Deserialize)]
@@ -89,8 +89,19 @@ fn migrate_step(mut value: serde_json::Value, version: u32) -> serde_json::Value
             migrate_v4_single_targets(&mut value);
             value
         }
+        5 => migrate_v5_visibility(value),
         _ => value,
     }
+}
+
+/// Version 6 saved what the user had hidden: bodies, sketches, the origin and the grid.
+///
+/// Additive, and `serde(default)`, so a version 5 document opens with everything shown
+/// apart from the origin, which is what every older file opened with. The bump is for the
+/// other direction: an older build would drop the visibility without a word and save it
+/// back out with everything on screen again.
+fn migrate_v5_visibility(value: serde_json::Value) -> serde_json::Value {
+    value
 }
 
 /// Version 5 let a boolean feature name several target bodies, so the `Join`, `Cut` and
@@ -206,6 +217,22 @@ mod tests {
         let doc = read(text.as_bytes()).expect("a version 2 file still loads");
         assert_eq!(doc.name, "old");
         assert!(doc.parameters().is_empty());
+    }
+
+    #[test]
+    fn a_version_5_document_loads_with_the_default_visibility() {
+        let file = serde_json::json!({
+            "format_version": 5,
+            "generator": "basset test",
+            "document": {
+                "name": "old",
+                "units": "Millimeters",
+                "timeline": { "features": [], "cursor": 0, "next_id": 1 },
+            }
+        });
+        let text = serde_json::to_string(&file).unwrap();
+        let doc = read(text.as_bytes()).expect("a version 5 file still loads");
+        assert_eq!(*doc.visibility(), crate::Visibility::default());
     }
 
     #[test]

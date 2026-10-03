@@ -17,6 +17,7 @@ use crate::model::ModelState;
 use crate::parameters::Parameters;
 use crate::regen::Regenerator;
 use crate::timeline::{ReorderError, Timeline};
+use crate::visibility::Visibility;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Units {
@@ -64,6 +65,10 @@ pub struct Document {
     /// re-drives the model from the beginning.
     #[serde(default)]
     parameters: Parameters,
+    /// What is hidden on screen. Not part of [`Snapshot`]: showing or hiding something is
+    /// not an edit, and undo stepping through visibility toggles would bury the edits.
+    #[serde(default)]
+    visibility: Visibility,
     #[serde(skip)]
     regen: Regenerator,
     #[serde(skip)]
@@ -107,6 +112,7 @@ impl Document {
             units: Units::Millimeters,
             timeline: Timeline::new(),
             parameters: Parameters::new(),
+            visibility: Visibility::default(),
             regen: Regenerator::default(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -278,6 +284,16 @@ impl Document {
     pub fn set_cursor(&mut self, cursor: usize) {
         self.record_undo();
         self.timeline.set_cursor(cursor);
+    }
+
+    // ----- visibility -------------------------------------------------------------------
+
+    pub fn visibility(&self) -> &Visibility {
+        &self.visibility
+    }
+
+    pub fn set_visibility(&mut self, visibility: Visibility) {
+        self.visibility = visibility;
     }
 
     // ----- parameters -------------------------------------------------------------------

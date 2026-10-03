@@ -9,7 +9,9 @@ use basset_math::{Vec2, Vec3};
 use winit::event::{ElementState, MouseButton};
 use winit::keyboard::NamedKey;
 
+use super::commands::Command;
 use super::harness::{Harness, TempDir};
+use super::panels;
 use super::selection::SelectMode;
 use super::sketch_mode::{ConstraintKind, SketchTool};
 use super::tools::ToolKind;
@@ -71,6 +73,78 @@ fn a_sketch_and_an_extrude_survive_a_round_trip_through_a_file() {
             .take_title_change()
             .is_some_and(|t| t.contains("block.bass"))
     );
+}
+
+/// What was hidden in the browser stays hidden after the file is closed and opened
+/// again. It used to come back with everything on screen, because the hidden sets lived
+/// only in the editor and the file never heard of them.
+#[test]
+fn hidden_items_stay_hidden_through_a_save_and_reopen() {
+    let dir = TempDir::new("visibility");
+    let path = dir.join("tidied.bass");
+    let mut h = Harness::new();
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    h.rectangle(Vec2::ZERO, Vec2::new(20.0, 10.0));
+    h.finish_sketch(true);
+    let sketch = h.last_feature();
+    let hidden_body = h.extrude(Vec2::new(10.0, 5.0), 3.0);
+    let shown_body = h.block();
+
+    // Through the same commands the browser's checkboxes and the View menu send.
+    panels::run(&mut h.editor, Command::ToggleBody(hidden_body));
+    panels::run(&mut h.editor, Command::ToggleSketch(sketch));
+    panels::run(&mut h.editor, Command::ToggleOrigin);
+    panels::run(&mut h.editor, Command::ToggleGrid);
+    h.frame();
+
+    let mut reopened = h.round_trip(&path);
+    reopened.frame();
+    let e = &reopened.editor;
+    assert!(e.hidden_bodies.contains(&hidden_body));
+    assert!(!e.hidden_bodies.contains(&shown_body));
+    assert!(e.hidden_sketches.contains(&sketch));
+    assert!(
+        e.visible_sketches().iter().all(|(id, _)| *id != sketch),
+        "the hidden sketch is not drawn"
+    );
+    assert!(e.show_origin, "the origin was turned on and stays on");
+    assert!(!e.show_grid, "the grid was turned off and stays off");
+
+    // Showing it again and saving over the same file sticks too: the document's copy is
+    // refreshed on every save, not only the first.
+    panels::run(&mut reopened.editor, Command::ToggleBody(hidden_body));
+    let again = reopened.round_trip(&path);
+    assert!(again.editor.hidden_bodies.is_empty());
+    assert!(again.editor.hidden_sketches.contains(&sketch));
+}
+
+/// A file saved before visibility was part of the format opens the way it always did:
+/// everything shown but the origin.
+#[test]
+fn a_file_from_before_visibility_was_saved_opens_with_everything_shown() {
+    let dir = TempDir::new("visibility-v5");
+    let path = dir.join("old.bass");
+    // Written out by hand, as a version 5 build saved it: no `visibility` at all.
+    let old = r#"{
+        "format_version": 5,
+        "generator": "basset 0.1.0",
+        "document": {
+            "name": "old",
+            "units": "Millimeters",
+            "timeline": { "features": [], "cursor": 0, "next_id": 1 }
+        }
+    }"#;
+    std::fs::write(&path, old).expect("writing the old file");
+    let mut h = Harness::new();
+    // Left over from whatever was open before, so the test sees the file's state win.
+    h.editor
+        .hidden_bodies
+        .insert(basset_core::BodyRef(basset_core::FeatureId(9)));
+    h.editor.show_origin = true;
+    h.editor.open_path(path);
+    assert!(h.editor.error.is_none(), "{:?}", h.editor.error);
+    assert!(h.editor.hidden_bodies.is_empty() && h.editor.hidden_sketches.is_empty());
+    assert!(!h.editor.show_origin && h.editor.show_grid);
 }
 
 #[test]
