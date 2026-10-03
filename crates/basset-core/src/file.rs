@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::document::Document;
 
-pub const FORMAT_VERSION: u32 = 6;
+pub const FORMAT_VERSION: u32 = 7;
 pub const EXTENSION: &str = "bass";
 
 #[derive(Serialize, Deserialize)]
@@ -90,8 +90,19 @@ fn migrate_step(mut value: serde_json::Value, version: u32) -> serde_json::Value
             value
         }
         5 => migrate_v5_visibility(value),
+        6 => migrate_v6_offset_dimension(value),
         _ => value,
     }
+}
+
+/// Version 7 added the sketch offset dimension, `Constraint::Offset`.
+///
+/// Nothing to rewrite: a version 6 sketch has no such constraint, and its offsets load
+/// as the plain parallel and concentric geometry they always were. The bump is for an
+/// older build, which would refuse the unknown constraint as a malformed document;
+/// "this file is newer than your build" is the honest way to say that.
+fn migrate_v6_offset_dimension(value: serde_json::Value) -> serde_json::Value {
+    value
 }
 
 /// Version 6 saved what the user had hidden: bodies, sketches, the origin and the grid.

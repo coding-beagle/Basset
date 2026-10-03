@@ -73,6 +73,29 @@ struct Pointer {
     dragged: bool,
     shift: bool,
     ctrl: bool,
+    /// When and where the last click in the viewport landed, to tell a double-click from
+    /// two clicks. Cleared once a double-click is taken, so a third click starts afresh
+    /// rather than making a second double out of the second and third.
+    last_click: Option<(std::time::Instant, [f64; 2])>,
+}
+
+/// The longest gap between the two clicks of a double-click, and how far apart on screen
+/// they may land. Both are egui's own defaults, so a double-click in the viewport is the
+/// same gesture as one on a panel.
+const DOUBLE_CLICK_SECONDS: f64 = 0.3;
+const DOUBLE_CLICK_PX: f64 = 6.0;
+
+impl Pointer {
+    /// Records a click at `pos` and says whether it completes a double-click.
+    fn second_click(&mut self, pos: [f64; 2]) -> bool {
+        let now = std::time::Instant::now();
+        let double = self.last_click.is_some_and(|(at, prev)| {
+            now.duration_since(at).as_secs_f64() <= DOUBLE_CLICK_SECONDS
+                && (pos[0] - prev[0]).hypot(pos[1] - prev[1]) <= DOUBLE_CLICK_PX
+        });
+        self.last_click = if double { None } else { Some((now, pos)) };
+        double
+    }
 }
 
 pub enum Mode {
@@ -712,7 +735,17 @@ impl Editor {
         let shift = self.pointer.shift;
         match &mut self.mode {
             Mode::Sketch(s) => {
+                // A drag in between means the next click starts a new pair.
+                let double = if clicked {
+                    self.pointer.second_click(pos)
+                } else {
+                    self.pointer.last_click = None;
+                    false
+                };
                 s.pointer_up(&ray, &self.camera, self.window_px, clicked, shift);
+                if double {
+                    s.double_click(&ray, &self.camera, self.window_px, shift);
+                }
                 let refused = s.take_constraint_error();
                 if s.take_dirty() {
                     self.commit_sketch();

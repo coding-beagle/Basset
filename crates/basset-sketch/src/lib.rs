@@ -69,7 +69,7 @@ slotmap::new_key_type! {
     pub struct ConstraintId;
 }
 
-pub use constraint::Constraint;
+pub use constraint::{Constraint, OffsetPair};
 pub use contour::{Contour, Profile, Segment, SegmentKind};
 pub use entity::{Entity, EntityData};
 pub use error::{SketchError, SolveError};

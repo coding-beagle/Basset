@@ -4862,3 +4862,99 @@ mod parameters {
         assert!((h.volume(BodyRef(extrude)) - before).abs() < 1e-9);
     }
 }
+
+/// A kept offset leaves its distance on the drawing as a dimension, and editing that
+/// dimension is how its size changes afterwards: one undoable step, like any other.
+#[test]
+fn a_kept_offset_is_resized_through_its_dimension() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    let s = sketch(&mut editor);
+    let center = s.sketch.add_point(Vec2::new(5.0, 5.0));
+    let circle = s.sketch.add_circle(center, 10.0).unwrap();
+    s.selected = vec![circle];
+    s.offset.distance = 3.0;
+    assert!(s.begin_offset());
+    s.finish_offset(true);
+    let radius_of_offset = |s: &sketch_mode::SketchEditor| {
+        s.sketch
+            .entities()
+            .find_map(|(id, d)| match d.entity {
+                Entity::Circle { radius, .. } if id != circle => Some(radius),
+                _ => None,
+            })
+            .expect("the offset circle")
+    };
+    assert!((radius_of_offset(s) - 13.0).abs() < 1e-9);
+
+    let graphics = s.dimension_graphics();
+    let g = graphics
+        .iter()
+        .find(|g| matches!(s.sketch.constraint(g.id), Some(Constraint::Offset { .. })))
+        .expect("the offset's distance is drawn");
+    assert_eq!(g.text, "3.000");
+    assert!(
+        !g.segments.is_empty(),
+        "with a dimension line across the gap"
+    );
+    let cid = g.id;
+
+    s.set_dimension(cid, 4.5);
+    // The source has no dimension of its own here, so the solver is free to share the
+    // change between the two circles; the gap between them is what the number says.
+    let source_radius = match s.sketch.entity(circle).unwrap().entity {
+        Entity::Circle { radius, .. } => radius,
+        _ => unreachable!(),
+    };
+    assert!((radius_of_offset(s) - source_radius - 4.5).abs() < 1e-6);
+    assert!(s.undo());
+    assert!((radius_of_offset(s) - 13.0).abs() < 1e-9);
+}
+
+/// Double-clicking a curve in the sketch picks the whole shape it is part of; shift adds
+/// the shape to what is already picked, and other tools ignore it.
+#[test]
+fn a_double_click_selects_the_connected_shape() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+    draw_line(&mut editor, Vec2::new(30.0, 0.0), Vec2::new(40.0, 0.0));
+    let camera = editor.camera;
+    let window = editor.window_px;
+    let s = sketch(&mut editor);
+    s.set_tool(SketchTool::Select);
+    let side = click_at(10.0, 0.0);
+    // Exactly what the window path does: the click first, then the double-click on it.
+    s.pointer_up(&side, &camera, window, true, false);
+    assert_eq!(s.selected.len(), 1, "a single click still picks one curve");
+    assert!(s.double_click(&side, &camera, window, false));
+    assert_eq!(s.selected.len(), 4, "the whole rectangle");
+    assert!(
+        s.selected
+            .iter()
+            .all(|id| s.sketch.entity(*id).is_some_and(|d| d.entity.is_line()))
+    );
+
+    let apart = click_at(35.0, 0.0);
+    s.pointer_up(&apart, &camera, window, true, true);
+    assert!(s.double_click(&apart, &camera, window, true));
+    assert_eq!(
+        s.selected.len(),
+        5,
+        "shift added the lone line to the rectangle"
+    );
+    s.pointer_up(&apart, &camera, window, true, false);
+    assert!(s.double_click(&apart, &camera, window, false));
+    assert_eq!(
+        s.selected.len(),
+        1,
+        "without shift the shape replaces the selection"
+    );
+
+    // Empty space is not a shape, and a drawing tool keeps its clicks to itself.
+    assert!(!s.double_click(&click_at(10.0, 5.0), &camera, window, false));
+    s.set_tool(SketchTool::Line);
+    assert!(!s.double_click(&side, &camera, window, false));
+}

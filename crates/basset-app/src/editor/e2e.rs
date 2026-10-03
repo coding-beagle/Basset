@@ -2020,3 +2020,186 @@ fn a_second_centre_rectangle_starts_on_the_first_ones_centre() {
         .count();
     assert_eq!(ties, 1, "the second centre is tied to the first");
 }
+
+/// How far each offset line sits from the source line it runs beside: the gap measured
+/// from both of its ends to the nearest parallel line of the source rectangle.
+fn offset_gaps(s: &super::SketchEditor, source: &[basset_sketch::EntityId]) -> Vec<f64> {
+    let mut gaps = Vec::new();
+    for (id, data) in s.sketch.entities() {
+        if !data.entity.is_line() || source.contains(&id) {
+            continue;
+        }
+        let (a, b) = s.sketch.curve_endpoints(id).expect("a line");
+        let dir = (b - a).normalize();
+        let gap = source
+            .iter()
+            .filter_map(|l| s.sketch.curve_endpoints(*l))
+            .filter(|(p, q)| (*q - *p).normalize().perp_dot(dir).abs() < 1e-6)
+            .map(|(p, _)| dir.perp_dot(p - a).abs())
+            .fold(f64::INFINITY, f64::min);
+        gaps.push(gap);
+    }
+    gaps
+}
+
+/// An offset's distance is a dimension on the drawing: click its number, type another,
+/// and every edge moves to it — and the dimension is still there to edit after a save
+/// and reopen, and one undo puts the old distance back.
+#[test]
+fn an_offset_distance_is_edited_afterwards_through_its_dimension() {
+    let tmp = TempDir::new("offset-dimension");
+    let path = tmp.join("offset.bass");
+    let mut h = Harness::new();
+    h.editor.set_window_size([800, 600]);
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    h.rectangle(Vec2::new(0.0, 0.0), Vec2::new(40.0, 20.0));
+    let source: Vec<_> = {
+        let s = h.sketch();
+        s.set_tool(SketchTool::Select);
+        s.selected = s
+            .sketch
+            .entities()
+            .filter(|(_, d)| d.entity.is_curve())
+            .map(|(id, _)| id)
+            .collect();
+        s.offset.distance = 5.0;
+        s.selected.clone()
+    };
+    h.frame();
+    h.frame();
+    assert!(h.click_ui("Offset"), "{:?}", h.frame().text());
+    h.frame();
+    assert!(h.click_ui("Square corners"));
+    h.frame();
+    assert!(h.click_ui("OK"), "{:?}", h.frame().text());
+    h.frame();
+    h.frame();
+
+    let gaps = offset_gaps(h.sketch(), &source);
+    assert_eq!(gaps.len(), 4);
+    assert!(gaps.iter().all(|g| (g - 5.0).abs() < 1e-6), "{gaps:?}");
+
+    // The distance is on the drawing as a number like any other dimension's.
+    assert!(
+        h.click_ui("5.000"),
+        "the offset shows its distance: {:?}",
+        h.frame().text()
+    );
+    let (cid, text) = h.sketch().dim_edit.clone().expect("the edit box opened");
+    assert_eq!(text, "5.000");
+    assert!(matches!(
+        h.sketch().sketch.constraint(cid),
+        Some(basset_sketch::Constraint::Offset { .. })
+    ));
+    h.sketch().dim_edit = Some((cid, "8".into()));
+    h.frame();
+    assert!(h.click_ui("OK"), "{:?}", h.frame().text());
+    let gaps = offset_gaps(h.sketch(), &source);
+    assert!(gaps.iter().all(|g| (g - 8.0).abs() < 1e-6), "{gaps:?}");
+
+    // One step of undo is the whole edit.
+    assert!(h.sketch().undo());
+    let gaps = offset_gaps(h.sketch(), &source);
+    assert!(gaps.iter().all(|g| (g - 5.0).abs() < 1e-6), "{gaps:?}");
+    assert!(h.sketch().redo());
+
+    h.finish_sketch(true);
+    let sketch_id = h.last_feature();
+    let mut reopened = h.round_trip(&path);
+    reopened.edit_sketch(sketch_id);
+    let cid = reopened
+        .sketch()
+        .sketch
+        .constraints()
+        .find(|(_, c)| matches!(c, basset_sketch::Constraint::Offset { .. }))
+        .map(|(id, _)| id)
+        .expect("the offset dimension was saved");
+    assert_eq!(
+        reopened
+            .sketch()
+            .sketch
+            .constraint(cid)
+            .and_then(|c| c.dimension_value()),
+        Some(8.0)
+    );
+    // And it still drives the offset, from a parameter this time.
+    reopened
+        .sketch()
+        .set_parameter("gap", "3")
+        .expect("a parameter");
+    reopened
+        .sketch()
+        .bind_dimension(cid, "gap / 2")
+        .expect("binds");
+    let gaps = offset_gaps(reopened.sketch(), &source);
+    assert!(gaps.iter().all(|g| (g - 1.5).abs() < 1e-6), "{gaps:?}");
+}
+
+/// Two clicks in quick succession on one side of a rectangle, through the window: the
+/// first picks the side, the second makes it the whole rectangle, and nothing moved or
+/// left an undo step on the way. Slow clicks are two clicks.
+#[test]
+fn double_clicking_a_sketch_curve_selects_its_whole_shape() {
+    let mut h = Harness::new();
+    h.editor.set_window_size([800, 600]);
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    h.rectangle(Vec2::new(0.0, 0.0), Vec2::new(40.0, 20.0));
+    h.line(Vec2::new(60.0, 0.0), Vec2::new(70.0, 0.0));
+    h.sketch().set_tool(SketchTool::Select);
+    h.frame();
+    let geometry = |h: &mut Harness| -> Vec<Vec2> {
+        let s = h.sketch();
+        s.sketch
+            .entities()
+            .filter_map(|(id, _)| s.sketch.point_pos(id))
+            .collect()
+    };
+    let before = geometry(&mut h);
+    let side = h.screen_of(Vec3::new(20.0, 0.0, 0.0));
+
+    h.click_px(side);
+    assert_eq!(h.sketch().selected.len(), 1, "one click, one curve");
+    h.click_px(side);
+    assert_eq!(
+        h.sketch().selected.len(),
+        4,
+        "a double-click, the rectangle"
+    );
+    assert_eq!(geometry(&mut h), before, "and nothing was dragged");
+    // Nor was anything recorded: the top of the undo stack is still the line drawn last.
+    let lines = |h: &mut Harness| {
+        h.sketch()
+            .sketch
+            .entities()
+            .filter(|(_, d)| d.entity.is_line())
+            .count()
+    };
+    assert_eq!(lines(&mut h), 5);
+    assert!(h.sketch().undo());
+    assert_eq!(lines(&mut h), 4);
+    assert!(h.sketch().redo());
+    h.sketch().select_only(Vec::new());
+
+    h.click_px(side);
+    h.click_px(side);
+    assert_eq!(h.sketch().selected.len(), 4);
+
+    // Shift-double-click on the lone line adds it.
+    let lone = h.screen_of(Vec3::new(65.0, 0.0, 0.0));
+    h.set_modifiers(true, false);
+    h.click_px(lone);
+    h.click_px(lone);
+    h.set_modifiers(false, false);
+    assert_eq!(h.sketch().selected.len(), 5);
+
+    // A third click is a click again, not a second double-click.
+    h.click_px(side);
+    assert_eq!(h.sketch().selected.len(), 1);
+
+    // Two clicks further apart in time than a double-click are two single clicks.
+    std::thread::sleep(std::time::Duration::from_millis(350));
+    h.click_px(side);
+    std::thread::sleep(std::time::Duration::from_millis(350));
+    h.click_px(side);
+    assert_eq!(h.sketch().selected.len(), 1);
+}

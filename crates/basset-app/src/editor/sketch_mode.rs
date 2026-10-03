@@ -2003,6 +2003,48 @@ impl SketchEditor {
         }
     }
 
+    /// The second click of a double-click, after [`Self::pointer_up`] has handled it as
+    /// a click. On a curve it selects the whole connected shape the curve belongs to —
+    /// every curve chained to it end to end — as Fusion does; with shift the shape is
+    /// added to the selection instead of replacing it. Anywhere else it does nothing
+    /// beyond the click it already was. Returns whether it selected anything.
+    ///
+    /// It runs after the single click rather than instead of it because a double-click
+    /// cannot be known until its second click arrives: the first click has already
+    /// selected the curve (or, with shift, toggled it), and so has the second, so the
+    /// chain is applied over whatever those left.
+    pub fn double_click(
+        &mut self,
+        ray: &Ray,
+        camera: &Camera,
+        window: [u32; 2],
+        shift: bool,
+    ) -> bool {
+        if self.tool != SketchTool::Select || self.modal() {
+            return false;
+        }
+        let Some(pos) = self.to_plane(ray) else {
+            return false;
+        };
+        let tol = self.tolerance(pos, camera, window);
+        let Some(hit) = self.pick_at(pos, tol) else {
+            return false;
+        };
+        let chain = self.sketch.connected_curves(hit);
+        if chain.is_empty() {
+            return false;
+        }
+        if !shift {
+            self.clear_selection();
+        }
+        for curve in chain {
+            if self.pickable(curve) && !self.selected.contains(&curve) {
+                self.selected.push(curve);
+            }
+        }
+        true
+    }
+
     /// Applies a finished rubber band. Shift adds to the selection the way shift-clicking
     /// does; without it the band replaces what was selected.
     fn select_in(&mut self, m: Marquee, shift: bool) {
@@ -4122,6 +4164,43 @@ impl SketchEditor {
                     }
                 }
                 label
+            }
+            Constraint::Offset { pairs, .. } => {
+                // The gap between the first measured curve and its source, drawn across
+                // it square to both; every other pair is that same gap elsewhere.
+                let pair = pairs.first()?;
+                let circle = |id: EntityId| match self.sketch.entity(id).map(|e| &e.entity)? {
+                    Entity::Circle { center, radius } => Some((pos(*center)?, *radius)),
+                    Entity::Arc { center, start, .. } => {
+                        let c = pos(*center)?;
+                        Some((c, c.distance(pos(*start)?)))
+                    }
+                    _ => None,
+                };
+                match (circle(pair.source), circle(pair.result)) {
+                    (Some((center, from)), Some((_, to))) => {
+                        let default_dir = Vec2::from_angle(std::f64::consts::FRAC_PI_4);
+                        let label = placed.unwrap_or(center + default_dir * (from.max(to) + gap));
+                        let dir = (label - center).normalize_or(default_dir);
+                        let (a, b) = (center + dir * from, center + dir * to);
+                        segments.push([a, b]);
+                        arrowheads(&mut segments, a, b, arrow);
+                        let outer = if from > to { a } else { b };
+                        segments.push([outer, label]);
+                        label
+                    }
+                    _ => {
+                        let (ra, rb) = self.sketch.curve_endpoints(pair.result)?;
+                        let (sa, sb) = self.sketch.curve_endpoints(pair.source)?;
+                        let dir = (sb - sa).normalize_or(Vec2::X);
+                        let mid = (ra + rb) * 0.5;
+                        let foot = sa + dir * dir.dot(mid - sa);
+                        let label = placed.unwrap_or((mid + foot) * 0.5 + dir * gap);
+                        let slide = (label - mid).dot(dir);
+                        distance_lines(&mut segments, mid, foot, dir, slide, arrow);
+                        label
+                    }
+                }
             }
             _ => return None,
         };

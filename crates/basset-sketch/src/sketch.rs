@@ -194,7 +194,8 @@ impl Sketch {
     }
 
     /// Removes an entity together with everything that depends on it: curves built on a
-    /// removed point, and constraints mentioning any removed entity.
+    /// removed point, and constraints mentioning any removed entity — except that an
+    /// offset dimension only loses the pairs that mention one.
     pub fn remove_entity(&mut self, id: EntityId) {
         if !self.entities.contains_key(id) {
             return;
@@ -212,9 +213,8 @@ impl Sketch {
         }
         let dead_constraints: Vec<ConstraintId> = self
             .constraints
-            .iter()
-            .filter(|(_, c)| c.references().iter().any(|r| doomed.contains(r)))
-            .map(|(cid, _)| cid)
+            .iter_mut()
+            .filter_map(|(cid, c)| (!c.survives_without(&doomed)).then_some(cid))
             .collect();
         for cid in dead_constraints {
             self.constraints.remove(cid);
@@ -601,6 +601,52 @@ impl Sketch {
             })
             .map(|(id, _)| id)
             .collect()
+    }
+
+    /// Every curve joined to `id` end to end, `id` included: the whole connected shape a
+    /// double-click picks — the four sides of a rectangle, a polyline, a loop of lines
+    /// and arcs. Curves join where an endpoint of one lies on an endpoint of another,
+    /// whether they share the point entity or only a position, since drawn joins and
+    /// coincident ones look the same to the user.
+    ///
+    /// Only curves of the same kind of geometry as `id` are followed, so a double-click
+    /// on an outline does not run off along the construction lines meeting its corners,
+    /// and the reverse. A circle joins nothing and comes back alone; anything that is not
+    /// a curve comes back empty.
+    pub fn connected_curves(&self, id: EntityId) -> Vec<EntityId> {
+        let Some(seed) = self.entities.get(id) else {
+            return Vec::new();
+        };
+        if !seed.entity.is_curve() {
+            return Vec::new();
+        }
+        let construction = seed.construction;
+        let ends: Vec<(EntityId, [Vec2; 2])> = self
+            .entities
+            .iter()
+            .filter(|(_, d)| d.entity.is_open_curve() && d.construction == construction)
+            .filter_map(|(cid, _)| {
+                let (a, b) = self.curve_endpoints(cid)?;
+                Some((cid, [a, b]))
+            })
+            .collect();
+        let mut found = vec![id];
+        let mut frontier = vec![id];
+        while let Some(at) = frontier.pop() {
+            let Some((_, here)) = ends.iter().find(|(cid, _)| *cid == at) else {
+                continue;
+            };
+            for (other, there) in &ends {
+                let joined = here
+                    .iter()
+                    .any(|p| there.iter().any(|q| p.distance(*q) <= JOIN_TOL));
+                if joined && !found.contains(other) {
+                    found.push(*other);
+                    frontier.push(*other);
+                }
+            }
+        }
+        found
     }
 
     // ----- profiles and paths ---------------------------------------------------------
