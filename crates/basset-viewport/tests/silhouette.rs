@@ -6,6 +6,7 @@
 use basset_kernel::{
     Contour, Extent, OpId, Profile, Solid, Tessellation,
     blend::fillet,
+    csg::{BoolOp, boolean},
     generate::{extrude, loft},
     ids::{FaceKey, FaceRole},
     primitives::cuboid,
@@ -327,4 +328,84 @@ fn an_empty_mesh_has_no_silhouette() {
     let silhouette = Silhouette::build(&TriMesh::default());
     assert!(silhouette.is_empty());
     assert_eq!(silhouette.edge_count(), 0);
+}
+
+/// A 20 × 20 × 10 block with a 3 mm hole straight through it, built the way a cut-extrude
+/// builds one: the circle extruded and subtracted.
+fn block_with_hole() -> Solid {
+    let tess = Tessellation::default();
+    let block = cuboid(OpId::new(1), Vec3::ZERO, Vec3::new(20.0, 20.0, 10.0));
+    let hole = basset_kernel::primitives::cylinder(
+        OpId::new(2),
+        Vec3::new(10.0, 10.0, 0.0),
+        Vec3::Z,
+        3.0,
+        10.0,
+        &tess,
+    );
+    boolean(&block, &hole, BoolOp::Subtract).expect("a through hole")
+}
+
+/// Whether `p` lies on a line the body genuinely has: one of the block's twelve edges, or
+/// the rim of the hole on either cap.
+fn on_a_real_edge_of_the_holed_block(p: Vec3) -> bool {
+    let near = |a: f64, b: f64| (a - b).abs() < 1e-6;
+    let on_x = near(p.x, 0.0) || near(p.x, 20.0);
+    let on_y = near(p.y, 0.0) || near(p.y, 20.0);
+    let on_z = near(p.z, 0.0) || near(p.z, 10.0);
+    let on_rim = on_z && ((p.x - 10.0).powi(2) + (p.y - 10.0).powi(2)).sqrt() <= 3.0 + 1e-6;
+    (on_x && on_y) || (on_x && on_z) || (on_y && on_z) || on_rim
+}
+
+/// Every face of a holed block is flat but for the hole's wall, and a flat face has no
+/// silhouette anywhere inside it: from any direction the outline is made of the block's
+/// edges, the rims of the hole and the wall's own sides. This used to draw sixteen lines
+/// radiating across the top face from one corner of a boolean fragment to the rim, from
+/// every direction, because the fragment's triangulation had slivers whose geometric
+/// normal pointed anywhere at all — into the body, as often as not — and a facet facing
+/// backwards disagrees with every neighbour it has.
+#[test]
+fn a_flat_face_round_a_hole_has_no_silhouette_inside_it() {
+    let solid = block_with_hole();
+    let mesh = mesh_of(&solid);
+    let views = [
+        ViewPoint::Direction(Vec3::new(1.0, 2.0, -3.0).normalize()),
+        ViewPoint::Direction(Vec3::new(-1.0, 0.5, -1.0).normalize()),
+        ViewPoint::Direction(-Vec3::Z),
+        ViewPoint::Direction(Vec3::new(1.0, 1.0, 0.2).normalize()),
+        ViewPoint::Eye(Vec3::new(40.0, 50.0, 60.0)),
+    ];
+    for view in views {
+        let sil = segments(&mesh, view);
+        assert!(
+            !sil.is_empty(),
+            "the body still has an outline from {view:?}"
+        );
+        let strays: Vec<&[Vec3; 2]> = sil
+            .iter()
+            .filter(|[a, b]| {
+                // The hole's wall is allowed its own silhouette: a vertical facet seam at
+                // the hole's radius, which is where a cylinder's outline falls.
+                let wall = |p: Vec3| {
+                    ((p.x - 10.0).powi(2) + (p.y - 10.0).powi(2)).sqrt() <= 3.0 + 1e-6
+                        && p.z > -1e-6
+                        && p.z < 10.0 + 1e-6
+                };
+                let on_wall_seam = wall(*a) && wall(*b) && near_xy(*a, *b);
+                !(on_wall_seam
+                    || (on_a_real_edge_of_the_holed_block(*a)
+                        && on_a_real_edge_of_the_holed_block(*b)))
+            })
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "{} silhouette segment(s) off the body's edges from {view:?}, first {:?}",
+            strays.len(),
+            strays[0]
+        );
+    }
+}
+
+fn near_xy(a: Vec3, b: Vec3) -> bool {
+    (a.x - b.x).abs() < 1e-6 && (a.y - b.y).abs() < 1e-6
 }

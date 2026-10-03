@@ -35,6 +35,48 @@ use crate::camera::{Camera, Projection};
 /// `MERGE_TOL`, restated because the viewport does not depend on the kernel.
 const WELD_TOL: f64 = 1e-5;
 
+/// Height below which a triangle is a sliver whose own normal says nothing.
+///
+/// The orientation of a facet comes from the cross product of its edges, and that is
+/// reliable only when the triangle stands well clear of the noise in its corners: the
+/// corners agree with their neighbours to [`WELD_TOL`], so a triangle a few tolerances
+/// high has a normal that is mostly round-off. Boolean caps are full of such triangles.
+/// A BSP fragment's boundary runs along the cutting plane with the real edge as a
+/// sub-stretch of it, so after healing the polygon has three or more vertices in a row
+/// on one line, and covering every vertex — which the exporter needs for a closed file —
+/// forces the triangulation to emit a triangle across them with no area to speak of. Its
+/// cross product normalises to a direction that can point anywhere, including straight
+/// back into the body, and a facet that faces the wrong way disagrees with every
+/// neighbour: all three of its edges get drawn, as a line radiating across the flat face
+/// to the fragment's far corner and two dashes along the hole's rim. A hundred weld
+/// tolerances is a micron on the mm-scale bodies this draws; a real facet is never that
+/// thin.
+const SLIVER_HEIGHT: f64 = 100.0 * WELD_TOL;
+
+/// The direction a facet faces: its geometric normal, or for a sliver the normal the mesh
+/// carries at its corners. `None` when neither says anything.
+///
+/// The carried normal is the fallback and not the rule because it is the *shaded* normal:
+/// on a curved face it describes the ideal surface rather than the drawn triangle, and
+/// testing that would put the outline up to half a facet off the shading it bounds. On a
+/// flat face it is the plane's exact normal, which is precisely what a sliver lying in that
+/// plane should be judged by, and on a curved face it is within the smoothing cone of the
+/// facet's own — close enough that a sliver on a rim behaves like its neighbours instead
+/// of sprouting lines.
+fn facet_normal(p: [Vec3; 3], carried: [Vec3; 3]) -> Option<Vec3> {
+    let cross = (p[1] - p[0]).cross(p[2] - p[0]);
+    let longest = (p[1] - p[0])
+        .length()
+        .max((p[2] - p[1]).length())
+        .max((p[0] - p[2]).length());
+    // Twice the area over the base is the height; `longest` is zero only when all three
+    // corners coincide, and then the comparison is false and the fallback decides.
+    if cross.length() > SLIVER_HEIGHT * longest {
+        return cross.try_normalize();
+    }
+    (carried[0] + carried[1] + carried[2]).try_normalize()
+}
+
 /// Where the camera is, expressed in the mesh's own coordinates.
 ///
 /// The two projections need different arithmetic and get separate variants rather than one
@@ -106,9 +148,7 @@ impl Silhouette {
         let mut users: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
         for tri in mesh.indices.as_chunks::<3>().0 {
             let p = tri.map(|i| mesh.positions[i as usize]);
-            // A sliver left by healing or triangulation has no orientation to test with,
-            // and the neighbours it separates are adjacent to each other through it.
-            let Some(normal) = (p[1] - p[0]).cross(p[2] - p[0]).try_normalize() else {
+            let Some(normal) = facet_normal(p, tri.map(|i| mesh.normals[i as usize])) else {
                 continue;
             };
             let facet = facets.len() as u32;

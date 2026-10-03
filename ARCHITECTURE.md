@@ -129,7 +129,12 @@ Details worth knowing:
   the body had a hole. Two faces on one surface (a sketch line cut in two extrudes into
   two coplanar faces) meet at a *smooth* edge: nothing is drawn along it, nothing can be
   picked on it, and its ends are not corners. `Solid::edges` still reports it, because
-  face boundaries are what `face_profile` traces and what booleans key from.
+  face boundaries are what `face_profile` traces and what booleans key from. The one
+  line the viewport adds of its own is the silhouette, worked out per camera from the
+  mesh's facet adjacency; a facet too thin for its own cross product to mean anything
+  (a boolean cap's triangulation has them, since covering every healed vertex forces
+  triangles across collinear runs) is oriented by the normal the mesh carries instead,
+  or it reads as facing backwards and sprouts lines across the flat face it lies in.
 
 ## Sketch representation
 
