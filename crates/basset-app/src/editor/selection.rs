@@ -341,7 +341,8 @@ const BLEND_EDGE_SLACK: f64 = 2.0;
 
 /// Everything under the ray that the filter allows, nearest first, then the one to use.
 /// Edges win over faces when both are within tolerance because edges are thin and a
-/// user aiming at one is never aiming at the face behind it.
+/// user aiming at one is never aiming at the face behind it. Sketch geometry lying on a
+/// body wins over the body for the same kind of reason: see [`sketch_beats_body`].
 pub fn pick(
     editor: &Editor,
     ray: &Ray,
@@ -372,6 +373,9 @@ pub fn pick(
         .map(|id| (id, editor.hidden_bodies.contains(&id)))
         .collect();
 
+    // What the body arbitration below settles on, held back from `consider` so a sketch
+    // drawn on the body can be weighed against it by more than depth alone.
+    let mut body_pick: Option<Pick> = None;
     if filter.faces || filter.edges || filter.vertices {
         let mut face_hit: Option<Pick> = None;
         let mut edge_hit: Option<Pick> = None;
@@ -449,15 +453,13 @@ pub fn pick(
                 let tol =
                     editor.camera.pixel_size_at(ray.at(f.t()), editor.window_px) * thin_px * 2.0;
                 let aimable = wide || edge_drawn || !matches!(thin, Pick::Edge(..));
-                consider(if aimable && thin.t() <= f.t() + tol {
+                body_pick = Some(if aimable && thin.t() <= f.t() + tol {
                     thin
                 } else {
                     f
                 });
             }
-            (Some(thin), None) => consider(thin),
-            (None, Some(f)) => consider(f),
-            (None, None) => {}
+            (thin, f) => body_pick = thin.or(f),
         }
     }
 
@@ -472,6 +474,12 @@ pub fn pick(
         }
     }
 
+    let mut sketch_pick: Option<Pick> = None;
+    let mut consider_sketch = |candidate: Pick| {
+        if sketch_pick.as_ref().is_none_or(|b| candidate.t() < b.t()) {
+            sketch_pick = Some(candidate);
+        }
+    };
     if filter.profiles || filter.curves || filter.points {
         for (id, solved) in editor.visible_sketches() {
             let Some((t, local)) = hit_plane(&solved.frame, ray) else {
@@ -487,7 +495,7 @@ pub fn pick(
                         .entity(h.entity)
                         .is_some_and(|e| e.entity.is_point())
                 }) {
-                    consider(Pick::Point {
+                    consider_sketch(Pick::Point {
                         sketch: id,
                         entity: hit.entity,
                         t,
@@ -503,7 +511,7 @@ pub fn pick(
                         .entity(h.entity)
                         .is_some_and(|e| e.entity.is_curve())
                 }) {
-                    consider(Pick::Curve {
+                    consider_sketch(Pick::Curve {
                         sketch: id,
                         entity: hit.entity,
                         t,
@@ -521,11 +529,62 @@ pub fn pick(
                 // Use a point of the region itself as the stable sample so that two
                 // clicks anywhere inside compare equal.
                 let sample = region_sample(region, local);
-                consider(Pick::Profile(ProfileRef { sketch: id, sample }, t));
+                consider_sketch(Pick::Profile(ProfileRef { sketch: id, sample }, t));
+            }
+        }
+    }
+
+    match (sketch_pick, body_pick) {
+        (Some(sketch), Some(body)) => {
+            let slack = editor
+                .camera
+                .pixel_size_at(ray.at(body.t()), editor.window_px)
+                * tolerance_px;
+            let face_filter = editor.select_mode == SelectMode::Faces;
+            consider(if sketch_beats_body(&sketch, &body, slack, face_filter) {
+                sketch
+            } else {
+                body
+            });
+        }
+        (sketch, body) => {
+            if let Some(p) = sketch.or(body) {
+                consider(p);
             }
         }
     }
     best
+}
+
+/// Whether a sketch hit takes the click from a body hit under the same pointer.
+///
+/// Depth alone cannot decide it. A sketch drawn on a face lies in that face's plane,
+/// so the two hits tie to within rounding and whichever came out a hair nearer would
+/// win — usually the face, which left a profile drawn on a body impossible to click
+/// for the extrude it was drawn for. So the sketch wins when it is on the body's
+/// surface or in front of it, within `slack` of depth: it is drawn over the face, and
+/// it is the more specific thing under the pointer. A sketch genuinely behind the
+/// surface stays hidden by it, as the viewer shows it.
+///
+/// Two body hits keep a tie. A body edge or corner, against a sketch region: a region
+/// is as broad a target as the face it covers, and the smaller target is always the
+/// one being aimed at — the same rule that lets an edge beat its face. And a face,
+/// against a region, once the user has chosen the Face filter: a sketch on a face
+/// opens with the face's outline copied in, so its regions tile the whole face, and
+/// without this the filter named for faces could not reach one under its own sketch.
+/// In both cases a region standing clear in front of the body still wins, as
+/// anything nearer does.
+fn sketch_beats_body(sketch: &Pick, body: &Pick, slack: f64, face_filter: bool) -> bool {
+    if sketch.t() > body.t() + slack {
+        return false;
+    }
+    let body_keeps_a_tie = matches!(sketch, Pick::Profile(..))
+        && match body {
+            Pick::Edge(..) | Pick::Vertex(..) => true,
+            Pick::Face(..) => face_filter,
+            _ => false,
+        };
+    !body_keeps_a_tie || sketch.t() < body.t() - slack
 }
 
 fn hit_plane(frame: &Frame, ray: &Ray) -> Option<(f64, Vec2)> {
@@ -662,5 +721,61 @@ mod tests {
         // Still only slack, not a free-for-all: the middle of the face is the face.
         let middle = pick(&editor, &click_at(5.0, 5.0), &editor.pick_filter(), 8.0);
         assert!(matches!(middle, Some(Pick::Face(..))), "{middle:?}");
+    }
+
+    /// The depth rules between a sketch and a body, away from any camera: on the
+    /// surface or in front the sketch wins, behind it loses, and the two ties a body
+    /// keeps (a region against an edge or corner, and against a face under the Face
+    /// filter) give way only to a region standing clear in front.
+    #[test]
+    fn a_sketch_on_the_surface_beats_the_body_and_one_behind_it_does_not() {
+        let body = BodyRef(FeatureId(1));
+        let face = |t| Pick::Face(crate::editor::harness::top_face(body), t);
+        let corner = |t| {
+            Pick::Vertex(
+                VertexHit {
+                    body,
+                    point: Vec3::ZERO,
+                },
+                t,
+            )
+        };
+        let region = |t| {
+            Pick::Profile(
+                ProfileRef {
+                    sketch: FeatureId(2),
+                    sample: Vec2::ZERO,
+                },
+                t,
+            )
+        };
+        let curve = |t| Pick::Curve {
+            sketch: FeatureId(2),
+            entity: EntityId::default(),
+            t,
+        };
+        let slack = 0.1;
+
+        // A hair behind the face, from rounding, is still on it; a millimetre is not.
+        assert!(sketch_beats_body(&region(10.05), &face(10.0), slack, false));
+        assert!(!sketch_beats_body(&region(11.0), &face(10.0), slack, false));
+        assert!(sketch_beats_body(
+            &curve(10.05),
+            &corner(10.0),
+            slack,
+            false
+        ));
+
+        // The ties a body keeps, and what still breaks them.
+        assert!(!sketch_beats_body(
+            &region(10.0),
+            &corner(10.0),
+            slack,
+            false
+        ));
+        assert!(sketch_beats_body(&region(9.0), &corner(10.0), slack, false));
+        assert!(!sketch_beats_body(&region(10.0), &face(10.0), slack, true));
+        assert!(sketch_beats_body(&region(9.0), &face(10.0), slack, true));
+        assert!(sketch_beats_body(&curve(10.0), &face(10.0), slack, true));
     }
 }
