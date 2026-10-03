@@ -51,7 +51,7 @@ fn extrude(
     op: BodyOp,
 ) -> FeatureId {
     doc.add_feature(FeatureKind::Extrude {
-        regions: vec![RegionRef::Profile(ProfileRef { sketch, sample })],
+        regions: vec![RegionRef::Profile(ProfileRef::new(sketch, sample))],
         extent: Extent::OneSide(distance),
         operation: op,
         component: ComponentId::ROOT,
@@ -545,10 +545,7 @@ fn move_revolve_sweep_and_loft_through_the_document() {
     };
     let sk = sketch_on(&mut doc, PlaneRef::Origin(OriginPlane::XY), profile);
     let rev = doc.add_feature(FeatureKind::Revolve {
-        regions: vec![RegionRef::Profile(ProfileRef {
-            sketch: sk,
-            sample: Vec2::new(2.0, 1.0),
-        })],
+        regions: vec![RegionRef::Profile(ProfileRef::new(sk, Vec2::new(2.0, 1.0)))],
         axis: AxisRef::Origin(OriginAxis::Y),
         angle: 2.0 * PI,
         operation: BodyOp::NewBody,
@@ -588,10 +585,7 @@ fn move_revolve_sweep_and_loft_through_the_document() {
     };
     let circ_sk = sketch_on(&mut doc, PlaneRef::Origin(OriginPlane::XY), circle);
     let sw = doc.add_feature(FeatureKind::Sweep {
-        regions: vec![RegionRef::Profile(ProfileRef {
-            sketch: circ_sk,
-            sample: Vec2::ZERO,
-        })],
+        regions: vec![RegionRef::Profile(ProfileRef::new(circ_sk, Vec2::ZERO))],
         path: PathRef {
             sketch: path_sk,
             curves: vec![l1, l2],
@@ -619,14 +613,8 @@ fn move_revolve_sweep_and_loft_through_the_document() {
     let s2 = sketch_on(&mut doc, PlaneRef::Feature(upper2), sq2);
     let lo = doc.add_feature(FeatureKind::Loft {
         regions: vec![
-            RegionRef::Profile(ProfileRef {
-                sketch: s1,
-                sample: Vec2::ONE,
-            }),
-            RegionRef::Profile(ProfileRef {
-                sketch: s2,
-                sample: Vec2::ONE,
-            }),
+            RegionRef::Profile(ProfileRef::new(s1, Vec2::ONE)),
+            RegionRef::Profile(ProfileRef::new(s2, Vec2::ONE)),
         ],
         operation: BodyOp::NewBody,
         component: ComponentId::ROOT,
@@ -739,10 +727,10 @@ fn base_and_small_sketch() -> (Document, FeatureId, FeatureId) {
 
 fn extrude_to(doc: &mut Document, sketch: FeatureId, target: FaceRef) -> FeatureId {
     doc.add_feature(FeatureKind::Extrude {
-        regions: vec![RegionRef::Profile(ProfileRef {
+        regions: vec![RegionRef::Profile(ProfileRef::new(
             sketch,
-            sample: Vec2::new(1.0, 1.0),
-        })],
+            Vec2::new(1.0, 1.0),
+        ))],
         extent: Extent::ToFace(target),
         operation: BodyOp::NewBody,
         component: ComponentId::ROOT,
@@ -774,11 +762,38 @@ fn an_extrude_to_a_face_reaches_it_and_follows_edits_of_the_target() {
     assert_relative_eq!(volume(&mut doc, up), 2.0 * 2.0 * 7.0, epsilon = 1e-9);
 }
 
+/// A target behind the profile is reached by going the other way: a sketch on a plane
+/// above the body, extruded "to" the body's top, means downwards.
+#[test]
+fn an_extrude_to_a_face_behind_the_profile_goes_backwards() {
+    let (mut doc, base, _) = base_and_small_sketch();
+    let plane = doc.add_feature(FeatureKind::OffsetPlane {
+        base: PlaneRef::Origin(OriginPlane::XY),
+        distance: 10.0,
+    });
+    let (small, _) = rect_sketch(2.0, 2.0);
+    let sk = sketch_on(&mut doc, PlaneRef::Feature(plane), small);
+    let down = extrude_to(
+        &mut doc,
+        sk,
+        FaceRef {
+            body: BodyRef(base),
+            key: face(base, FaceRole::EndCap),
+        },
+    );
+    assert_eq!(doc.state().status(down), Some(&FeatureStatus::Ok));
+    assert_relative_eq!(volume(&mut doc, down), 2.0 * 2.0 * 6.0, epsilon = 1e-9);
+    let aabb = doc.state().body(BodyRef(down)).unwrap().solid.aabb();
+    assert_relative_eq!(aabb.min.z, 4.0, epsilon = 1e-9);
+    assert_relative_eq!(aabb.max.z, 10.0, epsilon = 1e-9);
+}
+
 /// The refusals surface as feature errors, not panics: a target the direction runs
-/// along, and a target behind the profile, each name their problem and replay goes on.
+/// along, and a target plane the profile sits in, each name their problem and replay
+/// goes on.
 #[test]
 fn an_impossible_to_face_target_fails_the_feature_with_its_reason() {
-    // The base's bottom cap shares the profile's own plane, so the reach is zero.
+    // The base's bottom cap shares the profile's own plane, so the profile straddles it.
     let (mut doc, base, sk2) = base_and_small_sketch();
     let up = extrude_to(
         &mut doc,
@@ -792,7 +807,7 @@ fn an_impossible_to_face_target_fails_the_feature_with_its_reason() {
     let Some(FeatureStatus::Failed(message)) = state.status(up) else {
         panic!("{:?}", state.status(up));
     };
-    assert!(message.contains("behind"), "{message}");
+    assert!(message.contains("straddles"), "{message}");
 
     // A sketch on YZ extrudes along x; the top cap's normal is z, at right angles.
     let (mut doc, base, _) = base_and_small_sketch();

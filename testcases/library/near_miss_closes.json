@@ -1,0 +1,73 @@
+{
+  "description": "An outline whose last point lands a tenth of a micron short of the first still encloses its region: the join tolerance absorbs solver noise.",
+  "calls": [
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": "XY"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$0",
+        "ops": [
+          {
+            "op": "polyline",
+            "points": [
+              [
+                0,
+                0
+              ],
+              [
+                10,
+                0
+              ],
+              [
+                10,
+                10
+              ],
+              [
+                0,
+                10
+              ]
+            ],
+            "closed": false
+          },
+          {
+            "op": "line",
+            "from": [
+              0,
+              10
+            ],
+            "to": [
+              0,
+              1e-07
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": "all",
+        "sketch": "$0",
+        "distance": 2
+      }
+    }
+  ],
+  "expect": {
+    "ok": true,
+    "regions": {
+      "$0": 1
+    },
+    "bodies": {
+      "$2": {
+        "volume": 200,
+        "volume_tol": 1e-06,
+        "closed": true
+      }
+    }
+  }
+}

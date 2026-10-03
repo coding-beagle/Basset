@@ -139,8 +139,8 @@ impl Regenerator {
             state.statuses.insert(feature.id, FeatureStatus::Suppressed);
             return state;
         }
-        let (driven, stale) = self.drive(feature);
-        let status = match self.apply_kind(&mut state, &driven) {
+        let (driven, mut stale) = self.drive(feature);
+        let status = match self.apply_kind(&mut state, &driven, &mut stale) {
             Ok(()) if stale.is_empty() => FeatureStatus::Ok,
             Ok(()) => FeatureStatus::Warned(stale.join("; ")),
             Err(e) => {
@@ -182,7 +182,15 @@ impl Regenerator {
         (Cow::Owned(driven), stale)
     }
 
-    fn apply_kind(&self, state: &mut ModelState, feature: &Feature) -> Result<(), RegenError> {
+    /// Applies one feature to the state. Anything worth telling the user that did not
+    /// stop the feature from building — a region found by its curves after its sample
+    /// point was left outside, say — goes into `warnings`, and the feature is `Warned`.
+    fn apply_kind(
+        &self,
+        state: &mut ModelState,
+        feature: &Feature,
+        warnings: &mut Vec<String>,
+    ) -> Result<(), RegenError> {
         let id = feature.id;
         match &feature.kind {
             FeatureKind::NewComponent { name, parent } => {
@@ -267,7 +275,7 @@ impl Regenerator {
                 component,
             } => {
                 let solid = union_all(regions.iter().enumerate().map(|(k, p)| {
-                    let profile = resolve_region(state, p)?;
+                    let profile = resolve_region(state, p, warnings)?;
                     match extent {
                         // The target is resolved fresh on every replay, so the
                         // extrusion follows the face through edits of the body it
@@ -301,7 +309,7 @@ impl Regenerator {
             } => {
                 let axis = resolve_axis(state, axis)?;
                 let solid = union_all(regions.iter().enumerate().map(|(k, p)| {
-                    let profile = resolve_region(state, p)?;
+                    let profile = resolve_region(state, p, warnings)?;
                     Ok(kernel::revolve(
                         op_id(id, k),
                         &profile,
@@ -320,7 +328,7 @@ impl Regenerator {
             } => {
                 let path = resolve_path(state, path, &self.tessellation)?;
                 let solid = union_all(regions.iter().enumerate().map(|(k, p)| {
-                    let profile = resolve_region(state, p)?;
+                    let profile = resolve_region(state, p, warnings)?;
                     Ok(kernel::sweep(op_id(id, k), &profile, &path)?)
                 }))?;
                 self.finish_body(state, feature, *component, solid, operation)?;
@@ -332,7 +340,7 @@ impl Regenerator {
             } => {
                 let sections = regions
                     .iter()
-                    .map(|p| resolve_region(state, p))
+                    .map(|p| resolve_region(state, p, warnings))
                     .collect::<Result<Vec<_>, _>>()?;
                 let solid = kernel::loft(op_id(id, 0), &sections)?;
                 self.finish_body(state, feature, *component, solid, operation)?;
@@ -642,9 +650,13 @@ fn resolve_axis(state: &ModelState, axis: &AxisRef) -> Result<Axis, RegenError> 
 }
 
 /// A region as the kernel wants it, whichever kind of thing the user picked.
-fn resolve_region(state: &ModelState, region: &RegionRef) -> Result<Profile, RegenError> {
+fn resolve_region(
+    state: &ModelState,
+    region: &RegionRef,
+    warnings: &mut Vec<String>,
+) -> Result<Profile, RegenError> {
     match region {
-        RegionRef::Profile(p) => resolve_profile(state, p),
+        RegionRef::Profile(p) => resolve_profile(state, p, warnings),
         RegionRef::Face(f) => {
             let body = state
                 .bodies
@@ -657,20 +669,109 @@ fn resolve_region(state: &ModelState, region: &RegionRef) -> Result<Profile, Reg
     }
 }
 
-fn resolve_profile(state: &ModelState, p: &ProfileRef) -> Result<Profile, RegenError> {
+/// Finds the region a reference means, in three steps of decreasing confidence.
+///
+/// 1. By the curves around it, when the reference recorded them: those keep their
+///    identity through every re-dimensioning, so a match is the region the user picked
+///    even when the sample point has since been left outside it or carried into a
+///    neighbour. Several regions can share a curve set (a circle cut by a line), and the
+///    sample point settles that: the smallest matching region containing it, else the
+///    nearest matching one.
+/// 2. By the sample point alone, as files written before signatures existed are, and as
+///    a sketch whose topology changed under the reference has to be: the smallest region
+///    containing it, because nested regions are the inner one being clicked.
+/// 3. By the nearest region to the sample point, with a warning — but only for a
+///    reference that recorded its curves, since that says the point was inside a region
+///    when it was picked. The user re-dimensioned a drawing and the point they clicked
+///    three edits ago is now a millimetre outside the only region there is; failing the
+///    extrude would make them re-pick what they can see is still there, and saying what
+///    was done lets them check it was right. A point-only reference that misses was
+///    never known to be inside anything, and guessing a region for it would turn a typo
+///    into a body.
+fn resolve_profile(
+    state: &ModelState,
+    p: &ProfileRef,
+    warnings: &mut Vec<String>,
+) -> Result<Profile, RegenError> {
     let solved = state
         .sketches
         .get(&p.sketch)
         .ok_or(RegenError::MissingSketch(p.sketch))?;
-    solved
-        .profiles
-        .iter()
-        .filter(|profile| profile_contains(profile, p.sample))
-        // Nested regions: the smallest region containing the point is the one the user
-        // clicked in.
-        .min_by(|a, b| profile_area(a).total_cmp(&profile_area(b)))
-        .cloned()
-        .ok_or(RegenError::NoProfileAt(p.sample.x, p.sample.y, p.sketch))
+    let profiles = &solved.profiles;
+    let smallest_containing = |candidates: &[&Profile]| -> Option<Profile> {
+        candidates
+            .iter()
+            .filter(|profile| profile_contains(profile, p.sample))
+            .min_by(|a, b| profile_area(a).total_cmp(&profile_area(b)))
+            .map(|profile| (*profile).clone())
+    };
+    let nearest = |candidates: &[&Profile]| -> Option<(Profile, f64)> {
+        candidates
+            .iter()
+            .map(|profile| (profile, profile_distance(profile, p.sample)))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(profile, d)| ((*profile).clone(), d))
+    };
+    if p.curves != 0 {
+        let matching: Vec<&Profile> = profiles
+            .iter()
+            .filter(|profile| region_signature(profile) == p.curves)
+            .collect();
+        if let [only] = matching[..] {
+            return Ok(only.clone());
+        }
+        if let Some(found) = smallest_containing(&matching) {
+            return Ok(found);
+        }
+        if let Some((found, _)) = nearest(&matching) {
+            return Ok(found);
+        }
+    }
+    let all: Vec<&Profile> = profiles.iter().collect();
+    if let Some(found) = smallest_containing(&all) {
+        return Ok(found);
+    }
+    if p.curves != 0
+        && let Some((found, distance)) = nearest(&all)
+    {
+        warnings.push(format!(
+            "no region encloses the point ({:.3}, {:.3}) this feature was picked at any more; \
+             using the nearest one, {distance:.3} mm away — check it is the one meant",
+            p.sample.x, p.sample.y
+        ));
+        return Ok(found);
+    }
+    Err(RegenError::NoProfileAt(p.sample.x, p.sample.y, p.sketch))
+}
+
+/// The curve-set signature of a region in kernel form; the same number the sketch's own
+/// [`basset_sketch::Profile::signature`] gives the region it was converted from, because
+/// the kernel's curve tags are the sketch entities' slot indexes.
+pub fn region_signature(p: &Profile) -> u64 {
+    basset_sketch::curve_signature(p.loops().flat_map(|c| c.segments.iter()).map(|s| s.curve))
+}
+
+/// Distance from a point to the region's boundary; zero inside.
+fn profile_distance(p: &Profile, point: Vec2) -> f64 {
+    if profile_contains(p, point) {
+        return 0.0;
+    }
+    let mut best = f64::INFINITY;
+    for c in p.loops() {
+        let n = c.points.len();
+        for i in 0..n {
+            let a = c.points[i];
+            let b = c.points[(i + 1) % n];
+            let ab = b - a;
+            let t = if ab.length_squared() > 0.0 {
+                ((point - a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            best = best.min(point.distance(a + ab * t));
+        }
+    }
+    best
 }
 
 fn resolve_path(

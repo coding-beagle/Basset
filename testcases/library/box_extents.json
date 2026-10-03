@@ -1,0 +1,146 @@
+{
+  "description": "Every extent kind of one rectangle: negative one-sided, symmetric (total length), two-sided, and two-sided with both distances negative (signs are magnitudes).",
+  "calls": [
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": "XY"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$0",
+        "ops": [
+          {
+            "op": "rectangle",
+            "a": [
+              0,
+              0
+            ],
+            "b": [
+              10,
+              5
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": "all",
+        "sketch": "$0",
+        "distance": -4
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": "all",
+        "sketch": "$0",
+        "extent": {
+          "type": "symmetric",
+          "distance": 4
+        }
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": "all",
+        "sketch": "$0",
+        "extent": {
+          "type": "two_sides",
+          "positive": 1,
+          "negative": 3
+        }
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": "all",
+        "sketch": "$0",
+        "extent": {
+          "type": "two_sides",
+          "positive": -1,
+          "negative": -3
+        }
+      }
+    }
+  ],
+  "expect": {
+    "ok": true,
+    "bodies": {
+      "$2": {
+        "volume": 200,
+        "volume_tol": 1e-09,
+        "closed": true,
+        "aabb": [
+          [
+            0,
+            0,
+            -4
+          ],
+          [
+            10,
+            5,
+            0
+          ]
+        ]
+      },
+      "$3": {
+        "volume": 200,
+        "volume_tol": 1e-09,
+        "closed": true,
+        "aabb": [
+          [
+            0,
+            0,
+            -2
+          ],
+          [
+            10,
+            5,
+            2
+          ]
+        ]
+      },
+      "$4": {
+        "volume": 200,
+        "volume_tol": 1e-09,
+        "closed": true,
+        "aabb": [
+          [
+            0,
+            0,
+            -3
+          ],
+          [
+            10,
+            5,
+            1
+          ]
+        ]
+      },
+      "$5": {
+        "volume": 200,
+        "volume_tol": 1e-09,
+        "closed": true,
+        "aabb": [
+          [
+            0,
+            0,
+            -3
+          ],
+          [
+            10,
+            5,
+            1
+          ]
+        ]
+      }
+    }
+  }
+}

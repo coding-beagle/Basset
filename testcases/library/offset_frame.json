@@ -1,0 +1,68 @@
+{
+  "description": "A rectangle offset inwards by 2 (square corners, since an inward offset trims them): the frame between the two outlines extruded.",
+  "calls": [
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": "XY"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$0",
+        "ops": [
+          {
+            "op": "rectangle",
+            "a": [
+              0,
+              0
+            ],
+            "b": [
+              20,
+              10
+            ]
+          },
+          {
+            "op": "offset",
+            "entities": [
+              5,
+              6,
+              7,
+              8
+            ],
+            "distance": -2,
+            "corner": "round"
+          }
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": [
+          [
+            1,
+            1
+          ]
+        ],
+        "sketch": "$0",
+        "distance": 3
+      }
+    }
+  ],
+  "expect": {
+    "ok": true,
+    "regions": {
+      "$0": 2
+    },
+    "bodies": {
+      "$2": {
+        "volume": 312,
+        "volume_tol": 1e-06,
+        "closed": true,
+        "faces": 10
+      }
+    }
+  }
+}

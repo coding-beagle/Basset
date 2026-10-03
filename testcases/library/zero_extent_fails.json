@@ -1,0 +1,74 @@
+{
+  "description": "A zero distance and a sample point outside every region each fail their feature with a message, and replay carries on.",
+  "calls": [
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": "XY"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$0",
+        "ops": [
+          {
+            "op": "rectangle",
+            "a": [
+              0,
+              0
+            ],
+            "b": [
+              10,
+              5
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": "all",
+        "sketch": "$0",
+        "distance": 0
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": [
+          [
+            50,
+            50
+          ]
+        ],
+        "sketch": "$0",
+        "distance": 1
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": "all",
+        "sketch": "$0",
+        "distance": 2
+      }
+    }
+  ],
+  "expect": {
+    "ok": false,
+    "statuses": {
+      "$2": "failed",
+      "$3": "failed",
+      "$4": "ok"
+    },
+    "bodies": {
+      "$4": {
+        "volume": 100,
+        "volume_tol": 1e-09,
+        "closed": true
+      }
+    }
+  }
+}

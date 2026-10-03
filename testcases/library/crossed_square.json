@@ -1,0 +1,95 @@
+{
+  "description": "A square cut into quadrants by two lines through it: four regions, and two opposite ones extrude into one body of two shells.",
+  "calls": [
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": "XY"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$0",
+        "ops": [
+          {
+            "op": "rectangle",
+            "a": [
+              0,
+              0
+            ],
+            "b": [
+              10,
+              10
+            ]
+          },
+          {
+            "op": "line",
+            "from": [
+              0,
+              5
+            ],
+            "to": [
+              10,
+              5
+            ]
+          },
+          {
+            "op": "line",
+            "from": [
+              5,
+              0
+            ],
+            "to": [
+              5,
+              10
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": [
+          [
+            2.5,
+            2.5
+          ],
+          [
+            7.5,
+            7.5
+          ]
+        ],
+        "sketch": "$0",
+        "distance": 2
+      }
+    }
+  ],
+  "expect": {
+    "ok": true,
+    "regions": {
+      "$0": 4
+    },
+    "bodies": {
+      "$2": {
+        "volume": 100,
+        "volume_tol": 1e-09,
+        "closed": true,
+        "aabb": [
+          [
+            0,
+            0,
+            0
+          ],
+          [
+            10,
+            10,
+            2
+          ]
+        ],
+        "faces": 12
+      }
+    }
+  }
+}

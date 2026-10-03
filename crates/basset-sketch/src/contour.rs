@@ -5,8 +5,30 @@
 //! a stable identity. A [`Profile`] is one outer contour plus its holes.
 
 use basset_math::Vec2;
+use slotmap::Key;
 
 use crate::EntityId;
+
+/// A number naming a set of curves, stable across runs, builds and saves.
+///
+/// FNV-1a over the sorted, deduplicated slot indexes, so the order the curves were met
+/// in and how many pieces each contributed make no difference. Written into a file, which
+/// is why it is not `std`'s hasher: that one is free to change between Rust versions, and
+/// a region anchored by one build must be found by the next. Never zero, so zero can mean
+/// "no signature was recorded".
+pub fn curve_signature(curves: impl IntoIterator<Item = u32>) -> u64 {
+    let mut ids: Vec<u32> = curves.into_iter().collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for id in ids {
+        for byte in id.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    hash.max(1)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SegmentKind {
@@ -122,6 +144,19 @@ impl Profile {
 
     pub fn contains(&self, p: Vec2) -> bool {
         self.outer.contains(p) && !self.holes.iter().any(|h| h.contains(p))
+    }
+
+    /// The signature of every curve on this region's boundary, outer loop and holes, by
+    /// slot index — the same index the kernel's face keys carry. Two regions of one
+    /// sketch can share a signature (a circle cut by one line is two regions bounded by
+    /// the same two curves), so it narrows a search rather than settling it.
+    pub fn signature(&self) -> u64 {
+        curve_signature(
+            std::iter::once(&self.outer)
+                .chain(self.holes.iter())
+                .flat_map(|c| c.segments.iter())
+                .map(|s| s.curve.data().as_ffi() as u32),
+        )
     }
 
     /// A point strictly inside the region, for naming it in a reference that has to

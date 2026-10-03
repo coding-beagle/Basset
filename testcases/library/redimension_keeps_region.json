@@ -1,0 +1,101 @@
+{
+  "description": "An extrude picked by a point inside a 10-wide rectangle survives the rectangle being re-dimensioned to 2 wide, which leaves that point outside: the region is found by the curves around it, with no warning.",
+  "calls": [
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": "XY"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$0",
+        "ops": [
+          {
+            "op": "rectangle",
+            "a": [
+              0,
+              0
+            ],
+            "b": [
+              10,
+              5
+            ]
+          },
+          {
+            "op": "constrain",
+            "type": "fix",
+            "entity": 1
+          },
+          {
+            "op": "constrain",
+            "type": "horizontal_distance",
+            "a": 1,
+            "b": 2,
+            "value": 10
+          },
+          {
+            "op": "constrain",
+            "type": "vertical_distance",
+            "a": 1,
+            "b": 4,
+            "value": 5
+          }
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": [
+          [
+            5,
+            2.5
+          ]
+        ],
+        "sketch": "$0",
+        "distance": 4
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$0",
+        "ops": [
+          {
+            "op": "set_dimension",
+            "constraint": 6,
+            "value": 2
+          }
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "ok": true,
+    "warnings": 0,
+    "statuses": {
+      "$2": "ok"
+    },
+    "bodies": {
+      "$2": {
+        "volume": 40,
+        "volume_tol": 1e-06,
+        "closed": true,
+        "aabb": [
+          [
+            0,
+            0,
+            0
+          ],
+          [
+            2,
+            5,
+            4
+          ]
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,67 @@
+{
+  "description": "A D shape: a line closed by a three-point arc through its midpoint bulge.",
+  "calls": [
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": "XY"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$0",
+        "ops": [
+          {
+            "op": "arc_three_point",
+            "start": [
+              0,
+              0
+            ],
+            "mid": [
+              5,
+              5
+            ],
+            "end": [
+              10,
+              0
+            ]
+          },
+          {
+            "op": "line",
+            "from": [
+              0,
+              0
+            ],
+            "to": [
+              10,
+              0
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": "all",
+        "sketch": "$0",
+        "distance": 2
+      }
+    }
+  ],
+  "expect": {
+    "ok": true,
+    "regions": {
+      "$0": 1
+    },
+    "bodies": {
+      "$2": {
+        "volume": 78.53981633974483,
+        "volume_tol": 0.5,
+        "closed": true,
+        "faces": 4
+      }
+    }
+  }
+}

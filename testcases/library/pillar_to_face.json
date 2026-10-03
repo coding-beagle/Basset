@@ -1,0 +1,112 @@
+{
+  "description": "A circle on a plane above a block extruded 'to' the block's top face runs downwards to meet it, and follows the block when its height is edited.",
+  "calls": [
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": "XY"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$0",
+        "ops": [
+          {
+            "op": "rectangle",
+            "a": [
+              0,
+              0
+            ],
+            "b": [
+              20,
+              20
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": "all",
+        "sketch": "$0",
+        "distance": 10
+      }
+    },
+    {
+      "tool": "offset_plane",
+      "arguments": {
+        "base": "XY",
+        "distance": 30
+      }
+    },
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": "$3"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$4",
+        "ops": [
+          {
+            "op": "circle",
+            "center": [
+              10,
+              10
+            ],
+            "radius": 3
+          }
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": "all",
+        "sketch": "$4",
+        "extent": {
+          "type": "to_face",
+          "body": "$2.body",
+          "face": "${2}.0:EndCap"
+        }
+      }
+    },
+    {
+      "tool": "edit_feature",
+      "arguments": {
+        "feature": "$2",
+        "distance": 25
+      }
+    }
+  ],
+  "expect": {
+    "ok": true,
+    "statuses": {
+      "$6": "ok"
+    },
+    "bodies": {
+      "$6": {
+        "volume": 141.3716694115407,
+        "volume_tol": 1.0,
+        "closed": true,
+        "aabb": [
+          [
+            7,
+            7,
+            25
+          ],
+          [
+            13,
+            13,
+            30
+          ]
+        ],
+        "aabb_tol": 0.02
+      }
+    }
+  }
+}

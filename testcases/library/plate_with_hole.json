@@ -1,0 +1,77 @@
+{
+  "description": "A rectangle with a circle inside is two regions: the disc and the plate with the disc punched out. Extruding the plate region by a sample point gives a body with a cylindrical hole.",
+  "calls": [
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": "XY"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$0",
+        "ops": [
+          {
+            "op": "rectangle",
+            "a": [
+              0,
+              0
+            ],
+            "b": [
+              20,
+              10
+            ]
+          },
+          {
+            "op": "circle",
+            "center": [
+              10,
+              5
+            ],
+            "radius": 2
+          }
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": [
+          [
+            1,
+            1
+          ]
+        ],
+        "sketch": "$0",
+        "distance": 3
+      }
+    }
+  ],
+  "expect": {
+    "ok": true,
+    "regions": {
+      "$0": 2
+    },
+    "bodies": {
+      "$2": {
+        "volume": 562.3008881569224,
+        "volume_tol": 0.5,
+        "closed": true,
+        "aabb": [
+          [
+            0,
+            0,
+            0
+          ],
+          [
+            20,
+            10,
+            3
+          ]
+        ],
+        "faces": 7
+      }
+    }
+  }
+}

@@ -1,0 +1,57 @@
+{
+  "description": "Two circles touching at one point from outside: two discs, extruded together into one body of two shells.",
+  "calls": [
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": "XY"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$0",
+        "ops": [
+          {
+            "op": "circle",
+            "center": [
+              0,
+              0
+            ],
+            "radius": 5
+          },
+          {
+            "op": "circle",
+            "center": [
+              10,
+              0
+            ],
+            "radius": 5
+          }
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": "all",
+        "sketch": "$0",
+        "distance": 2
+      }
+    }
+  ],
+  "expect": {
+    "ok": true,
+    "regions": {
+      "$0": 2
+    },
+    "bodies": {
+      "$2": {
+        "volume": 314.1592653589793,
+        "volume_tol": 2.0,
+        "closed": true,
+        "faces": 6
+      }
+    }
+  }
+}

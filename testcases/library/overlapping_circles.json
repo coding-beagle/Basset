@@ -1,0 +1,102 @@
+{
+  "description": "Two circles overlapping: three regions (two crescents and a lens), each extruded on its own.",
+  "calls": [
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": "XY"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$0",
+        "ops": [
+          {
+            "op": "circle",
+            "center": [
+              0,
+              0
+            ],
+            "radius": 5
+          },
+          {
+            "op": "circle",
+            "center": [
+              6,
+              0
+            ],
+            "radius": 5
+          }
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": [
+          [
+            -2,
+            0
+          ]
+        ],
+        "sketch": "$0",
+        "distance": 1
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": [
+          [
+            3,
+            0
+          ]
+        ],
+        "sketch": "$0",
+        "distance": 1
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": [
+          [
+            8,
+            0
+          ]
+        ],
+        "sketch": "$0",
+        "distance": 1
+      }
+    }
+  ],
+  "expect": {
+    "ok": true,
+    "regions": {
+      "$0": 3
+    },
+    "statuses": {
+      "$2": "ok",
+      "$3": "ok",
+      "$4": "ok"
+    },
+    "bodies": {
+      "$2": {
+        "volume": 0,
+        "volume_tol": 1000000000.0,
+        "closed": true
+      },
+      "$3": {
+        "volume": 0,
+        "volume_tol": 1000000000.0,
+        "closed": true
+      },
+      "$4": {
+        "volume": 0,
+        "volume_tol": 1000000000.0,
+        "closed": true
+      }
+    }
+  }
+}

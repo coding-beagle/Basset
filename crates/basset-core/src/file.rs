@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::document::Document;
 
-pub const FORMAT_VERSION: u32 = 8;
+pub const FORMAT_VERSION: u32 = 9;
 pub const EXTENSION: &str = "bass";
 
 #[derive(Serialize, Deserialize)]
@@ -92,8 +92,20 @@ fn migrate_step(mut value: serde_json::Value, version: u32) -> serde_json::Value
         5 => migrate_v5_visibility(value),
         6 => migrate_v6_offset_dimension(value),
         7 => migrate_v7_body_names(value),
+        8 => migrate_v8_region_curves(value),
         _ => value,
     }
+}
+
+/// Version 9 added the curve-set signature a region reference carries beside its sample
+/// point (`ProfileRef::curves`).
+///
+/// Additive and defaulted: a reference without one is found by its sample point alone,
+/// which is how every version 8 file was resolved anyway. Bumped so an older build refuses
+/// the file instead of dropping the signatures and saving back references that go stale
+/// on the next re-dimensioning.
+fn migrate_v8_region_curves(value: serde_json::Value) -> serde_json::Value {
+    value
 }
 
 /// Version 8 added body names the user chose and the component-from-body step.
@@ -334,19 +346,13 @@ mod tests {
             sketch,
         });
         let base = doc.add_feature(FeatureKind::Extrude {
-            regions: vec![RegionRef::Profile(ProfileRef {
-                sketch: sk,
-                sample: Vec2::new(1.0, 1.0),
-            })],
+            regions: vec![RegionRef::Profile(ProfileRef::new(sk, Vec2::new(1.0, 1.0)))],
             extent: Extent::OneSide(2.0),
             operation: BodyOp::NewBody,
             component: ComponentId::ROOT,
         });
         doc.add_feature(FeatureKind::Extrude {
-            regions: vec![RegionRef::Profile(ProfileRef {
-                sketch: sk,
-                sample: Vec2::new(5.0, 5.0),
-            })],
+            regions: vec![RegionRef::Profile(ProfileRef::new(sk, Vec2::new(5.0, 5.0)))],
             extent: Extent::OneSide(2.0),
             operation: BodyOp::Cut(vec![BodyRef(base)]),
             component: ComponentId::ROOT,
@@ -403,10 +409,7 @@ mod tests {
             sketch,
         });
         let body = doc.add_feature(FeatureKind::Extrude {
-            regions: vec![RegionRef::Profile(ProfileRef {
-                sketch: sk,
-                sample: Vec2::new(1.0, 1.0),
-            })],
+            regions: vec![RegionRef::Profile(ProfileRef::new(sk, Vec2::new(1.0, 1.0)))],
             extent: Extent::OneSide(2.0),
             operation: BodyOp::NewBody,
             component: ComponentId::ROOT,

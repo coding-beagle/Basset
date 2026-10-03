@@ -1,0 +1,115 @@
+{
+  "description": "A fully dimensioned rectangle whose width is bound to a document parameter, and an extrude distance driven by an expression over it: changing the parameter re-drives both.",
+  "calls": [
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": "XY"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$0",
+        "ops": [
+          {
+            "op": "rectangle",
+            "a": [
+              0,
+              0
+            ],
+            "b": [
+              10,
+              5
+            ]
+          },
+          {
+            "op": "constrain",
+            "type": "fix",
+            "entity": 1
+          },
+          {
+            "op": "constrain",
+            "type": "horizontal_distance",
+            "a": 1,
+            "b": 2,
+            "value": 10
+          },
+          {
+            "op": "constrain",
+            "type": "vertical_distance",
+            "a": 1,
+            "b": 4,
+            "value": 5
+          }
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": "all",
+        "sketch": "$0",
+        "distance": 4
+      }
+    },
+    {
+      "tool": "set_parameter",
+      "arguments": {
+        "name": "w",
+        "expression": "12"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$0",
+        "ops": [
+          {
+            "op": "bind_dimension",
+            "constraint": 6,
+            "expression": "w"
+          }
+        ]
+      }
+    },
+    {
+      "tool": "set_feature_expr",
+      "arguments": {
+        "feature": "$2",
+        "field": "distance",
+        "expression": "w / 4"
+      }
+    },
+    {
+      "tool": "set_parameter",
+      "arguments": {
+        "name": "w",
+        "expression": "24"
+      }
+    }
+  ],
+  "expect": {
+    "ok": true,
+    "warnings": 0,
+    "bodies": {
+      "$2": {
+        "volume": 720,
+        "volume_tol": 1e-06,
+        "closed": true,
+        "aabb": [
+          [
+            0,
+            0,
+            0
+          ],
+          [
+            24,
+            5,
+            6
+          ]
+        ]
+      }
+    }
+  }
+}

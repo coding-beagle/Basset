@@ -177,9 +177,12 @@ const TRIM_SUB: u32 = 1 << 31;
 /// touches the surface without piercing it. (The honest end shape there would be the
 /// surface itself; TODO.md records the flat-end limitation.)
 ///
-/// Anything the semantics cannot promise is refused rather than approximated: a target
-/// parallel to the direction of travel, a target any part of the profile has already
-/// passed, and a curved target the extrusion never meets are each their own error.
+/// The target may lie on either side of the profile. A sketch drawn on a plane above a
+/// body and extruded "to" the body's top is the everyday case, and it means downwards;
+/// the extrusion goes whichever way the target is, as Fusion's does. What is refused
+/// rather than approximated: a target parallel to the direction of travel, a target
+/// plane the profile straddles (the extrusion would thin to nothing along the crossing
+/// line), and a curved target the extrusion never meets in either direction.
 pub fn extrude_to_face(op: OpId, profile: &Profile, target: &Face) -> Result<Solid, KernelError> {
     let profile = profile.normalised()?;
     let frame = profile.frame;
@@ -188,7 +191,8 @@ pub fn extrude_to_face(op: OpId, profile: &Profile, target: &Face) -> Result<Sol
         if along.abs() < ANGULAR_TOL {
             return Err(KernelError::TargetFaceParallel);
         }
-        // Reach of every profile corner: where its travel line pierces the target plane.
+        // Reach of every profile corner: where its travel line pierces the target plane,
+        // signed along the profile normal.
         let anchor = target.centroid();
         let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
         for p in profile.loops().flat_map(|c| c.points.iter()) {
@@ -196,22 +200,28 @@ pub fn extrude_to_face(op: OpId, profile: &Profile, target: &Face) -> Result<Sol
             lo = lo.min(t);
             hi = hi.max(t);
         }
-        // The whole profile must lie in front of the plane. A profile that crosses it
-        // would thin to nothing along the crossing line, and one behind it has nowhere
-        // to go; both are refusals, not zero-thickness shells.
-        if lo <= LINEAR_TOL {
+        // The whole profile must lie on one side of the plane; which side says which way
+        // to go. `near` and `far` are the reaches of the nearest and farthest corners,
+        // both carrying the sign of the direction of travel.
+        let (near, far) = if lo > LINEAR_TOL {
+            (lo, hi)
+        } else if hi < -LINEAR_TOL {
+            (hi, lo)
+        } else {
             return Err(KernelError::TargetFaceBehind);
-        }
-        if hi - lo <= LINEAR_TOL {
+        };
+        if (far - near).abs() <= LINEAR_TOL {
             // Parallel planes: one distance serves the whole profile.
-            return extrude(op, &profile, Extent::OneSide(hi));
+            return extrude(op, &profile, Extent::OneSide(far));
         }
         // Tilted plane: overshoot past the farthest corner, then keep only the material
         // on the profile's side of the plane. The overshoot means the boolean never has
         // to split coincident faces, and the trim box's near cap becomes the end face,
         // lying on the target plane by construction.
-        let solid = extrude(op, &profile, Extent::OneSide(hi + (hi - lo)))?;
-        let back = -normal * along.signum();
+        let solid = extrude(op, &profile, Extent::OneSide(far + (far - near)))?;
+        // The side of the plane the profile is on: against the normal when travelling
+        // along it, and with the normal when travelling against it.
+        let back = -normal * along.signum() * far.signum();
         let bframe = Frame::from_normal(anchor, back);
         let aabb = solid.aabb();
         let (mut min, mut max) = (Vec2::splat(f64::INFINITY), Vec2::splat(f64::NEG_INFINITY));
@@ -267,8 +277,11 @@ pub fn extrude_to_face(op: OpId, profile: &Profile, target: &Face) -> Result<Sol
             }
         }
     }
-    let mut reach: Option<f64> = None;
-    let mut met = false;
+    // The first contact ahead of the profile and the first behind it, each the shortest
+    // reach in its direction. Ahead wins when there is one; behind is what a sketch
+    // above the body means.
+    let mut ahead: Option<f64> = None;
+    let mut behind: Option<f64> = None;
     for s in samples {
         let origin = frame.to_world(s);
         for poly in &target.polygons {
@@ -283,15 +296,15 @@ pub fn extrude_to_face(op: OpId, profile: &Profile, target: &Face) -> Result<Sol
             if !polygon_contains(&flat, hit) {
                 continue;
             }
-            met = true;
             if t > LINEAR_TOL {
-                reach = Some(reach.map_or(t, |r: f64| r.min(t)));
+                ahead = Some(ahead.map_or(t, |r: f64| r.min(t)));
+            } else if t < -LINEAR_TOL {
+                behind = Some(behind.map_or(t, |r: f64| r.max(t)));
             }
         }
     }
-    match reach {
+    match ahead.or(behind) {
         Some(d) => extrude(op, &profile, Extent::OneSide(d)),
-        None if met => Err(KernelError::TargetFaceBehind),
         None => Err(KernelError::TargetFaceMissed),
     }
 }
@@ -999,10 +1012,11 @@ mod tests {
         assert!(past.abs() < 1e-6, "material reaches {past} past the plane");
     }
 
-    /// The refusals: a target the travel direction runs along, and one the profile has
-    /// already passed, are errors rather than degenerate solids.
+    /// The refusals: a target the travel direction runs along, and a target plane the
+    /// profile sits in, are errors rather than degenerate solids. A target behind the
+    /// profile is not a refusal: the extrusion goes backwards to meet it.
     #[test]
-    fn extrude_to_face_refuses_parallel_and_behind_targets() {
+    fn extrude_to_face_refuses_parallel_and_straddled_targets_and_goes_backwards() {
         let target = crate::primitives::cuboid(
             OpId::new(9),
             Vec3::new(0.0, 20.0, -5.0),
@@ -1015,10 +1029,18 @@ mod tests {
             extrude_to_face(OpId::new(1), &profile, side).unwrap_err(),
             KernelError::TargetFaceParallel
         );
-        // The slab's top cap sits at z = −3, behind a profile on the XY plane.
+        // The slab's top cap sits at z = −3, behind a profile on the XY plane: the
+        // extrusion runs down to it, 4·2·3 of material between z = −3 and 0.
         let top = face_of(&target, FaceKey::new(OpId::new(9), FaceRole::EndCap));
+        let down = extrude_to_face(OpId::new(1), &profile, top).unwrap();
+        assert!(down.is_closed(), "{:?}", down.validate());
+        assert_relative_eq!(down.volume(), 24.0, epsilon = 1e-9);
+        assert_relative_eq!(down.aabb().min.z, -3.0, epsilon = 1e-9);
+        assert_relative_eq!(down.aabb().max.z, 0.0, epsilon = 1e-9);
+        // A profile lying in the target's own plane has nowhere to go either way.
+        let flat = Profile::new(Frame::XY.offset(-3.0), rect(4.0, 2.0));
         assert_eq!(
-            extrude_to_face(OpId::new(1), &profile, top).unwrap_err(),
+            extrude_to_face(OpId::new(1), &flat, top).unwrap_err(),
             KernelError::TargetFaceBehind
         );
     }

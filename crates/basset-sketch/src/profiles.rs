@@ -16,7 +16,10 @@
 //!    ordering correct where a line meets an arc).
 //! 6. Faces are traced by always taking the next outgoing edge in the smallest
 //!    clockwise turn from the reversed incoming edge. This walks every bounded face
-//!    counter-clockwise; the unbounded face comes out clockwise and is dropped.
+//!    counter-clockwise; the unbounded face comes out clockwise and is dropped. Where
+//!    two edges leave a node at the same angle — a circle touching a line from inside —
+//!    the angle cannot order them and the bend does: the edge curving further left is
+//!    further counter-clockwise.
 //! 7. Uncrossed circles and text glyph outlines are loops of their own.
 //! 8. Loops are nested by containment: every loop is a region in its own right, and any
 //!    loop directly inside it (from another connected component, with nothing between)
@@ -27,7 +30,10 @@
 //! Splitting happens on the *tessellated* curves, so a crossing point sits on the chord
 //! rather than the true arc. Both curves are cut at the identical point, so the graph is
 //! still watertight; the region boundary is simply as accurate as the tessellation, which
-//! is what the kernel consumes anyway.
+//! is what the kernel consumes anyway. The one contact chords cannot find is a tangency —
+//! a circle touching a line has its nearest chord vertex a sagitta short of the line and
+//! no chord crossing it — so the analytic contact point of every tangent pair is put into
+//! both polylines as a vertex first, and the chord scan then meets it like any crossing.
 //!
 //! Every fragment keeps its source curve's id, so two fragments of one curve bounding the
 //! same region produce one kernel face in two pieces rather than two faces. That is rare
@@ -37,6 +43,8 @@
 use basset_math::Vec2;
 
 use crate::contour::{Contour, Profile, Segment, SegmentKind, signed_area};
+use crate::geometry::point_segment_distance;
+use crate::intersect::{CurveGeom, circle_circle, line_circle};
 use crate::sketch::JOIN_TOL;
 use crate::tessellation::{Tessellation, circle_polyline};
 use crate::{Entity, EntityId, Sketch};
@@ -78,6 +86,8 @@ struct Edge {
     nodes: [usize; 2],
     /// Tangent direction leaving each node along this edge.
     out_angle: [f64; 2],
+    /// Signed curvature leaving each node: positive bends left, zero for a line.
+    curvature: [f64; 2],
     polyline: Vec<Vec2>,
     kind: SegmentKind,
 }
@@ -94,7 +104,8 @@ pub(crate) fn profiles(sketch: &Sketch, tess: &Tessellation) -> Vec<Profile> {
     let mut next_component = 0;
 
     // --- Graph of curve fragments -----------------------------------------------------
-    let flats = flatten(sketch, tess);
+    let mut flats = flatten(sketch, tess);
+    seed_tangent_contacts(sketch, &mut flats, tess);
     let splits = crossings(&flats);
     let mut nodes: Vec<Vec2> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
@@ -117,6 +128,7 @@ pub(crate) fn profiles(sketch: &Sketch, tess: &Tessellation) -> Vec<Profile> {
                 curve: flat.curve,
                 nodes: [a, b],
                 out_angle: out_angles(&polyline, flat.kind),
+                curvature: curvatures(flat.kind),
                 polyline,
                 kind: flat.kind,
             });
@@ -132,8 +144,9 @@ pub(crate) fn profiles(sketch: &Sketch, tess: &Tessellation) -> Vec<Profile> {
         outgoing[e.nodes[1]].push((e.out_angle[1], HalfEdge { edge: i, dir: 1 }));
     }
     for list in &mut outgoing {
-        list.sort_by(|a, b| a.0.total_cmp(&b.0));
+        sort_departures(list, &edges);
     }
+
     let component_of = components(nodes.len(), &edges);
 
     // Circle loops were numbered 0..next_component; graph components continue after them.
@@ -172,6 +185,7 @@ pub(crate) fn profiles(sketch: &Sketch, tess: &Tessellation) -> Vec<Profile> {
             }
             let (points, segments) = face_polyline(&edges, &nodes, &face);
             let area = signed_area(&points);
+
             if area > 1e-12 {
                 let component = graph_base + component_of[edges[start_edge].nodes[0]];
                 loops.push(Loop {
@@ -288,6 +302,106 @@ fn flatten(sketch: &Sketch, tess: &Tessellation) -> Vec<Flat> {
     out
 }
 
+/// Puts the point where two curves touch without crossing into both polylines as a
+/// vertex.
+///
+/// The chord scan in [`crossings`] finds where polylines cross, and a tangency is where
+/// the true curves meet without crossing: the circle's nearest chord vertex is a sagitta
+/// short of the line, so the chords never touch it and the contact is lost — a circle
+/// inscribed in a square came out as two half-rings instead of a disc and four corners.
+/// With the analytic contact seeded into both curves their polylines share that vertex
+/// exactly, and the tolerant chord test finds it like any crossing.
+///
+/// Only tangencies are seeded. Transversal crossings the chord scan already finds, and
+/// seeding those too put a vertex a micron from the endpoint a near-miss T-junction is
+/// cut at ([`t_junctions`]), which traced slivers between the two. Tangent contact is
+/// one of two things: a line against a circle or arc, and two circles or arcs against
+/// each other; each is the single root of the analytic intersection.
+fn seed_tangent_contacts(sketch: &Sketch, flats: &mut [Flat], tess: &Tessellation) {
+    let geoms: Vec<Option<CurveGeom>> = flats
+        .iter()
+        .map(|f| CurveGeom::of(sketch, f.curve))
+        .collect();
+    // A seeded point lies on the true curve, at most a sagitta from its nearest chord;
+    // anything further is not a point of this curve, whatever the arithmetic said.
+    let reach = 2.0 * tess.chord_tolerance + JOIN_TOL;
+    for i in 0..flats.len() {
+        for j in (i + 1)..flats.len() {
+            let (Some(a), Some(b)) = (geoms[i], geoms[j]) else {
+                continue;
+            };
+            for p in tangent_contacts(&a, &b) {
+                insert_vertex(&mut flats[i], p, reach);
+                insert_vertex(&mut flats[j], p, reach);
+            }
+        }
+    }
+    for flat in flats.iter_mut() {
+        flat.min = flat
+            .points
+            .iter()
+            .copied()
+            .reduce(Vec2::min)
+            .unwrap_or_default();
+        flat.max = flat
+            .points
+            .iter()
+            .copied()
+            .reduce(Vec2::max)
+            .unwrap_or_default();
+    }
+}
+
+/// Where `a` and `b` touch tangentially, within both curves' extents. Two lines never
+/// do, and a crossing pair (two roots) is the chord scan's business.
+fn tangent_contacts(a: &CurveGeom, b: &CurveGeom) -> Vec<Vec2> {
+    let candidates = match (a, b) {
+        (CurveGeom::Line { .. }, CurveGeom::Line { .. }) => Vec::new(),
+        (CurveGeom::Line { a: p0, b: p1 }, CurveGeom::Arc { center, radius, .. })
+        | (CurveGeom::Arc { center, radius, .. }, CurveGeom::Line { a: p0, b: p1 }) => {
+            line_circle(*p0, *p1, *center, *radius)
+        }
+        (
+            CurveGeom::Arc {
+                center: c0,
+                radius: r0,
+                ..
+            },
+            CurveGeom::Arc {
+                center: c1,
+                radius: r1,
+                ..
+            },
+        ) => circle_circle(*c0, *r0, *c1, *r1),
+    };
+    if candidates.len() != 1 {
+        return Vec::new();
+    }
+    candidates
+        .into_iter()
+        .filter(|p| a.covers(*p) && b.covers(*p))
+        .collect()
+}
+
+/// Adds `p` to the polyline between the ends of the chord nearest it, unless a vertex is
+/// already there or no chord comes within `reach`.
+fn insert_vertex(flat: &mut Flat, p: Vec2, reach: f64) {
+    if flat.points.iter().any(|q| q.distance(p) <= JOIN_TOL) {
+        return;
+    }
+    let nearest = flat
+        .points
+        .windows(2)
+        .enumerate()
+        .map(|(i, w)| (i, point_segment_distance(p, w[0], w[1])))
+        .min_by(|a, b| a.1.total_cmp(&b.1));
+    if let Some((i, d)) = nearest
+        && d <= reach
+    {
+        flat.points.insert(i + 1, p);
+    }
+}
+
 /// Every point where two curves cross, recorded against both of them. Crossings at a
 /// curve's own endpoint are dropped for that curve: merging nodes already joins it there,
 /// and a zero-length fragment would only confuse the walk.
@@ -297,8 +411,16 @@ fn crossings(flats: &[Flat]) -> Vec<Vec<Split>> {
         for j in (i + 1)..flats.len() {
             let (a, b) = (&flats[i], &flats[j]);
             // Curves whose bounding boxes miss each other cannot cross; this is what keeps
-            // the pairwise scan affordable on sketches with many curves.
-            if a.min.x > b.max.x || b.min.x > a.max.x || a.min.y > b.max.y || b.min.y > a.max.y {
+            // the pairwise scan affordable on sketches with many curves. Padded by the
+            // join tolerance, since a crossing is now found to that tolerance: a circle
+            // touching a line from below has its top vertex a rounding error short of
+            // the line, and a box that stops there would reject the pair before the
+            // crossing test could accept it.
+            if a.min.x > b.max.x + JOIN_TOL
+                || b.min.x > a.max.x + JOIN_TOL
+                || a.min.y > b.max.y + JOIN_TOL
+                || b.min.y > a.max.y + JOIN_TOL
+            {
                 continue;
             }
             for (si, wa) in a.points.windows(2).enumerate() {
@@ -338,6 +460,20 @@ fn crossings(flats: &[Flat]) -> Vec<Vec<Split>> {
     }
     t_junctions(flats, &mut splits);
     for (flat, list) in flats.iter().zip(&mut splits) {
+        // A closed curve's seam is one point with two parameters, the start and the end
+        // of the polyline. A crossing there is found on the chords either side of it and
+        // recorded at both, and two splits at one point would cut the ring into a single
+        // whole fragment that starts and ends at the same node, which the graph drops:
+        // a circle touching another at its seam vanished. Folded onto the start, the two
+        // are neighbours in the sorted list and the coincidence check below keeps one.
+        if flat.closed {
+            let end = (flat.points.len() - 1) as f64;
+            for s in list.iter_mut() {
+                if s.at >= end {
+                    s.at -= end;
+                }
+            }
+        }
         list.sort_by(|a, b| a.at.total_cmp(&b.at));
         let ends = [flat.points[0], *flat.points.last().unwrap()];
         let mut kept: Vec<Split> = Vec::new();
@@ -427,19 +563,34 @@ fn nearest_on_polyline(points: &[Vec2], p: Vec2) -> Option<f64> {
 /// Parameters `(ta, tb)` in `[0, 1]` where the two segments meet, or `None` if they are
 /// parallel or miss. Parallel segments are [`segment_overlap`]'s business: there is no
 /// single crossing point to report, only a shared stretch.
+///
+/// A crossing within [`JOIN_TOL`] of a segment's end counts and is clamped onto it. A
+/// circle touching a line has a chord vertex *on* the line, and the parameter that says
+/// so comes out of the arithmetic as `1.0000000000000002` as readily as `1.0`; the exact
+/// test accepted one chord and not the other, so whether the contact was cut depended
+/// on the rounding of a sine. The clamped crossing is still on both curves to within the
+/// tolerance the graph merges nodes at, which is all a cut needs.
 fn segment_crossing(a0: Vec2, a1: Vec2, b0: Vec2, b1: Vec2) -> Option<(f64, f64)> {
     let r = a1 - a0;
     let s = b1 - b0;
+    let (la, ls) = (r.length(), s.length());
+    if la <= JOIN_TOL || ls <= JOIN_TOL {
+        return None;
+    }
     let denom = r.perp_dot(s);
     // Scale the parallel test by the segment lengths so it means "the angle between them
     // is tiny", not "the segments are short".
-    if denom.abs() <= 1e-12 * r.length() * s.length() {
+    if denom.abs() <= 1e-12 * la * ls {
         return None;
     }
     let d = b0 - a0;
     let ta = d.perp_dot(s) / denom;
     let tb = d.perp_dot(r) / denom;
-    ((0.0..=1.0).contains(&ta) && (0.0..=1.0).contains(&tb)).then_some((ta, tb))
+    let within = |t: f64, len: f64| {
+        let slack = JOIN_TOL / len;
+        (-slack..=1.0 + slack).contains(&t)
+    };
+    (within(ta, la) && within(tb, ls)).then_some((ta.clamp(0.0, 1.0), tb.clamp(0.0, 1.0)))
 }
 
 /// The two ends of the stretch two collinear segments share, as `(parameter on a,
@@ -470,19 +621,28 @@ fn segment_overlap(a0: Vec2, a1: Vec2, b0: Vec2, b1: Vec2) -> Option<[(f64, f64,
     if (r / la).perp_dot(b0 - a0).abs() > JOIN_TOL {
         return None;
     }
-    // Both segments as intervals in a's parameter. The middle two of the four sorted ends
-    // bound the intersection of the intervals, and each of them is a real endpoint.
+    // Both segments as intervals in a's parameter: a is [0, 1] and b is [bl, bh]. The
+    // shared stretch is the intersection of the two, and each of its ends is a real
+    // endpoint — a's where a's bounds it, b's where b's does. Taking the middle two of the
+    // four sorted ends instead, as this once did, is only the intersection when the
+    // intervals meet; for two collinear chords that do not (the flat top chords of two
+    // equal circles side by side) it is the gap *between* them, and cutting both curves
+    // at each other's vertices spliced a phantom chord from one circle to the other.
     let param_a = |p: Vec2| (p - a0).dot(r) / (la * la);
-    let mut ends = [(0.0, a0), (1.0, a1), (param_a(b0), b0), (param_a(b1), b1)];
-    ends.sort_by(|x, y| x.0.total_cmp(&y.0));
-    let (lo, hi) = (ends[1], ends[2]);
-    if (hi.0 - lo.0) * la <= JOIN_TOL {
+    let (pb0, pb1) = (param_a(b0), param_a(b1));
+    let (bl, bh) = (pb0.min(pb1), pb0.max(pb1));
+    let (lo, hi) = (bl.max(0.0), bh.min(1.0));
+    if (hi - lo) * la <= JOIN_TOL {
         return None;
     }
+    let b_low = if pb0 < pb1 { b0 } else { b1 };
+    let b_high = if pb0 < pb1 { b1 } else { b0 };
+    let lo_point = if bl > 0.0 { b_low } else { a0 };
+    let hi_point = if bh < 1.0 { b_high } else { a1 };
     let param_b = |p: Vec2| ((p - b0).dot(s) / (ls * ls)).clamp(0.0, 1.0);
     Some([
-        (lo.0.clamp(0.0, 1.0), param_b(lo.1), lo.1),
-        (hi.0.clamp(0.0, 1.0), param_b(hi.1), hi.1),
+        (lo, param_b(lo_point), lo_point),
+        (hi, param_b(hi_point), hi_point),
     ])
 }
 
@@ -557,6 +717,60 @@ fn out_angles(polyline: &[Vec2], kind: SegmentKind) -> [f64; 2] {
             (start - center).perp().to_angle(),
             (-(end - center).perp()).to_angle(),
         ],
+    }
+}
+
+/// Signed curvature of a fragment leaving each of its ends. Fragments of an arc run
+/// counter-clockwise from their first point, as [`out_angles`] assumes, so leaving the
+/// start the curve bends left and leaving the end (travelling the arc backwards) it
+/// bends right.
+fn curvatures(kind: SegmentKind) -> [f64; 2] {
+    match kind {
+        SegmentKind::Line => [0.0, 0.0],
+        SegmentKind::Arc { radius, .. } => {
+            let k = 1.0 / radius.max(JOIN_TOL);
+            [k, -k]
+        }
+    }
+}
+
+/// Orders a node's departures counter-clockwise.
+///
+/// The angle alone cannot order two edges that leave the node tangent to each other, and
+/// a circle touching a line from inside leaves exactly that: the arc departs along the
+/// line and only then bends away from it. Up to the solver's noise their angles are
+/// equal, so a sort on the angle put them in whichever order the noise chose, and the
+/// face walk — which steps to the neighbour of the reversed incoming edge — then crossed
+/// between the line and the arc and traced nothing. Within a tangent group the bend
+/// decides: the edge curving further left is further counter-clockwise. The group that
+/// straddles ±π is made contiguous by starting the cyclic list at a gap first, since the
+/// walk only ever reads the list cyclically.
+fn sort_departures(list: &mut [(f64, HalfEdge)], edges: &[Edge]) {
+    use std::f64::consts::TAU;
+    const TANGENT_EPS: f64 = 1e-6;
+    list.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let n = list.len();
+    if n < 2 {
+        return;
+    }
+    let tangent = |a: f64, b: f64| {
+        let d = (a - b).rem_euclid(TAU);
+        d.min(TAU - d) <= TANGENT_EPS
+    };
+    if let Some(gap) = (0..n).find(|&i| !tangent(list[i].0, list[(i + 1) % n].0)) {
+        list.rotate_left((gap + 1) % n);
+    }
+    let curvature = |h: HalfEdge| edges[h.edge].curvature[h.dir];
+    let mut i = 0;
+    while i < n {
+        let mut j = i + 1;
+        while j < n && tangent(list[j - 1].0, list[j].0) {
+            j += 1;
+        }
+        if j - i > 1 {
+            list[i..j].sort_by(|a, b| curvature(a.1).total_cmp(&curvature(b.1)));
+        }
+        i = j;
     }
 }
 

@@ -505,7 +505,7 @@ impl Harness {
         self.editor
             .selection
             .profiles
-            .push(ProfileRef { sketch, sample });
+            .push(ProfileRef::new(sketch, sample));
     }
 
     /// Extrudes the region of the newest sketch containing `sample` through the tool, as
@@ -702,10 +702,10 @@ pub(crate) fn block(editor: &mut Editor) -> BodyRef {
     sketch_mode::finish(editor, true);
     let sketch = editor.doc.timeline().features()[0].id;
     let base = editor.doc.add_feature(FeatureKind::Extrude {
-        regions: vec![RegionRef::Profile(ProfileRef {
+        regions: vec![RegionRef::Profile(ProfileRef::new(
             sketch,
-            sample: Vec2::new(5.0, 5.0),
-        })],
+            Vec2::new(5.0, 5.0),
+        ))],
         extent: Extent::OneSide(2.0),
         operation: BodyOp::NewBody,
         component: ComponentId::ROOT,

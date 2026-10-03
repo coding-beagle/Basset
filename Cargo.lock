@@ -289,6 +289,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "basset-mcp"
+version = "0.1.0"
+dependencies = [
+ "approx",
+ "basset-core",
+ "basset-io",
+ "basset-kernel",
+ "basset-math",
+ "basset-sketch",
+ "env_logger",
+ "log",
+ "serde",
+ "serde_json",
+ "slotmap",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "basset-sketch"
 version = "0.1.0"
 dependencies = [

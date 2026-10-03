@@ -2824,3 +2824,107 @@ fn connected_curves_keep_to_their_own_kind_of_geometry() {
     assert_eq!(s.connected_curves(circle), vec![circle]);
     assert!(s.connected_curves(c).is_empty());
 }
+
+/// A circle touching all four sides of a rectangle from inside. Each contact is a node
+/// where the arc leaves tangent to the line, and the walk used to lose every region
+/// there; Fusion makes five of this drawing, and so should we.
+#[test]
+fn a_circle_inscribed_in_a_rectangle_yields_the_disc_and_four_corners() {
+    use crate::{Tessellation, shapes};
+    use approx::assert_relative_eq;
+    use basset_math::Vec2;
+    use std::f64::consts::PI;
+
+    let mut s = Sketch::new();
+    shapes::rectangle_two_point(&mut s, Vec2::new(0.0, 0.0), Vec2::new(10.0, 10.0));
+    shapes::circle_center(&mut s, Vec2::new(5.0, 5.0), 5.0);
+    let profiles = s.profiles(&Tessellation::default());
+    let mut areas: Vec<f64> = profiles.iter().map(|p| p.area()).collect();
+    areas.sort_by(f64::total_cmp);
+    assert_eq!(areas.len(), 5, "{areas:?}");
+    // Tessellated, so the disc is a touch under πr² and the corners a touch over.
+    assert_relative_eq!(areas[4], PI * 25.0, epsilon = 0.3);
+    for corner in &areas[..4] {
+        assert_relative_eq!(*corner, (100.0 - PI * 25.0) / 4.0, epsilon = 0.1);
+    }
+    assert_relative_eq!(areas.iter().sum::<f64>(), 100.0, epsilon = 1e-6);
+    assert!(profiles.iter().all(|p| p.holes.is_empty()));
+}
+
+/// The same contact from outside: a circle sitting on a line. The line is not cut into
+/// a region by it, and the disc must still come out whole.
+#[test]
+fn a_circle_resting_on_a_line_is_still_one_disc() {
+    use crate::{Tessellation, shapes};
+    use approx::assert_relative_eq;
+    use basset_math::Vec2;
+    use std::f64::consts::PI;
+
+    let mut s = Sketch::new();
+    shapes::polyline(
+        &mut s,
+        &[Vec2::new(-10.0, 0.0), Vec2::new(10.0, 0.0)],
+        false,
+    );
+    shapes::circle_center(&mut s, Vec2::new(0.0, 5.0), 5.0);
+    let profiles = s.profiles(&Tessellation::default());
+    assert_eq!(profiles.len(), 1);
+    assert_relative_eq!(profiles[0].area(), PI * 25.0, epsilon = 0.3);
+}
+
+/// Two equal circles side by side overlap into a lens and two crescents. Their flat top
+/// chords are collinear and disjoint, and the overlap test used to report the gap
+/// between them as a shared stretch, splicing a phantom chord from one circle to the
+/// other and tracing one self-overlapping loop instead of the three regions.
+#[test]
+fn two_equal_circles_at_one_height_overlap_into_three_regions() {
+    use crate::{Tessellation, shapes};
+    use approx::assert_relative_eq;
+    use basset_math::Vec2;
+
+    let mut s = Sketch::new();
+    shapes::circle_center(&mut s, Vec2::new(0.0, 0.0), 5.0);
+    shapes::circle_center(&mut s, Vec2::new(6.0, 0.0), 5.0);
+    let mut areas: Vec<f64> = s
+        .profiles(&Tessellation::default())
+        .iter()
+        .map(|p| p.area())
+        .collect();
+    areas.sort_by(f64::total_cmp);
+    assert_eq!(areas.len(), 3, "{areas:?}");
+    // Lens of two radius-5 circles 6 apart: 2r²·acos(d/2r) − (d/2)·√(4r² − d²).
+    let lens = 50.0 * (0.6f64).acos() - 3.0 * 8.0;
+    assert_relative_eq!(areas[0], lens, epsilon = 0.2);
+    assert_relative_eq!(areas[1], areas[2], epsilon = 1e-9);
+    assert_relative_eq!(
+        areas[1] + areas[0],
+        std::f64::consts::PI * 25.0,
+        epsilon = 0.3
+    );
+}
+
+/// Two circles touching from outside at the first one's seam are two discs. The seam
+/// is one point with two parameters, and a crossing recorded at both used to cut the
+/// circle into a single whole fragment that the graph then dropped.
+#[test]
+fn circles_touching_at_a_seam_are_two_discs() {
+    use crate::{Tessellation, shapes};
+    use approx::assert_relative_eq;
+    use basset_math::Vec2;
+    use std::f64::consts::PI;
+
+    let mut s = Sketch::new();
+    shapes::circle_center(&mut s, Vec2::new(0.0, 0.0), 5.0);
+    shapes::circle_center(&mut s, Vec2::new(10.0, 0.0), 5.0);
+    let profiles = s.profiles(&Tessellation::default());
+    assert_eq!(
+        profiles.len(),
+        2,
+        "{:?}",
+        profiles.iter().map(|p| p.area()).collect::<Vec<_>>()
+    );
+    for p in &profiles {
+        assert_relative_eq!(p.area(), PI * 25.0, epsilon = 0.3);
+        assert!(p.holes.is_empty());
+    }
+}

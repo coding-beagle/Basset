@@ -1,0 +1,85 @@
+{
+  "description": "A fillet and a chamfer on two top edges of a block, named by the faces they lie between.",
+  "calls": [
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": "XY"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$0",
+        "ops": [
+          {
+            "op": "rectangle",
+            "a": [
+              0,
+              0
+            ],
+            "b": [
+              10,
+              5
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": "all",
+        "sketch": "$0",
+        "distance": 4
+      }
+    },
+    {
+      "tool": "fillet",
+      "arguments": {
+        "body": "$2.body",
+        "edges": [
+          "${2}.0:EndCap|${2}.0:Side(5)"
+        ],
+        "radius": 1
+      }
+    },
+    {
+      "tool": "chamfer",
+      "arguments": {
+        "body": "$2.body",
+        "edges": [
+          "${2}.0:EndCap|${2}.0:Side(7)"
+        ],
+        "distance": 1
+      }
+    }
+  ],
+  "expect": {
+    "ok": true,
+    "statuses": {
+      "$3": "ok",
+      "$4": "ok"
+    },
+    "bodies": {
+      "$2": {
+        "volume": 192.85398163397448,
+        "volume_tol": 0.1,
+        "closed": true,
+        "aabb": [
+          [
+            0,
+            0,
+            0
+          ],
+          [
+            10,
+            5,
+            4
+          ]
+        ],
+        "faces": 8
+      }
+    }
+  }
+}

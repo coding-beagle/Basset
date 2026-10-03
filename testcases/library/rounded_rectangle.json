@@ -1,0 +1,89 @@
+{
+  "description": "A square with all four corners filleted in the sketch (radius 2) extruded 3.",
+  "calls": [
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": "XY"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$0",
+        "ops": [
+          {
+            "op": "rectangle",
+            "a": [
+              0,
+              0
+            ],
+            "b": [
+              10,
+              10
+            ]
+          },
+          {
+            "op": "fillet",
+            "a": 5,
+            "b": 6,
+            "radius": 2
+          },
+          {
+            "op": "fillet",
+            "a": 6,
+            "b": 7,
+            "radius": 2
+          },
+          {
+            "op": "fillet",
+            "a": 7,
+            "b": 8,
+            "radius": 2
+          },
+          {
+            "op": "fillet",
+            "a": 8,
+            "b": 5,
+            "radius": 2
+          }
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": "all",
+        "sketch": "$0",
+        "distance": 3
+      }
+    }
+  ],
+  "expect": {
+    "ok": true,
+    "regions": {
+      "$0": 1
+    },
+    "bodies": {
+      "$2": {
+        "volume": 289.6991118430775,
+        "volume_tol": 0.3,
+        "closed": true,
+        "aabb": [
+          [
+            0,
+            0,
+            0
+          ],
+          [
+            10,
+            10,
+            3
+          ]
+        ],
+        "faces": 10,
+        "aabb_tol": 1e-06
+      }
+    }
+  }
+}

@@ -90,10 +90,10 @@ fn extrude_tool_previews_then_commits_or_rolls_back() {
         editor.tool.as_ref().unwrap().feature.is_none(),
         "nothing to preview yet"
     );
-    editor.selection.profiles.push(ProfileRef {
-        sketch,
-        sample: Vec2::new(5.0, 5.0),
-    });
+    editor
+        .selection
+        .profiles
+        .push(ProfileRef::new(sketch, Vec2::new(5.0, 5.0)));
     tools::sync_tool(&mut editor);
     let feature = editor
         .tool
@@ -117,10 +117,10 @@ fn extrude_tool_previews_then_commits_or_rolls_back() {
     assert_eq!(editor.doc.timeline().len(), 1);
 
     tools::start_tool(&mut editor, ToolKind::Extrude);
-    editor.selection.profiles.push(ProfileRef {
-        sketch,
-        sample: Vec2::new(5.0, 5.0),
-    });
+    editor
+        .selection
+        .profiles
+        .push(ProfileRef::new(sketch, Vec2::new(5.0, 5.0)));
     tools::sync_tool(&mut editor);
     let feature = editor.tool.as_ref().unwrap().feature.unwrap();
     tools::confirm_tool(&mut editor);
@@ -143,10 +143,10 @@ fn editing_an_existing_extrude_loads_its_parameters() {
     sketch_mode::finish(&mut editor, true);
     let sketch = editor.doc.timeline().features()[0].id;
     let extrude = editor.doc.add_feature(FeatureKind::Extrude {
-        regions: vec![RegionRef::Profile(ProfileRef {
+        regions: vec![RegionRef::Profile(ProfileRef::new(
             sketch,
-            sample: Vec2::new(5.0, 5.0),
-        })],
+            Vec2::new(5.0, 5.0),
+        ))],
         extent: basset_core::Extent::OneSide(7.0),
         operation: basset_core::BodyOp::NewBody,
         component: basset_core::ComponentId::ROOT,
@@ -361,10 +361,10 @@ fn extrude_tool_accepts_a_planar_face_as_a_region() {
     sketch_mode::finish(&mut editor, true);
     let sketch = editor.doc.timeline().features()[0].id;
     let base = editor.doc.add_feature(FeatureKind::Extrude {
-        regions: vec![RegionRef::Profile(ProfileRef {
+        regions: vec![RegionRef::Profile(ProfileRef::new(
             sketch,
-            sample: Vec2::new(5.0, 5.0),
-        })],
+            Vec2::new(5.0, 5.0),
+        ))],
         extent: basset_core::Extent::OneSide(2.0),
         operation: basset_core::BodyOp::NewBody,
         component: basset_core::ComponentId::ROOT,
@@ -485,7 +485,7 @@ fn a_shape_inside_a_rectangle_is_its_own_region() {
         editor
             .selection
             .profiles
-            .push(ProfileRef { sketch, sample });
+            .push(ProfileRef::new(sketch, sample));
         editor.tool.as_mut().unwrap().params.distance = 4.0;
         tools::sync_tool(&mut editor);
         let feature = editor.tool.as_ref().unwrap().feature.unwrap();
@@ -613,10 +613,10 @@ fn a_selected_region_is_drawn_filled() {
         "nothing selected yet"
     );
 
-    editor.selection.profiles.push(ProfileRef {
-        sketch,
-        sample: Vec2::new(5.0, 5.0),
-    });
+    editor
+        .selection
+        .profiles
+        .push(ProfileRef::new(sketch, Vec2::new(5.0, 5.0)));
     let built = scene::build(&editor);
     let area: f64 = built
         .tris
@@ -1108,10 +1108,10 @@ fn extrude_handle_follows_the_distance() {
     let sketch = editor.doc.timeline().features()[0].id;
     tools::start_tool(&mut editor, ToolKind::Extrude);
     assert!(tools::handle(&editor).is_none(), "nothing to size yet");
-    editor.selection.profiles.push(ProfileRef {
-        sketch,
-        sample: Vec2::new(5.0, 5.0),
-    });
+    editor
+        .selection
+        .profiles
+        .push(ProfileRef::new(sketch, Vec2::new(5.0, 5.0)));
     editor.tool.as_mut().unwrap().params.distance = 7.0;
     tools::sync_tool(&mut editor);
     let h = tools::handle(&editor).expect("extrude handle");

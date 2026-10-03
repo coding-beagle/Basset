@@ -20,7 +20,7 @@ endif
 RUN_ARGS := $(if $(FILE),-- $(FILE),)
 
 .DEFAULT_GOAL := help
-.PHONY: help run build build-dev test test-crate check fmt fmt-check clippy lint doc doc-open \
+.PHONY: help run build build-dev test test-crate geometries mcp check fmt fmt-check clippy lint doc doc-open \
         audit outdated tree update clean distclean ci
 
 help: ## List the available targets
@@ -53,6 +53,12 @@ test: ## Run the workspace test suite
 
 test-crate: ## Run one crate's tests (PKG=basset-kernel)
 	$(CARGO) test -p $(PKG) --all-targets
+
+geometries: ## Run the library of test geometries (testcases/library) through the MCP server
+	$(CARGO) test -p basset-mcp --test library
+
+mcp: ## Build and start the Model Context Protocol server on stdin/stdout
+	$(CARGO) run $(PROFILE_FLAG) -p basset-mcp
 
 check: ## Type-check everything without producing binaries
 	$(CARGO) check --workspace --all-targets

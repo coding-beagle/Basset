@@ -1,0 +1,74 @@
+{
+  "description": "An outline that does not quite close (a 0.01 mm gap, far beyond the join tolerance) encloses nothing, so the extrude fails with a message instead of building from a leaking loop.",
+  "calls": [
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": "XY"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$0",
+        "ops": [
+          {
+            "op": "polyline",
+            "points": [
+              [
+                0,
+                0
+              ],
+              [
+                10,
+                0
+              ],
+              [
+                10,
+                10
+              ],
+              [
+                0,
+                10
+              ]
+            ],
+            "closed": false
+          },
+          {
+            "op": "line",
+            "from": [
+              0,
+              10
+            ],
+            "to": [
+              0,
+              0.01
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": [
+          [
+            5,
+            5
+          ]
+        ],
+        "sketch": "$0",
+        "distance": 2
+      }
+    }
+  ],
+  "expect": {
+    "ok": false,
+    "regions": {
+      "$0": 0
+    },
+    "statuses": {
+      "$2": "failed"
+    }
+  }
+}

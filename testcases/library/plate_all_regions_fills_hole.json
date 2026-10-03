@@ -1,0 +1,69 @@
+{
+  "description": "Extruding every region of a plate-with-hole sketch unions the disc back in: a plain block.",
+  "calls": [
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": "XY"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$0",
+        "ops": [
+          {
+            "op": "rectangle",
+            "a": [
+              0,
+              0
+            ],
+            "b": [
+              20,
+              10
+            ]
+          },
+          {
+            "op": "circle",
+            "center": [
+              10,
+              5
+            ],
+            "radius": 2
+          }
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": "all",
+        "sketch": "$0",
+        "distance": 3
+      }
+    }
+  ],
+  "expect": {
+    "ok": true,
+    "bodies": {
+      "$2": {
+        "volume": 600,
+        "volume_tol": 1e-06,
+        "closed": true,
+        "aabb": [
+          [
+            0,
+            0,
+            0
+          ],
+          [
+            20,
+            10,
+            3
+          ]
+        ],
+        "faces": 6
+      }
+    }
+  }
+}

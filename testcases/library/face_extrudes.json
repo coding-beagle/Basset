@@ -1,0 +1,109 @@
+{
+  "description": "A body's planar faces used directly as regions: the top face joined upwards keeps the box six-faced, a side face joined outwards, another side cut inwards.",
+  "calls": [
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": "XY"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$0",
+        "ops": [
+          {
+            "op": "rectangle",
+            "a": [
+              0,
+              0
+            ],
+            "b": [
+              10,
+              10
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": "all",
+        "sketch": "$0",
+        "distance": 5
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": [
+          {
+            "body": "$2.body",
+            "face": "${2}.0:EndCap"
+          }
+        ],
+        "distance": 5,
+        "operation": "join",
+        "targets": [
+          "$2.body"
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": [
+          {
+            "body": "$2.body",
+            "face": "${2}.0:Side(5)"
+          }
+        ],
+        "distance": 3,
+        "operation": "join",
+        "targets": [
+          "$2.body"
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": [
+          {
+            "body": "$2.body",
+            "face": "${2}.0:Side(6)"
+          }
+        ],
+        "distance": -3,
+        "operation": "cut",
+        "targets": [
+          "$2.body"
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "ok": true,
+    "bodies": {
+      "$2": {
+        "volume": 910,
+        "volume_tol": 1e-06,
+        "closed": true,
+        "aabb": [
+          [
+            0,
+            -3,
+            0
+          ],
+          [
+            7,
+            10,
+            10
+          ]
+        ],
+        "faces": 6
+      }
+    }
+  }
+}

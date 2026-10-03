@@ -1,0 +1,103 @@
+{
+  "description": "A sketch on the top face of a block (its frame sits at the face centroid) with a circle cut down through the whole block.",
+  "calls": [
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": "XY"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$0",
+        "ops": [
+          {
+            "op": "rectangle",
+            "a": [
+              0,
+              0
+            ],
+            "b": [
+              20,
+              20
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": "all",
+        "sketch": "$0",
+        "distance": 10
+      }
+    },
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": {
+          "body": "$2.body",
+          "face": "${2}.0:EndCap"
+        }
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$3",
+        "ops": [
+          {
+            "op": "circle",
+            "center": [
+              0,
+              0
+            ],
+            "radius": 3
+          }
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": [
+          [
+            0,
+            0
+          ]
+        ],
+        "sketch": "$3",
+        "distance": -10,
+        "operation": "cut",
+        "targets": [
+          "$2.body"
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "ok": true,
+    "bodies": {
+      "$2": {
+        "volume": 3717.2566611769184,
+        "volume_tol": 2.0,
+        "closed": true,
+        "aabb": [
+          [
+            0,
+            0,
+            0
+          ],
+          [
+            20,
+            20,
+            10
+          ]
+        ],
+        "faces": 7
+      }
+    }
+  }
+}

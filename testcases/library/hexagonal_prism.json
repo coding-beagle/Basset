@@ -1,0 +1,50 @@
+{
+  "description": "A regular hexagon of circumradius 5 (its construction circle is not geometry) extruded 2.",
+  "calls": [
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": "XY"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$0",
+        "ops": [
+          {
+            "op": "polygon",
+            "center": [
+              0,
+              0
+            ],
+            "sides": 6,
+            "radius": 5
+          }
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": "all",
+        "sketch": "$0",
+        "distance": 2
+      }
+    }
+  ],
+  "expect": {
+    "ok": true,
+    "regions": {
+      "$0": 1
+    },
+    "bodies": {
+      "$2": {
+        "volume": 129.9038105676658,
+        "volume_tol": 1e-06,
+        "closed": true,
+        "faces": 8
+      }
+    }
+  }
+}

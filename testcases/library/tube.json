@@ -1,0 +1,75 @@
+{
+  "description": "Two concentric circles: the ring between them extruded is a tube.",
+  "calls": [
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": "XY"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$0",
+        "ops": [
+          {
+            "op": "circle",
+            "center": [
+              0,
+              0
+            ],
+            "radius": 5
+          },
+          {
+            "op": "circle",
+            "center": [
+              0,
+              0
+            ],
+            "radius": 3
+          }
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": [
+          [
+            4,
+            0
+          ]
+        ],
+        "sketch": "$0",
+        "distance": 10
+      }
+    }
+  ],
+  "expect": {
+    "ok": true,
+    "regions": {
+      "$0": 2
+    },
+    "bodies": {
+      "$2": {
+        "volume": 502.6548245743669,
+        "volume_tol": 2.0,
+        "closed": true,
+        "aabb": [
+          [
+            -5,
+            -5,
+            0
+          ],
+          [
+            5,
+            5,
+            10
+          ]
+        ],
+        "faces": 4,
+        "aabb_tol": 0.02
+      }
+    }
+  }
+}

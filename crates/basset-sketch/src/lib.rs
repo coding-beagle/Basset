@@ -70,7 +70,7 @@ slotmap::new_key_type! {
 }
 
 pub use constraint::{Constraint, OffsetPair};
-pub use contour::{Contour, Profile, Segment, SegmentKind};
+pub use contour::{Contour, Profile, Segment, SegmentKind, curve_signature};
 pub use entity::{Entity, EntityData};
 pub use error::{SketchError, SolveError};
 pub use intersect::CurveGeom;

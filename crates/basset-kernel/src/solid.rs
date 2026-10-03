@@ -221,6 +221,28 @@ impl Polygon {
         newell_normal(&self.vertices).length() * 0.5
     }
 
+    /// The area centroid, which the plane's origin is not: that is the vertex average,
+    /// and a vertex healing inserted along one edge drags it towards that edge. Computed
+    /// in the polygon's own plane by the shoelace formula, so a reflex fragment left by a
+    /// boolean is handled as well as a convex one.
+    pub fn centroid(&self) -> Vec3 {
+        let frame = Frame::from_normal(self.plane.origin, self.plane.normal);
+        let flat: Vec<Vec2> = self.vertices.iter().map(|v| frame.to_local(*v)).collect();
+        let n = flat.len();
+        let mut twice_area = 0.0;
+        let mut sum = Vec2::ZERO;
+        for i in 0..n {
+            let (a, b) = (flat[i], flat[(i + 1) % n]);
+            let cross = a.x * b.y - b.x * a.y;
+            twice_area += cross;
+            sum += (a + b) * cross;
+        }
+        if twice_area.abs() < 1e-18 {
+            return self.plane.origin;
+        }
+        frame.to_world(sum / (3.0 * twice_area))
+    }
+
     fn transformed(&self, t: &Affine3, flip: bool) -> Option<Polygon> {
         let mut vertices: Vec<Vec3> = self
             .vertices
@@ -265,7 +287,7 @@ impl Face {
         let mut total = 0.0;
         for p in &self.polygons {
             let a = p.area();
-            sum += p.plane.origin * a;
+            sum += p.centroid() * a;
             total += a;
         }
         if total > 0.0 { sum / total } else { Vec3::ZERO }

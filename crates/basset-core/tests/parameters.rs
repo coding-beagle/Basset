@@ -44,7 +44,7 @@ fn sketch_on(doc: &mut Document, plane: PlaneRef, sketch: Sketch) -> FeatureId {
 
 fn extrude(doc: &mut Document, sketch: FeatureId, sample: Vec2, distance: f64) -> FeatureId {
     doc.add_feature(FeatureKind::Extrude {
-        regions: vec![RegionRef::Profile(ProfileRef { sketch, sample })],
+        regions: vec![RegionRef::Profile(ProfileRef::new(sketch, sample))],
         extent: Extent::OneSide(distance),
         operation: BodyOp::NewBody,
         component: ComponentId::ROOT,
@@ -249,10 +249,7 @@ fn an_angle_expression_is_written_in_degrees() {
     let (sketch, _) = rect_sketch(10.0, 5.0);
     let sk = sketch_on(&mut expressed, PlaneRef::Origin(OriginPlane::XZ), sketch);
     let rev = expressed.add_feature(FeatureKind::Revolve {
-        regions: vec![RegionRef::Profile(ProfileRef {
-            sketch: sk,
-            sample: Vec2::new(1.0, 1.0),
-        })],
+        regions: vec![RegionRef::Profile(ProfileRef::new(sk, Vec2::new(1.0, 1.0)))],
         axis: AxisRef::Origin(OriginAxis::Z),
         angle: 0.1,
         operation: BodyOp::NewBody,
@@ -274,10 +271,10 @@ fn an_angle_expression_is_written_in_degrees() {
     let (sketch, _) = rect_sketch(10.0, 5.0);
     let sk2 = sketch_on(&mut literal, PlaneRef::Origin(OriginPlane::XZ), sketch);
     let rev2 = literal.add_feature(FeatureKind::Revolve {
-        regions: vec![RegionRef::Profile(ProfileRef {
-            sketch: sk2,
-            sample: Vec2::new(1.0, 1.0),
-        })],
+        regions: vec![RegionRef::Profile(ProfileRef::new(
+            sk2,
+            Vec2::new(1.0, 1.0),
+        ))],
         axis: AxisRef::Origin(OriginAxis::Z),
         angle: PI / 2.0,
         operation: BodyOp::NewBody,

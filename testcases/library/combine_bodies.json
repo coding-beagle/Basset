@@ -1,0 +1,103 @@
+{
+  "description": "Two separate bodies combined: join keeps the union under the target's name, the tool body is consumed.",
+  "calls": [
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": "XY"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$0",
+        "ops": [
+          {
+            "op": "rectangle",
+            "a": [
+              0,
+              0
+            ],
+            "b": [
+              10,
+              10
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": "all",
+        "sketch": "$0",
+        "distance": 5
+      }
+    },
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": "XY"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$3",
+        "ops": [
+          {
+            "op": "rectangle",
+            "a": [
+              5,
+              5
+            ],
+            "b": [
+              15,
+              15
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": "all",
+        "sketch": "$3",
+        "distance": 5
+      }
+    },
+    {
+      "tool": "combine",
+      "arguments": {
+        "target": "$2.body",
+        "tools": [
+          "$5.body"
+        ],
+        "operation": "join"
+      }
+    }
+  ],
+  "expect": {
+    "ok": true,
+    "bodies": {
+      "$2": {
+        "volume": 875,
+        "volume_tol": 1e-06,
+        "closed": true,
+        "aabb": [
+          [
+            0,
+            0,
+            0
+          ],
+          [
+            15,
+            15,
+            5
+          ]
+        ]
+      }
+    }
+  }
+}

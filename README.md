@@ -19,6 +19,8 @@ rewritten when the next tool arrives.
 | Viewport | wgpu renderer with orbit camera, MSAA, pixel-width lines, view-dependent silhouettes so a curved body is bounded against the background, a grid on any plane, face highlighting, translucent region fills, ray picking |
 | App | winit + egui desktop shell: browser, timeline with rollback marker and context menu, live-preview tool dialogs, viewport transform manipulator (arrows and rotation rings) for sketch and body moves, navigation cube, sketch mode with shape tools, constraint tools and click-to-edit dimensions, native open/save/export dialogs; one declared table of keyboard commands, a shortcut overlay and a fuzzy command palette over it |
 
+| Automation | `basset-mcp`, a Model Context Protocol server over stdio that builds and inspects documents — sketches, extrudes and the rest of the timeline, body volumes and shells, a whole-document check — so an agent can model with and test the modeller; `testcases/library/`, a library of test geometries written in that protocol with the results they must produce |
+
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the crate layout, identity strategy and the
 honest list of kernel limitations.
 
@@ -29,7 +31,25 @@ cargo build --release
 cargo run --release -p basset-app            # optionally: -- path/to/model.bass
 cargo test --workspace                       # includes headless tests of the app
 cargo clippy --workspace --all-targets -- -D warnings
+make geometries                              # the test-geometry library, via the MCP server
 ```
+
+## Driving Basset from an agent
+
+`basset-mcp` speaks the Model Context Protocol over stdin and stdout. `.mcp.json` at the
+workspace root registers it with Claude Code, so an agent working in this repository can
+build a model, read back every region a sketch encloses, extrude by region, and ask
+`check_document` whether every body's shell is closed and which features failed. To run
+it by hand:
+
+```sh
+cargo run --release -p basset-mcp            # then write JSON-RPC lines to stdin
+```
+
+The tools and their arguments are listed by `tools/list`; `testcases/library/*.json` are
+complete scripts in the same vocabulary, each with the volumes and region counts the model
+must come out with. Those files are the regression suite for sketching and extruding, and
+`make geometries` runs them.
 
 ## Using the application
 

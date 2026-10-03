@@ -60,6 +60,42 @@ pub struct ProfileRef {
     pub sketch: FeatureId,
     /// A point (in sketch coordinates) inside the wanted region.
     pub sample: Vec2,
+    /// A signature of the curves that bounded the region when it was picked
+    /// ([`basset_sketch::curve_signature`]), or zero when none was recorded.
+    ///
+    /// The sample point is the reference a user understands — "the region I clicked in" —
+    /// but it is a point in a drawing that is still being dimensioned, and a rectangle
+    /// shrunk from 10 wide to 2 leaves the point it was clicked at out in the open. The
+    /// curves around a region keep their identity through every such edit, so when they
+    /// are known they are what the region is found by, and the sample only breaks a tie
+    /// between regions the same curves bound. Zero in files written before it existed;
+    /// those fall back to the sample alone, as they always did.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub curves: u64,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
+impl ProfileRef {
+    /// A region named by a point alone.
+    pub fn new(sketch: FeatureId, sample: Vec2) -> Self {
+        Self {
+            sketch,
+            sample,
+            curves: 0,
+        }
+    }
+
+    /// A region named by a point and by the curves around it.
+    pub fn anchored(sketch: FeatureId, sample: Vec2, curves: u64) -> Self {
+        Self {
+            sketch,
+            sample,
+            curves,
+        }
+    }
 }
 
 /// Anything a generator can push, spin or skin: a region of a sketch, or a planar face of

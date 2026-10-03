@@ -1,0 +1,76 @@
+{
+  "description": "A hole patterned three across a plate; the plate region, with three holes, extruded.",
+  "calls": [
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": "XY"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$0",
+        "ops": [
+          {
+            "op": "rectangle",
+            "a": [
+              0,
+              0
+            ],
+            "b": [
+              20,
+              10
+            ]
+          },
+          {
+            "op": "circle",
+            "center": [
+              4,
+              5
+            ],
+            "radius": 1
+          },
+          {
+            "op": "pattern_rectangular",
+            "entities": [
+              10
+            ],
+            "x_step": [
+              6,
+              0
+            ],
+            "cols": 3
+          }
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": [
+          [
+            1,
+            1
+          ]
+        ],
+        "sketch": "$0",
+        "distance": 2
+      }
+    }
+  ],
+  "expect": {
+    "ok": true,
+    "regions": {
+      "$0": 4
+    },
+    "bodies": {
+      "$2": {
+        "volume": 381.15044407846125,
+        "volume_tol": 0.3,
+        "closed": true,
+        "faces": 9
+      }
+    }
+  }
+}

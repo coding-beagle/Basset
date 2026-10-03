@@ -1,0 +1,66 @@
+{
+  "description": "A stadium slot 10 between centres and 4 wide: two lines and two arcs make one region.",
+  "calls": [
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": "XY"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$0",
+        "ops": [
+          {
+            "op": "slot",
+            "a": [
+              0,
+              0
+            ],
+            "b": [
+              10,
+              0
+            ],
+            "width": 4
+          }
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": "all",
+        "sketch": "$0",
+        "distance": 2
+      }
+    }
+  ],
+  "expect": {
+    "ok": true,
+    "regions": {
+      "$0": 1
+    },
+    "bodies": {
+      "$2": {
+        "volume": 105.13274122871834,
+        "volume_tol": 0.3,
+        "closed": true,
+        "aabb": [
+          [
+            -2,
+            -2,
+            0
+          ],
+          [
+            12,
+            2,
+            2
+          ]
+        ],
+        "faces": 6,
+        "aabb_tol": 0.01
+      }
+    }
+  }
+}

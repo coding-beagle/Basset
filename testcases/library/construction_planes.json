@@ -1,0 +1,125 @@
+{
+  "description": "A circle on an offset plane extruded back towards the origin, and a square on a plane turned 45\u00b0 about x.",
+  "calls": [
+    {
+      "tool": "offset_plane",
+      "arguments": {
+        "base": "XY",
+        "distance": 20
+      }
+    },
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": "$0"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$1",
+        "ops": [
+          {
+            "op": "circle",
+            "center": [
+              0,
+              0
+            ],
+            "radius": 3
+          }
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": "all",
+        "sketch": "$1",
+        "distance": -5
+      }
+    },
+    {
+      "tool": "angled_plane",
+      "arguments": {
+        "base": "XY",
+        "axis": "X",
+        "angle_deg": 45
+      }
+    },
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": "$4"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$5",
+        "ops": [
+          {
+            "op": "rectangle",
+            "a": [
+              0,
+              0
+            ],
+            "b": [
+              2,
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": "all",
+        "sketch": "$5",
+        "distance": 3
+      }
+    }
+  ],
+  "expect": {
+    "ok": true,
+    "bodies": {
+      "$3": {
+        "volume": 141.3716694115407,
+        "volume_tol": 1.0,
+        "closed": true,
+        "aabb": [
+          [
+            -3,
+            -3,
+            15
+          ],
+          [
+            3,
+            3,
+            20
+          ]
+        ],
+        "faces": 3,
+        "aabb_tol": 0.02
+      },
+      "$7": {
+        "volume": 12,
+        "volume_tol": 1e-09,
+        "closed": true,
+        "aabb": [
+          [
+            0,
+            -2.1213203435596424,
+            0
+          ],
+          [
+            2,
+            1.414213562373095,
+            3.5355339059327373
+          ]
+        ],
+        "aabb_tol": 1e-06
+      }
+    }
+  }
+}

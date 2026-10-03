@@ -1,0 +1,95 @@
+{
+  "description": "A circle touching all four sides of a square from inside: the disc and four corner slivers are five regions, where the tangencies used to lose all of them.",
+  "calls": [
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": "XY"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$0",
+        "ops": [
+          {
+            "op": "rectangle",
+            "a": [
+              0,
+              0
+            ],
+            "b": [
+              10,
+              10
+            ]
+          },
+          {
+            "op": "circle",
+            "center": [
+              5,
+              5
+            ],
+            "radius": 5
+          }
+        ]
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": [
+          [
+            5,
+            5
+          ]
+        ],
+        "sketch": "$0",
+        "distance": 2
+      }
+    },
+    {
+      "tool": "extrude",
+      "arguments": {
+        "regions": [
+          [
+            0.3,
+            0.3
+          ],
+          [
+            9.7,
+            0.3
+          ],
+          [
+            9.7,
+            9.7
+          ],
+          [
+            0.3,
+            9.7
+          ]
+        ],
+        "sketch": "$0",
+        "distance": 2
+      }
+    }
+  ],
+  "expect": {
+    "ok": true,
+    "regions": {
+      "$0": 5
+    },
+    "bodies": {
+      "$2": {
+        "volume": 157.07963267948966,
+        "volume_tol": 1.0,
+        "closed": true,
+        "faces": 3
+      },
+      "$3": {
+        "volume": 42.92036732051034,
+        "volume_tol": 1.0,
+        "closed": true
+      }
+    }
+  }
+}

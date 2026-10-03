@@ -2098,6 +2098,24 @@ impl SketchEditor {
         !self.region_samples().is_empty()
     }
 
+    /// The same regions as references a feature can hold: each sample point together
+    /// with the signature of the curves around the region it is in, so the reference
+    /// survives the drawing being re-dimensioned under it.
+    pub fn region_refs(&self) -> Vec<ProfileRef> {
+        self.region_samples()
+            .into_iter()
+            .map(|sample| {
+                let curves = self
+                    .profiles
+                    .iter()
+                    .filter(|p| p.contains(sample))
+                    .min_by(|a, b| a.area().total_cmp(&b.area()))
+                    .map_or(0, |p| p.signature());
+                ProfileRef::anchored(self.feature, sample, curves)
+            })
+            .collect()
+    }
+
     fn clear_selection(&mut self) {
         self.selected.clear();
         self.selected_regions.clear();
@@ -5245,19 +5263,15 @@ pub fn extrude_region(editor: &mut Editor) {
     let super::Mode::Sketch(s) = &editor.mode else {
         return;
     };
-    let samples = s.region_samples();
-    let sketch = s.feature;
-    if samples.is_empty() {
+    let regions = s.region_refs();
+    if regions.is_empty() {
         editor.set_status("Point at a closed region, or click inside one, then press E");
         editor.request_repaint();
         return;
     }
     finish(editor, true);
     editor.selection.clear();
-    editor.selection.profiles = samples
-        .into_iter()
-        .map(|sample| ProfileRef { sketch, sample })
-        .collect();
+    editor.selection.profiles = regions;
     super::tools::start_tool(editor, super::tools::ToolKind::Extrude);
 }
 

@@ -529,7 +529,10 @@ pub fn pick(
                 // Use a point of the region itself as the stable sample so that two
                 // clicks anywhere inside compare equal.
                 let sample = region_sample(region, local);
-                consider_sketch(Pick::Profile(ProfileRef { sketch: id, sample }, t));
+                consider_sketch(Pick::Profile(
+                    ProfileRef::anchored(id, sample, basset_core::region_signature(region)),
+                    t,
+                ));
             }
         }
     }
@@ -740,15 +743,7 @@ mod tests {
                 t,
             )
         };
-        let region = |t| {
-            Pick::Profile(
-                ProfileRef {
-                    sketch: FeatureId(2),
-                    sample: Vec2::ZERO,
-                },
-                t,
-            )
-        };
+        let region = |t| Pick::Profile(ProfileRef::new(FeatureId(2), Vec2::ZERO), t);
         let curve = |t| Pick::Curve {
             sketch: FeatureId(2),
             entity: EntityId::default(),

@@ -1,0 +1,62 @@
+{
+  "description": "A rectangle standing off the y axis revolved a full turn about it: a tube.",
+  "calls": [
+    {
+      "tool": "create_sketch",
+      "arguments": {
+        "plane": "XY"
+      }
+    },
+    {
+      "tool": "sketch_ops",
+      "arguments": {
+        "sketch": "$0",
+        "ops": [
+          {
+            "op": "rectangle",
+            "a": [
+              2,
+              0
+            ],
+            "b": [
+              5,
+              10
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "tool": "revolve",
+      "arguments": {
+        "sketch": "$0",
+        "regions": "all",
+        "axis": "Y",
+        "angle_deg": 360
+      }
+    }
+  ],
+  "expect": {
+    "ok": true,
+    "bodies": {
+      "$2": {
+        "volume": 659.7344572538566,
+        "volume_tol": 3.0,
+        "closed": true,
+        "aabb": [
+          [
+            -5,
+            0,
+            -5
+          ],
+          [
+            5,
+            10,
+            5
+          ]
+        ],
+        "aabb_tol": 0.05
+      }
+    }
+  }
+}

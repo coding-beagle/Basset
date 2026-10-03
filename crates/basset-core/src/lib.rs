@@ -37,7 +37,7 @@ pub use refs::{
     AxisRef, BodyRef, EdgeRef, FaceRef, OriginAxis, OriginPlane, PathRef, PlaneRef, ProfileRef,
     RegionRef,
 };
-pub use regen::convert_profile;
+pub use regen::{convert_profile, region_signature};
 pub use timeline::Timeline;
 pub use visibility::Visibility;
 

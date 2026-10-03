@@ -24,10 +24,10 @@ fn a_faces_outline_comes_back_as_the_curves_that_made_it() {
         sketch: plate,
     });
     let body = doc.add_feature(FeatureKind::Extrude {
-        regions: vec![RegionRef::Profile(ProfileRef {
+        regions: vec![RegionRef::Profile(ProfileRef::new(
             sketch,
-            sample: Vec2::new(1.0, 1.0),
-        })],
+            Vec2::new(1.0, 1.0),
+        ))],
         extent: Extent::OneSide(2.0),
         operation: BodyOp::NewBody,
         component: ComponentId::ROOT,

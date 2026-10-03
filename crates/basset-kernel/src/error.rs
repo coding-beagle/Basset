@@ -46,7 +46,9 @@ pub enum KernelError {
     BlendTooLarge { size: f64, limit: f64 },
     #[error("the target face is parallel to the extrude direction")]
     TargetFaceParallel,
-    #[error("the target face is behind the profile")]
+    #[error(
+        "the profile straddles the target face's plane, so the extrusion would thin to nothing"
+    )]
     TargetFaceBehind,
     #[error("the extrusion never reaches the target face")]
     TargetFaceMissed,

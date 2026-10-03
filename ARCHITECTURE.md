@@ -15,9 +15,11 @@ basset-core      Document, Components, Planes/Axes/Sketches/Bodies, document par
 basset-io        STL / 3MF export
 basset-viewport  wgpu renderer: camera, mesh/line/point/triangle batches, grid, selection highlight
 basset-app       winit + egui desktop application (Linux first)
+basset-mcp       Model Context Protocol server over stdio: the document model driven by an agent
 ```
 
-Dependency direction is strictly downward: `math ← sketch, kernel ← core ← io, viewport ← app`.
+Dependency direction is strictly downward: `math ← sketch, kernel ← core ← io, viewport ← app`;
+`basset-mcp` sits beside the app, over `core` and `io`, and knows nothing of the viewport.
 `sketch` and `kernel` do not know about each other; `core` converts sketch profiles into
 kernel profiles. This keeps both testable in isolation and lets the kernel be replaced.
 Where `core` has to put something of its own *into* a sketch — the document's parameter
@@ -42,7 +44,19 @@ feature that produced it. Faces are identified by a `FaceKey { op: OpId, role }`
 `role` is deterministic from the operation's inputs (`StartCap`, `EndCap`, `Side(curve)`,
 `Fillet(n)`, `Chamfer(n)`). Booleans preserve `FaceKey`s of surviving face fragments.
 Edges are identified by the unordered pair of `FaceKey`s they separate (`EdgeKey`).
-Sketch profiles are referenced by a sample point inside the region, and planar faces used
+Sketch profiles are referenced by a sample point inside the region together with a
+signature of the curves that bounded it when it was picked (`ProfileRef::curves`, an
+order-independent hash of their slot indexes). The point is the reference a user
+understands, but it is a point in a drawing still being dimensioned: a rectangle shrunk
+from 10 wide to 2 leaves the point it was clicked at out in the open. The curves keep
+their identity through every such edit, so when the signature is known it is what the
+region is found by, and the point only settles which of several regions the same curves
+bound (a circle cut by one line is two). A reference whose curves no longer bound any
+region falls back to the point, and if that encloses nothing either, to the nearest
+region with a warning, since it was once inside one and the drawing moved under it; a
+point-only reference (files from before the signature existed) that encloses nothing
+fails as it always did, because guessing a region for a point never known to be inside
+anything would turn a typo into a body. Planar faces used
 as sketch planes get a frame anchored at the face centroid. A sketch started on a face
 also opens with the face's outline copied in (`core::project_face`): the kernel's
 `face_profile` is turned back into lines, arcs and circles — a run of boundary pieces
@@ -53,6 +67,13 @@ and not a loose drawing the timeline would warn about. A generator's inputs are
 used as a region tags each stretch of its outline with a hash of the face it borders, so
 the lateral faces the generator grows there keep their keys when the body below changes.
 This is what lets a fillet applied in step 5 survive an edit to the extrude in step 2.
+
+An extrude "to" a face goes whichever way the face is. A sketch on a plane above a body,
+extruded to the body's top, means downwards, so the reach is signed along the profile
+normal and a target behind the profile is reached by travelling backwards; only a target
+plane the profile straddles is refused, since the extrusion would thin to nothing along
+the crossing line. A curved target is met at its first contact ahead if there is one,
+otherwise at its first contact behind.
 
 ## Kernel representation (MVP)
 
@@ -135,7 +156,17 @@ the answer to "which one?" is on the drawing and the fix is one click away.
 Profiles (closed regions usable by extrude etc.) are found by planar face tracing.
 Curves are tessellated into polylines at extraction time and split wherever two of them
 cross, so every region the drawing encloses is a profile, not only the ones the user drew
-with matching endpoints. Each polyline segment is tagged with its source curve index so
+with matching endpoints. The one contact chords cannot find is a tangency — a circle
+touching a line from inside has its nearest chord vertex a sagitta short of the line and
+no chord crossing it — so the analytic contact point of every tangent pair (line against
+circle or arc, two circles or arcs) is seeded into both polylines as a vertex first, and
+the chord scan then meets it like any crossing. Only tangencies are seeded: transversal
+crossings the chords already find, and seeding those put a vertex a micron from the
+endpoint a near-miss T-junction is cut at, which traced slivers between the two. At a
+node where two edges leave tangent to each other the departure angle cannot order them,
+and the face walk orders them by their bend instead: the edge curving further left is
+further counter-clockwise. A circle inscribed in a square is the test for all of this,
+five regions where there used to be none. Each polyline segment is tagged with its source curve index so
 the kernel can give the resulting side faces stable keys and correct surface kinds.
 Splitting happens on the tessellated curves and both sides are cut at the identical
 point, so the graph stays watertight and the boundary is as accurate as the tessellation
@@ -346,7 +377,9 @@ with the defaults a fresh editor shows. Visibility sits outside the undo snapsho
 hiding something is not an edit. The editor keeps its own working copy and syncs it into
 the document on save and back out on open. Version 8 added body names and the
 component-from-body step on the same terms: both additive, an identity migration, bumped
-so an older build refuses the file instead of dropping a body's name. The document is the
+so an older build refuses the file instead of dropping a body's name. Version 9 added the
+curve-set signature a region reference carries beside its sample point, on the same
+terms. The document is the
 timeline plus that table plus metadata; geometry is never stored because it
 is fully regenerable. Old versions are migrated on load; newer versions are refused with a
 clear error. Saves go through a temporary file and rename so a crash never truncates the
@@ -504,6 +537,35 @@ upright, since yaw and pitch are measured against world +Z.
 
 Panels never hold `&mut Editor` while borrowing document state: they queue commands that
 run after the frame's UI closure returns.
+
+## Driving the modeller from an agent
+
+`basset-mcp` is a Model Context Protocol server: JSON-RPC over stdin and stdout, one
+message per line, implemented directly on `serde_json` because the protocol a tool
+server needs — `initialize`, `tools/list`, `tools/call`, `ping` — is a few hundred lines
+and an SDK would be the only dependency the workspace could not build offline. It holds
+one `Document` and exposes the operations the editor's dialogs perform: a sketch is a
+feature holding a `Sketch`, drawn into by a batch of operations applied to a copy and
+written back only if every one succeeds; an extrude names regions by sample point and
+curve signature exactly as a click would; `body_info` and `check_document` return what
+the regenerator and the kernel can say about the result — statuses, volumes, bounding
+boxes, face and edge keys, and whether every shell is closed — so a failure that the
+viewport would show as a yellow badge comes back as data. Entities and constraints are
+named by their slot index, resolved against the live sketch, since a wire id is meant to
+be read back and quoted; faces are `feature.sub:Role` and edges two of those joined by
+`|`, the parts a `FaceKey` is made of. `.mcp.json` at the workspace root registers the
+server for Claude Code.
+
+`testcases/library/` is a library of test geometries in that protocol: each file is a
+script of tool calls that builds a model and the volumes, bounding boxes, region counts
+and statuses it must come out with. `make geometries` runs them (it is an ordinary
+`cargo test` of the `basset-mcp` crate). They are regression tests for the sketch and
+extrude fundamentals — every extent kind, every origin plane, regions that touch, cross,
+nest and overlap, booleans on faces, to-face extents, blends, parameters, and a sketch
+re-dimensioned under an extrude — and, being plain JSON, they double as worked examples
+of driving the modeller. A `$N` in a script's arguments is the feature call N made, and
+`${N}` inside a string is substituted as text, which is how a face key quotes the body
+it belongs to.
 
 ## Testing the application headlessly
 

@@ -1,0 +1,27 @@
+[package]
+name = "basset-mcp"
+description = "Model Context Protocol server exposing Basset's sketch, extrude and inspection operations over stdio."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "basset-mcp"
+path = "src/main.rs"
+
+[dependencies]
+basset-math = { workspace = true }
+basset-sketch = { workspace = true }
+basset-kernel = { workspace = true }
+basset-core = { workspace = true }
+basset-io = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+slotmap = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }
