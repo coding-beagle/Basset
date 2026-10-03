@@ -3162,6 +3162,14 @@ fn entry_overlay(editor: &mut Editor, ctx: &egui::Context, commands: &mut Vec<Co
 /// The badge itself is drawn with the sketch geometry; this puts an invisible button on
 /// top of it. Without one a geometric constraint could be applied but never inspected or
 /// undone, because it has no value text to click the way a dimension does.
+///
+/// The button yields to geometry under the pointer. A badge sits a few pixels off the
+/// entity it marks, and egui's hit test reaches `interact_radius` beyond a widget, so
+/// without this a press on the entity's own pick radius — on a tied corner, right where
+/// the user is aiming — left egui holding a click on the badge: the press reached the
+/// editor, the release was claimed by egui, and the shape never started. The badge is
+/// the secondary thing here; a tooltip and a delete entry are reachable from the side
+/// of it that faces away from the drawing.
 fn constraint_overlay(editor: &mut Editor, ctx: &egui::Context, commands: &mut Vec<Command>) {
     let camera = editor.camera;
     let window = editor.window_px;
@@ -3169,6 +3177,7 @@ fn constraint_overlay(editor: &mut Editor, ctx: &egui::Context, commands: &mut V
         return;
     };
     let ppp = ctx.pixels_per_point();
+    let geometry_first = s.hover.is_some();
     for g in &s.constraint_glyphs() {
         let Some(px) = camera.world_to_screen(g.center, window) else {
             continue;
@@ -3181,8 +3190,16 @@ fn constraint_overlay(editor: &mut Editor, ctx: &egui::Context, commands: &mut V
         egui::Area::new(egui::Id::new(("constraint", g.id, g.target)))
             .fixed_pos(pos - size * 0.5)
             .order(egui::Order::Foreground)
+            // Not interactable: egui then leaves the pointer to whatever is under it,
+            // rather than counting the press as over one of its areas.
+            .interactable(!geometry_first)
             .show(ctx, |ui| {
-                let response = ui.allocate_response(size, egui::Sense::click());
+                let sense = if geometry_first {
+                    egui::Sense::hover()
+                } else {
+                    egui::Sense::click()
+                };
+                let response = ui.allocate_response(size, sense);
                 response
                     .clone()
                     .on_hover_text(format!("{name} \u{2014} right-click to delete"));

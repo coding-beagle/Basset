@@ -327,6 +327,49 @@ impl Harness {
         self.egui.pixels_per_point()
     }
 
+    /// A click at this pixel routed the way the window loop routes it: egui sees every
+    /// event first and the editor gets only the ones egui does not claim, each decided
+    /// on egui's state at the moment the event arrives, as egui-winit decides them.
+    ///
+    /// The press is claimed when the pointer is over an egui area; the release is
+    /// claimed when egui believes a click or drag of one of its widgets is in progress —
+    /// which it can believe about a widget *near* the pointer, because egui's hit test
+    /// reaches `interact_radius` beyond a widget's rectangle while the area test the
+    /// press is decided by does not. [`Self::click_px`] bypasses all of that, so this is
+    /// the one to use for a click aimed at geometry an overlay sits next to.
+    pub fn click_px_through_ui(&mut self, px: [f64; 2]) {
+        let ppp = f64::from(self.egui.pixels_per_point());
+        let pos = egui::pos2((px[0] / ppp) as f32, (px[1] / ppp) as f32);
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let moving = self.egui.egui_is_using_pointer();
+        self.frame_with(vec![egui::Event::PointerMoved(pos)]);
+        if moving {
+            self.editor.pointer_over_ui();
+        } else {
+            self.move_px(px);
+        }
+        for pressed in [true, false] {
+            let claimed = self.egui.egui_wants_pointer_input();
+            self.frame_with(vec![button(pressed)]);
+            if claimed {
+                self.editor.pointer_over_ui();
+            } else {
+                let state = if pressed {
+                    ElementState::Pressed
+                } else {
+                    ElementState::Released
+                };
+                self.button(MouseButton::Left, state);
+            }
+        }
+        self.frame();
+    }
+
     fn press_ui(&mut self, pos: egui::Pos2, button: egui::PointerButton) {
         self.frame_with(vec![egui::Event::PointerMoved(pos)]);
         let event = |pressed| egui::Event::PointerButton {

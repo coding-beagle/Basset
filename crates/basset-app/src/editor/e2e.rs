@@ -2386,3 +2386,143 @@ fn a_body_becomes_a_component_from_its_context_menu() {
         "one undo puts the body back"
     );
 }
+
+/// One click with a drawing tool on geometry that is already there starts the shape
+/// there, snapped to it, whatever kind of thing it landed on: the editor's own click
+/// path, through the camera and the pixel tolerances a real click goes through.
+#[test]
+fn a_shape_starts_with_one_click_on_existing_geometry() {
+    let mut h = Harness::new();
+    h.editor.set_window_size([800, 600]);
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    h.line(Vec2::new(0.0, 0.0), Vec2::new(40.0, 0.0));
+    h.sketch().set_tool(SketchTool::Circle);
+    h.click_world(Vec3::new(60.0, 20.0, 0.0));
+    h.click_world(Vec3::new(70.0, 20.0, 0.0));
+    h.frame();
+
+    let ties = |h: &mut Harness| {
+        h.sketch()
+            .sketch
+            .constraints()
+            .filter(|(_, c)| matches!(c, Constraint::Coincident { .. }))
+            .count()
+    };
+
+    // On the line's midpoint, on its endpoint, on the circle: each is one click.
+    for (at, what) in [
+        (Vec3::new(20.0, 0.0, 0.0), "the line's midpoint"),
+        (Vec3::new(40.0, 0.0, 0.0), "the line's end"),
+        (Vec3::new(60.0, 30.0, 0.0), "the circle"),
+    ] {
+        h.sketch().set_tool(SketchTool::Rectangle);
+        h.frame();
+        let px = h.screen_of(at);
+        assert!(
+            !h.ui_takes_press_at(px),
+            "nothing drawn over {what} swallows the press"
+        );
+        h.move_world(at);
+        h.frame();
+        let before = ties(&mut h);
+        h.click_world(at);
+        assert!(
+            h.sketch().has_pending(),
+            "one click on {what} starts the rectangle"
+        );
+        // The far corner is well clear of everything, so the one tie is the first's.
+        let far = Vec3::new(at.x - 10.0, at.y + 15.0, 0.0);
+        h.click_world(far);
+        assert!(!h.sketch().has_pending(), "two clicks finish it");
+        assert_eq!(
+            ties(&mut h),
+            before + 1,
+            "the first corner is tied to {what}"
+        );
+        h.frame();
+    }
+    let lines = h
+        .sketch()
+        .sketch
+        .entities()
+        .filter(|(_, d)| d.entity.is_line())
+        .count();
+    assert_eq!(lines, 1 + 3 * 4, "three rectangles and the line");
+}
+
+/// A click aimed at geometry that a constraint badge sits beside is the sketch's, not
+/// the badge's. egui's hit test reaches a few points beyond a widget, so a press just
+/// outside a badge — on the point or the line it marks — used to leave egui believing
+/// a click on the badge was in progress, and the release that should have placed the
+/// shape's first point was swallowed with it. The user saw a tool that needed two or
+/// three clicks to start anywhere a shape already was.
+#[test]
+fn a_click_on_geometry_beside_a_badge_starts_the_shape_first_time() {
+    let mut h = Harness::new();
+    h.editor.set_window_size([1200, 800]);
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    h.rectangle(Vec2::new(0.0, 0.0), Vec2::new(40.0, 20.0));
+    // A second rectangle tied to the first's corner puts a coincident badge up and to
+    // the right of that corner, within reach of a click placed exactly on it.
+    h.rectangle(Vec2::new(40.0, 20.0), Vec2::new(60.0, 35.0));
+    h.frame();
+    assert!(
+        h.sketch()
+            .sketch
+            .constraints()
+            .any(|(_, c)| matches!(c, Constraint::Coincident { .. })),
+        "the corner carries a coincident badge"
+    );
+
+    let corner = h.screen_of(Vec3::new(40.0, 20.0, 0.0));
+    // The bottom side's horizontal badge sits above the side's midpoint on screen; a
+    // click a few pixels up from the midpoint is still well inside the side's pick
+    // radius and lands between the line and the badge.
+    let mid = h.screen_of(Vec3::new(20.0, 0.0, 0.0));
+    let beside_badge = [mid[0], mid[1] - 4.0];
+    for (px, what) in [
+        (corner, "a tied corner"),
+        (beside_badge, "a side by its badge"),
+    ] {
+        h.sketch().set_tool(SketchTool::Rectangle);
+        h.move_px(px);
+        h.frame();
+        assert!(h.sketch().hover.is_some(), "{what} is under the pointer");
+        h.click_px_through_ui(px);
+        assert!(
+            h.sketch().has_pending(),
+            "one click on {what} starts the rectangle"
+        );
+        h.click_px_through_ui([px[0] - 60.0, px[1] + 60.0]);
+        assert!(!h.sketch().has_pending(), "and a second finishes it");
+    }
+    let lines = h
+        .sketch()
+        .sketch
+        .entities()
+        .filter(|(_, d)| d.entity.is_line())
+        .count();
+    assert_eq!(lines, 4 * 4, "four rectangles");
+
+    // The badge is still a badge: with the pointer on it and clear of the geometry it
+    // takes the press, which is what its tooltip and its context menu need.
+    h.sketch().set_tool(SketchTool::Select);
+    let center = {
+        let s = h.sketch();
+        s.constraint_glyphs()
+            .into_iter()
+            .find(|g| {
+                matches!(
+                    s.sketch.constraint(g.id),
+                    Some(Constraint::Coincident { .. })
+                )
+            })
+            .expect("the coincident badge is laid out")
+            .center
+    };
+    let on_badge = h.screen_of(center);
+    assert!(
+        h.ui_takes_press_at(on_badge),
+        "a press on the badge itself is egui's"
+    );
+}
