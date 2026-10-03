@@ -1896,3 +1896,72 @@ fn an_offset_distance_is_edited_afterwards_through_its_dimension() {
     let gaps = offset_gaps(reopened.sketch(), &source);
     assert!(gaps.iter().all(|g| (g - 1.5).abs() < 1e-6), "{gaps:?}");
 }
+
+/// Two clicks in quick succession on one side of a rectangle, through the window: the
+/// first picks the side, the second makes it the whole rectangle, and nothing moved or
+/// left an undo step on the way. Slow clicks are two clicks.
+#[test]
+fn double_clicking_a_sketch_curve_selects_its_whole_shape() {
+    let mut h = Harness::new();
+    h.editor.set_window_size([800, 600]);
+    h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+    h.rectangle(Vec2::new(0.0, 0.0), Vec2::new(40.0, 20.0));
+    h.line(Vec2::new(60.0, 0.0), Vec2::new(70.0, 0.0));
+    h.sketch().set_tool(SketchTool::Select);
+    h.frame();
+    let geometry = |h: &mut Harness| -> Vec<Vec2> {
+        let s = h.sketch();
+        s.sketch
+            .entities()
+            .filter_map(|(id, _)| s.sketch.point_pos(id))
+            .collect()
+    };
+    let before = geometry(&mut h);
+    let side = h.screen_of(Vec3::new(20.0, 0.0, 0.0));
+
+    h.click_px(side);
+    assert_eq!(h.sketch().selected.len(), 1, "one click, one curve");
+    h.click_px(side);
+    assert_eq!(
+        h.sketch().selected.len(),
+        4,
+        "a double-click, the rectangle"
+    );
+    assert_eq!(geometry(&mut h), before, "and nothing was dragged");
+    // Nor was anything recorded: the top of the undo stack is still the line drawn last.
+    let lines = |h: &mut Harness| {
+        h.sketch()
+            .sketch
+            .entities()
+            .filter(|(_, d)| d.entity.is_line())
+            .count()
+    };
+    assert_eq!(lines(&mut h), 5);
+    assert!(h.sketch().undo());
+    assert_eq!(lines(&mut h), 4);
+    assert!(h.sketch().redo());
+    h.sketch().select_only(Vec::new());
+
+    h.click_px(side);
+    h.click_px(side);
+    assert_eq!(h.sketch().selected.len(), 4);
+
+    // Shift-double-click on the lone line adds it.
+    let lone = h.screen_of(Vec3::new(65.0, 0.0, 0.0));
+    h.set_modifiers(true, false);
+    h.click_px(lone);
+    h.click_px(lone);
+    h.set_modifiers(false, false);
+    assert_eq!(h.sketch().selected.len(), 5);
+
+    // A third click is a click again, not a second double-click.
+    h.click_px(side);
+    assert_eq!(h.sketch().selected.len(), 1);
+
+    // Two clicks further apart in time than a double-click are two single clicks.
+    std::thread::sleep(std::time::Duration::from_millis(350));
+    h.click_px(side);
+    std::thread::sleep(std::time::Duration::from_millis(350));
+    h.click_px(side);
+    assert_eq!(h.sketch().selected.len(), 1);
+}

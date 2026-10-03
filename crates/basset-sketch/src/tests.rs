@@ -2705,3 +2705,48 @@ fn an_offset_dimension_refuses_mismatched_curves() {
     };
     assert!(s.add_constraint(empty).is_err());
 }
+
+// ----- connected shapes -------------------------------------------------------------------
+
+#[test]
+fn connected_curves_follow_a_shape_end_to_end_and_stop_where_it_does() {
+    let mut s = Sketch::new();
+    let rect = shapes::rectangle_two_point(&mut s, v(0.0, 0.0), v(40.0, 20.0));
+    // A polyline beside it, its second segment drawn from a point of its own that only
+    // lies on the first one's end: joined by position, not by a shared entity.
+    let (a, _, _) = line(&mut s, v(60.0, 0.0), v(70.0, 0.0));
+    let (b, _, _) = line(&mut s, v(70.0, 0.0), v(70.0, 10.0));
+    let arc_center = s.add_point(v(75.0, 10.0));
+    let arc_start = s.add_point(v(80.0, 10.0));
+    let arc_end = s.add_point(v(70.0, 10.0));
+    let arc = s.add_arc(arc_center, arc_start, arc_end).unwrap();
+    let mut chain = s.connected_curves(rect.lines[2]);
+    chain.sort();
+    let mut sides = rect.lines.to_vec();
+    sides.sort();
+    assert_eq!(chain, sides, "the rectangle and only the rectangle");
+    let mut chain = s.connected_curves(a);
+    chain.sort();
+    let mut polyline = vec![a, b, arc];
+    polyline.sort();
+    assert_eq!(
+        chain, polyline,
+        "lines and an arc chained through positions"
+    );
+}
+
+#[test]
+fn connected_curves_keep_to_their_own_kind_of_geometry() {
+    let mut s = Sketch::new();
+    let rect = shapes::rectangle_two_point(&mut s, v(0.0, 0.0), v(40.0, 20.0));
+    // A construction diagonal from corner to corner touches two sides' ends.
+    let diagonal = s.add_line(rect.corners[0], rect.corners[2]).unwrap();
+    s.set_construction(diagonal, true).unwrap();
+    assert_eq!(s.connected_curves(rect.lines[0]).len(), 4);
+    assert_eq!(s.connected_curves(diagonal), vec![diagonal]);
+    // A circle joins nothing; a point is not a shape.
+    let c = s.add_point(v(100.0, 0.0));
+    let circle = s.add_circle(c, 5.0).unwrap();
+    assert_eq!(s.connected_curves(circle), vec![circle]);
+    assert!(s.connected_curves(c).is_empty());
+}

@@ -4706,3 +4706,50 @@ fn a_kept_offset_is_resized_through_its_dimension() {
     assert!(s.undo());
     assert!((radius_of_offset(s) - 13.0).abs() < 1e-9);
 }
+
+/// Double-clicking a curve in the sketch picks the whole shape it is part of; shift adds
+/// the shape to what is already picked, and other tools ignore it.
+#[test]
+fn a_double_click_selects_the_connected_shape() {
+    let mut editor = Editor::new(None);
+    editor.window_px = [800, 600];
+    sketch_mode::enter_new(&mut editor, PlaneRef::Origin(OriginPlane::XY));
+    draw_rectangle(&mut editor, Vec2::new(0.0, 0.0), Vec2::new(20.0, 10.0));
+    draw_line(&mut editor, Vec2::new(30.0, 0.0), Vec2::new(40.0, 0.0));
+    let camera = editor.camera;
+    let window = editor.window_px;
+    let s = sketch(&mut editor);
+    s.set_tool(SketchTool::Select);
+    let side = click_at(10.0, 0.0);
+    // Exactly what the window path does: the click first, then the double-click on it.
+    s.pointer_up(&side, &camera, window, true, false);
+    assert_eq!(s.selected.len(), 1, "a single click still picks one curve");
+    assert!(s.double_click(&side, &camera, window, false));
+    assert_eq!(s.selected.len(), 4, "the whole rectangle");
+    assert!(
+        s.selected
+            .iter()
+            .all(|id| s.sketch.entity(*id).is_some_and(|d| d.entity.is_line()))
+    );
+
+    let apart = click_at(35.0, 0.0);
+    s.pointer_up(&apart, &camera, window, true, true);
+    assert!(s.double_click(&apart, &camera, window, true));
+    assert_eq!(
+        s.selected.len(),
+        5,
+        "shift added the lone line to the rectangle"
+    );
+    s.pointer_up(&apart, &camera, window, true, false);
+    assert!(s.double_click(&apart, &camera, window, false));
+    assert_eq!(
+        s.selected.len(),
+        1,
+        "without shift the shape replaces the selection"
+    );
+
+    // Empty space is not a shape, and a drawing tool keeps its clicks to itself.
+    assert!(!s.double_click(&click_at(10.0, 5.0), &camera, window, false));
+    s.set_tool(SketchTool::Line);
+    assert!(!s.double_click(&side, &camera, window, false));
+}

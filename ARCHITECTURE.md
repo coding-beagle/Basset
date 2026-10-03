@@ -368,7 +368,13 @@ view of the same surface (egui blends in gamma space, the viewport in linear). T
   working copy back into the feature after each change (so downstream
   features update live), and keeps its own undo stack for the session. The grid is drawn
   on the sketch plane and points that snap to no existing point snap to it; dragging on
-  empty space is a rubber band, enclosing or crossing by its direction.
+  empty space is a rubber band, enclosing or crossing by its direction. Double-clicking a
+  curve selects the whole shape it is chained into (`Sketch::connected_curves`), shift
+  adding it to the selection. The viewport's clicks come from winit, which has no notion
+  of a double-click, so the editor times the pair itself with egui's thresholds and
+  applies the chain on top of the second click rather than instead of it — a
+  double-click cannot be known until its second click arrives, by which time both clicks
+  have done what single clicks do.
 
   Everything the user *does* there is a tool, including the geometric constraints: a
   constraint is picked first and its geometry after, and `constraints_for` decides what a
