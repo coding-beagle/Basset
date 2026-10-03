@@ -304,7 +304,7 @@ pub fn show(editor: &mut Editor, ctx: &egui::Context, free: egui::Rect) {
             let label = hovered.map(hotspot_name).unwrap_or_default();
             ui.horizontal(|ui| {
                 home = ui
-                    .small_button("⌂")
+                    .small_button("Home")
                     .on_hover_text(format!(
                         "Isometric view{}",
                         super::commands::hint("view.isometric")

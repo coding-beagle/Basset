@@ -890,7 +890,7 @@ fn the_palette_lists_redundant_constraints_and_offers_to_delete_them() {
         frame
             .texts
             .iter()
-            .find(|(r, t)| t.trim() == "\u{2715}" && (r.center().y - row.center().y).abs() < 4.0)
+            .find(|(r, t)| t.trim() == "Delete" && (r.center().y - row.center().y).abs() < 4.0)
             .map(|(r, _)| *r)
             .unwrap_or_else(|| panic!("a delete on the row: {:?}", frame.text()))
     };

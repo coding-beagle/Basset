@@ -269,8 +269,8 @@ fn named_label(key: NamedKey) -> &'static str {
         NamedKey::Backspace => "Backspace",
         NamedKey::F1 => "F1",
         NamedKey::Home => "Home",
-        NamedKey::ArrowLeft => "←",
-        NamedKey::ArrowRight => "→",
+        NamedKey::ArrowLeft => "Left",
+        NamedKey::ArrowRight => "Right",
         // Nothing else is bound to a named key; a new one shows as its debug name rather
         // than as a lie.
         _ => "(key)",

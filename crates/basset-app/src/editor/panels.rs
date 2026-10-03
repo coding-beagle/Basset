@@ -1782,7 +1782,7 @@ fn document_parameters(editor: &mut Editor, ui: &mut egui::Ui, commands: &mut Ve
                             shadowed.join(", ")
                         ));
                 }
-                if ui.small_button("\u{2715}").clicked() {
+                if ui.small_button("Delete").clicked() {
                     ui_state.confirm_delete = Some(name.clone());
                 }
             });
@@ -1918,9 +1918,9 @@ fn component_tree(
         .unwrap_or_default();
     let active = editor.active_component == id;
     let header = if active {
-        format!("● {name}")
+        egui::RichText::new(name.clone()).strong()
     } else {
-        name.clone()
+        egui::RichText::new(name.clone())
     };
     let response = egui::CollapsingHeader::new(header)
         .id_salt(("component", id.0))
@@ -2208,7 +2208,7 @@ fn abbreviation(kind: &FeatureKind) -> &'static str {
         FeatureKind::NewComponent { .. } | FeatureKind::ComponentFromBody { .. } => "Cmp",
         FeatureKind::Sketch { .. } => "Sk",
         FeatureKind::OffsetPlane { .. } => "Pl+",
-        FeatureKind::AngledPlane { .. } => "Pl∠",
+        FeatureKind::AngledPlane { .. } => "PlA",
         FeatureKind::Extrude { .. } => "Ext",
         FeatureKind::Revolve { .. } => "Rev",
         FeatureKind::Sweep { .. } => "Swp",
@@ -2816,11 +2816,7 @@ fn conflict_report(
             continue;
         };
         ui.horizontal(|ui| {
-            if ui
-                .add(egui::Button::new("\u{2715}").frame(false))
-                .on_hover_text("Delete")
-                .clicked()
-            {
+            if ui.add(egui::Button::new("Delete").frame(false)).clicked() {
                 commands.push(Command::SketchRemoveConstraint(*id));
             }
             let response = ui.add(
@@ -2869,11 +2865,7 @@ fn redundant_report(
             continue;
         };
         ui.horizontal(|ui| {
-            if ui
-                .add(egui::Button::new("\u{2715}").frame(false))
-                .on_hover_text("Delete")
-                .clicked()
-            {
+            if ui.add(egui::Button::new("Delete").frame(false)).clicked() {
                 commands.push(Command::SketchRemoveConstraint(*id));
             }
             let response = ui.add(
@@ -2933,11 +2925,7 @@ fn constraint_list(
             }
             for (id, label, entities) in &rows {
                 ui.horizontal(|ui| {
-                    if ui
-                        .add(egui::Button::new("\u{2715}").frame(false))
-                        .on_hover_text("Delete")
-                        .clicked()
-                    {
+                    if ui.add(egui::Button::new("Delete").frame(false)).clicked() {
                         commands.push(Command::SketchRemoveConstraint(*id));
                     }
                     // Clicking selects what the constraint holds, so the toolbar and the
@@ -2990,7 +2978,7 @@ fn parameters_panel(s: &mut super::SketchEditor, ui: &mut egui::Ui, commands: &m
                          reach the document's one"
                     ));
             }
-            if ui.small_button("✕").clicked() {
+            if ui.small_button("Delete").clicked() {
                 commands.push(Command::SketchRemoveParameter(name.clone()));
             }
         });

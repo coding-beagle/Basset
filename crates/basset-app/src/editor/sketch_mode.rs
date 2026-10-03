@@ -5129,7 +5129,7 @@ fn distance_to_line(p: Vec2, a: Vec2, b: Vec2) -> f64 {
 fn format_value(c: &Constraint) -> String {
     match c {
         Constraint::Angle { value, .. } => format!("{:.2}°", value.to_degrees().abs()),
-        Constraint::Diameter { value, .. } => format!("⌀{value:.3}"),
+        Constraint::Diameter { value, .. } => format!("D{value:.3}"),
         Constraint::Radius { value, .. } => format!("R{value:.3}"),
         other => other
             .dimension_value()
