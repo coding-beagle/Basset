@@ -44,15 +44,19 @@ const DISPLAY_CREASE_COS: f64 = 0.7; // ≈ 45.6°
 ///
 /// It is a separate number from [`DISPLAY_CREASE_COS`] because the two answer different
 /// questions. 45° is where a fold stops being shading and starts being a corner — the
-/// right place to cut a crease *within* one surface. A fillet running out into the face it
-/// blends into is not a corner at all: the surfaces are tangent there, the shading already
-/// carries across it, and a line drawn along it says "fold" about something that is smooth.
-/// Before this constant existed that boundary was always drawn, because the two faces'
-/// surfaces differ, and every fillet came out ringed like a chamfer.
+/// right place to cut a crease *within* one surface. Two surfaces meeting tangentially —
+/// the facets of two fillets of one feature mitred at a corner, a swept wall carrying on
+/// into a cylinder — are not a corner at all: the shading already carries across them,
+/// and a line drawn along them says "fold" about something that is smooth.
 ///
-/// The only reason it is not 1.0 is that the blend is faceted: the first facet of an arc
-/// is tilted about half a facet angle off the neighbouring face, so the test has to absorb
-/// half of the coarsest arc the blend tool will draw. [`Tessellation`](crate::Tessellation)
+/// A fillet's run-out into the face it blends into is tangent too, but it is drawn all the
+/// same, by role rather than by angle ([`Solid::blend_boundary`]): it is the outline of
+/// the round, and without it the user cannot see where the round begins. This threshold
+/// is what decides the tangent boundaries that are *not* a blend's outline.
+///
+/// The only reason it is not 1.0 is that the surfaces are faceted: the first facet of an
+/// arc is tilted about half a facet angle off the neighbouring face, so the test has to
+/// absorb half of the coarsest arc the blend tool will draw. [`Tessellation`](crate::Tessellation)
 /// defaults to 10° facets, and a blend coarsened against the tool's polygon budget can
 /// reach 45°/facet; 20° covers everything down to a 40°-facet arc while staying far below
 /// a fold anyone would call an edge.
@@ -368,23 +372,24 @@ pub struct Edge {
     /// there to the user, so nothing can be picked on it and there is no dihedral to
     /// fillet.
     ///
-    /// This is deliberately the strict test and not the looser one drawing asks
+    /// This is deliberately the strict test and not the one drawing asks
     /// ([`Solid::flush`]). Whether a line is *drawn* along an edge and whether the edge
-    /// can be *selected* are different questions, and a fillet's two boundaries are the
-    /// case that separates them: they are tangent, so drawing a line there would claim a
-    /// fold that is not there, but they are still where one face stops and another
-    /// starts, and the user has to be able to click them. Answering both with one test
-    /// made a tangent boundary unpickable as the price of not drawing it.
+    /// can be *selected* are different questions. Two faces of different surfaces that
+    /// meet tangentially (a swept wall carrying on into a cylinder) have no line drawn
+    /// between them, but they are still where one face stops and another starts, and
+    /// the user has to be able to click them. Answering both with one test once made a
+    /// fillet's tangent boundary unpickable as the price of not drawing it.
     pub smooth: bool,
     /// Whether the viewer is shown a line along any piece of this edge — the same
-    /// [`Solid::flush`] verdict [`Solid::display_edges`] draws by. A fold is `drawn`;
-    /// a fillet's tangent boundary is `!smooth` (selectable — it is where one face
-    /// stops and another starts) but `!drawn` (no line, because nothing folds there).
+    /// [`Solid::flush`] verdict [`Solid::display_edges`] draws by. A fold is `drawn`, and
+    /// so is a fillet's or chamfer's outline, tangent or not; a tangent boundary between
+    /// two ordinary faces is `!smooth` (selectable) but `!drawn` (no line, because
+    /// nothing folds there).
     ///
     /// Picking reads this when a face and an edge compete for one click: an edge the
     /// user cannot see must never steal a click from the face they can. It does not
     /// gate whether the edge exists as a target at all — an edge-only filter, or a
-    /// tool that asks for edges, has no face in the running and reaches a tangent
+    /// tool that asks for edges, has no face in the running and reaches an undrawn
     /// boundary exactly as before.
     pub drawn: bool,
 }
@@ -823,22 +828,60 @@ impl Solid {
 
     /// Whether two polygons meeting along an edge leave nothing to see there: either they
     /// are the same surface and do not fold, or they are different surfaces meeting
-    /// tangentially, as a fillet meets the face it blends into.
+    /// tangentially — unless one of them is a blend, whose outline is drawn whatever the
+    /// angle ([`Solid::blend_boundary`]).
     ///
-    /// Distinct from [`Solid::continuous`]: a fillet is genuinely a different face from the
-    /// plane it runs out into — it has its own key, its own radius, and a user can select
-    /// it — but there is no line to draw between them. This decides drawing only.
-    /// [`Edge::smooth`], which decides what can be picked and what can be filleted, is
-    /// the strict test, or a fillet's own boundaries would stop being selectable.
+    /// Distinct from [`Solid::continuous`]: two faces can be flush and still be two faces,
+    /// each with its own key, that a user can select separately. This decides drawing
+    /// only. [`Edge::smooth`], which decides what can be picked and what can be filleted,
+    /// is the strict test.
     fn flush(&self, a: (usize, Vec3), b: (usize, Vec3)) -> bool {
-        self.continuous(a, b) || a.1.dot(b.1) >= TANGENT_EDGE_COS
+        // The blend test comes first, before `continuous`: two fillets of *different*
+        // features can lie on one and the same cylinder, and that seam is still where one
+        // feature's face ends and the next one's begins.
+        !self.blend_boundary(a.0, b.0)
+            && (self.continuous(a, b) || a.1.dot(b.1) >= TANGENT_EDGE_COS)
     }
 
-    /// The straight pieces a viewer should see as the body's outline: every fold, and
-    /// every change of surface that is not tangent, whether or not the topology calls it a
-    /// face boundary. A fillet's two boundaries are tangent, so they are not in here; what
-    /// bounds a blend against the background is its silhouette, which is view-dependent and
-    /// so the viewport's business rather than the kernel's.
+    /// Whether the edge between faces `a` and `b` is where a fillet or chamfer face
+    /// starts or ends, and so is drawn even though nothing folds there.
+    ///
+    /// A fillet's two run-outs are tangent to the faces they blend into, so the fold rule
+    /// alone draws nothing along them and a rounded edge shows no outline at all: the user
+    /// cannot see where the round begins and ends, or how wide it is. Fusion 360 and every
+    /// other modeller outline a blend's tangent edges, and the edge *is* a face boundary —
+    /// it has its own key, it can be clicked, a later fillet can round it — so the line is
+    /// drawn by role rather than by angle.
+    ///
+    /// The rule is by face, not by polygon: a fillet is a faceted strip, and the seams
+    /// between its own facets (`a == b`) stay out, or every round would come out striped.
+    /// Two blend faces of the *same* feature meeting — the mitre where a chained fillet
+    /// turns a corner, or a fillet dying into the chamfer beside it — go by the fold rule
+    /// like any other pair of faces: the feature made them as one surface and the user
+    /// reads them as one, so a line there would cut the round in two for no reason. Blend
+    /// faces of *different* features are different rounds, and the join between them is
+    /// where one stops and the other starts, so that is drawn.
+    fn blend_boundary(&self, a: usize, b: usize) -> bool {
+        use crate::ids::FaceRole;
+        if a == b {
+            return false;
+        }
+        let (ka, kb) = (self.faces[a].key, self.faces[b].key);
+        let is_blend = |k: FaceKey| matches!(k.role, FaceRole::Fillet(_) | FaceRole::Chamfer(_));
+        match (is_blend(ka), is_blend(kb)) {
+            (false, false) => false,
+            (true, true) => ka.op != kb.op,
+            _ => true,
+        }
+    }
+
+    /// The straight pieces a viewer should see as the body's outline: every fold, every
+    /// change of surface that is not tangent, whether or not the topology calls it a face
+    /// boundary, and the outline of every fillet and chamfer face — its two tangent
+    /// run-outs included, because that is how a user sees where a round begins and ends
+    /// ([`Solid::blend_boundary`]). What bounds a smooth face against the background is
+    /// its silhouette, which is view-dependent and so the viewport's business rather than
+    /// the kernel's.
     ///
     /// These are segments, not polylines: one visual line comes back cut wherever a
     /// neighbouring face happens to end against it. That suits a line batch, and nothing
@@ -1576,16 +1619,10 @@ mod tests {
         assert_eq!(c.edges().iter().filter(|e| !e.smooth).count(), 2);
     }
 
-    /// The tangent half of the problem: a fillet meets the faces it blends into with no
-    /// corner between them, so neither boundary is drawn. Before the drawn-edge cut-off
-    /// was split from the shading one, both were drawn — the fillet came out ringed,
-    /// exactly like the chamfer it is not.
-    ///
-    /// Not drawn is as far as it goes. The boundary is still where one face stops and
-    /// another starts, so it stays selectable; see
-    /// [`a_fillets_tangent_boundaries_stay_selectable`].
-    #[test]
-    fn a_fillets_tangent_boundaries_are_not_drawn() {
+    /// The cube with one top edge rounded, and the lines along which that round runs out
+    /// into the top and the side: y = 0, z = 8 and y = 2, z = 10, each the cube's full
+    /// length in x.
+    fn cube_with_one_top_edge_filleted() -> Solid {
         let op = OpId::new(1);
         let cube = crate::primitives::cuboid(op, Vec3::ZERO, Vec3::splat(10.0));
         let key = EdgeKey::new(
@@ -1593,34 +1630,142 @@ mod tests {
             FaceKey::new(op, FaceRole::Side(0)),
         );
         let tess = crate::geometry::Tessellation::default();
-        let r = crate::blend::fillet(OpId::new(2), &cube, &[key], 2.0, &tess)
-            .expect("filleting one top edge of a cube");
+        crate::blend::fillet(OpId::new(2), &cube, &[key], 2.0, &tess)
+            .expect("filleting one top edge of a cube")
+    }
+
+    /// Length of the drawn segments lying along the line `y = at.0, z = at.1`.
+    fn drawn_length_along(drawn: &[[Vec3; 2]], at: (f64, f64)) -> f64 {
+        let on = |p: &Vec3| (p.y - at.0).abs() < 1e-6 && (p.z - at.1).abs() < 1e-6;
+        drawn
+            .iter()
+            .filter(|[a, b]| on(a) && on(b))
+            .map(|[a, b]| a.distance(*b))
+            .sum()
+    }
+
+    /// A fillet meets the faces it blends into with no corner between them, and the fold
+    /// rule alone draws nothing there — which left a rounded edge with no outline at all,
+    /// so the user could not see where the round began or how wide it was. Both run-outs
+    /// are drawn, by role, the way every modeller outlines a blend; and the round is not
+    /// striped by its own facet seams, which are no boundary to anyone.
+    #[test]
+    fn a_fillets_tangent_boundaries_are_drawn_and_its_facet_seams_are_not() {
+        let r = cube_with_one_top_edge_filleted();
+        let drawn = r.display_edges();
+        for line in [(0.0, 8.0), (2.0, 10.0)] {
+            assert!(
+                (drawn_length_along(&drawn, line) - 10.0).abs() < 1e-6,
+                "the run-out along y = {}, z = {} is drawn for the cube's whole length",
+                line.0,
+                line.1
+            );
+        }
+        // A facet seam runs along x somewhere strictly inside the arc; the two short arcs
+        // where the blend dies into the ±x faces have both ends at one x and are folds.
+        let inside_arc = |p: &Vec3| p.y > 1e-6 && p.y < 2.0 - 1e-6;
+        assert!(
+            !drawn
+                .iter()
+                .any(|[a, b]| inside_arc(a) && inside_arc(b) && (a.x - b.x).abs() > 1e-6),
+            "a facet seam of the blend was drawn"
+        );
+        // Picking agrees with drawing: every edge bounding the blend is both drawn and
+        // selectable, so clicking the line the user sees selects the edge it is.
         let blend = FaceKey::new(OpId::new(2), FaceRole::Fillet(0));
         let edges = r.edges();
         let touching: Vec<&Edge> = edges.iter().filter(|e| e.key.touches(blend)).collect();
         assert_eq!(touching.len(), 4, "the blend is bounded by four edges");
-        // The blend is a quarter cylinder of radius 2 rounding the edge at y = 0, z = 10,
-        // so it runs out along y = 0, z = 8 and along y = 2, z = 10.
-        let on_a_tangent_line = |p: &Vec3| {
-            (p.y.abs() < 1e-6 && (p.z - 8.0).abs() < 1e-6)
-                || ((p.y - 2.0).abs() < 1e-6 && (p.z - 10.0).abs() < 1e-6)
-        };
         assert!(
-            r.display_edges()
-                .iter()
-                .all(|[a, b]| !(on_a_tangent_line(a) && on_a_tangent_line(b))),
-            "a line was drawn where the fillet runs tangentially into its neighbour"
+            touching.iter().all(|e| e.drawn && !e.smooth),
+            "{touching:#?}"
         );
-        // Every other edge of the cube survives as a drawn one: twelve, less the filleted
-        // one, plus the two short ends the blend adds at the faces it dies into, and the
-        // two tangent boundaries, which are not drawn but are still edges.
-        assert_eq!(edges.iter().filter(|e| !e.smooth).count(), 11 + 2 + 2);
+        // And the drawing rule has not grown lines anywhere else: a plain cube still has
+        // its twelve edges, and the filleted one has them less the filleted edge, plus
+        // the four bounding the blend.
+        let cube = crate::primitives::cuboid(OpId::new(1), Vec3::ZERO, Vec3::splat(10.0));
+        assert_eq!(cube.display_edges().len(), 12);
+        assert_eq!(edges.iter().filter(|e| e.drawn).count(), 11 + 4);
     }
 
-    /// The other half of the same question, and the one that regressed when both were
-    /// answered by the drawing test: a fillet's tangent boundary is still where one face
-    /// stops and another starts, so it has to stay selectable. Losing it means the user
-    /// cannot click the edge of a fillet at all.
+    /// A chamfer's boundaries fold, so they were always drawn; the role rule must not
+    /// change that or draw the flat face's interior.
+    #[test]
+    fn a_chamfers_boundaries_are_drawn() {
+        let op = OpId::new(1);
+        let cube = crate::primitives::cuboid(op, Vec3::ZERO, Vec3::splat(10.0));
+        let key = EdgeKey::new(
+            FaceKey::new(op, FaceRole::EndCap),
+            FaceKey::new(op, FaceRole::Side(0)),
+        );
+        let r = crate::blend::chamfer(OpId::new(2), &cube, &[key], 2.0)
+            .expect("chamfering one top edge of a cube");
+        let drawn = r.display_edges();
+        for line in [(0.0, 8.0), (2.0, 10.0)] {
+            assert!((drawn_length_along(&drawn, line) - 10.0).abs() < 1e-6);
+        }
+        let chamfer = FaceKey::new(OpId::new(2), FaceRole::Chamfer(0));
+        let edges = r.edges();
+        assert!(
+            edges
+                .iter()
+                .filter(|e| e.key.touches(chamfer))
+                .all(|e| e.drawn && !e.smooth)
+        );
+        assert_eq!(edges.iter().filter(|e| e.drawn).count(), 11 + 4);
+    }
+
+    /// Four fillets of one feature running round the top of a cube meet each other at the
+    /// corners. Each one's run-outs into the cube are drawn; where two of them meet, the
+    /// feature made them as one round and the join goes by the fold rule like any other
+    /// pair of faces, so nothing extra is painted across the corner.
+    #[test]
+    fn fillets_of_one_feature_are_outlined_against_the_body_not_against_each_other() {
+        let op = OpId::new(1);
+        let cube = crate::primitives::cuboid(op, Vec3::ZERO, Vec3::splat(10.0));
+        let keys: Vec<EdgeKey> = (0..4)
+            .map(|i| {
+                EdgeKey::new(
+                    FaceKey::new(op, FaceRole::EndCap),
+                    FaceKey::new(op, FaceRole::Side(i)),
+                )
+            })
+            .collect();
+        let tess = crate::geometry::Tessellation::default();
+        let r = crate::blend::fillet(OpId::new(2), &cube, &keys, 2.0, &tess)
+            .expect("filleting the four top edges of a cube");
+        let is_blend = |k: FaceKey| matches!(k.role, FaceRole::Fillet(_));
+        let edges = r.edges();
+        let (joins, outlines): (Vec<&Edge>, Vec<&Edge>) = edges
+            .iter()
+            .filter(|e| is_blend(e.key.a) || is_blend(e.key.b))
+            .partition(|e| is_blend(e.key.a) && is_blend(e.key.b));
+        assert!(!outlines.is_empty() && !joins.is_empty(), "{edges:#?}");
+        assert!(
+            outlines.iter().all(|e| e.drawn && !e.smooth),
+            "a run-out into the cube is not drawn: {:?}",
+            outlines
+                .iter()
+                .filter(|e| !e.drawn)
+                .map(|e| e.key)
+                .collect::<Vec<_>>()
+        );
+        for join in joins {
+            let folds = join
+                .segments
+                .iter()
+                .any(|s| s.normal_a.dot(s.normal_b) < TANGENT_EDGE_COS);
+            assert_eq!(
+                join.drawn, folds,
+                "a join between two fillets of one feature is drawn by role, not by fold: {:?}",
+                join.key
+            );
+        }
+    }
+
+    /// A fillet's tangent boundary is still where one face stops and another starts, so
+    /// it has to be selectable. Losing it means the user cannot click the edge of a
+    /// fillet at all.
     #[test]
     fn a_fillets_tangent_boundaries_stay_selectable() {
         let op = OpId::new(1);
@@ -1649,11 +1794,11 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         // Each edge also says which answer it got from the *other* question, so picking
-        // can keep an invisible edge from stealing a click a visible face is claiming:
-        // the two tangent run-outs are selectable but drawn nowhere, and the two short
-        // ends where the blend dies into the cube's side faces are real folds.
-        let drawn = touching.iter().filter(|e| e.drawn).count();
-        assert_eq!((drawn, touching.len() - drawn), (2, 2), "{touching:#?}");
+        // can keep an invisible edge from stealing a click a visible face is claiming.
+        // A blend's boundaries are all shown — the two tangent run-outs by role, the two
+        // short ends where it dies into the cube's side faces because they fold — so all
+        // four may take a click.
+        assert!(touching.iter().all(|e| e.drawn), "{touching:#?}");
         // And every ordinary edge of the cube is both: a fold is selectable and shown.
         assert!(
             r.edges()
