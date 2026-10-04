@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::document::Document;
 
-pub const FORMAT_VERSION: u32 = 10;
+pub const FORMAT_VERSION: u32 = 11;
 pub const EXTENSION: &str = "bass";
 
 #[derive(Serialize, Deserialize)]
@@ -101,8 +101,18 @@ fn migrate_step(mut value: serde_json::Value, version: u32) -> serde_json::Value
         7 => migrate_v7_body_names(value),
         8 => migrate_v8_region_curves(value),
         9 => migrate_v9_face_frames(value),
+        10 => migrate_v10_threads(value),
         _ => value,
     }
+}
+
+/// Version 11 added the thread step.
+///
+/// Additive, so a version 10 document loads as it is. The bump is for the older build,
+/// which would refuse the unknown step as a malformed document; "this file is newer than
+/// your build" is the honest way to say that.
+fn migrate_v10_threads(value: serde_json::Value) -> serde_json::Value {
+    value
 }
 
 /// Version 10 moved the origin of a sketch on a face from the average of the face's

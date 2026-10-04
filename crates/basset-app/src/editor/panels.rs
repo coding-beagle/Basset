@@ -577,6 +577,7 @@ fn menu_bar(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
                 &[
                     ToolKind::Fillet,
                     ToolKind::Chamfer,
+                    ToolKind::Thread,
                     ToolKind::Combine,
                     ToolKind::Move,
                 ],
@@ -624,6 +625,7 @@ fn toolbar(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
             &[
                 (ToolKind::Fillet, "Fillet"),
                 (ToolKind::Chamfer, "Chamfer"),
+                (ToolKind::Thread, "Thread"),
                 (ToolKind::Combine, "Combine"),
                 (ToolKind::Move, "Move"),
                 (ToolKind::OffsetPlane, "Offset Plane"),
@@ -1540,6 +1542,19 @@ fn model_symbol(
                 line(egui::pos2(l, t + cut), egui::pos2(l, b));
             });
         }
+        ToolKind::Thread => {
+            // A rod side-on with its crests slanting across it, which is how a thread
+            // is drawn on any drawing.
+            let (x0, x1) = (c.x - (r - l) * 0.3, c.x + (r - l) * 0.3);
+            line(egui::pos2(x0, t), egui::pos2(x0, b));
+            line(egui::pos2(x1, t), egui::pos2(x1, b));
+            let rise = (b - t) * 0.12;
+            let mut y = t + 3.0;
+            while y + rise <= b - 1.0 {
+                line(egui::pos2(x0, y + rise), egui::pos2(x1, y));
+                y += (b - t) * 0.22;
+            }
+        }
         ToolKind::Combine => {
             // Two bodies overlapping: what the tool joins, cuts or intersects.
             let radius = (b - t) * 0.36;
@@ -2226,6 +2241,7 @@ fn abbreviation(kind: &FeatureKind) -> &'static str {
         FeatureKind::Loft { .. } => "Lft",
         FeatureKind::Fillet { .. } => "Fil",
         FeatureKind::Chamfer { .. } => "Chm",
+        FeatureKind::Thread { .. } => "Thr",
         FeatureKind::Combine { .. } => "Cmb",
         FeatureKind::Move { .. } => "Mov",
     }

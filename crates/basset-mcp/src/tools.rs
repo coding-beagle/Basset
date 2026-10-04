@@ -8,8 +8,8 @@
 use std::path::PathBuf;
 
 use basset_core::{
-    BodyOp, BodyRef, CombineOp, ComponentId, Document, EdgeRef, Extent, FeatureId, FeatureKind,
-    NumericField, ProfileRef, RegionRef, file,
+    BodyOp, BodyRef, CombineOp, ComponentId, Document, EdgeRef, Extent, FaceRef, FeatureId,
+    FeatureKind, NumericField, ProfileRef, RegionRef, file,
 };
 use basset_io::{ExportItem, Unit};
 use basset_math::{Affine3, Vec2};
@@ -161,6 +161,22 @@ pub fn tool_definitions() -> Vec<Value> {
             ),
         ),
         tool(
+            "thread",
+            "Cut an ISO metric thread (60° basic profile) into a cylindrical face: outside a shaft, where the face is the major diameter, or inside a hole, where it is the minor diameter (drill a hole at the tap size). It runs out past an end that opens into air and stops dead at a shoulder or a hole's floor. Returns the thread's nominal diameter.",
+            obj(
+                json!({
+                    "body": { "type": "integer" },
+                    "face": { "type": "string", "description": "Key of a cylindrical face, from body_info faces=true." },
+                    "pitch": { "type": "number", "description": "mm per turn. Default: the ISO coarse pitch for the face's size." },
+                    "length": { "type": "number", "description": "How far along the face, from the end it opens out of. Default: all of it." },
+                    "reversed": { "type": "boolean", "default": false, "description": "Measure the length from the face's other end." },
+                    "left_handed": { "type": "boolean", "default": false },
+                    "name": { "type": "string" },
+                }),
+                &["body", "face"],
+            ),
+        ),
+        tool(
             "combine",
             "Boolean of whole bodies: target (join|cut|intersect) tools.",
             obj(
@@ -194,11 +210,12 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "edit_feature",
-            "Change a feature after the fact: its driven numbers (distance, negative, angle_deg, radius), extent, name, suppression; or remove it or move it to another index in the timeline.",
+            "Change a feature after the fact: its driven numbers (distance, negative, angle_deg, radius, pitch), a thread's length, extent, name, suppression; or remove it or move it to another index in the timeline.",
             obj(
                 json!({
                     "feature": { "type": "integer" },
-                    "distance": { "type": "number" }, "negative": { "type": "number" }, "angle_deg": { "type": "number" }, "radius": { "type": "number" },
+                    "distance": { "type": "number" }, "negative": { "type": "number" }, "angle_deg": { "type": "number" }, "radius": { "type": "number" }, "pitch": { "type": "number" },
+                    "length": { "description": "A thread's length in mm, or null for the whole face." },
                     "extent": { "description": "As for extrude." },
                     "name": { "type": "string" }, "suppressed": { "type": "boolean" },
                     "remove": { "type": "boolean" }, "move_to": { "type": "integer" },
@@ -241,7 +258,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "set_feature_expr",
-            "Drive a feature's number (distance|negative|angle|radius) by an expression; an empty expression releases it.",
+            "Drive a feature's number (distance|negative|angle|radius|pitch) by an expression; an empty expression releases it. A thread's length is its distance.",
             obj(
                 json!({ "feature": { "type": "integer" }, "field": { "type": "string" }, "expression": { "type": "string" } }),
                 &["feature", "field", "expression"],
@@ -283,6 +300,7 @@ pub fn call(session: &mut Session, name: &str, args: &Value) -> Result<Value, To
         "revolve" => revolve(session, args),
         "fillet" => blend(session, args, true),
         "chamfer" => blend(session, args, false),
+        "thread" => thread(session, args),
         "combine" => combine(session, args),
         "offset_plane" => offset_plane(session, args),
         "angled_plane" => angled_plane(session, args),
@@ -716,6 +734,7 @@ fn feature_result(doc: &mut Document, id: FeatureId) -> Value {
                 b.dedup();
                 b
             }
+            FeatureKind::Thread { face, .. } => vec![face.body],
             FeatureKind::Combine { target, .. } => vec![*target],
             FeatureKind::Move { body, .. } => vec![*body],
             _ => Vec::new(),
@@ -818,6 +837,45 @@ fn blend(session: &mut Session, args: &Value, is_fillet: bool) -> Result<Value, 
     };
     let id = doc.add_named_feature(kind, opt_str(args, "name").map(String::from));
     Ok(feature_result(doc, id))
+}
+
+fn thread(session: &mut Session, args: &Value) -> Result<Value, ToolError> {
+    let face = FaceRef {
+        body: BodyRef(feature_from_json(field(args, "body")?)?),
+        key: face_key_from_str(req_str(args, "face")?)?,
+    };
+    let doc = session.document_mut();
+    // Read the face before adding anything, so a flat face or a typo is refused with the
+    // reason rather than left in the timeline as a failed step.
+    let cylinder = {
+        let body = doc.state().body(face.body).ok_or_else(|| {
+            ToolError::bad(format!("no body {} at the timeline cursor", face.body.0.0))
+        })?;
+        basset_kernel::cylinder_face(&body.solid, face.key).map_err(|e| {
+            ToolError::bad(format!(
+                "{e}; list the body's faces with body_info faces=true"
+            ))
+        })?
+    };
+    let pitch = opt_f64(args, "pitch")?.unwrap_or_else(|| cylinder.coarse_pitch());
+    let id = doc.add_named_feature(
+        FeatureKind::Thread {
+            face,
+            pitch,
+            length: opt_f64(args, "length")?,
+            left_handed: opt_bool(args, "left_handed")?.unwrap_or(false),
+            reversed: opt_bool(args, "reversed")?.unwrap_or(false),
+        },
+        opt_str(args, "name").map(String::from),
+    );
+    let mut out = feature_result(doc, id);
+    out["thread"] = json!({
+        "kind": if cylinder.external { "external" } else { "internal" },
+        "nominal_diameter": round(cylinder.nominal_diameter(pitch)),
+        "pitch": round(pitch),
+        "face_length": round(cylinder.length()),
+    });
+    Ok(out)
 }
 
 fn combine(session: &mut Session, args: &Value) -> Result<Value, ToolError> {
@@ -924,11 +982,32 @@ fn edit_feature(session: &mut Session, args: &Value) -> Result<Value, ToolError>
         doc.set_suppressed(id, s)?;
     }
     let extent = opt(args, "extent").map(|_| extent_arg(args)).transpose()?;
+    // Present and null is a request too: thread the whole face.
+    let length = match args.get("length") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(_) => Some(Some(req_f64(args, "length")?)),
+    };
+    if let Some(length) = length {
+        let mut threaded = false;
+        doc.edit_feature(id, |f| {
+            if let FeatureKind::Thread { length: l, .. } = &mut f.kind {
+                *l = length;
+                threaded = true;
+                let offered = f.kind.numeric_fields();
+                f.exprs.retain(|k, _| offered.contains(k));
+            }
+        })?;
+        if !threaded {
+            return Err(ToolError::bad("only a thread has a length"));
+        }
+    }
     let fields = [
         (NumericField::Distance, opt_f64(args, "distance")?),
         (NumericField::Negative, opt_f64(args, "negative")?),
         (NumericField::Angle, opt_f64(args, "angle_deg")?),
         (NumericField::Radius, opt_f64(args, "radius")?),
+        (NumericField::Pitch, opt_f64(args, "pitch")?),
     ];
     let wanted: Vec<(NumericField, f64)> = fields
         .iter()
@@ -976,9 +1055,10 @@ fn set_feature_expr(session: &mut Session, args: &Value) -> Result<Value, ToolEr
         "negative" | "second_distance" => NumericField::Negative,
         "angle" => NumericField::Angle,
         "radius" => NumericField::Radius,
+        "pitch" => NumericField::Pitch,
         other => {
             return Err(ToolError::bad(format!(
-                "unknown field {other:?}; one of distance, negative, angle, radius"
+                "unknown field {other:?}; one of distance, negative, angle, radius, pitch"
             )));
         }
     };

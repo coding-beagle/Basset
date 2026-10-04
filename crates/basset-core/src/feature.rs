@@ -74,6 +74,8 @@ pub enum NumericField {
     Negative,
     Angle,
     Radius,
+    /// A thread's advance per turn.
+    Pitch,
 }
 
 impl NumericField {
@@ -84,6 +86,7 @@ impl NumericField {
             NumericField::Negative => "Second distance",
             NumericField::Angle => "Angle",
             NumericField::Radius => "Radius",
+            NumericField::Pitch => "Pitch",
         }
     }
 }
@@ -217,6 +220,18 @@ pub enum FeatureKind {
         edges: Vec<EdgeRef>,
         distance: f64,
     },
+    /// A modelled thread cut into a cylindrical face: a shaft threaded on the outside, a
+    /// hole on the inside, to the ISO metric basic profile. The face's diameter is the
+    /// size, so the only number of the thread's own is its pitch.
+    Thread {
+        face: FaceRef,
+        pitch: f64,
+        /// How far along the face, from the end it opens out of; `None` is all of it.
+        length: Option<f64>,
+        left_handed: bool,
+        /// Measures `length` from the face's other end.
+        reversed: bool,
+    },
     Combine {
         target: BodyRef,
         tools: Vec<BodyRef>,
@@ -255,6 +270,7 @@ impl FeatureKind {
             FeatureKind::Loft { .. } => "Loft",
             FeatureKind::Fillet { .. } => "Fillet",
             FeatureKind::Chamfer { .. } => "Chamfer",
+            FeatureKind::Thread { .. } => "Thread",
             FeatureKind::Combine { .. } => "Combine",
             FeatureKind::Move { .. } => "Move",
         }
@@ -263,7 +279,7 @@ impl FeatureKind {
     /// Which of this kind's numbers an expression can drive, in the order a panel shows
     /// them.
     pub fn numeric_fields(&self) -> &'static [NumericField] {
-        use NumericField::{Angle, Distance, Negative, Radius};
+        use NumericField::{Angle, Distance, Negative, Pitch, Radius};
         match self {
             FeatureKind::OffsetPlane { .. } | FeatureKind::Chamfer { .. } => &[Distance],
             FeatureKind::AngledPlane { .. } | FeatureKind::Revolve { .. } => &[Angle],
@@ -274,6 +290,11 @@ impl FeatureKind {
                 Extent::ToFace(_) => &[],
             },
             FeatureKind::Fillet { .. } => &[Radius],
+            // A full-length thread has no length to drive.
+            FeatureKind::Thread { length, .. } => match length {
+                Some(_) => &[Pitch, Distance],
+                None => &[Pitch],
+            },
             _ => &[],
         }
     }
@@ -287,6 +308,8 @@ impl FeatureKind {
             (FeatureKind::OffsetPlane { distance, .. }, NumericField::Distance) => Some(*distance),
             (FeatureKind::Chamfer { distance, .. }, NumericField::Distance) => Some(*distance),
             (FeatureKind::Fillet { radius, .. }, NumericField::Radius) => Some(*radius),
+            (FeatureKind::Thread { pitch, .. }, NumericField::Pitch) => Some(*pitch),
+            (FeatureKind::Thread { length, .. }, NumericField::Distance) => *length,
             (FeatureKind::AngledPlane { angle, .. }, NumericField::Angle)
             | (FeatureKind::Revolve { angle, .. }, NumericField::Angle) => Some(angle.to_degrees()),
             (FeatureKind::Extrude { extent, .. }, NumericField::Distance) => match extent {
@@ -328,6 +351,20 @@ impl FeatureKind {
             }
             (FeatureKind::Fillet { radius, .. }, NumericField::Radius) => {
                 *radius = value;
+                true
+            }
+            (FeatureKind::Thread { pitch, .. }, NumericField::Pitch) => {
+                *pitch = value;
+                true
+            }
+            (
+                FeatureKind::Thread {
+                    length: Some(length),
+                    ..
+                },
+                NumericField::Distance,
+            ) => {
+                *length = value;
                 true
             }
             (FeatureKind::AngledPlane { angle, .. }, NumericField::Angle)
@@ -438,6 +475,7 @@ impl FeatureKind {
             FeatureKind::Fillet { edges, .. } | FeatureKind::Chamfer { edges, .. } => {
                 out.extend(edges.iter().map(|e| e.body.0));
             }
+            FeatureKind::Thread { face, .. } => out.push(face.body.0),
             FeatureKind::Combine { target, tools, .. } => {
                 out.push(target.0);
                 out.extend(tools.iter().map(|b| b.0));
@@ -524,7 +562,31 @@ mod tests {
                 operation: BodyOp::NewBody,
                 component: ComponentId::ROOT,
             },
+            FeatureKind::Thread {
+                face: thread_face(),
+                pitch: 1.5,
+                length: None,
+                left_handed: false,
+                reversed: false,
+            },
+            FeatureKind::Thread {
+                face: thread_face(),
+                pitch: 1.5,
+                length: Some(8.0),
+                left_handed: true,
+                reversed: false,
+            },
         ]
+    }
+
+    fn thread_face() -> crate::refs::FaceRef {
+        crate::refs::FaceRef {
+            body: BodyRef(FeatureId(1)),
+            key: basset_kernel::FaceKey::new(
+                basset_kernel::OpId::new(1),
+                basset_kernel::FaceRole::Side(0),
+            ),
+        }
     }
 
     #[test]
@@ -550,10 +612,10 @@ mod tests {
 
     #[test]
     fn a_field_a_kind_does_not_offer_is_neither_read_nor_written() {
-        use NumericField::{Angle, Distance, Negative, Radius};
+        use NumericField::{Angle, Distance, Negative, Pitch, Radius};
         for mut kind in every_kind() {
             let offered = kind.numeric_fields().to_vec();
-            for field in [Distance, Negative, Angle, Radius] {
+            for field in [Distance, Negative, Angle, Radius, Pitch] {
                 if offered.contains(&field) {
                     continue;
                 }

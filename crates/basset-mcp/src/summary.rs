@@ -180,6 +180,20 @@ pub fn feature(f: &Feature, state: &ModelState) -> Value {
             "edges": edges.iter().map(|e| json!({ "body": e.body.0.0, "edge": edge_key_to_string(e.key) })).collect::<Vec<_>>(),
             "distance": round(*distance),
         }),
+        FeatureKind::Thread {
+            face,
+            pitch,
+            length,
+            left_handed,
+            reversed,
+        } => json!({
+            "body": face.body.0.0,
+            "face": face_key_to_string(face.key),
+            "pitch": round(*pitch),
+            "length": length.map(round),
+            "left_handed": left_handed,
+            "reversed": reversed,
+        }),
         FeatureKind::Combine {
             target,
             tools,

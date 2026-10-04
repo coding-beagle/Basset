@@ -821,7 +821,10 @@ impl Editor {
                 if !additive && self.tool.is_none() {
                     self.selection.clear();
                 }
-                if !tools::take_to_face_pick(self, &pick) && !tools::expand_face_pick(self, &pick) {
+                if !tools::take_to_face_pick(self, &pick)
+                    && !tools::take_thread_pick(self, &pick)
+                    && !tools::expand_face_pick(self, &pick)
+                {
                     self.selection.toggle(&pick);
                 }
                 self.selected_feature = pick.feature();

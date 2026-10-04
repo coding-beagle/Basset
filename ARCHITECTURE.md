@@ -9,7 +9,7 @@ feature parity with Fusion 360; the MVP deliberately ships few tools, each finis
 basset-math      f64 vectors (glam), Frame/Plane/Ray, tolerances, TriMesh interchange type
 basset-sketch    2D sketch entities, constraints, solver, shapes, text, profile extraction
 basset-kernel    solid modelling: Solid/Face topology, CSG, extrude/revolve/sweep/loft,
-                  fillet/chamfer/combine/transform, tessellation, picking, mass properties
+                  fillet/chamfer/thread/combine/transform, tessellation, picking, mass properties
 basset-core      Document, Components, Planes/Axes/Sketches/Bodies, document parameters,
                   Timeline + regeneration, document save/open (.bass JSON)
 basset-io        STL / 3MF export
@@ -42,7 +42,7 @@ Every entity is produced by a timeline feature and is identified by the `Feature
 feature that produced it. Faces are identified by a `FaceKey { op: OpId, role }` where
 `OpId` is the feature id plus a sub-index (one per profile a feature extrudes) and
 `role` is deterministic from the operation's inputs (`StartCap`, `EndCap`, `Side(curve)`,
-`Fillet(n)`, `Chamfer(n)`). Booleans preserve `FaceKey`s of surviving face fragments.
+`Fillet(n)`, `Chamfer(n)`, `Thread(n)`). Booleans preserve `FaceKey`s of surviving face fragments.
 Edges are identified by the unordered pair of `FaceKey`s they separate (`EdgeKey`).
 Sketch profiles are referenced by a sample point inside the region together with a
 signature of the curves that bounded it when it was picked (`ProfileRef::curves`, an
@@ -132,6 +132,20 @@ Details worth knowing:
   need a corner blend). Along a chain that turns, the arc is drawn no finer than 10° per
   facet: the boolean cuts the body's faces along the arc's tangent facets, and finer
   tangent facets on a curved chain disagree about where the face ends.
+* A thread is a tool too: the ISO metric groove swept along a helix about a cylindrical
+  face and subtracted, cut inward from a shaft (the face is the major diameter) and
+  outward from a hole (the minor one, so a hole drilled at the tap size threads to size).
+  It runs a turn past an end that opens into air and is clipped dead in the plane of an
+  end that runs into material, a shoulder or a hole's floor. A helical flank cannot be
+  faceted flat, so each facet of one is two triangles, and the BSP is at its weakest
+  there: two near-parallel cuts across a body facet leave a sliver below its tolerance
+  and the shell leaks. Three measures together closed all 155 threads of a sweep over
+  sizes and pitches where the plain helix closed 100: the root steps a hundredth of the
+  pitch along the axis on alternate rings, which creases every flank facet by a degree
+  or so; each attempt is validated and retried drawn a fraction of a facet round with
+  the other diagonals; the last retries draw 24 facets to the turn instead of 36. Fewer
+  facets from the start would have been robust but inaccurate — the groove is an
+  inscribed polygon, and at 12 to the turn its chords cut a fifth of an M10's depth.
 * A BSP tree over a convex body is a list — the solid is the intersection of its face
   half-spaces, so every face plane has the rest behind it — and a boolean is quadratic
   in the facets of such a body. A fillet tool swept round a rim is one, and so is the
@@ -325,10 +339,10 @@ A feature's numbers are driven by the same expressions. `Feature::exprs` is a
 each number: the numbers live in the variants of `FeatureKind` and most of them are never
 driven, so a neighbour field would have to be added to a dozen variants, written `None`
 at every construction site, and could still come to disagree with the number it annotates.
-A `NumericField` names a value by role — `Distance`, `Negative`, `Angle`, `Radius` — so
-one key means the same thing across the kinds that offer it (an extrude's distance and
-second distance, a revolve's angle, a fillet's radius, a chamfer's distance, an offset
-plane's distance, an angled plane's angle) and a panel can label it without matching on
+A `NumericField` names a value by role — `Distance`, `Negative`, `Angle`, `Radius`,
+`Pitch` — so one key means the same thing across the kinds that offer it (an extrude's
+distance and second distance, a revolve's angle, a fillet's radius, a chamfer's distance,
+a thread's pitch and length, an offset plane's distance, an angled plane's angle) and a panel can label it without matching on
 the kind.
 
 Replay resolves those expressions into a *copy* of the feature (`Regenerator::drive`,
