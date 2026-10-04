@@ -227,6 +227,7 @@ impl Document {
         if self.timeline.index_of(id).is_none() {
             return Err(DocumentError::UnknownFeature(id));
         }
+        self.sign_region_refs(id);
         self.record_undo();
         let index = self
             .timeline
@@ -609,6 +610,70 @@ impl Document {
         self.regen.invalidate_from(0);
     }
 
+    /// Gives every region picked from sketch `id` by its sample point alone the signature
+    /// of the region that point finds now, before the sketch is changed.
+    ///
+    /// References made before signatures existed find their region by the point, and a
+    /// point is a place in a drawing that is about to move: drag a circle off the point an
+    /// extrude was picked at and the extrude takes whatever region is left around the
+    /// point — the square the circle sat in, say. Recording the curves now changes nothing
+    /// about what the reference finds (the region the point finds is the smallest holding
+    /// it, and it is the smallest among those with its own curves too), but from here on
+    /// the curves find it wherever the edit puts them. Nothing happens for a feature that
+    /// is not a sketch, a sketch past the cursor, or one that failed to solve.
+    fn sign_region_refs(&mut self, id: FeatureId) {
+        let unsigned = |f: &Feature| match &f.kind {
+            FeatureKind::Extrude { regions, .. }
+            | FeatureKind::Revolve { regions, .. }
+            | FeatureKind::Sweep { regions, .. }
+            | FeatureKind::Loft { regions, .. } => regions
+                .iter()
+                .any(|r| matches!(r, RegionRef::Profile(p) if p.sketch == id && p.curves == 0)),
+            _ => false,
+        };
+        if !matches!(
+            self.timeline.get(id).map(|f| &f.kind),
+            Some(FeatureKind::Sketch { .. })
+        ) || !self.timeline.features().iter().any(unsigned)
+        {
+            return;
+        }
+        let Some(index) = self.timeline.index_of(id) else {
+            return;
+        };
+        if index >= self.timeline.cursor() {
+            return;
+        }
+        self.sync_parameters();
+        let Some(solved) = self
+            .regen
+            .evaluate_prefix(&self.timeline, index + 1)
+            .sketches
+            .get(&id)
+            .cloned()
+        else {
+            return;
+        };
+        let mut first = None;
+        for (at, feature) in self.timeline.features_mut().iter_mut().enumerate() {
+            for region in feature.kind.regions_mut() {
+                let RegionRef::Profile(p) = region else {
+                    continue;
+                };
+                if p.sketch != id || p.curves != 0 {
+                    continue;
+                }
+                if let Some(found) = crate::regen::smallest_region_at(&solved.profiles, p.sample) {
+                    p.curves = crate::regen::region_signature(found);
+                    first.get_or_insert(at);
+                }
+            }
+        }
+        if let Some(at) = first {
+            self.regen.invalidate_from(at);
+        }
+    }
+
     /// Edits a sketch feature with the document's parameter table in hand.
     ///
     /// Binding a dimension to an expression has to resolve the names in it *now*, to refuse
@@ -627,6 +692,7 @@ impl Document {
         ) {
             return Err(DocumentError::UnknownFeature(id));
         }
+        self.sign_region_refs(id);
         self.record_undo();
         let lookup = self.parameters.lookup();
         let mut out = None;

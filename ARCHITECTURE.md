@@ -56,7 +56,11 @@ region falls back to the point, and if that encloses nothing either, to the near
 region with a warning, since it was once inside one and the drawing moved under it; a
 point-only reference (files from before the signature existed) that encloses nothing
 fails as it always did, because guessing a region for a point never known to be inside
-anything would turn a typo into a body. Planar faces used
+anything would turn a typo into a body. Such a reference is given its signature the
+moment its sketch is about to be edited (`Document::sign_region_refs`): the region its
+point finds then is the one the user sees, so recording its curves changes nothing yet,
+and from then on a circle dragged off the point keeps its cut instead of handing it to
+the square around it. Planar faces used
 as sketch planes get a frame whose origin is where the world origin falls on the face's
 plane, as in Fusion: nothing about the face's extent goes into it, so a sketch on a wall
 stays where it was drawn when an edit upstream makes the wall taller. (Before format 10
