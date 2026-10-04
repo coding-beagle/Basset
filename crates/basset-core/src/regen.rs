@@ -795,6 +795,15 @@ pub fn region_signature(p: &Profile) -> u64 {
     basset_sketch::curve_signature(p.loops().flat_map(|c| c.segments.iter()).map(|s| s.curve))
 }
 
+/// The region a point-only reference finds: the smallest one holding the point, because
+/// nested regions are the inner one being clicked.
+pub(crate) fn smallest_region_at(profiles: &[Profile], point: Vec2) -> Option<&Profile> {
+    profiles
+        .iter()
+        .filter(|profile| profile_contains(profile, point))
+        .min_by(|a, b| profile_area(a).total_cmp(&profile_area(b)))
+}
+
 /// Distance from a point to the region's boundary; zero inside.
 fn profile_distance(p: &Profile, point: Vec2) -> f64 {
     if profile_contains(p, point) {

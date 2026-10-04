@@ -1507,3 +1507,34 @@ fn the_top_loop_of_a_t_rounds_and_a_bead_meeting_it_is_refused() {
         epsilon = 1e-6
     );
 }
+
+/// A hole picked by its sample point alone, as files from before region signatures have
+/// it, inside a square drawn round it. Moving the drawing up leaves the point inside the
+/// square but outside the circle; the cut must stay the circle, not become the square.
+#[test]
+fn a_point_only_region_follows_its_curves_when_the_sketch_moves() {
+    let mut doc = Document::new("point only");
+    let (base, _) = rect_sketch(20.0, 20.0);
+    let sk = sketch_on(&mut doc, PlaneRef::Origin(OriginPlane::XY), base);
+    let block = extrude(&mut doc, sk, Vec2::new(1.0, 1.0), 5.0, BodyOp::NewBody);
+    let mut drawing = Sketch::new();
+    shapes::rectangle_two_point(&mut drawing, Vec2::new(6.0, 6.0), Vec2::new(14.0, 14.0));
+    shapes::circle_center(&mut drawing, Vec2::new(10.0, 10.0), 2.0);
+    let holes = sketch_on(&mut doc, PlaneRef::Origin(OriginPlane::XY), drawing);
+    // Picked just inside the circle, the way a click lands.
+    let cut = extrude(
+        &mut doc,
+        holes,
+        Vec2::new(9.7, 9.9),
+        5.0,
+        BodyOp::Cut(vec![BodyRef(block)]),
+    );
+    let hole = PI * 4.0 * 5.0;
+    assert_relative_eq!(volume(&mut doc, block), 2000.0 - hole, epsilon = 0.5);
+
+    doc.edit_sketch(holes, |s, _| s.translate(Vec2::new(0.0, 2.5)))
+        .unwrap();
+    // Found by its curves, with no fallback to the nearest region and its warning.
+    assert_eq!(doc.state().status(cut), Some(&FeatureStatus::Ok));
+    assert_relative_eq!(volume(&mut doc, block), 2000.0 - hole, epsilon = 0.5);
+}
