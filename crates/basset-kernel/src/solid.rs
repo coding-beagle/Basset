@@ -364,6 +364,7 @@ fn neighbour_tag(neighbour: FaceKey) -> u32 {
         crate::ids::FaceRole::Fillet(c) => (3, c),
         crate::ids::FaceRole::Chamfer(c) => (4, c),
         crate::ids::FaceRole::Generic(c) => (5, c),
+        crate::ids::FaceRole::Thread(c) => (6, c),
     };
     eat(discriminant);
     for byte in payload.to_le_bytes() {

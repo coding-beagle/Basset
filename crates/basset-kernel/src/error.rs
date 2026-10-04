@@ -54,6 +54,22 @@ pub enum KernelError {
         "blend of {size:.3} mm runs past the material it has to work with: this edge has room for {limit:.3} mm"
     )]
     BlendTooLarge { size: f64, limit: f64 },
+    #[error("face {0:?} is not cylindrical: a thread goes on a shaft or into a hole")]
+    NotCylindricalFace(FaceKey),
+    #[error("thread pitch must be positive")]
+    NonPositivePitch,
+    #[error(
+        "a {pitch:.3} mm pitch cuts {depth:.3} mm deep, which leaves nothing of a {radius:.3} mm shaft: use a finer pitch"
+    )]
+    ThreadTooDeep { pitch: f64, depth: f64, radius: f64 },
+    #[error(
+        "thread length must be positive and fit on the face: asked for {length:.3} mm, the face is {available:.3} mm long"
+    )]
+    ThreadLength { length: f64, available: f64 },
+    #[error(
+        "thread would need {needed} facets, over the budget of {budget}: use a coarser pitch or a shorter length"
+    )]
+    ThreadTooDense { needed: usize, budget: usize },
     #[error("the target face is parallel to the extrude direction")]
     TargetFaceParallel,
     #[error(

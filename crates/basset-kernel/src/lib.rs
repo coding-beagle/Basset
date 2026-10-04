@@ -33,6 +33,7 @@ pub mod measure;
 pub mod pick;
 pub mod primitives;
 pub mod solid;
+pub mod thread;
 
 pub use blend::{chamfer, fillet};
 pub use csg::{BoolOp, boolean};
@@ -47,3 +48,4 @@ pub use measure::{
 };
 pub use pick::{EdgePick, FacePick, VertexPick, corners, pick_edge, pick_face, pick_vertex};
 pub use solid::{Edge, EdgeSegment, Face, Polygon, Solid, SurfaceKind, Tessellated};
+pub use thread::{CylinderFace, ThreadSpec, cylinder_face, thread};
