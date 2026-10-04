@@ -4,6 +4,8 @@ struct MeshDraw {
     normal_matrix: mat4x4<f32>,
     color: vec4<f32>,
     highlight_color: vec4<f32>,
+    // x: 1.0 when the vertices' own colours replace `color`.
+    params: vec4<f32>,
 };
 @group(1) @binding(0) var<uniform> draw: MeshDraw;
 
@@ -14,6 +16,7 @@ struct VsIn {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) face_id: u32,
+    @location(3) color: vec3<f32>,
 };
 
 struct VsOut {
@@ -21,6 +24,7 @@ struct VsOut {
     @location(0) world_pos: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) @interpolate(flat) highlighted: u32,
+    @location(3) color: vec3<f32>,
 };
 
 fn is_highlighted(face_id: u32) -> u32 {
@@ -39,12 +43,17 @@ fn vs_main(in: VsIn) -> VsOut {
     out.world_pos = world.xyz;
     out.normal = (draw.normal_matrix * vec4<f32>(in.normal, 0.0)).xyz;
     out.highlighted = is_highlighted(in.face_id);
+    out.color = in.color;
     return out;
 }
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let base = select(draw.color, draw.highlight_color, in.highlighted == 1u);
+    var base = draw.color;
+    if draw.params.x > 0.5 {
+        base = vec4<f32>(in.color, draw.color.a);
+    }
+    base = select(base, draw.highlight_color, in.highlighted == 1u);
     let view_dir = normalize(globals.camera_pos.xyz - in.world_pos);
     var n = normalize(in.normal);
     // Two-sided lighting: back faces are visible inside open or sectioned bodies, and a

@@ -1,0 +1,17 @@
+[package]
+name = "basset-fea"
+description = "Basic finite element analysis for Basset: voxel hexahedral meshing of a solid, linear elastic static solve, von Mises stresses, VTK export."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+basset-math = { workspace = true }
+basset-kernel = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }

@@ -14,4 +14,6 @@ pub enum ViewportError {
     NormalCountMismatch { positions: usize, normals: usize },
     #[error("mesh has {face_ids} face ids for {triangles} triangles")]
     FaceIdCountMismatch { triangles: usize, face_ids: usize },
+    #[error("mesh has {colors} vertex colours for {positions} positions")]
+    ColorCountMismatch { positions: usize, colors: usize },
 }

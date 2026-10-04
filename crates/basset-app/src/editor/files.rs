@@ -22,6 +22,8 @@ impl Editor {
         }
         self.compare = None;
         self.commit_box = None;
+        // A study was of a body of the old document.
+        self.simulation = None;
         self.selection.clear();
         self.apply_visibility(&Visibility::default());
         self.active_component = basset_core::ComponentId::ROOT;
@@ -53,6 +55,7 @@ impl Editor {
                 // its own.
                 self.compare = None;
                 self.commit_box = None;
+                self.simulation = None;
                 self.refresh_project();
                 self.selection.clear();
                 let visibility = self.doc.visibility().clone();

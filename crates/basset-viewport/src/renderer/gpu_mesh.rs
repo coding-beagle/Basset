@@ -15,13 +15,17 @@ pub(crate) struct MeshVertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
     pub face_id: u32,
+    /// Linear RGB, read only when the mesh was uploaded with colours; a plain mesh
+    /// carries white here and the shader never looks at it. Every mesh pays the twelve
+    /// bytes so there is one vertex layout and one pipeline family rather than two.
+    pub color: [f32; 3],
 }
 
 impl MeshVertex {
     pub const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
         array_stride: size_of::<MeshVertex>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Vertex,
-        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Uint32],
+        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Uint32, 3 => Float32x3],
     };
 }
 
@@ -77,16 +81,29 @@ pub(crate) struct GpuMesh {
     /// Facet adjacency for the silhouette. Built here, with the upload, because that is
     /// the one moment the mesh is known to have changed.
     pub silhouette: Silhouette,
+    /// Whether the vertices carry colours of their own, which then replace the instance
+    /// colour: a stress plot, where the colour is the data.
+    pub vertex_colored: bool,
 }
 
 impl GpuMesh {
+    /// `colors`, when given, is one linear RGB per entry of `mesh.positions`.
     pub fn upload(
         device: &wgpu::Device,
         mesh: &TriMesh,
+        colors: Option<&[[f32; 3]]>,
         edges: &[[Vec3; 2]],
     ) -> Result<Self, ViewportError> {
         validate(mesh)?;
-        let (vertices, indices) = split_vertices_by_face(mesh);
+        if let Some(c) = colors
+            && c.len() != mesh.positions.len()
+        {
+            return Err(ViewportError::ColorCountMismatch {
+                positions: mesh.positions.len(),
+                colors: c.len(),
+            });
+        }
+        let (vertices, indices) = split_vertices_by_face(mesh, colors);
         let edges: Vec<SegmentInstance> = edges
             .iter()
             .map(|[a, b]| SegmentInstance::new(*a, *b))
@@ -118,6 +135,7 @@ impl GpuMesh {
             edge_count: edges.len() as u32,
             highlight_words: max_face_id / 32 + 1,
             silhouette: Silhouette::build(mesh),
+            vertex_colored: colors.is_some(),
         })
     }
 }
@@ -154,15 +172,20 @@ fn validate(mesh: &TriMesh) -> Result<(), ViewportError> {
 /// Face ids live per triangle in a `TriMesh` but per vertex on the GPU. A vertex shared by
 /// triangles of different faces (smooth-shaded kernels do this along tangent edges) is
 /// duplicated once per face; everything else keeps its index reuse.
-fn split_vertices_by_face(mesh: &TriMesh) -> (Vec<MeshVertex>, Vec<u32>) {
+fn split_vertices_by_face(
+    mesh: &TriMesh,
+    colors: Option<&[[f32; 3]]>,
+) -> (Vec<MeshVertex>, Vec<u32>) {
     let mut vertices: Vec<MeshVertex> = mesh
         .positions
         .iter()
         .zip(&mesh.normals)
-        .map(|(p, n)| MeshVertex {
+        .enumerate()
+        .map(|(i, (p, n))| MeshVertex {
             position: p.as_vec3().to_array(),
             normal: n.as_vec3().to_array(),
             face_id: u32::MAX,
+            color: colors.map_or([1.0; 3], |c| c[i]),
         })
         .collect();
     let mut duplicates: HashMap<(u32, u32), u32> = HashMap::new();
@@ -224,7 +247,7 @@ mod tests {
             indices: vec![0, 1, 2, 1, 3, 2],
             face_ids: vec![0, 1],
         };
-        let (vertices, indices) = split_vertices_by_face(&m);
+        let (vertices, indices) = split_vertices_by_face(&m, None);
         assert_eq!(
             vertices.len(),
             6,
@@ -235,6 +258,22 @@ mod tests {
             for &i in tri {
                 assert_eq!(vertices[i as usize].face_id, face);
             }
+        }
+    }
+
+    #[test]
+    fn colours_follow_their_vertex_through_duplication() {
+        let m = TriMesh {
+            positions: vec![Vec3::ZERO, Vec3::X, Vec3::Y, Vec3::new(1.0, 1.0, 0.0)],
+            normals: vec![Vec3::Z; 4],
+            indices: vec![0, 1, 2, 1, 3, 2],
+            face_ids: vec![0, 1],
+        };
+        let colors = [[0.0; 3], [0.25; 3], [0.5; 3], [0.75; 3]];
+        let (vertices, indices) = split_vertices_by_face(&m, Some(&colors));
+        for (k, &i) in indices.iter().enumerate() {
+            let original = m.indices[k] as usize;
+            assert_eq!(vertices[i as usize].color, colors[original]);
         }
     }
 

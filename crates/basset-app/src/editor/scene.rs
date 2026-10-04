@@ -48,15 +48,35 @@ const DIFF_REMOVED_BODY: [f32; 4] = [0.92, 0.28, 0.26, 1.0];
 /// A ghost of the whole base body carrying its removed faces: nothing of it shows but the
 /// faces lit red, so the body's unchanged faces do not double what is already drawn.
 const INVISIBLE: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
+/// The faces a study holds still and the faces it loads, while the dialog is open and the
+/// plot is not up. The held faces take the instance's one highlight; the loaded ones are
+/// a depth-tested fill over the face, which is how a second colour lands on the same body
+/// without a second instance (that would lose the depth test to the first).
+const STUDY_FIXED: [f32; 4] = [0.30, 0.55, 1.0, 1.0];
+const STUDY_LOAD: [f32; 4] = [1.0, 0.55, 0.15, 0.65];
 
 pub fn build(editor: &Editor) -> Scene<'_> {
     let mut scene = Scene::new(&editor.camera);
     scene.show_grid = editor.show_grid;
     scene.show_grid_axes = editor.show_axes;
 
+    // The study, if one is open: the body the plot stands in for, and the faces picked
+    // for it to light up while the plot is down.
+    let revision = editor.doc.revision();
+    let plotted = editor
+        .simulation
+        .as_ref()
+        .and_then(|s| s.plotted(revision))
+        .map(|(body, _)| body);
+    let study = editor
+        .simulation
+        .as_ref()
+        .filter(|_| plotted.is_none())
+        .and_then(|s| s.body.map(|b| (b, s)));
+
     // Bodies with face highlights.
     for (id, mesh) in editor.meshes_iter() {
-        if editor.hidden_bodies.contains(&id) {
+        if editor.hidden_bodies.contains(&id) || plotted == Some(id) {
             continue;
         }
         let mut instance = MeshInstance::new(mesh.handle);
@@ -90,6 +110,15 @@ pub fn build(editor: &Editor) -> Scene<'_> {
         {
             instance.highlight_faces.extend(face_index(f.key));
         }
+        if let Some((body, sim)) = study
+            && body == id
+            && !sim.fixed.is_empty()
+        {
+            instance.highlight_color = STUDY_FIXED;
+            for key in &sim.fixed {
+                instance.highlight_faces.extend(face_index(*key));
+            }
+        }
         // What the comparison has to say about this body. A body with a face selected or
         // hovered keeps the selection colour: the instance has one highlight colour, and
         // the user pointing at a face is asking about that face, not about the diff.
@@ -113,6 +142,46 @@ pub fn build(editor: &Editor) -> Scene<'_> {
             _ => {}
         }
         scene.meshes.push(instance);
+    }
+
+    // The stress plot in the studied body's place. Headless there is no GPU copy, and the
+    // body is simply not drawn, which is what the tests look for.
+    if plotted.is_some()
+        && let Some(results) = editor.results_mesh.as_ref()
+    {
+        let mut instance = MeshInstance::new(results.handle);
+        instance.style = MeshStyle::Shaded;
+        scene.meshes.push(instance);
+    }
+    // The faces a study loads, as a fill over each. Every triangle of the face, so a
+    // curved face is lit whole.
+    if let Some((body, sim)) = study
+        && !sim.loaded.is_empty()
+        && !editor.hidden_bodies.contains(&body)
+        && let Some(pick) = editor.pick_body(body)
+    {
+        let mut fill = TriBatch::new(STUDY_LOAD);
+        fill.depth_test = true;
+        let mesh = &pick.tess.mesh;
+        for (tri, face) in mesh.face_ids.iter().enumerate() {
+            let Some(key) = pick.tess.face_keys.get(*face as usize) else {
+                continue;
+            };
+            if !sim.loaded.contains(key) {
+                continue;
+            }
+            let at = |k: usize| {
+                mesh.indices
+                    .get(tri * 3 + k)
+                    .and_then(|i| mesh.positions.get(*i as usize).copied())
+            };
+            if let (Some(a), Some(b), Some(c)) = (at(0), at(1), at(2)) {
+                fill.triangles.push([a, b, c]);
+            }
+        }
+        if !fill.triangles.is_empty() {
+            scene.tris.push(fill);
+        }
     }
 
     // What the compared version had and this one has not: removed bodies whole, and of

@@ -5238,3 +5238,252 @@ mod thread {
         h.cancel_tool();
     }
 }
+
+/// The Simulate tool: a study set up by clicking faces, run from its dialog and read back
+/// as a plot. The bar is 100 × 10 × 10 mm, which beam theory bends 0.2 mm under 100 N at
+/// its free end (δ = FL³/3EI with I = 10⁴/12 mm⁴ and E = 200 GPa), the number the test
+/// pins the solver to.
+mod simulate {
+    use basset_core::{ComponentId, FeatureKind, OriginPlane, PlaneRef, Sketch};
+    use basset_math::{Vec2, Vec3};
+    use basset_sketch::shapes;
+    use basset_viewport::ViewPreset;
+
+    use crate::editor::harness::Harness;
+    use crate::editor::simulate::{self, Armed};
+
+    /// A bar along x from 0 to 100, 10 square, standing on the XY plane.
+    fn bar() -> (Harness, basset_core::BodyRef) {
+        let mut h = Harness::new();
+        let mut sketch = Sketch::new();
+        shapes::rectangle_two_point(&mut sketch, Vec2::ZERO, Vec2::new(100.0, 10.0));
+        h.editor.doc.add_feature(FeatureKind::Sketch {
+            plane: PlaneRef::Origin(OriginPlane::XY),
+            component: ComponentId::ROOT,
+            sketch,
+        });
+        h.editor.refresh_cache();
+        let body = h.extrude(Vec2::new(50.0, 5.0), 10.0);
+        (h, body)
+    }
+
+    /// Clicks the end face of the bar at `x`, looking straight at it so the click cannot
+    /// land on a side.
+    fn click_end(h: &mut Harness, x: f64) {
+        h.editor.look_from(if x > 50.0 {
+            ViewPreset::Right
+        } else {
+            ViewPreset::Left
+        });
+        h.editor.zoom_to_fit();
+        h.click_world(Vec3::new(x, 5.0, 5.0));
+    }
+
+    /// Holds one end and loads the other with 100 N downwards, through the dialog's own
+    /// controls, on bricks fine enough for bending to come out right.
+    fn set_up(h: &mut Harness) {
+        assert!(h.click_ui("Simulate"), "the toolbar has the button");
+        assert!(h.editor.simulation.is_some());
+        click_end(h, 0.0);
+        // The dialog is laid out afresh each frame, and a click lands on the last one.
+        h.frame();
+        assert!(h.click_ui("Pick loads"), "the dialog arms the load list");
+        click_end(h, 100.0);
+        let sim = h.editor.simulation.as_mut().expect("the dialog is open");
+        assert_eq!(sim.fixed.len(), 1, "one held face");
+        assert_eq!(sim.loaded.len(), 1, "one loaded face");
+        assert_ne!(sim.fixed[0], sim.loaded[0]);
+        assert_eq!(sim.element_size, 5.0, "a twentieth of the longest side");
+        sim.element_size = 2.0;
+        sim.force = Vec3::new(0.0, 0.0, -100.0);
+    }
+
+    #[test]
+    fn the_toolbar_button_opens_the_dialog_on_the_only_body() {
+        let (mut h, body) = bar();
+        assert!(h.click_ui("Simulate"));
+        let sim = h.editor.simulation.as_ref().expect("opened");
+        assert_eq!(
+            sim.body,
+            Some(body),
+            "the one body needs no pick to choose it"
+        );
+        let frame = h.frame();
+        assert!(frame.has_text("Fixed faces") && frame.has_text("Load faces"));
+        assert!(frame.has_text("Run"));
+        // Nothing of this touched the document.
+        assert!(!h.editor.doc.in_transaction());
+        assert_eq!(h.editor.doc.timeline().features().len(), 2);
+        h.editor.cancel();
+        assert!(h.editor.simulation.is_none(), "Escape closes it");
+    }
+
+    #[test]
+    fn a_face_clicked_twice_leaves_the_list_and_a_face_moves_between_lists() {
+        let (mut h, _) = bar();
+        simulate::start(&mut h.editor);
+        click_end(&mut h, 0.0);
+        assert_eq!(h.editor.simulation.as_ref().unwrap().fixed.len(), 1);
+        click_end(&mut h, 0.0);
+        assert!(
+            h.editor.simulation.as_ref().unwrap().fixed.is_empty(),
+            "picked again, the face is removed"
+        );
+        click_end(&mut h, 0.0);
+        h.editor.simulation.as_mut().unwrap().armed = Armed::Load;
+        click_end(&mut h, 0.0);
+        let sim = h.editor.simulation.as_ref().unwrap();
+        assert!(
+            sim.fixed.is_empty() && sim.loaded.len() == 1,
+            "held or loaded, not both"
+        );
+        assert!(
+            h.editor.selection.faces.is_empty(),
+            "a study's picks are not a selection"
+        );
+    }
+
+    #[test]
+    fn faces_of_a_second_body_are_refused() {
+        let (mut h, body) = bar();
+        // A second block, off to the side.
+        let mut sketch = Sketch::new();
+        shapes::rectangle_two_point(&mut sketch, Vec2::new(0.0, 30.0), Vec2::new(10.0, 40.0));
+        h.editor.doc.add_feature(FeatureKind::Sketch {
+            plane: PlaneRef::Origin(OriginPlane::XY),
+            component: ComponentId::ROOT,
+            sketch,
+        });
+        h.editor.refresh_cache();
+        let other = h.extrude(Vec2::new(5.0, 35.0), 10.0);
+        simulate::start(&mut h.editor);
+        assert_eq!(
+            h.editor.simulation.as_ref().unwrap().body,
+            None,
+            "two bodies: the first pick decides"
+        );
+        h.editor.look_from(ViewPreset::Top);
+        h.editor.zoom_to_fit();
+        h.click_world(Vec3::new(50.0, 5.0, 10.0));
+        let sim = h.editor.simulation.as_ref().unwrap();
+        assert_eq!(sim.body, Some(body));
+        assert_eq!(sim.fixed.len(), 1);
+        h.click_world(Vec3::new(5.0, 35.0, 10.0));
+        let sim = h.editor.simulation.as_ref().unwrap();
+        assert_eq!(sim.fixed.len(), 1, "the other body's face was not taken");
+        assert_ne!(sim.body, Some(other));
+        assert!(h.editor.status.contains("one body"), "{}", h.editor.status);
+    }
+
+    #[test]
+    fn a_cantilever_bends_as_beam_theory_says_and_the_plot_replaces_the_body() {
+        let (mut h, body) = bar();
+        set_up(&mut h);
+        h.frame();
+        assert!(h.click_ui("Run"), "the dialog's Run button");
+        let revision = h.editor.doc.revision();
+        let sim = h.editor.simulation.as_ref().expect("still open");
+        let outcome = sim
+            .outcome
+            .as_ref()
+            .unwrap_or_else(|| panic!("the run failed: {}", sim.message));
+        let (max_disp, _) = outcome.results.max_displacement();
+        assert!(
+            (max_disp - 0.2).abs() < 0.02,
+            "max displacement {max_disp} mm is not within 10% of 0.2 mm"
+        );
+        assert!(outcome.results.max_von_mises().0 > 0.0);
+        assert!(
+            outcome.results.reaction.z > 90.0,
+            "the wall holds the load up"
+        );
+        assert!(!sim.is_stale(revision));
+        assert_eq!(sim.plotted(revision).map(|(b, _)| b), Some(body));
+        assert!(sim.scale > 1.0, "microns are exaggerated to be seen");
+
+        // The dialog reports the run.
+        let frame = h.frame();
+        assert!(frame.has_text("Max displacement"), "{:?}", frame.text());
+        assert!(frame.has_text("Max von Mises"));
+        assert!(frame.has_text("Reaction"));
+        assert!(frame.has_text("iterations"));
+        assert!(frame.has_text("Show results"));
+        assert!(frame.has_text("MPa"), "the legend is labelled");
+
+        // With the plot up the body is not drawn and neither is the load fill; headless
+        // there is no GPU copy of the plot, so what shows is nothing at all.
+        let scene = h.editor.scene();
+        assert!(scene.meshes.is_empty(), "the body's own mesh stands down");
+        assert!(scene.tris.is_empty());
+        // Hidden, the body comes back with its picked faces lit.
+        h.editor.simulation.as_mut().unwrap().show = false;
+        let scene = h.editor.scene();
+        assert_eq!(scene.tris.len(), 1, "the loaded face is filled");
+        assert_eq!(
+            scene.tris[0].triangles.len(),
+            2,
+            "one square end, two triangles"
+        );
+        assert!(scene.tris[0].depth_test);
+        assert!(!h.editor.doc.in_transaction(), "a study is not an edit");
+    }
+
+    #[test]
+    fn an_edit_marks_the_results_stale() {
+        let (mut h, body) = bar();
+        set_up(&mut h);
+        simulate::run(&mut h.editor);
+        let before = h.editor.doc.revision();
+        assert!(h.editor.simulation.as_ref().unwrap().outcome.is_some());
+        assert!(h.frame().has_text("Max displacement"));
+        assert!(!h.frame().has_text("stale"));
+        // An edit: a parameter on the table is the smallest there is.
+        h.editor
+            .doc
+            .set_parameter("w", "12")
+            .expect("a new parameter");
+        let after = h.editor.doc.revision();
+        assert_ne!(before, after);
+        let sim = h.editor.simulation.as_ref().unwrap();
+        assert!(sim.is_stale(after));
+        assert!(sim.plotted(after).is_none(), "stale results are not drawn");
+        assert!(h.frame().has_text("stale"));
+        // The body is back in the scene's accounting: its faces light up again.
+        let scene = h.editor.scene();
+        assert_eq!(scene.tris.len(), 1);
+        // Running again clears it.
+        simulate::run(&mut h.editor);
+        let sim = h.editor.simulation.as_ref().unwrap();
+        assert!(!sim.is_stale(h.editor.doc.revision()));
+        assert_eq!(
+            sim.plotted(h.editor.doc.revision()).map(|(b, _)| b),
+            Some(body)
+        );
+    }
+
+    #[test]
+    fn the_solver_s_refusal_is_shown_verbatim() {
+        let (mut h, _) = bar();
+        simulate::start(&mut h.editor);
+        // A new egui window sizes itself on its first frame and paints on its second.
+        h.frame();
+        h.frame();
+        assert!(h.click_ui("Run"));
+        let sim = h.editor.simulation.as_ref().unwrap();
+        assert!(sim.outcome.is_none());
+        assert_eq!(
+            sim.message,
+            simulate::error_text(&basset_fea::FeaError::NothingFixed)
+        );
+        assert!(h.frame().has_text("at least one fixed face"));
+    }
+
+    #[test]
+    fn starting_a_modelling_tool_closes_the_study() {
+        let (mut h, _) = bar();
+        simulate::start(&mut h.editor);
+        h.start_tool(crate::editor::tools::ToolKind::Fillet);
+        assert!(h.editor.simulation.is_none());
+        h.cancel_tool();
+    }
+}

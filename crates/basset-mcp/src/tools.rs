@@ -11,6 +11,7 @@ use basset_core::{
     BodyOp, BodyRef, CombineOp, ComponentId, Document, EdgeRef, Extent, FaceRef, FeatureId,
     FeatureKind, NumericField, ProfileRef, RegionRef, file,
 };
+use basset_fea::{Load, LoadKind, Material, Study};
 use basset_io::{ExportItem, Unit};
 use basset_math::{Affine3, Vec2};
 use basset_sketch::Sketch;
@@ -33,7 +34,9 @@ read sketch_info to find the closed regions (each has a 'sample' point inside it
 those regions by sample point. Inspect results with body_info and check_document; both report \
 whether every shell is closed and which features failed or warned. Units are millimetres; \
 angles cross this interface in degrees. Entity and constraint ids are the integers the replies \
-quote; faces are 'feature.sub:Role' strings and edges are two of those joined by '|'.";
+quote; faces are 'feature.sub:Role' strings and edges are two of those joined by '|'. fea_static runs \
+a linear elastic study on a body: fixed faces, forces or pressures on faces, and the displacement \
+and von Mises stress that result.";
 
 fn tool(name: &str, description: &str, schema: Value) -> Value {
     json!({ "name": name, "description": description, "inputSchema": schema })
@@ -265,6 +268,30 @@ pub fn tool_definitions() -> Vec<Value> {
             ),
         ),
         tool(
+            "fea_static",
+            "Linear elastic static analysis of a body on a voxel brick mesh: hold faces fixed, apply forces (N) or pressures (MPa) to faces, and get the maximum displacement (mm) and von Mises stress (MPa), where they occur, the reaction at the fixed faces, and optionally a legacy VTK file of the whole result. Face keys come from body_info with faces=true.",
+            obj(
+                json!({
+                    "body": { "type": "integer" },
+                    "fixed": { "type": "array", "items": { "type": "string" }, "description": "Face keys held still in every direction." },
+                    "loads": {
+                        "type": "array",
+                        "items": { "type": "object", "properties": {
+                            "face": { "type": "string" },
+                            "force": { "type": "array", "items": { "type": "number" }, "description": "Total force [x, y, z] in newtons, shared over the face by area." },
+                            "pressure": { "type": "number", "description": "Pressure in MPa pushing into the face; negative pulls." },
+                        }, "required": ["face"] },
+                    },
+                    "material": { "type": "string", "enum": ["steel", "aluminium"], "description": "A preset, default steel (E = 200 000 MPa, nu = 0.3)." },
+                    "youngs_modulus": { "type": "number", "description": "MPa; overrides the preset." },
+                    "poisson_ratio": { "type": "number", "description": "Overrides the preset." },
+                    "element_size": { "type": "number", "description": "Brick edge length in mm. Default: a twentieth of the body's longest extent. The solve time follows the element count." },
+                    "export": { "type": "string", "description": "Path of a .vtk file to write the mesh, displacements and stresses to." },
+                }),
+                &["body", "fixed", "loads"],
+            ),
+        ),
+        tool(
             "export",
             "Write bodies to an STL or 3MF file.",
             obj(
@@ -342,6 +369,7 @@ pub fn call(session: &mut Session, name: &str, args: &Value) -> Result<Value, To
             Ok(json!({ "removed": removed }))
         }
         "set_feature_expr" => set_feature_expr(session, args),
+        "fea_static" => fea_static(session, args),
         "export" => export(session, args),
         "run_script" => run_script(session, args),
         _ => Err(ToolError::bad(format!("unknown tool {name:?}"))),
@@ -1103,6 +1131,91 @@ fn body_info(session: &mut Session, args: &Value) -> Result<Value, ToolError> {
                 .map(summary::edge)
                 .collect(),
         );
+    }
+    Ok(out)
+}
+
+fn fea_static(session: &mut Session, args: &Value) -> Result<Value, ToolError> {
+    let id = BodyRef(feature_from_json(field(args, "body")?)?);
+    let fixed: Vec<_> = req_array(args, "fixed")?
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .ok_or_else(|| ToolError::bad(format!("expected a face key string, got {v}")))
+                .and_then(face_key_from_str)
+        })
+        .collect::<Result<_, _>>()?;
+    let mut loads = Vec::new();
+    for l in req_array(args, "loads")? {
+        let face = face_key_from_str(req_str(l, "face")?)?;
+        let kind = match (opt(l, "force"), opt_f64(l, "pressure")?) {
+            (Some(f), None) => LoadKind::Force(req_vec3(l, "force").map_err(|_| {
+                ToolError::bad(format!("a force is [x, y, z] in newtons, got {f}"))
+            })?),
+            (None, Some(p)) => LoadKind::Pressure(p),
+            _ => {
+                return Err(ToolError::bad(
+                    "each load needs exactly one of \"force\" or \"pressure\"",
+                ));
+            }
+        };
+        loads.push(Load { face, kind });
+    }
+    let mut material = match opt_str(args, "material") {
+        None | Some("steel") => Material::STEEL,
+        Some("aluminium") | Some("aluminum") => Material::ALUMINIUM,
+        Some(other) => {
+            return Err(ToolError::bad(format!(
+                "unknown material {other:?}; steel or aluminium, or give youngs_modulus and poisson_ratio"
+            )));
+        }
+    };
+    if let Some(e) = opt_f64(args, "youngs_modulus")? {
+        material.youngs_modulus = e;
+    }
+    if let Some(nu) = opt_f64(args, "poisson_ratio")? {
+        material.poisson_ratio = nu;
+    }
+    let export_path = opt_str(args, "export").map(PathBuf::from);
+
+    let doc = session.document_mut();
+    let state = doc.state();
+    let body = state.body(id).ok_or_else(|| {
+        let known: Vec<u64> = state.bodies.keys().map(|b| b.0.0).collect();
+        ToolError::bad(format!(
+            "no body {} at the timeline cursor; bodies: {known:?}",
+            id.0.0
+        ))
+    })?;
+    let extent = body.solid.aabb().extent();
+    let element_size = match opt_f64(args, "element_size")? {
+        Some(h) => h,
+        None => extent.x.max(extent.y).max(extent.z) / 20.0,
+    };
+    let study = Study {
+        material,
+        fixed,
+        loads,
+        element_size,
+    };
+    let results = basset_fea::run(&body.solid, &study)?;
+    let (dmax, d_at) = results.max_displacement();
+    let (smax, s_at) = results.max_von_mises();
+    let mut out = json!({
+        "body": id.0.0,
+        "nodes": results.mesh.nodes.len(),
+        "elements": results.mesh.elements.len(),
+        "element_size": summary::v3(results.mesh.size),
+        "mesh_volume": round(results.mesh.volume()),
+        "material": { "youngs_modulus": material.youngs_modulus, "poisson_ratio": material.poisson_ratio },
+        "iterations": results.iterations,
+        "max_displacement": { "mm": dmax, "at": summary::v3(d_at) },
+        "max_von_mises": { "mpa": smax, "at": summary::v3(s_at) },
+        "reaction": summary::v3(results.reaction),
+    });
+    if let Some(path) = export_path {
+        basset_fea::vtk::write_file(&results, &path)?;
+        out["exported"] = Value::String(path.display().to_string());
     }
     Ok(out)
 }

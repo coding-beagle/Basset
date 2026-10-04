@@ -27,6 +27,10 @@ pub(crate) enum Command {
     Measure(bool),
     /// Leave it if it is running, start it if it is not: what one key has to mean.
     ToggleMeasure,
+    /// Open or close the Simulate dialog, which owns no feature either; see
+    /// [`super::simulate`].
+    Simulate(bool),
+    ToggleSimulate,
     New,
     Open,
     Save(bool),
@@ -934,6 +938,15 @@ pub(crate) const BINDINGS: &[Binding] = &[
         chords: &[Chord::plain('i')],
         live: LiveIn::Model,
         make: || Command::ToggleMeasure,
+        enabled: IDLE,
+    },
+    Binding {
+        id: "modify.simulate",
+        label: "Simulate",
+        group: Group::Modify,
+        chords: &[],
+        live: LiveIn::Model,
+        make: || Command::ToggleSimulate,
         enabled: IDLE,
     },
     // --- Sketch tools. Each key opens the tool the toolbar's button for that shape is

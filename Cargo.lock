@@ -225,6 +225,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "basset-core",
+ "basset-fea",
  "basset-io",
  "basset-kernel",
  "basset-math",
@@ -253,6 +254,18 @@ dependencies = [
  "serde",
  "serde_json",
  "slotmap",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "basset-fea"
+version = "0.1.0"
+dependencies = [
+ "approx",
+ "basset-kernel",
+ "basset-math",
+ "log",
+ "serde",
  "thiserror 2.0.20",
 ]
 
@@ -294,6 +307,7 @@ version = "0.1.0"
 dependencies = [
  "approx",
  "basset-core",
+ "basset-fea",
  "basset-io",
  "basset-kernel",
  "basset-math",

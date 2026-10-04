@@ -505,6 +505,7 @@ pub fn start_tool(editor: &mut Editor, kind: ToolKind) {
     // Measuring and modelling are different jobs: a tool takes over the picking, so the
     // readout would stop agreeing with what a click does.
     super::measure::stop(editor);
+    super::simulate::stop(editor);
     let mut params = Params::default();
     match kind {
         ToolKind::Fillet => params.radius = 2.0,

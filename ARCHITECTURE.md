@@ -14,13 +14,18 @@ basset-core      Document, Components, Planes/Axes/Sketches/Bodies, document par
                   Timeline + regeneration, document save/open (.bass JSON), the diff
                   between two versions of a document
 basset-io        STL / 3MF export
-basset-viewport  wgpu renderer: camera, mesh/line/point/triangle batches, grid, selection highlight
+basset-fea       basic finite element analysis: voxel brick mesh of a Solid, linear elastic
+                  static solve, von Mises stresses, legacy VTK output
+basset-viewport  wgpu renderer: camera, mesh/line/point/triangle batches, grid, selection highlight,
+                  meshes with a colour per vertex and the ramp a stress plot paints with
 basset-app       winit + egui desktop application (Linux first)
 basset-mcp       Model Context Protocol server over stdio: the document model driven by an agent
 ```
 
 Dependency direction is strictly downward: `math ← sketch, kernel ← core ← io, viewport ← app`;
-`basset-mcp` sits beside the app, over `core` and `io`, and knows nothing of the viewport.
+`basset-mcp` sits beside the app, over `core`, `io` and `fea`, and knows nothing of the viewport.
+`basset-fea` sits over `kernel` alone: it takes a `Solid` and face keys and knows nothing of
+documents, so a study can be run on any body the kernel can make.
 `sketch` and `kernel` do not know about each other; `core` converts sketch profiles into
 kernel profiles. This keeps both testable in isolation and lets the kernel be replaced.
 Where `core` has to put something of its own *into* a sketch — the document's parameter
@@ -589,6 +594,38 @@ camera's `roll` angle about the view axis is what lets a square-on view be turne
 at a time (the cube's curved arrows, `Shift+←`/`Shift+→`). Orbiting stands the view back
 upright, since yaw and pitch are measured against world +Z.
 
+The Simulate dialog (`editor::simulate`) runs a linear elastic study of one body with
+`basset-fea`: two face lists, held and loaded, each with a button that arms it so the next
+faces clicked in the viewport join it (a face clicked again leaves; a face is never in
+both); a force or a pressure; a material preset or its two numbers typed over; the brick
+size, defaulting to a twentieth of the body's longest side; Run; and, after a run, the
+maxima, the reaction, the element and iteration counts, a deformation scale, a Show
+toggle and a legend painted with the renderer's own `stress_ramp`. A study is editor
+state, not a timeline feature, for the reason Measure is: it changes nothing about the
+model, and a feature that regenerates to no geometry would cost an undo step for every
+retyped load and sit in the history as a step that does nothing. The editor therefore
+holds one `Simulation` beside the Measure tool, its picks never reach the selection, and
+no transaction is opened. What a feature would have given for free — staying true to the
+model — the study has to earn: the results carry the document revision they were computed
+at, and any edit since marks them stale, at which point the dialog says so and the
+viewport goes back to the plain body rather than keep colouring it with stresses of a body
+that no longer exists. While the plot is up the body's own mesh is not drawn and a mesh of
+the deformed brick surface, uploaded through `upload_colored_mesh` with one colour per
+vertex and re-uploaded only when the run or the scale changes, is drawn in its place.
+While it is down, the held faces take the body's one highlight colour and the loaded ones
+are a depth-tested fill over the face, because a second instance of the same geometry
+would lose the depth test to the first.
+
+The renderer learned one thing for this: a mesh may be uploaded with a linear RGB colour
+per vertex (`Renderer::upload_colored_mesh`), and an instance of such a mesh ignores its
+own colour and shows those, lit as every other body is and with highlights still painted
+over them. Every vertex carries the twelve bytes whether or not it uses them, so there is
+one vertex layout and one family of mesh pipelines rather than two of each; a per-draw
+flag tells the shader which colour to read. `basset_viewport::stress_ramp` is the blue-to-red
+ramp, kept in the viewport rather than in `fea` because it is about looking, not about
+stress, and the legend in the dialog is painted with the same function so the bar and the
+body cannot disagree.
+
 Panels never hold `&mut Editor` while borrowing document state: they queue commands that
 run after the frame's UI closure returns.
 
@@ -640,6 +677,47 @@ timeline bars each changed chip in the colour of its change and stands a struck-
 chip in for each removed feature at the slot it occupied, before whatever now stands
 there, as a text diff shows the old line above the new.
 
+## Finite element analysis
+
+`basset-fea` answers one question so far: how far does a body of one isotropic material
+move, and how hard is it stressed, when some of its faces are held and forces or pressures
+act on others. A `Study` is the material, the fixed `FaceKey`s, the loads and a target
+element size; `run` returns displacements at every node and von Mises stress in every
+element, the maxima and where they are, and the total reaction at the fixed faces, which
+should equal and oppose the applied load and is reported so the caller can see that it does.
+
+The mesh is a **voxel grid of identical bricks** rather than a tetrahedral mesh fitted to
+the surface. Fitting tetrahedra to a faceted boundary that booleans have left agreeing
+only to a micron is the hard half of a meshing library; a voxel grid cannot fail to mesh
+anything the kernel can tessellate. A grid is laid over the body's bounding box with a
+whole number of bricks along each axis, so a box meshes exactly; every cell whose centre
+is inside the body is an element, decided by ray parity against the body's own
+tessellation with one ray per column of cells, run a hair off the column's centre line so
+it never passes through a triangle edge where two triangles would both report a hit.
+Each exposed brick facet is tagged with the kernel face nearest its centre (a triangle
+facing the same way is preferred, so a facet on a thin wall takes the near side), and that
+is how a study's fixed faces and loads, named by `FaceKey`, find their nodes: the same
+names a fillet is written on, surviving the same edits.
+
+Because every element is the same brick, the stiffness matrix is computed once
+(`element::Brick`, eight-node trilinear, 2×2×2 Gauss) and never assembled: the solver
+multiplies by it element by element inside a Jacobi-preconditioned conjugate gradient,
+with fixed degrees of freedom masked out. The cap on iterations is what turns a body left
+free to float into an error with a hint rather than a hang. Stresses are read at each
+brick's centre, where the trilinear element is most accurate, and averaged to the nodes
+for a smooth plot. The known costs of the choice are a stair-stepped surface, which blurs
+stress concentrations on curved and oblique faces, and a fully integrated brick's
+stiffness in bending when a section is a brick or two thick: a cantilever five bricks deep
+comes out a few percent stiffer than beam theory, and converges as the mesh is refined.
+The tests pin a bar in tension to Hooke's law within 2% and a cantilever to beam theory
+within 10%.
+
+Results go out as legacy ASCII VTK (`fea::vtk`), which every viewer reads and needs no
+dependency, and as a deformed surface mesh with a stress value per vertex
+(`Results::deformed_surface`) with a stress value per vertex, which the editor's Simulate
+dialog colours with `stress_ramp` and draws in the body's place. The `fea_static` tool of
+the MCP server and that dialog are the two callers.
+
 ## Driving the modeller from an agent
 
 `basset-mcp` is a Model Context Protocol server: JSON-RPC over stdin and stdout, one
@@ -652,7 +730,8 @@ written back only if every one succeeds; an extrude names regions by sample poin
 curve signature exactly as a click would; `body_info` and `check_document` return what
 the regenerator and the kernel can say about the result — statuses, volumes, bounding
 boxes, face and edge keys, and whether every shell is closed — so a failure that the
-viewport would show as a yellow badge comes back as data. Entities and constraints are
+viewport would show as a yellow badge comes back as data; `fea_static` runs a study on a
+body by face keys and reports the maxima and the reaction. Entities and constraints are
 named by their slot index, resolved against the live sketch, since a wire id is meant to
 be read back and quoted; faces are `feature.sub:Role` and edges two of those joined by
 `|`, the parts a `FaceKey` is made of. `.mcp.json` at the workspace root registers the

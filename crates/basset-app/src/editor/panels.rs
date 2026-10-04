@@ -80,6 +80,7 @@ pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
     compare_banner(editor, &ctx, free, &mut commands);
     sketch_operation_dialog(editor, &ctx, free, &mut commands);
     tools::dialog(editor, &ctx);
+    super::simulate::dialog(editor, &ctx);
     super::gizmo::interact(editor, &ctx);
     if let Some(hint) = &editor.snap_hint {
         super::snap::paint(&ctx, &editor.camera, editor.window_px, hint);
@@ -114,6 +115,20 @@ pub(super) fn run(editor: &mut Editor, c: Command) {
                 super::measure::stop(editor)
             } else {
                 super::measure::start(editor)
+            }
+        }
+        Command::Simulate(on) => {
+            if on {
+                super::simulate::start(editor)
+            } else {
+                super::simulate::stop(editor)
+            }
+        }
+        Command::ToggleSimulate => {
+            if editor.simulation.is_some() {
+                super::simulate::stop(editor)
+            } else {
+                super::simulate::start(editor)
             }
         }
         Command::New => editor.new_document(),
@@ -648,6 +663,20 @@ fn menu_bar(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
                 ],
                 commands,
             );
+            let label = format!("Simulate{}", commands::hint("modify.simulate"));
+            if tool_button(
+                ui,
+                "modify-menu",
+                AnyTool::Simulate,
+                Some(&label),
+                false,
+                true,
+            )
+            .clicked()
+            {
+                commands.push(Command::ToggleSimulate);
+                ui.close();
+            }
         });
         // The two ways to find a command without already knowing where it is. They are
         // in a menu as well as on keys, because a shortcut overlay only reachable by a
@@ -713,6 +742,23 @@ fn toolbar(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
         let measuring = editor.measure.is_some();
         if measure_button(ui, !busy, measuring) {
             commands.push(Command::Measure(!measuring));
+        }
+        let simulating = editor.simulation.is_some();
+        if tool_button(
+            ui,
+            "toolbar",
+            AnyTool::Simulate,
+            Some("Simulate"),
+            simulating,
+            !busy,
+        )
+        .on_hover_text(format!(
+            "Simulate: a linear elastic study of one body (no change to the model){}",
+            commands::hint("modify.simulate")
+        ))
+        .clicked()
+        {
+            commands.push(Command::Simulate(!simulating));
         }
         ui.separator();
         if ui
@@ -1096,6 +1142,8 @@ fn constraint_button(
 pub(crate) enum AnyTool {
     Sketch(SketchTool),
     Model(ToolKind),
+    /// The study dialog, which is neither: it is a button with a symbol all the same.
+    Simulate,
 }
 
 impl AnyTool {
@@ -1105,6 +1153,7 @@ impl AnyTool {
         match self {
             AnyTool::Sketch(t) => t.name(),
             AnyTool::Model(k) => k.title(),
+            AnyTool::Simulate => "Simulate",
         }
     }
 }
@@ -1234,6 +1283,21 @@ fn tool_button(
         AnyTool::Sketch(t) => t,
         AnyTool::Model(kind) => {
             model_symbol(kind, inner, pi, &line, &arc, &arrow, &dot);
+            return response;
+        }
+        AnyTool::Simulate => {
+            // A cantilever: a wall, a beam bending away from it and the load pressing
+            // on its free end — the textbook picture of a stress study.
+            line(egui::pos2(l, t), egui::pos2(l, b));
+            let n = 8;
+            let pts: Vec<egui::Pos2> = (0..=n)
+                .map(|i| {
+                    let f = i as f32 / n as f32;
+                    egui::pos2(l + (r - l) * f, c.y + (b - c.y) * 0.6 * f * f)
+                })
+                .collect();
+            painter.add(egui::Shape::line(pts, stroke));
+            arrow(egui::pos2(r, t), egui::pos2(r, c.y + (b - c.y) * 0.6 - 2.0));
             return response;
         }
     };

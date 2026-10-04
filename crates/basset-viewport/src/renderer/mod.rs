@@ -226,7 +226,25 @@ impl Renderer {
         mesh: &TriMesh,
         edges: &[[Vec3; 2]],
     ) -> Result<MeshHandle, ViewportError> {
-        let gpu = GpuMesh::upload(device, mesh, edges)?;
+        self.insert_mesh(GpuMesh::upload(device, mesh, None, edges)?)
+    }
+
+    /// [`Self::upload_mesh`] with a linear RGB colour per vertex of `mesh.positions`. An
+    /// instance of the result ignores its `color` and shows these, lit as usual, with
+    /// highlights still painted over them: the colour is the data (a stress plot), and the
+    /// instance colour would hide it.
+    pub fn upload_colored_mesh(
+        &mut self,
+        device: &wgpu::Device,
+        _queue: &wgpu::Queue,
+        mesh: &TriMesh,
+        colors: &[[f32; 3]],
+        edges: &[[Vec3; 2]],
+    ) -> Result<MeshHandle, ViewportError> {
+        self.insert_mesh(GpuMesh::upload(device, mesh, Some(colors), edges)?)
+    }
+
+    fn insert_mesh(&mut self, gpu: GpuMesh) -> Result<MeshHandle, ViewportError> {
         let handle = MeshHandle(self.next_handle);
         self.next_handle += 1;
         self.meshes.insert(handle, gpu);
@@ -357,6 +375,7 @@ impl Renderer {
                         .to_cols_array_2d(),
                     color,
                     highlight_color: instance.highlight_color,
+                    params: [if gpu.vertex_colored { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
                 });
                 draws.meshes.push(MeshDrawCall {
                     handle: instance.handle,

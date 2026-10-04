@@ -15,6 +15,7 @@ mod panels;
 mod project;
 mod scene;
 mod selection;
+mod simulate;
 mod sketch_mode;
 pub(crate) mod snap;
 mod tools;
@@ -44,6 +45,7 @@ use winit::keyboard::Key;
 
 pub use measure::Measure;
 pub use selection::{Pick, SelectMode, Selection};
+pub use simulate::Simulation;
 pub use sketch_mode::SketchEditor;
 pub use tools::Tool;
 
@@ -214,6 +216,9 @@ pub struct Editor {
     /// The Measure tool, which is not a [`Tool`]: it owns no feature and never writes to
     /// the document. See [`measure`].
     pub measure: Option<Measure>,
+    /// The Simulate tool, likewise not a [`Tool`]: a study of one body that is editor
+    /// state rather than a timeline feature. See [`simulate`].
+    pub simulation: Option<Simulation>,
     pub selected_feature: Option<FeatureId>,
     pub status: String,
     pub error: Option<String>,
@@ -242,6 +247,9 @@ pub struct Editor {
     /// Meshes of the bodies the compared version has that differ: what is drawn in red.
     /// Synced beside [`Self::meshes`] and emptied when the comparison stops.
     base_meshes: HashMap<BodyRef, BodyMesh>,
+    /// The GPU copy of the stress plot, while results are shown. Synced beside
+    /// [`Self::meshes`]; headless there is none, and the scene tolerates that.
+    results_mesh: Option<simulate::ResultsMesh>,
     /// Bodies as picking sees them, see [`PickBody`]. Refreshed with the cache.
     pick_bodies: HashMap<BodyRef, PickBody>,
     // Read-only copies of the regenerated state for code paths (picking, panels) that
@@ -286,6 +294,7 @@ impl Editor {
             mode: Mode::Model,
             tool: None,
             measure: None,
+            simulation: None,
             selected_feature: None,
             status: "Ready".into(),
             error: None,
@@ -301,6 +310,7 @@ impl Editor {
             compare: None,
             commit_box: None,
             base_meshes: HashMap::new(),
+            results_mesh: None,
             pick_bodies: HashMap::new(),
             cached_planes: Vec::new(),
             cached_sketches: Vec::new(),
@@ -533,6 +543,7 @@ impl Editor {
             }
         }
         self.sync_base_meshes(renderer, device, queue);
+        self.sync_results_mesh(renderer, device, queue);
     }
 
     /// The same for the compared version's solids: one mesh per body the diff has a base
@@ -856,9 +867,12 @@ impl Editor {
             }
             Mode::Model if clicked => {
                 let pick = selection::pick(self, &ray, &self.pick_filter(), 8.0);
-                // Measuring takes the click whole: its picks are not a selection any
-                // later tool should act on, so they never reach `apply_pick`.
-                if !measure::clicked(self, pick.as_ref(), self.pointer.ctrl) {
+                // Measuring and simulating take the click whole: their picks are not a
+                // selection any later tool should act on, so they never reach
+                // `apply_pick`.
+                if !simulate::clicked(self, pick.as_ref())
+                    && !measure::clicked(self, pick.as_ref(), self.pointer.ctrl)
+                {
                     self.apply_pick(pick, shift);
                 }
             }
@@ -873,6 +887,7 @@ impl Editor {
         match (self.tool.as_ref(), self.measure.is_some()) {
             (Some(tool), _) => self.select_mode.narrow(tool.filter()),
             (None, true) => self.select_mode.narrow(measure::FILTER),
+            (None, false) if self.simulation.is_some() => self.select_mode.narrow(simulate::FILTER),
             (None, false) => self.select_mode.filter(),
         }
     }
@@ -941,6 +956,8 @@ impl Editor {
             Mode::Model => {
                 if self.measure.is_some() {
                     measure::stop(self);
+                } else if self.simulation.is_some() {
+                    simulate::stop(self);
                 } else if self.tool.is_some() {
                     tools::cancel_tool(self);
                 } else {
@@ -1099,6 +1116,7 @@ impl Editor {
             return;
         }
         measure::stop(self);
+        simulate::stop(self);
         let Some(feature) = self.doc.timeline().get(id) else {
             return;
         };

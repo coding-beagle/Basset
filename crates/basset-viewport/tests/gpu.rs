@@ -260,6 +260,50 @@ fn cube_covers_centre_but_not_corner() {
 }
 
 #[test]
+fn a_coloured_mesh_shows_its_vertex_colours_and_still_highlights() {
+    let Some(gpu) = gpu() else { return };
+    let mut renderer = Renderer::new(&gpu.device, FORMAT, 1);
+    let mesh = cube(20.0);
+    // Every vertex the hot end of the ramp: the front face must come out red whatever
+    // the instance colour says.
+    let colors = vec![basset_viewport::stress_ramp(1.0); mesh.positions.len()];
+    let handle = renderer
+        .upload_colored_mesh(&gpu.device, &gpu.queue, &mesh, &colors, &cube_edges(20.0))
+        .expect("valid coloured cube");
+    let camera = looking_at_origin();
+    let mut scene = Scene::new(&camera);
+    scene.background = BACKGROUND;
+    scene.show_grid = false;
+    let mut instance = MeshInstance::new(handle);
+    instance.color = [0.0, 0.0, 1.0, 1.0];
+    scene.meshes.push(instance.clone());
+    let pixels = render_with(&gpu, &mut renderer, &scene);
+    let centre = pixel(&pixels, SIZE[0] / 2, SIZE[1] / 2);
+    assert!(
+        centre[0] > 150 && centre[2] < 60,
+        "centre pixel {centre:?} should be the vertex red, not the instance blue"
+    );
+
+    // A highlight is painted over the data as it is over a plain body. Face id 2 is the
+    // -Y face, which the Front view looks straight at.
+    instance.highlight_faces = vec![2];
+    instance.highlight_color = [0.0, 1.0, 0.0, 1.0];
+    scene.meshes[0] = instance;
+    let pixels = render_with(&gpu, &mut renderer, &scene);
+    let centre = pixel(&pixels, SIZE[0] / 2, SIZE[1] / 2);
+    assert!(
+        centre[1] > 150 && centre[0] < 60,
+        "centre pixel {centre:?} should be the highlight green"
+    );
+
+    // The wrong number of colours is refused rather than read off the end.
+    assert!(matches!(
+        renderer.upload_colored_mesh(&gpu.device, &gpu.queue, &mesh, &colors[1..], &[]),
+        Err(basset_viewport::ViewportError::ColorCountMismatch { .. })
+    ));
+}
+
+#[test]
 fn highlighted_face_changes_colour() {
     let Some(gpu) = gpu() else { return };
     let mut renderer = Renderer::new(&gpu.device, FORMAT, 1);

@@ -6,6 +6,7 @@ members = [
     "crates/basset-kernel",
     "crates/basset-core",
     "crates/basset-io",
+    "crates/basset-fea",
     "crates/basset-viewport",
     "crates/basset-app",
     "crates/basset-mcp",
@@ -24,6 +25,7 @@ basset-sketch = { path = "crates/basset-sketch" }
 basset-kernel = { path = "crates/basset-kernel" }
 basset-core = { path = "crates/basset-core" }
 basset-io = { path = "crates/basset-io" }
+basset-fea = { path = "crates/basset-fea" }
 basset-viewport = { path = "crates/basset-viewport" }
 
 glam = { version = "0.33", features = ["serde"] }

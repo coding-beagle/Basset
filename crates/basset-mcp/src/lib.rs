@@ -53,6 +53,7 @@ from_error!(
     basset_sketch::SolveError,
     basset_kernel::KernelError,
     basset_io::IoError,
+    basset_fea::FeaError,
     std::io::Error,
     serde_json::Error,
 );

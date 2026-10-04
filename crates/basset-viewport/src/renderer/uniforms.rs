@@ -24,6 +24,8 @@ pub(crate) struct MeshDraw {
     pub normal_matrix: [[f32; 4]; 4],
     pub color: [f32; 4],
     pub highlight_color: [f32; 4],
+    /// `[use_vertex_color, 0, 0, 0]`: 1 when the mesh's own vertex colours replace `color`.
+    pub params: [f32; 4],
 }
 
 #[repr(C)]
