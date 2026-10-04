@@ -1240,7 +1240,7 @@ pub(super) fn study_tree(editor: &mut Editor, ui: &mut egui::Ui) {
             ),
             LoadForm::Pressure => format!("{:.2} MPa on", sim.pressure),
         };
-        egui::CollapsingHeader::new(format!("Loads ({})", sim.loaded.len()))
+        super::theme::section(format!("Loads ({})", sim.loaded.len()))
             .id_salt("study-loads")
             .default_open(true)
             .show(ui, |ui| {
@@ -1289,7 +1289,7 @@ pub(super) fn study_tree(editor: &mut Editor, ui: &mut egui::Ui) {
 
 /// A collapsing list of one face list's rows, each removable.
 fn face_rows(ui: &mut egui::Ui, list: &mut Vec<FaceKey>, title: &str, salt: &str) {
-    egui::CollapsingHeader::new(format!("{title} ({})", list.len()))
+    super::theme::section(format!("{title} ({})", list.len()))
         .id_salt(salt)
         .default_open(true)
         .show(ui, |ui| {
@@ -1369,7 +1369,7 @@ pub(super) fn study_panel(editor: &mut Editor, ui: &mut egui::Ui, commands: &mut
             if sim.outcome.is_some() || sim.solving() || sim.message == STOPPED {
                 ui.label(egui::RichText::new(&sim.message).weak());
             } else {
-                ui.colored_label(egui::Color32::from_rgb(230, 120, 100), &sim.message);
+                ui.colored_label(super::theme::ERROR, &sim.message);
             }
         }
         if sim.is_stale(revision) {

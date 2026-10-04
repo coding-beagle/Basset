@@ -10,6 +10,7 @@ use basset_viewport::ViewPreset;
 use super::commands::{self, Command};
 use super::files::MeshFormat;
 use super::sketch_mode::{self, SketchTool, ToolGroup, edit_text, parse_value};
+use super::symbols::Symbol;
 use super::tools::{self, ToolKind};
 use super::{DisplayMode, Editor, Mode, SelectMode, Workspace};
 
@@ -17,7 +18,7 @@ use super::{DisplayMode, Editor, Mode, SelectMode, Workspace};
 /// match what the user is looking at.
 const LOOSE_LABEL: egui::Color32 = egui::Color32::from_rgb(140, 184, 255);
 /// Amber for a feature that built but warns about its result, matching the timeline chip.
-const WARNING_LABEL: egui::Color32 = egui::Color32::from_rgb(235, 190, 90);
+const WARNING_LABEL: egui::Color32 = super::theme::WARNING;
 /// The orange the viewport draws a redundant constraint's badge in, so the row that
 /// names it matches the mark on the drawing.
 const REDUNDANT_LABEL: egui::Color32 = egui::Color32::from_rgb(255, 160, 80);
@@ -45,36 +46,55 @@ pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
     editor.snap_hint = None;
 
     let simulation = editor.workspace == Workspace::Simulation;
-    egui::Panel::top("menu").show(ui, |ui| {
-        ui.horizontal(|ui| {
-            workspace_tabs(editor, ui, &mut commands);
-            ui.separator();
-            menu_bar(editor, ui, &mut commands);
-        });
-        if simulation {
-            super::simulate::toolbar(editor, ui, &mut commands);
-        } else {
-            toolbar(editor, ui, &mut commands);
-        }
-    });
-    egui::Panel::bottom("status").show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.label(&editor.status);
-            warning_summary(editor, ui, &mut commands);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(egui::RichText::new(editor.selection.summary()).weak());
-                git_chip(editor, ui, &mut commands);
+    egui::Panel::top("menu")
+        .frame(super::theme::menu_frame())
+        .show_separator_line(false)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                workspace_tabs(editor, ui, &mut commands);
+                ui.add_space(6.0);
+                menu_bar(editor, ui, &mut commands);
             });
         });
-    });
+    egui::Panel::top("ribbon")
+        .frame(super::theme::ribbon_frame())
+        .show(ui, |ui| {
+            if simulation {
+                super::simulate::toolbar(editor, ui, &mut commands);
+            } else {
+                toolbar(editor, ui, &mut commands);
+            }
+        });
+    egui::Panel::bottom("status")
+        .frame(super::theme::status_frame())
+        .show_separator_line(false)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(&editor.status);
+                warning_summary(editor, ui, &mut commands);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(editor.selection.summary()).weak());
+                    git_chip(editor, ui, &mut commands);
+                    if !editor.is_sketching() && !simulation {
+                        ui.label(
+                            egui::RichText::new("Right-drag orbit · middle-drag pan · wheel zoom")
+                                .small()
+                                .weak(),
+                        );
+                    }
+                });
+            });
+        });
     // The timeline is the Design workspace's: a study has no history to walk, and a
     // cursor dragged while results were up would only make them stale.
     if !simulation {
         egui::Panel::bottom("timeline")
+            .frame(super::theme::timeline_frame())
             .default_size(64.0)
             .show(ui, |ui| timeline(editor, ui, &mut commands));
     }
     egui::Panel::left("browser")
+        .frame(super::theme::side_frame())
         .default_size(230.0)
         .show(ui, |ui| {
             if simulation {
@@ -85,16 +105,19 @@ pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
         });
     if simulation {
         egui::Panel::right("study")
+            .frame(super::theme::side_frame())
             .default_size(250.0)
             .show(ui, |ui| {
                 super::simulate::study_panel(editor, ui, &mut commands)
             });
     } else if editor.is_sketching() {
         egui::Panel::right("sketch-palette")
+            .frame(super::theme::side_frame())
             .default_size(210.0)
             .show(ui, |ui| sketch_palette(editor, ui, &mut commands));
     } else if editor.show_project && editor.project.is_some() {
         egui::Panel::right("project")
+            .frame(super::theme::side_frame())
             .default_size(250.0)
             .show(ui, |ui| project_panel(editor, ui, &mut commands));
     }
@@ -486,22 +509,20 @@ pub(super) fn run(editor: &mut Editor, c: Command) {
 /// row off the viewport, and they sit before the menus because they are not commands
 /// among commands: they decide which commands there are.
 fn workspace_tabs(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
-    ui.spacing_mut().item_spacing.x = 2.0;
-    for workspace in Workspace::ALL {
-        let active = editor.workspace == workspace;
-        let text = egui::RichText::new(workspace.title());
-        let text = if active { text.strong() } else { text };
-        let button = egui::Button::new(text)
-            .selected(active)
-            .min_size(egui::vec2(84.0, 0.0));
-        if ui
-            .add(button)
+    let titles: Vec<&str> = Workspace::ALL.iter().map(|w| w.title()).collect();
+    let chosen = Workspace::ALL
+        .iter()
+        .position(|w| *w == editor.workspace)
+        .unwrap_or(0);
+    let responses = super::theme::segmented(ui, &titles, chosen);
+    for (workspace, response) in Workspace::ALL.into_iter().zip(responses) {
+        if response
             .on_hover_text(match workspace {
                 Workspace::Design => "Model the part: sketches, features, the timeline",
                 Workspace::Simulation => "Study one body under load; the model is not changed",
             })
             .clicked()
-            && !active
+            && editor.workspace != workspace
         {
             commands.push(Command::Workspace(workspace));
         }
@@ -758,87 +779,209 @@ fn toolbar(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
         sketch_toolbar(s, ui, commands);
         return;
     }
+    let busy = editor.tool.is_some();
     ui.horizontal_wrapped(|ui| {
-        let busy = editor.tool.is_some();
-        let groups: [&[(ToolKind, &str)]; 3] = [
-            &[(ToolKind::Sketch, "Sketch")],
-            &[
-                (ToolKind::Extrude, "Extrude"),
-                (ToolKind::Revolve, "Revolve"),
-                (ToolKind::Sweep, "Sweep"),
-                (ToolKind::Loft, "Loft"),
-            ],
-            &[
-                (ToolKind::Fillet, "Fillet"),
-                (ToolKind::Chamfer, "Chamfer"),
-                (ToolKind::Thread, "Thread"),
-                (ToolKind::Combine, "Combine"),
-                (ToolKind::Move, "Move"),
-                (ToolKind::OffsetPlane, "Offset Plane"),
-                (ToolKind::AngledPlane, "Angled Plane"),
-            ],
+        let groups: [(&str, &[(ToolKind, &str)]); 3] = [
+            (
+                "Create",
+                &[
+                    (ToolKind::Sketch, "Sketch"),
+                    (ToolKind::Extrude, "Extrude"),
+                    (ToolKind::Revolve, "Revolve"),
+                    (ToolKind::Sweep, "Sweep"),
+                    (ToolKind::Loft, "Loft"),
+                ],
+            ),
+            (
+                "Modify",
+                &[
+                    (ToolKind::Fillet, "Fillet"),
+                    (ToolKind::Chamfer, "Chamfer"),
+                    (ToolKind::Thread, "Thread"),
+                    (ToolKind::Combine, "Combine"),
+                    (ToolKind::Move, "Move"),
+                ],
+            ),
+            (
+                "Construct",
+                &[
+                    (ToolKind::OffsetPlane, "Offset Plane"),
+                    (ToolKind::AngledPlane, "Angled Plane"),
+                ],
+            ),
         ];
-        for group in groups {
-            for (kind, label) in group {
-                // Icon and label are one button, so the symbol is as clickable as the
-                // word beside it.
-                if tool_button(ui, "toolbar", *kind, Some(label), false, !busy)
+        for (caption, tools) in groups {
+            let labels: Vec<Option<&str>> = tools.iter().map(|(_, l)| Some(*l)).collect();
+            ribbon_group(ui, caption, &labels, |ui| {
+                for (kind, label) in tools {
+                    // Icon and label are one button, so the symbol is as clickable as
+                    // the word under it.
+                    if shaped_tool_button(
+                        ui,
+                        "toolbar",
+                        AnyTool::Model(*kind),
+                        Some(label),
+                        false,
+                        !busy,
+                        ButtonShape::Stacked,
+                    )
                     .on_hover_text(format!("{}{}", kind.title(), commands::tool_hint(*kind)))
                     .clicked()
-                {
-                    commands.push(Command::Tool(*kind));
+                    {
+                        commands.push(Command::Tool(*kind));
+                    }
                 }
-            }
+            });
             ui.separator();
         }
         let measuring = editor.measure.is_some();
-        if measure_button(ui, !busy, measuring) {
-            commands.push(Command::Measure(!measuring));
-        }
-        // The way into the other workspace from the toolbar, beside the tool it most
-        // resembles: it studies the model and changes nothing.
-        if tool_button(
+        ribbon_group(
             ui,
-            "toolbar",
-            AnyTool::Simulate,
-            Some("Simulate"),
-            false,
-            !busy,
-        )
-        .on_hover_text(format!(
-            "Simulation workspace: a linear elastic study of one body (no change to the model){}",
-            commands::hint("modify.simulate")
-        ))
-        .clicked()
-        {
-            commands.push(Command::Workspace(Workspace::Simulation));
-        }
-        ui.separator();
-        if ui
-            .button("Fit")
-            .on_hover_text(format!(
-                "Fit the model in the view{}",
-                commands::hint("view.fit")
-            ))
-            .clicked()
-        {
-            commands.push(Command::Fit);
-        }
-        ui.separator();
-        ui.label("Select:");
-        for (i, mode) in SelectMode::ALL.iter().enumerate() {
-            let button = egui::Button::new(mode.name()).selected(editor.select_mode == *mode);
-            if ui
-                .add(button)
-                .on_hover_text(format!("{} (press {})", mode.name(), i + 1))
+            "Inspect",
+            &[Some("Measure"), Some("Simulate"), Some("Fit")],
+            |ui| {
+                if shaped_tool_button(
+                    ui,
+                    "toolbar",
+                    AnyTool::Measure,
+                    Some("Measure"),
+                    measuring,
+                    !busy,
+                    ButtonShape::Stacked,
+                )
+                .on_hover_text("Measure (no change to the model)")
                 .clicked()
-            {
-                commands.push(Command::SelectMode(*mode));
+                {
+                    commands.push(Command::Measure(!measuring));
+                }
+                // The way into the other workspace, beside the tool it most resembles:
+                // it studies the model and changes nothing.
+                if shaped_tool_button(
+                    ui,
+                    "toolbar",
+                    AnyTool::Simulate,
+                    Some("Simulate"),
+                    false,
+                    !busy,
+                    ButtonShape::Stacked,
+                )
+                .on_hover_text(format!(
+                    "Simulation workspace: a linear elastic study of one body (no change to the model){}",
+                    commands::hint("modify.simulate")
+                ))
+                .clicked()
+                {
+                    commands.push(Command::Workspace(Workspace::Simulation));
+                }
+                if shaped_tool_button(
+                    ui,
+                    "toolbar",
+                    AnyTool::Fit,
+                    Some("Fit"),
+                    false,
+                    true,
+                    ButtonShape::Stacked,
+                )
+                .on_hover_text(format!(
+                    "Fit the model in the view{}",
+                    commands::hint("view.fit")
+                ))
+                .clicked()
+                {
+                    commands.push(Command::Fit);
+                }
+            },
+        );
+        ui.separator();
+        let names: Vec<&str> = SelectMode::ALL.iter().map(|m| m.name()).collect();
+        let chosen = SelectMode::ALL
+            .iter()
+            .position(|m| *m == editor.select_mode)
+            .unwrap_or(0);
+        if let Some(i) = ribbon_segmented(ui, "Select", &names, chosen, |i| {
+            format!("{} (press {})", names[i], i + 1)
+        }) {
+            commands.push(Command::SelectMode(SelectMode::ALL[i]));
+        }
+    });
+}
+
+/// Height of a ribbon button: symbol over name.
+const RIBBON_BUTTON: f32 = ICON + 15.0;
+
+/// A captioned group of the ribbon, measured before it is laid out so a narrow window
+/// wraps the ribbon between groups rather than through one. `labels` are the names of
+/// the stacked buttons `add` will place, which is all the measuring needs.
+fn ribbon_group(
+    ui: &mut egui::Ui,
+    caption: &str,
+    labels: &[Option<&str>],
+    add: impl FnOnce(&mut egui::Ui),
+) {
+    const GAP: f32 = 2.0;
+    let buttons: f32 = labels
+        .iter()
+        .map(|l| tool_button_size(ui, *l, ButtonShape::Stacked).x + GAP)
+        .sum::<f32>()
+        - GAP;
+    ribbon_column(ui, caption, buttons, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = GAP;
+            add(ui);
+        });
+    });
+}
+
+/// A segmented choice in the ribbon, captioned like a group of tools and centred on the
+/// buttons' height. Returns the segment clicked, if one was.
+fn ribbon_segmented(
+    ui: &mut egui::Ui,
+    caption: &str,
+    labels: &[&str],
+    chosen: usize,
+    hover: impl Fn(usize) -> String,
+) -> Option<usize> {
+    let width = super::theme::segmented_width(ui, labels);
+    let mut clicked = None;
+    ribbon_column(ui, caption, width, |ui| {
+        ui.add_space((RIBBON_BUTTON - super::theme::SEGMENT_HEIGHT) * 0.5);
+        let responses = super::theme::segmented(ui, labels, chosen);
+        ui.add_space((RIBBON_BUTTON - super::theme::SEGMENT_HEIGHT) * 0.5);
+        for (i, r) in responses.into_iter().enumerate() {
+            if r.on_hover_text(hover(i)).clicked() && i != chosen {
+                clicked = Some(i);
             }
         }
-        ui.separator();
-        ui.label(egui::RichText::new("Right-drag orbit · middle-drag pan · wheel zoom").weak());
     });
+    clicked
+}
+
+/// One column of the ribbon: content of a known width, the caption centred under it.
+fn ribbon_column(ui: &mut egui::Ui, caption: &str, width: f32, add: impl FnOnce(&mut egui::Ui)) {
+    let font = egui::FontId::proportional(10.0);
+    let caption_text = caption.to_uppercase();
+    let caption_width = ui
+        .painter()
+        .layout_no_wrap(caption_text.clone(), font.clone(), egui::Color32::WHITE)
+        .size()
+        .x
+        + caption.len() as f32 * 0.8;
+    let width = width.max(caption_width);
+    let height = RIBBON_BUTTON + 1.0 + 13.0;
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, height),
+        egui::Layout::top_down(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
+            add(ui);
+            ui.label(
+                egui::RichText::new(caption_text)
+                    .font(font)
+                    .extra_letter_spacing(0.8)
+                    .color(super::theme::TEXT_WEAK),
+            );
+        },
+    );
 }
 
 /// One menu's worth of modelling tools, each an icon and its name in one button.
@@ -951,15 +1094,35 @@ fn sketch_toolbar(s: &super::SketchEditor, ui: &mut egui::Ui, commands: &mut Vec
         // meet there and the region beyond them within a few pixels of each other, and
         // the filter is how the user says which of them they mean — the same answer, and
         // the same keys, as the model-mode filter.
-        ui.label("Select:");
-        for (i, mode) in sketch_mode::SketchPick::ALL.iter().enumerate() {
-            let response = ui
-                .add(egui::Button::new(mode.name()).selected(s.pick == *mode))
-                .on_hover_text(format!("{} ({})", mode.hint(), i + 1));
-            if response.clicked() {
-                commands.push(Command::SketchPick(*mode));
-            }
-        }
+        let names: Vec<&str> = sketch_mode::SketchPick::ALL
+            .iter()
+            .map(|m| m.name())
+            .collect();
+        let chosen = sketch_mode::SketchPick::ALL
+            .iter()
+            .position(|m| *m == s.pick)
+            .unwrap_or(0);
+        ui.add_space(2.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(super::theme::segmented_width(ui, &names), ICON),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.add_space((ICON - super::theme::SEGMENT_HEIGHT) * 0.5);
+                let responses = super::theme::segmented(ui, &names, chosen);
+                for (i, (mode, response)) in sketch_mode::SketchPick::ALL
+                    .iter()
+                    .zip(responses)
+                    .enumerate()
+                {
+                    if response
+                        .on_hover_text(format!("{} ({})", mode.hint(), i + 1))
+                        .clicked()
+                    {
+                        commands.push(Command::SketchPick(*mode));
+                    }
+                }
+            },
+        );
         ui.separator();
         // Constraints are tools, like the shapes to their left: clicking one arms it and
         // the picks that follow are what it acts on. They are always available, because
@@ -1003,7 +1166,7 @@ fn sketch_toolbar(s: &super::SketchEditor, ui: &mut egui::Ui, commands: &mut Vec
         // degrees of freedom and the redundant constraints are reported, and they are
         // worth more than a key printed twice: the overlay and the palette have it.
         if ui
-            .add(egui::Button::new("Construction").selected(lit))
+            .add(action_button(Symbol::Construction, "Construction", lit))
             .on_hover_text(format!(
                 "{}{}",
                 if selection {
@@ -1018,7 +1181,10 @@ fn sketch_toolbar(s: &super::SketchEditor, ui: &mut egui::Ui, commands: &mut Vec
             commands.push(Command::SketchConstruction);
         }
         if ui
-            .add_enabled(!s.selected.is_empty(), egui::Button::new("Delete"))
+            .add_enabled(
+                !s.selected.is_empty(),
+                action_button(Symbol::Delete, "Delete", false),
+            )
             .on_hover_text(format!(
                 "Delete the selection{}",
                 commands::hint("edit.delete")
@@ -1032,7 +1198,7 @@ fn sketch_toolbar(s: &super::SketchEditor, ui: &mut egui::Ui, commands: &mut Vec
         if ui
             .add_enabled(
                 !s.selected.is_empty() && !s.modal(),
-                egui::Button::new("Move"),
+                action_button(Symbol::SketchMove, "Move", false),
             )
             .on_hover_text(format!(
                 "Move the selection: drag the arrows and ring, or type offsets{}",
@@ -1049,7 +1215,7 @@ fn sketch_toolbar(s: &super::SketchEditor, ui: &mut egui::Ui, commands: &mut Vec
         if ui
             .add_enabled(
                 !s.selected.is_empty() && !s.modal(),
-                egui::Button::new("Pattern"),
+                action_button(Symbol::Pattern, "Pattern", false),
             )
             .on_hover_text("Repeat the selection; the copies preview as you set them up")
             .on_disabled_hover_text("Select the geometry to repeat first")
@@ -1062,7 +1228,7 @@ fn sketch_toolbar(s: &super::SketchEditor, ui: &mut egui::Ui, commands: &mut Vec
         if ui
             .add_enabled(
                 !s.selected.is_empty() && !s.modal(),
-                egui::Button::new("Offset"),
+                action_button(Symbol::Offset, "Offset", false),
             )
             .on_hover_text(format!(
                 "Draw a chain of curves alongside the selection at a fixed distance{}",
@@ -1074,10 +1240,14 @@ fn sketch_toolbar(s: &super::SketchEditor, ui: &mut egui::Ui, commands: &mut Vec
             commands.push(Command::SketchOffset);
         }
         ui.separator();
-        if ui.button("✔ Finish Sketch").clicked() {
+        // The way out that keeps the work is the one primary button on the row.
+        if ui.add(finish_button()).clicked() {
             commands.push(Command::FinishSketch(true));
         }
-        if ui.button("✖ Cancel Sketch").clicked() {
+        if ui
+            .add(egui::Button::new("✖ Cancel Sketch").frame_when_inactive(false))
+            .clicked()
+        {
             commands.push(Command::FinishSketch(false));
         }
     });
@@ -1131,11 +1301,10 @@ fn warning_summary(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Comman
     }
 }
 
-/// A constraint button: the symbol the viewport draws for this constraint, and its name.
+/// A constraint button: the constraint's symbol, and its name.
 ///
-/// The symbol is there so the toolbar and the badges on the drawing teach each other —
-/// they come from one definition, [`sketch_mode::kind_strokes`] — and the name is there
-/// because a row of bare symbols is only discoverable to someone who already knows them.
+/// The name is there because a row of bare symbols is only discoverable to someone who
+/// already knows them.
 /// A selection that would satisfy the constraint outlines the button, so the user can
 /// see which one is about to do something without hovering all eleven.
 fn constraint_button(
@@ -1144,46 +1313,127 @@ fn constraint_button(
     armed: bool,
     ready: bool,
 ) -> egui::Response {
-    const GLYPH: f32 = 15.0;
-    let font = egui::FontId::proportional(13.0);
+    const GLYPH: f32 = 13.0;
+    let font = egui::FontId::proportional(12.0);
     let galley = ui.painter().layout_no_wrap(
         kind.name().to_owned(),
         font,
         ui.style().visuals.text_color(),
     );
-    let size = egui::vec2(GLYPH + 6.0 + galley.size().x + 10.0, 24.0);
+    let size = egui::vec2(GLYPH + 4.0 + galley.size().x + 12.0, 24.0);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-    let visuals = ui.style().interact_selectable(&response, armed);
+    let (fill, color) = if armed {
+        (Some(super::theme::ACCENT_TINT), super::theme::ACCENT_TEXT)
+    } else if response.hovered() {
+        (Some(super::theme::HOVER), super::theme::TEXT_STRONG)
+    } else {
+        (None, super::theme::TEXT)
+    };
     let painter = ui.painter();
-    painter.rect(
-        rect,
-        visuals.corner_radius,
-        visuals.weak_bg_fill,
-        if ready {
-            egui::Stroke::new(1.0, LOOSE_LABEL)
-        } else {
-            visuals.bg_stroke
-        },
-        egui::StrokeKind::Inside,
-    );
-    let stroke = egui::Stroke::new(1.5, visuals.fg_stroke.color);
-    let centre = egui::pos2(rect.left() + 5.0 + GLYPH * 0.5, rect.center().y);
-    let scale = GLYPH * 0.5;
-    for [a, b] in sketch_mode::kind_strokes(kind) {
-        // The glyph is defined in a frame spanning -1..1 with y upwards, as the viewport
-        // draws it; the painter's y runs the other way.
-        let to = |p: basset_math::Vec2| centre + egui::vec2(p.x as f32, -p.y as f32) * scale;
-        painter.line_segment([to(a), to(b)], stroke);
+    if let Some(fill) = fill {
+        painter.rect_filled(rect, 5.0, fill);
     }
+    // A selection that suits the constraint outlines it, in the blue of loose geometry.
+    if ready {
+        painter.rect_stroke(
+            rect,
+            5.0,
+            egui::Stroke::new(1.0, LOOSE_LABEL),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let glyph = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 6.0 + GLYPH * 0.5, rect.center().y),
+        egui::vec2(GLYPH, GLYPH),
+    );
+    super::symbols::paint(painter, glyph, constraint_symbol(kind), color);
     painter.galley(
         egui::pos2(
-            rect.left() + 5.0 + GLYPH + 6.0,
+            rect.left() + 6.0 + GLYPH + 4.0,
             rect.center().y - galley.size().y * 0.5,
         ),
         galley,
-        visuals.fg_stroke.color,
+        color,
     );
     response
+}
+
+/// A sketch action — construction, delete, move and the rest: a small symbol and the
+/// action's name, flat until touched like the tools beside it.
+///
+/// Smaller than a tool's symbol because these act on what is already drawn rather than
+/// drawing, and because the row they sit in has to stay within three lines.
+fn action_button(symbol: Symbol, label: &str, selected: bool) -> impl egui::Widget + '_ {
+    move |ui: &mut egui::Ui| {
+        const SMALL: f32 = 18.0;
+        let font = egui::FontId::proportional(12.5);
+        let galley = ui
+            .painter()
+            .layout_no_wrap(label.to_owned(), font, super::theme::TEXT);
+        let size = egui::vec2(3.0 + SMALL + 3.0 + galley.size().x + 8.0, 24.0);
+        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+        let (fill, color) = if !ui.is_enabled() {
+            (None, super::theme::TEXT_DISABLED)
+        } else if selected {
+            (Some(super::theme::ACCENT_TINT), super::theme::ACCENT_TEXT)
+        } else if response.is_pointer_button_down_on() {
+            (Some(super::theme::PRESS), super::theme::TEXT_STRONG)
+        } else if response.hovered() {
+            (Some(super::theme::HOVER), super::theme::TEXT_STRONG)
+        } else {
+            (None, super::theme::TEXT)
+        };
+        let painter = ui.painter();
+        if let Some(fill) = fill {
+            painter.rect_filled(rect, 5.0, fill);
+        }
+        let icon = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + 3.0, rect.center().y - SMALL * 0.5),
+            egui::vec2(SMALL, SMALL),
+        );
+        super::symbols::paint(painter, icon, symbol, color);
+        painter.galley(
+            egui::pos2(icon.right() + 3.0, rect.center().y - galley.size().y * 0.5),
+            galley,
+            color,
+        );
+        response
+    }
+}
+
+/// The one primary button of the sketch toolbar: the check and "Finish Sketch", in white
+/// on the accent.
+fn finish_button() -> impl egui::Widget {
+    |ui: &mut egui::Ui| {
+        const SMALL: f32 = 18.0;
+        let font = egui::FontId::proportional(12.5);
+        let galley = ui.painter().layout_no_wrap(
+            "Finish Sketch".to_owned(),
+            font,
+            super::theme::TEXT_STRONG,
+        );
+        let size = egui::vec2(4.0 + SMALL + 3.0 + galley.size().x + 10.0, 24.0);
+        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+        let fill = if response.hovered() {
+            super::theme::ACCENT
+        } else {
+            super::theme::ACCENT_BUTTON
+        };
+        let painter = ui.painter();
+        painter.rect_filled(rect, 5.0, fill);
+        let icon = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + 4.0, rect.center().y - SMALL * 0.5),
+            egui::vec2(SMALL, SMALL),
+        );
+        let white = super::theme::TEXT_STRONG;
+        super::symbols::paint_inked(painter, icon, Symbol::FinishSketch, white, white);
+        painter.galley(
+            egui::pos2(icon.right() + 3.0, rect.center().y - galley.size().y * 0.5),
+            galley,
+            white,
+        );
+        response
+    }
 }
 
 /// Either kind of tool, so one icon set serves the sketch toolbar and the modelling one.
@@ -1198,6 +1448,10 @@ pub(crate) enum AnyTool {
     /// The way into the Simulation workspace, which is neither: it is a button with a
     /// symbol all the same.
     Simulate,
+    /// The caliper: inspects the model, changes nothing.
+    Measure,
+    /// Frames the model in the view.
+    Fit,
 }
 
 impl AnyTool {
@@ -1208,6 +1462,8 @@ impl AnyTool {
             AnyTool::Sketch(t) => t.name(),
             AnyTool::Model(k) => k.title(),
             AnyTool::Simulate => "Simulate",
+            AnyTool::Measure => "Measure",
+            AnyTool::Fit => "Fit",
         }
     }
 }
@@ -1261,16 +1517,61 @@ fn tool_button(
     selected: bool,
     enabled: bool,
 ) -> egui::Response {
-    let tool = tool.into();
-    let galley = label.map(|text| {
-        ui.painter().layout_no_wrap(
-            text.to_owned(),
-            egui::FontId::proportional(13.0),
-            ui.style().visuals.text_color(),
-        )
+    shaped_tool_button(
+        ui,
+        salt,
+        tool.into(),
+        label,
+        selected,
+        enabled,
+        ButtonShape::Inline,
+    )
+}
+
+/// How a tool button arranges its symbol and its name.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ButtonShape {
+    /// Name beside the symbol: menus, and the icon-only sketch tools.
+    Inline,
+    /// Name under the symbol, small: the ribbon.
+    Stacked,
+}
+
+/// Font of a stacked button's name.
+const STACKED_LABEL: f32 = 11.5;
+
+/// The size a tool button will take, so a ribbon group can be measured before it is laid
+/// out and wrapped as one piece.
+fn tool_button_size(ui: &egui::Ui, label: Option<&str>, shape: ButtonShape) -> egui::Vec2 {
+    let font = match shape {
+        ButtonShape::Inline => egui::FontId::proportional(13.0),
+        ButtonShape::Stacked => egui::FontId::proportional(STACKED_LABEL),
+    };
+    let text = label.map_or(0.0, |text| {
+        ui.painter()
+            .layout_no_wrap(text.to_owned(), font, egui::Color32::WHITE)
+            .size()
+            .x
     });
-    let width = ICON + galley.as_ref().map_or(0.0, |g| g.size().x + 8.0);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, ICON), egui::Sense::hover());
+    match shape {
+        ButtonShape::Inline => {
+            egui::vec2(ICON + if label.is_some() { text + 8.0 } else { 0.0 }, ICON)
+        }
+        ButtonShape::Stacked => egui::vec2((text + 14.0).max(ICON + 12.0), ICON + 15.0),
+    }
+}
+
+fn shaped_tool_button(
+    ui: &mut egui::Ui,
+    salt: &str,
+    tool: AnyTool,
+    label: Option<&str>,
+    selected: bool,
+    enabled: bool,
+    shape: ButtonShape,
+) -> egui::Response {
+    let size = tool_button_size(ui, label, shape);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     // A stable id rather than an automatic one: these buttons may paint no text, so an
     // id is the only handle anything — a test, or egui's own focus — has on them. `salt`
     // keeps the toolbar's copy of an icon apart from the same icon in a variant menu.
@@ -1280,299 +1581,118 @@ fn tool_button(
         egui::Sense::hover()
     };
     let response = ui.interact(rect, tool_icon_id(salt, tool), sense);
-    let visuals = if enabled {
-        ui.style().interact_selectable(&response, selected)
+    // Flat until touched, the way a ribbon is: a strip of filled boxes is what makes a
+    // toolbar look like a form.
+    let (fill, color) = if !enabled {
+        (None, super::theme::TEXT_DISABLED)
+    } else if selected {
+        (Some(super::theme::ACCENT_TINT), super::theme::ACCENT_TEXT)
+    } else if response.is_pointer_button_down_on() {
+        (Some(super::theme::PRESS), super::theme::TEXT_STRONG)
+    } else if response.hovered() {
+        (Some(super::theme::HOVER), super::theme::TEXT_STRONG)
     } else {
-        ui.style().visuals.widgets.noninteractive
+        (None, super::theme::TEXT)
     };
     let painter = ui.painter();
-    painter.rect(
-        rect,
-        visuals.corner_radius,
-        visuals.weak_bg_fill,
-        visuals.bg_stroke,
-        egui::StrokeKind::Inside,
-    );
-    if let Some(galley) = galley {
-        let at = egui::pos2(
-            rect.left() + ICON + 4.0,
-            rect.center().y - galley.size().y * 0.5,
-        );
-        painter.galley(at, galley, visuals.fg_stroke.color);
+    if let Some(fill) = fill {
+        painter.rect_filled(rect, 5.0, fill);
     }
-    // Everything below draws inside the icon's own square, whatever the label did to the
-    // width of the button.
-    let rect = egui::Rect::from_min_size(rect.min, egui::vec2(ICON, ICON));
-    let stroke = egui::Stroke::new(1.6, visuals.fg_stroke.color);
-    let dot = |p: egui::Pos2| {
-        painter.circle_filled(p, 1.8, stroke.color);
+    let icon = match shape {
+        ButtonShape::Inline => egui::Rect::from_min_size(rect.min, egui::vec2(ICON, ICON)),
+        ButtonShape::Stacked => egui::Rect::from_center_size(
+            egui::pos2(rect.center().x, rect.top() + 1.0 + ICON * 0.5),
+            egui::vec2(ICON, ICON),
+        ),
     };
-    let inner = rect.shrink(6.0);
-    let (l, r, t, b) = (inner.left(), inner.right(), inner.top(), inner.bottom());
-    let c = inner.center();
-    let line = |a: egui::Pos2, b: egui::Pos2| {
-        painter.line_segment([a, b], stroke);
-    };
-    let arc = |center: egui::Pos2, radius: f32, from: f32, to: f32| {
-        let n = 12;
-        let pts: Vec<egui::Pos2> = (0..=n)
-            .map(|i| {
-                let a = from + (to - from) * i as f32 / n as f32;
-                center + egui::vec2(a.cos(), -a.sin()) * radius
-            })
-            .collect();
-        painter.add(egui::Shape::line(pts, stroke));
-    };
-    let pi = std::f32::consts::PI;
-    // An arrowhead on a shaft, for the symbols that have to say "this way".
-    let arrow = |from: egui::Pos2, to: egui::Pos2| {
-        line(from, to);
-        let dir = (to - from).normalized();
-        let back = -dir * 5.0;
-        let side = egui::vec2(-dir.y, dir.x) * 3.0;
-        line(to, to + back + side);
-        line(to, to + back - side);
-    };
-    let sketch_tool = match tool {
-        AnyTool::Sketch(t) => t,
-        AnyTool::Model(kind) => {
-            model_symbol(kind, inner, pi, &line, &arc, &arrow, &dot);
-            return response;
-        }
-        AnyTool::Simulate => {
-            // A cantilever: a wall, a beam bending away from it and the load pressing
-            // on its free end — the textbook picture of a stress study.
-            line(egui::pos2(l, t), egui::pos2(l, b));
-            let n = 8;
-            let pts: Vec<egui::Pos2> = (0..=n)
-                .map(|i| {
-                    let f = i as f32 / n as f32;
-                    egui::pos2(l + (r - l) * f, c.y + (b - c.y) * 0.6 * f * f)
-                })
-                .collect();
-            painter.add(egui::Shape::line(pts, stroke));
-            arrow(egui::pos2(r, t), egui::pos2(r, c.y + (b - c.y) * 0.6 - 2.0));
-            return response;
-        }
-    };
-    match sketch_tool {
-        SketchTool::Select => {
-            // A pointer arrow.
-            let tip = egui::pos2(l + 2.0, t + 1.0);
-            painter.add(egui::Shape::convex_polygon(
-                vec![
-                    tip,
-                    egui::pos2(tip.x, b - 2.0),
-                    egui::pos2(tip.x + 4.0, b - 6.0),
-                    egui::pos2(tip.x + 10.0, b - 3.0),
-                    egui::pos2(tip.x + 12.0, b - 6.0),
-                    egui::pos2(tip.x + 6.0, b - 9.0),
-                    egui::pos2(r - 2.0, b - 9.0),
-                ],
-                stroke.color,
-                egui::Stroke::NONE,
-            ));
-        }
-        SketchTool::Line => {
-            line(egui::pos2(l, b), egui::pos2(r, t));
-            dot(egui::pos2(l, b));
-            dot(egui::pos2(r, t));
-        }
-        SketchTool::Rectangle => {
-            painter.rect_stroke(inner, 0.0, stroke, egui::StrokeKind::Middle);
-            dot(egui::pos2(l, b));
-            dot(egui::pos2(r, t));
-        }
-        SketchTool::CenterRectangle => {
-            painter.rect_stroke(inner, 0.0, stroke, egui::StrokeKind::Middle);
-            dot(c);
-            dot(egui::pos2(r, t));
-        }
-        SketchTool::Circle => {
-            painter.circle_stroke(c, inner.width() * 0.5, stroke);
-            dot(c);
-        }
-        SketchTool::Circle2Point => {
-            painter.circle_stroke(c, inner.width() * 0.5, stroke);
-            dot(egui::pos2(l, c.y));
-            dot(egui::pos2(r, c.y));
-        }
-        SketchTool::Circle3Point => {
-            let radius = inner.width() * 0.5;
-            painter.circle_stroke(c, radius, stroke);
-            for a in [pi * 0.5, pi * 7.0 / 6.0, pi * 11.0 / 6.0] {
-                dot(c + egui::vec2(a.cos(), -a.sin()) * radius);
-            }
-        }
-        SketchTool::Arc3Point => {
-            let center = egui::pos2(c.x, b);
-            arc(center, inner.width() * 0.5, 0.0, pi);
-            dot(egui::pos2(l, b));
-            dot(egui::pos2(c.x, t));
-            dot(egui::pos2(r, b));
-        }
-        SketchTool::ArcCenter => {
-            let center = egui::pos2(c.x, b);
-            arc(center, inner.width() * 0.5, 0.0, pi);
-            dot(center);
-            dot(egui::pos2(r, b));
-        }
-        SketchTool::Polygon => {
-            let radius = inner.width() * 0.5;
-            let pts: Vec<egui::Pos2> = (0..6)
-                .map(|i| {
-                    let a = pi / 3.0 * i as f32;
-                    c + egui::vec2(a.cos(), -a.sin()) * radius
-                })
-                .collect();
-            painter.add(egui::Shape::closed_line(pts, stroke));
-        }
-        SketchTool::Slot | SketchTool::SlotOverall | SketchTool::SlotCenterPoint => {
-            let radius = inner.height() * 0.3;
-            let (ca, cb) = (egui::pos2(l + radius, c.y), egui::pos2(r - radius, c.y));
-            line(
-                egui::pos2(ca.x, c.y - radius),
-                egui::pos2(cb.x, c.y - radius),
-            );
-            line(
-                egui::pos2(ca.x, c.y + radius),
-                egui::pos2(cb.x, c.y + radius),
-            );
-            arc(ca, radius, pi * 0.5, pi * 1.5);
-            arc(cb, radius, -pi * 0.5, pi * 0.5);
-            match sketch_tool {
-                SketchTool::Slot => {
-                    dot(ca);
-                    dot(cb);
-                }
-                SketchTool::SlotOverall => {
-                    dot(egui::pos2(l, c.y));
-                    dot(egui::pos2(r, c.y));
-                }
-                _ => {
-                    dot(c);
-                    dot(cb);
-                }
-            }
-        }
-        SketchTool::Text => {
-            painter.text(
-                c,
-                egui::Align2::CENTER_CENTER,
-                "T",
-                egui::FontId::proportional(18.0),
-                stroke.color,
-            );
-        }
-        SketchTool::Fillet => {
-            // Two edges meeting at a corner that has been replaced by an arc: each
-            // edge stops where the round begins, which is what the tool does to them.
-            let rad = inner.width() * 0.5;
-            let hub = egui::pos2(l + rad, t + rad);
-            line(egui::pos2(l, b), egui::pos2(l, t + rad));
-            arc(hub, rad, pi * 0.5, pi);
-            line(egui::pos2(l + rad, t), egui::pos2(r, t));
-            // The centre and the radius it is measured by, so the symbol says which
-            // number the tool is about.
-            dot(hub);
-            line(hub, egui::pos2(l, t + rad));
-        }
-        SketchTool::Trim | SketchTool::Break => {
-            // A line crossed by a second one; for Trim the crossed-off piece is gone,
-            // for Break the two halves are drawn apart.
-            let y = c.y;
-            line(egui::pos2(l, t + 2.0), egui::pos2(l + 7.0, b - 2.0));
-            if sketch_tool == SketchTool::Trim {
-                line(egui::pos2(l + 6.0, y), egui::pos2(r, y));
-                dot(egui::pos2(l + 3.0, y));
-            } else {
-                line(egui::pos2(l, y - 2.0), egui::pos2(l + 4.0, y - 2.0));
-                line(egui::pos2(l + 8.0, y + 2.0), egui::pos2(r, y + 2.0));
-            }
-        }
-        // Constraints have their own button, which carries the name as well; this arm
-        // exists so the icon of any tool can be drawn, and draws the same symbol.
-        SketchTool::Constrain(kind) => {
-            let scale = inner.width() * 0.5;
-            for [a, b] in sketch_mode::kind_strokes(kind) {
-                let to = |p: basset_math::Vec2| c + egui::vec2(p.x as f32, -p.y as f32) * scale;
-                line(to(a), to(b));
-            }
-        }
-        SketchTool::Dimension => {
-            // A dimension line with arrowheads and extension lines.
-            line(egui::pos2(l, t), egui::pos2(l, b));
-            line(egui::pos2(r, t), egui::pos2(r, b));
-            let y = c.y;
-            line(egui::pos2(l, y), egui::pos2(r, y));
-            for (x, d) in [(l, 1.0), (r, -1.0)] {
-                line(egui::pos2(x, y), egui::pos2(x + 4.0 * d, y - 3.0));
-                line(egui::pos2(x, y), egui::pos2(x + 4.0 * d, y + 3.0));
-            }
-        }
+    if let Some(text) = label {
+        let font = match shape {
+            ButtonShape::Inline => egui::FontId::proportional(13.0),
+            ButtonShape::Stacked => egui::FontId::proportional(STACKED_LABEL),
+        };
+        let galley = painter.layout_no_wrap(text.to_owned(), font, color);
+        let at = match shape {
+            ButtonShape::Inline => egui::pos2(
+                rect.left() + ICON + 4.0,
+                rect.center().y - galley.size().y * 0.5,
+            ),
+            ButtonShape::Stacked => egui::pos2(
+                rect.center().x - galley.size().x * 0.5,
+                rect.bottom() - 2.0 - galley.size().y,
+            ),
+        };
+        painter.galley(at, galley, color);
     }
+    paint_symbol(painter, icon, tool, color);
     response
 }
 
-/// The id of the painted caliper, so tests and egui's focus have a handle on a button
-/// that carries no text of its own. Shaped like [`tool_icon_id`] for the same reason.
-fn measure_icon_id() -> egui::Id {
-    egui::Id::new(("tool-icon", "toolbar", "Measure"))
+/// A tool's symbol, painted into the square `rect` in `color`.
+fn paint_symbol(painter: &egui::Painter, rect: egui::Rect, tool: AnyTool, color: egui::Color32) {
+    super::symbols::paint(painter, rect, tool_symbol(tool), color);
 }
 
-/// The Measure tool's button: a painted caliper with its name beside it.
-///
-/// Painted rather than typed for the reason the sketch tools are — the default fonts have
-/// no caliper — and the icon takes the click as readily as the name does, because
-/// something that looks like a button and lights up on hover has to do something when it
-/// is pressed. Returns whether it was clicked.
-fn measure_button(ui: &mut egui::Ui, enabled: bool, active: bool) -> bool {
-    ui.add_enabled_ui(enabled, |ui| {
-        ui.horizontal(|ui| {
-            let icon = measure_icon(ui, active);
-            let label = ui.selectable_label(active, "Measure");
-            icon.on_hover_text("Measure (no change to the model)")
-                .clicked()
-                || label.clicked()
-        })
-        .inner
-    })
-    .inner
+/// Which symbol of the set a tool wears.
+fn tool_symbol(tool: AnyTool) -> Symbol {
+    match tool {
+        AnyTool::Model(kind) => match kind {
+            ToolKind::Sketch => Symbol::CreateSketch,
+            ToolKind::Extrude => Symbol::Extrude,
+            ToolKind::Revolve => Symbol::Revolve,
+            ToolKind::Sweep => Symbol::Sweep,
+            ToolKind::Loft => Symbol::Loft,
+            ToolKind::Fillet => Symbol::Fillet,
+            ToolKind::Chamfer => Symbol::Chamfer,
+            ToolKind::Thread => Symbol::Thread,
+            ToolKind::Combine => Symbol::Combine,
+            ToolKind::Move => Symbol::Move,
+            ToolKind::OffsetPlane => Symbol::OffsetPlane,
+            ToolKind::AngledPlane => Symbol::AngledPlane,
+            ToolKind::Component => Symbol::Component,
+        },
+        AnyTool::Simulate => Symbol::Simulate,
+        AnyTool::Measure => Symbol::Measure,
+        AnyTool::Fit => Symbol::Fit,
+        AnyTool::Sketch(t) => match t {
+            SketchTool::Select => Symbol::Select,
+            SketchTool::Line => Symbol::Line,
+            SketchTool::Rectangle => Symbol::Rectangle,
+            SketchTool::CenterRectangle => Symbol::CenterRectangle,
+            SketchTool::Circle => Symbol::Circle,
+            SketchTool::Circle2Point => Symbol::Circle2Point,
+            SketchTool::Circle3Point => Symbol::Circle3Point,
+            SketchTool::Arc3Point => Symbol::Arc3Point,
+            SketchTool::ArcCenter => Symbol::ArcCenter,
+            SketchTool::Polygon => Symbol::Polygon,
+            SketchTool::Slot => Symbol::Slot,
+            SketchTool::SlotOverall => Symbol::SlotOverall,
+            SketchTool::SlotCenterPoint => Symbol::SlotCenterPoint,
+            SketchTool::Text => Symbol::Text,
+            SketchTool::Dimension => Symbol::Dimension,
+            SketchTool::Trim => Symbol::Trim,
+            SketchTool::Break => Symbol::Break,
+            SketchTool::Fillet => Symbol::SketchFillet,
+            SketchTool::Constrain(kind) => constraint_symbol(kind),
+        },
+    }
 }
 
-/// A vernier caliper seen side on: the beam, the fixed jaw, the sliding jaw and its body.
-fn measure_icon(ui: &mut egui::Ui, selected: bool) -> egui::Response {
-    const SIZE: f32 = 28.0;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(SIZE, SIZE), egui::Sense::hover());
-    let response = ui.interact(rect, measure_icon_id(), egui::Sense::click());
-    let visuals = ui.style().interact_selectable(&response, selected);
-    let painter = ui.painter();
-    painter.rect(
-        rect,
-        visuals.corner_radius,
-        visuals.weak_bg_fill,
-        visuals.bg_stroke,
-        egui::StrokeKind::Inside,
-    );
-    let stroke = egui::Stroke::new(1.6, visuals.fg_stroke.color);
-    let inner = rect.shrink(5.0);
-    let (l, r, t, b) = (inner.left(), inner.right(), inner.top(), inner.bottom());
-    let beam = inner.center().y;
-    let line = |a: egui::Pos2, b: egui::Pos2| painter.line_segment([a, b], stroke);
-    line(egui::pos2(l, beam), egui::pos2(r, beam));
-    line(egui::pos2(l, beam), egui::pos2(l, t));
-    let slide = l + (r - l) * 0.6;
-    line(egui::pos2(slide, beam), egui::pos2(slide, t));
-    painter.rect_stroke(
-        egui::Rect::from_min_max(egui::pos2(slide, beam), egui::pos2(slide + 5.0, b)),
-        0.0,
-        stroke,
-        egui::StrokeKind::Middle,
-    );
-    // The gap between the jaws: the thing the tool actually reports.
-    let gap = (beam + t) * 0.5;
-    line(egui::pos2(l + 2.0, gap), egui::pos2(slide - 2.0, gap));
-    response
+/// The symbol of a constraint, on its button and on the toolbar alike.
+fn constraint_symbol(kind: sketch_mode::ConstraintKind) -> Symbol {
+    use sketch_mode::ConstraintKind as K;
+    match kind {
+        K::Coincident => Symbol::Coincident,
+        K::Horizontal => Symbol::Horizontal,
+        K::Vertical => Symbol::Vertical,
+        K::Parallel => Symbol::Parallel,
+        K::Perpendicular => Symbol::Perpendicular,
+        K::Tangent => Symbol::Tangent,
+        K::Equal => Symbol::Equal,
+        K::Concentric => Symbol::Concentric,
+        K::Midpoint => Symbol::Midpoint,
+        K::Symmetric => Symbol::Symmetric,
+        K::Fix => Symbol::Fix,
+    }
 }
 
 /// The measurement, drawn on the geometry it describes.
@@ -1611,212 +1731,49 @@ fn measure_overlay(editor: &Editor, ctx: &egui::Context) {
         });
 }
 
-/// The symbol of a modelling tool, painted into `inner`.
-///
-/// Split out of [`tool_button`] rather than folded into its match because the two sets
-/// are drawn in different vocabularies: a sketch symbol is the shape the tool draws, a
-/// modelling symbol is a little picture of what the operation does to a solid. The
-/// drawing primitives are shared so both read as one family at the same size.
-#[allow(clippy::too_many_arguments)]
-fn model_symbol(
-    kind: ToolKind,
-    inner: egui::Rect,
-    pi: f32,
-    line: &dyn Fn(egui::Pos2, egui::Pos2),
-    arc: &dyn Fn(egui::Pos2, f32, f32, f32),
-    arrow: &dyn Fn(egui::Pos2, egui::Pos2),
-    dot: &dyn Fn(egui::Pos2),
-) {
-    let (l, r, t, b) = (inner.left(), inner.right(), inner.top(), inner.bottom());
-    let c = inner.center();
-    // A plane seen at an angle: the shape every datum and every sketch sits on.
-    let plane = |top: f32, height: f32| {
-        let (a, b2) = (egui::pos2(l + 4.0, top), egui::pos2(r, top));
-        let (c2, d) = (
-            egui::pos2(r - 4.0, top + height),
-            egui::pos2(l, top + height),
-        );
-        line(a, b2);
-        line(b2, c2);
-        line(c2, d);
-        line(d, a);
-    };
-    // A box seen square on, with one corner left open for the tools that change it.
-    let box_but_corner = |corner: &dyn Fn()| {
-        line(egui::pos2(l, b), egui::pos2(r, b));
-        line(egui::pos2(r, b), egui::pos2(r, t));
-        corner();
-    };
-    match kind {
-        ToolKind::Sketch => {
-            plane(t + 2.0, b - t - 4.0);
-            // A line drawn on the plane, with the points it was drawn between.
-            let (from, to) = (egui::pos2(l + 4.0, b - 5.0), egui::pos2(r - 4.0, t + 6.0));
-            line(from, to);
-            dot(from);
-            dot(to);
-        }
-        ToolKind::Extrude => {
-            plane(b - 5.0, 5.0);
-            arrow(egui::pos2(c.x, b - 6.0), egui::pos2(c.x, t));
-        }
-        ToolKind::Revolve => {
-            // The axis, the profile beside it, and the turn it makes about it.
-            line(egui::pos2(l, t), egui::pos2(l, b));
-            let (x0, x1) = (l + 4.0, l + 8.0);
-            line(egui::pos2(x0, t + 4.0), egui::pos2(x1, t + 4.0));
-            line(egui::pos2(x1, t + 4.0), egui::pos2(x1, b - 4.0));
-            line(egui::pos2(x1, b - 4.0), egui::pos2(x0, b - 4.0));
-            line(egui::pos2(x0, b - 4.0), egui::pos2(x0, t + 4.0));
-            let radius = r - l - 2.0;
-            arc(egui::pos2(l, c.y), radius, -0.9, 0.9);
-            let head = egui::pos2(l + radius * 0.9f32.cos(), c.y - radius * 0.9f32.sin());
-            arrow(egui::pos2(head.x + 1.0, head.y + 4.0), head);
-        }
-        ToolKind::Sweep => {
-            // A profile carried along a path: the path is the curve, the square is what
-            // travels down it.
-            let radius = r - l;
-            arc(egui::pos2(r, b), radius, pi * 0.5, pi);
-            let start = egui::pos2(r, b - radius);
-            for (a, b2) in [
-                (
-                    egui::pos2(start.x - 3.0, start.y - 3.0),
-                    egui::pos2(start.x + 3.0, start.y - 3.0),
-                ),
-                (
-                    egui::pos2(start.x + 3.0, start.y - 3.0),
-                    egui::pos2(start.x + 3.0, start.y + 3.0),
-                ),
-                (
-                    egui::pos2(start.x + 3.0, start.y + 3.0),
-                    egui::pos2(start.x - 3.0, start.y + 3.0),
-                ),
-                (
-                    egui::pos2(start.x - 3.0, start.y + 3.0),
-                    egui::pos2(start.x - 3.0, start.y - 3.0),
-                ),
-            ] {
-                line(a, b2);
-            }
-        }
-        ToolKind::Loft => {
-            // Two sections and the skin stretched between them.
-            line(egui::pos2(l + 4.0, t), egui::pos2(r - 4.0, t));
-            line(egui::pos2(l, b), egui::pos2(r, b));
-            line(egui::pos2(l + 4.0, t), egui::pos2(l, b));
-            line(egui::pos2(r - 4.0, t), egui::pos2(r, b));
-        }
-        ToolKind::Fillet => {
-            // A solid whose corner has been rounded away.
-            let radius = (r - l) * 0.45;
-            box_but_corner(&|| {
-                line(egui::pos2(r, t), egui::pos2(l + radius, t));
-                arc(egui::pos2(l + radius, t + radius), radius, pi * 0.5, pi);
-                line(egui::pos2(l, t + radius), egui::pos2(l, b));
-            });
-        }
-        ToolKind::Chamfer => {
-            // The same corner taken off flat, which is the whole difference.
-            let cut = (r - l) * 0.45;
-            box_but_corner(&|| {
-                line(egui::pos2(r, t), egui::pos2(l + cut, t));
-                line(egui::pos2(l + cut, t), egui::pos2(l, t + cut));
-                line(egui::pos2(l, t + cut), egui::pos2(l, b));
-            });
-        }
-        ToolKind::Thread => {
-            // A rod side-on with its crests slanting across it, which is how a thread
-            // is drawn on any drawing.
-            let (x0, x1) = (c.x - (r - l) * 0.3, c.x + (r - l) * 0.3);
-            line(egui::pos2(x0, t), egui::pos2(x0, b));
-            line(egui::pos2(x1, t), egui::pos2(x1, b));
-            let rise = (b - t) * 0.12;
-            let mut y = t + 3.0;
-            while y + rise <= b - 1.0 {
-                line(egui::pos2(x0, y + rise), egui::pos2(x1, y));
-                y += (b - t) * 0.22;
-            }
-        }
-        ToolKind::Combine => {
-            // Two bodies overlapping: what the tool joins, cuts or intersects.
-            let radius = (b - t) * 0.36;
-            arc(egui::pos2(c.x - radius * 0.7, c.y), radius, 0.0, pi * 2.0);
-            arc(egui::pos2(c.x + radius * 0.7, c.y), radius, 0.0, pi * 2.0);
-        }
-        ToolKind::Move => {
-            for to in [
-                egui::pos2(c.x, t),
-                egui::pos2(c.x, b),
-                egui::pos2(l, c.y),
-                egui::pos2(r, c.y),
-            ] {
-                arrow(c, to);
-            }
-        }
-        ToolKind::OffsetPlane => {
-            plane(t + 1.0, 4.0);
-            plane(b - 5.0, 4.0);
-            // The gap between them is the parameter, marked end to end. An arrowhead
-            // would not fit in the few pixels left between two planes.
-            line(egui::pos2(c.x, t + 5.0), egui::pos2(c.x, b - 5.0));
-            dot(egui::pos2(c.x, t + 5.0));
-            dot(egui::pos2(c.x, b - 5.0));
-        }
-        ToolKind::AngledPlane => {
-            plane(b - 5.0, 5.0);
-            // The new plane hinged off the base's near corner, drawn edge-on as the
-            // thin wedge it looks like from here, and the angle it turned through.
-            let hinge = egui::pos2(l, b);
-            let (tip, back) = (egui::pos2(r - 2.0, t + 1.0), egui::pos2(r - 7.0, t + 5.0));
-            line(hinge, tip);
-            line(tip, back);
-            line(back, hinge);
-            arc(hinge, (r - l) * 0.45, 0.0, pi * 0.32);
-        }
-        ToolKind::Component => {
-            // A cube: a part in its own right, which is what a component is.
-            let (top, bottom) = (egui::pos2(c.x, t), egui::pos2(c.x, b));
-            let (ul, ur) = (egui::pos2(l, t + 4.0), egui::pos2(r, t + 4.0));
-            let (ll, lr) = (egui::pos2(l, b - 4.0), egui::pos2(r, b - 4.0));
-            for (a, b2) in [
-                (top, ur),
-                (ur, lr),
-                (lr, bottom),
-                (bottom, ll),
-                (ll, ul),
-                (ul, top),
-            ] {
-                line(a, b2);
-            }
-            for to in [top, ll, lr] {
-                line(c, to);
-            }
-        }
-    }
+/// The head of a side panel: what the panel is, small and spaced, over the name of the
+/// thing it shows.
+fn panel_title(ui: &mut egui::Ui, kind: &str, name: &str) {
+    ui.add_space(4.0);
+    super::theme::caption(ui, kind);
+    ui.heading(name);
+    ui.add_space(2.0);
+}
+
+/// A selectable row of a list that takes the rest of the line, so the whole row lights
+/// up on hover and selection rather than a box hugging the text.
+fn row_label(
+    ui: &mut egui::Ui,
+    selected: bool,
+    text: impl Into<egui::WidgetText>,
+) -> egui::Response {
+    ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+        ui.selectable_label(selected, text)
+    })
+    .inner
 }
 
 fn browser(editor: &mut Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
-    ui.heading(&editor.doc.name);
+    panel_title(ui, "Browser", &editor.doc.name);
     egui::ScrollArea::vertical().show(ui, |ui| {
-        ui.collapsing("Origin", |ui| {
+        super::theme::section("Origin").show(ui, |ui| {
             ui.checkbox(&mut editor.show_origin, "Show origin planes and axes");
             ui.checkbox(&mut editor.show_grid, "Show grid");
             ui.checkbox(&mut editor.show_axes, "Show grid axes");
         });
         // Salted, because the count is part of the header text and a section keyed on its
         // own label would shut itself the moment a parameter was added to it.
-        egui::CollapsingHeader::new(format!("Parameters ({})", editor.doc.parameters().len()))
+        super::theme::section(format!("Parameters ({})", editor.doc.parameters().len()))
             .id_salt("document-parameters")
             .default_open(false)
             .show(ui, |ui| document_parameters(editor, ui, commands));
         let planes = editor.cached_planes.clone();
         if !planes.is_empty() {
-            ui.collapsing("Construction planes", |ui| {
+            super::theme::section("Construction planes").show(ui, |ui| {
                 for (id, _) in planes {
                     let name = editor.feature_name(id);
                     let selected = editor.selected_feature == Some(id);
-                    if ui.selectable_label(selected, name).clicked() {
+                    if row_label(ui, selected, name).clicked() {
                         commands.push(Command::SelectFeature(id));
                         editor.selection.clear();
                         editor.selection.planes.push(PlaneRef::Feature(id));
@@ -2023,7 +1980,7 @@ fn document_parameters(editor: &mut Editor, ui: &mut egui::Ui, commands: &mut Ve
             }
         });
         if let Some(e) = &ui_state.error {
-            ui.colored_label(egui::Color32::from_rgb(230, 120, 100), e);
+            ui.colored_label(super::theme::ERROR, e);
         }
         ui.label(
             egui::RichText::new(
@@ -2131,7 +2088,7 @@ fn component_tree(
     } else {
         egui::RichText::new(name.clone())
     };
-    let response = egui::CollapsingHeader::new(header)
+    let response = super::theme::section(header)
         .id_salt(("component", id.0))
         .default_open(true)
         .show(ui, |ui| {
@@ -2145,11 +2102,11 @@ fn component_tree(
                 .cloned()
                 .collect();
             if !bodies.is_empty() {
-                ui.label(egui::RichText::new("Bodies").weak());
+                super::theme::caption(ui, "Bodies");
                 for (b, bname) in bodies {
                     ui.horizontal(|ui| {
-                        let mut visible = !editor.hidden_bodies.contains(&b);
-                        if ui.checkbox(&mut visible, "").changed() {
+                        let visible = !editor.hidden_bodies.contains(&b);
+                        if super::theme::eye(ui, visible).clicked() {
                             commands.push(Command::ToggleBody(b));
                         }
                         body_row(editor, ui, b, bname, commands);
@@ -2163,14 +2120,15 @@ fn component_tree(
                 .map(|(sid, _)| *sid)
                 .collect();
             if !sketches.is_empty() {
-                ui.label(egui::RichText::new("Sketches").weak());
+                super::theme::caption(ui, "Sketches");
                 for s in sketches {
                     ui.horizontal(|ui| {
-                        let mut visible = !editor.hidden_sketches.contains(&s);
-                        if ui.checkbox(&mut visible, "").changed() {
+                        let visible = !editor.hidden_sketches.contains(&s);
+                        if super::theme::eye(ui, visible).clicked() {
                             commands.push(Command::ToggleSketch(s));
                         }
-                        let label = ui.selectable_label(
+                        let label = row_label(
+                            ui,
                             editor.selected_feature == Some(s),
                             editor.feature_name(s),
                         );
@@ -2250,7 +2208,7 @@ fn body_row(
     }
     let locked = editor.tool.is_some() || editor.is_sketching();
     let selected = editor.selection.bodies.contains(&b);
-    let response = ui.selectable_label(selected, &name);
+    let response = row_label(ui, selected, &name);
     if response.clicked() {
         editor.selection.clear();
         editor.selection.bodies.push(b);
@@ -2299,16 +2257,25 @@ fn timeline(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
     let diff = editor.compare.as_ref().map(|c| &c.diff);
     ui.horizontal(|ui| {
         ui.add_enabled_ui(!locked, |ui| {
-            if ui.button("⏮").clicked() {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let transport = |ui: &mut egui::Ui, glyph: &str| {
+                ui.add(
+                    egui::Button::new(egui::RichText::new(glyph).color(super::theme::TEXT_WEAK))
+                        .frame_when_inactive(false)
+                        .min_size(egui::vec2(22.0, 22.0)),
+                )
+                .clicked()
+            };
+            if transport(ui, "⏮") {
                 commands.push(Command::SetCursor(0));
             }
-            if ui.button("◀").clicked() {
+            if transport(ui, "◀") {
                 commands.push(Command::SetCursor(cursor.saturating_sub(1)));
             }
-            if ui.button("▶").clicked() {
+            if transport(ui, "▶") {
                 commands.push(Command::SetCursor((cursor + 1).min(len)));
             }
-            if ui.button("⏭").clicked() {
+            if transport(ui, "⏭") {
                 commands.push(Command::SetCursor(len));
             }
         });
@@ -2323,37 +2290,26 @@ fn timeline(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
                         cursor_marker(ui, true);
                     }
                     let status = editor.cached_statuses.get(&f.id);
-                    let abbrev = abbreviation(&f.kind);
-                    let mut text = egui::RichText::new(abbrev);
-                    if i >= cursor {
-                        text = text.weak();
-                    }
-                    if f.suppressed {
-                        text = text.strikethrough();
-                    }
-                    let fill = match status {
-                        Some(FeatureStatus::Failed(_)) => {
-                            Some(egui::Color32::from_rgb(120, 50, 40))
-                        }
-                        Some(FeatureStatus::Warned(_)) => {
-                            Some(egui::Color32::from_rgb(110, 85, 30))
-                        }
-                        _ => None,
+                    let chip = Chip {
+                        kind: f.kind.default_name(),
+                        rolled_back: i >= cursor,
+                        suppressed: f.suppressed,
+                        selected: editor.selected_feature == Some(f.id),
+                        status: match status {
+                            Some(FeatureStatus::Failed(_)) => Some(super::theme::ERROR),
+                            Some(FeatureStatus::Warned(_)) => Some(WARNING_LABEL),
+                            _ => None,
+                        },
                     };
-                    let mut button =
-                        egui::Button::new(text).selected(editor.selected_feature == Some(f.id));
-                    if let Some(fill) = fill {
-                        button = button.fill(fill);
-                    }
                     let change = diff.and_then(|d| d.feature(f.id)).map(|c| c.change);
-                    let response = ui.add(button).on_hover_ui(|ui| {
+                    let response = chip.show(ui).on_hover_ui(|ui| {
                         ui.label(&f.name);
                         if let Some(change) = change {
                             ui.colored_label(change_color(change), change_label(change));
                         }
                         match status {
                             Some(FeatureStatus::Failed(msg)) => {
-                                ui.colored_label(egui::Color32::from_rgb(230, 120, 100), msg);
+                                ui.colored_label(super::theme::ERROR, msg);
                             }
                             Some(FeatureStatus::Warned(msg)) => {
                                 ui.colored_label(WARNING_LABEL, msg);
@@ -2420,6 +2376,98 @@ fn timeline(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
     });
 }
 
+/// One feature on the timeline: its tool's symbol and its abbreviation on a rounded
+/// chip, tinted when it failed or warned, dimmed once the cursor has rolled back past it.
+struct Chip {
+    /// The kind as [`FeatureKind::default_name`] names it.
+    kind: &'static str,
+    rolled_back: bool,
+    suppressed: bool,
+    selected: bool,
+    /// The colour of a failure or warning, which tints the chip and draws its edge.
+    status: Option<egui::Color32>,
+}
+
+impl Chip {
+    fn show(self, ui: &mut egui::Ui) -> egui::Response {
+        const H: f32 = 22.0;
+        let abbrev = abbreviation_of(self.kind);
+        let galley = ui.painter().layout_no_wrap(
+            abbrev.to_owned(),
+            egui::FontId::proportional(11.5),
+            egui::Color32::WHITE,
+        );
+        let tool = feature_tool(self.kind);
+        let icon_w = if tool.is_some() { H - 2.0 } else { 4.0 };
+        let size = egui::vec2(icon_w + galley.size().x + 8.0, H);
+        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+        let base = egui::Color32::from_rgb(34, 37, 44);
+        let fill = if self.selected {
+            super::theme::ACCENT_TINT
+        } else if response.hovered() {
+            super::theme::HOVER
+        } else {
+            base
+        };
+        let fill = match self.status {
+            Some(c) => fill.lerp_to_gamma(c, 0.22),
+            None => fill,
+        };
+        let stroke = match (self.status, self.selected) {
+            (Some(c), _) => egui::Stroke::new(1.0, c.gamma_multiply(0.7)),
+            (None, true) => egui::Stroke::new(1.0, super::theme::ACCENT),
+            (None, false) => egui::Stroke::NONE,
+        };
+        let painter = ui.painter();
+        painter.rect(rect, 6.0, fill, stroke, egui::StrokeKind::Inside);
+        let color = if self.rolled_back {
+            super::theme::TEXT_DISABLED
+        } else if self.selected {
+            super::theme::ACCENT_TEXT
+        } else {
+            super::theme::TEXT
+        };
+        if let Some(tool) = tool {
+            let icon = egui::Rect::from_min_size(rect.min + egui::vec2(1.0, 0.0), egui::vec2(H, H));
+            paint_symbol(painter, icon.shrink(1.0), AnyTool::Model(tool), color);
+        }
+        let at = egui::pos2(
+            rect.left() + icon_w + 2.0,
+            rect.center().y - galley.size().y * 0.5,
+        );
+        let width = galley.size().x;
+        painter.galley_with_override_text_color(at, galley, color);
+        if self.suppressed {
+            let y = rect.center().y;
+            painter.line_segment(
+                [egui::pos2(at.x - 1.0, y), egui::pos2(at.x + width + 1.0, y)],
+                egui::Stroke::new(1.0, color),
+            );
+        }
+        response
+    }
+}
+
+/// The modelling tool whose symbol stands for a feature of this kind on the timeline.
+fn feature_tool(kind: &str) -> Option<ToolKind> {
+    Some(match kind {
+        "Component" | "Component from Body" => ToolKind::Component,
+        "Sketch" => ToolKind::Sketch,
+        "Offset Plane" => ToolKind::OffsetPlane,
+        "Angled Plane" => ToolKind::AngledPlane,
+        "Extrude" => ToolKind::Extrude,
+        "Revolve" => ToolKind::Revolve,
+        "Sweep" => ToolKind::Sweep,
+        "Loft" => ToolKind::Loft,
+        "Fillet" => ToolKind::Fillet,
+        "Chamfer" => ToolKind::Chamfer,
+        "Thread" => ToolKind::Thread,
+        "Combine" => ToolKind::Combine,
+        "Move" => ToolKind::Move,
+        _ => return None,
+    })
+}
+
 /// The chips for the features the compared version had at `slot` and this one has not:
 /// struck through and red, named on hover, and clickable to nothing, since there is no
 /// feature to select. Drawn before the chip that now stands at `slot`, the way a text
@@ -2458,13 +2506,8 @@ fn change_label(change: Change) -> &'static str {
 }
 
 fn cursor_marker(ui: &mut egui::Ui, _active: bool) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(6.0, 22.0), egui::Sense::hover());
-    ui.painter()
-        .rect_filled(rect, 1.0, egui::Color32::from_rgb(90, 160, 255));
-}
-
-fn abbreviation(kind: &FeatureKind) -> &'static str {
-    abbreviation_of(kind.default_name())
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(4.0, 22.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 2.0, super::theme::ACCENT);
 }
 
 /// The chip text for a kind named as [`FeatureKind::default_name`] names it, which is
@@ -2814,7 +2857,7 @@ fn project_panel(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>
     });
     ui.separator();
     egui::ScrollArea::vertical().show(ui, |ui| {
-        egui::CollapsingHeader::new(format!("Parts ({parts})"))
+        super::theme::section(format!("Parts ({parts})"))
             .id_salt("project-parts")
             .default_open(true)
             .show(ui, |ui| {
@@ -2842,7 +2885,7 @@ fn project_panel(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>
                     }
                 }
             });
-        egui::CollapsingHeader::new(format!("History ({})", project.log.len()))
+        super::theme::section(format!("History ({})", project.log.len()))
             .id_salt("project-history")
             .default_open(true)
             .show(ui, |ui| {
@@ -3110,7 +3153,7 @@ fn sketch_palette_body(editor: &mut Editor, ui: &mut egui::Ui, commands: &mut Ve
         // prompts the question the list answers: what *is* holding this sketch?
         constraint_list(s, ui, commands, highlight);
         ui.separator();
-        egui::CollapsingHeader::new("Parameters")
+        super::theme::section("Parameters")
             .default_open(false)
             .show(ui, |ui| parameters_panel(s, ui, commands));
     });
@@ -3163,7 +3206,7 @@ fn sketch_operation_dialog(
                         .changed();
                 }
                 if let Some(why) = s.move_refused() {
-                    ui.colored_label(egui::Color32::from_rgb(235, 190, 90), why);
+                    ui.colored_label(super::theme::WARNING, why);
                     ui.label(
                         egui::RichText::new(
                             "The geometry is left where it was. Delete or relax what is \
@@ -3345,9 +3388,7 @@ fn sketch_operation_dialog(
                     );
                 }
                 match s.pattern_status() {
-                    Some((_, Some(error))) => {
-                        ui.colored_label(egui::Color32::from_rgb(230, 120, 100), error)
-                    }
+                    Some((_, Some(error))) => ui.colored_label(super::theme::ERROR, error),
                     Some((copies, None)) => ui.colored_label(
                         LOOSE_LABEL,
                         match copies {
@@ -3386,9 +3427,7 @@ fn sketch_operation_dialog(
                         .changed();
                 }
                 match s.offset_status() {
-                    Some((_, Some(error))) => {
-                        ui.colored_label(egui::Color32::from_rgb(230, 120, 100), error)
-                    }
+                    Some((_, Some(error))) => ui.colored_label(super::theme::ERROR, error),
                     Some((made, None)) => ui.colored_label(
                         LOOSE_LABEL,
                         match made {
@@ -3444,9 +3483,7 @@ fn sketch_operation_dialog(
                     )
                     .changed();
                 match s.fillet_status() {
-                    Some((_, Some(error))) => {
-                        ui.colored_label(egui::Color32::from_rgb(230, 120, 100), error)
-                    }
+                    Some((_, Some(error))) => ui.colored_label(super::theme::ERROR, error),
                     Some((true, None)) => ui.colored_label(LOOSE_LABEL, "Corner rounded"),
                     _ => ui.label(""),
                 };
@@ -3505,7 +3542,7 @@ fn conflict_report(
     commands: &mut Vec<Command>,
 ) {
     let basset_sketch::SolveError::DidNotConverge { conflicting, .. } = error else {
-        ui.colored_label(egui::Color32::from_rgb(230, 120, 100), error.to_string());
+        ui.colored_label(super::theme::ERROR, error.to_string());
         return;
     };
     ui.colored_label(egui::Color32::YELLOW, "Constraints conflict");
@@ -3624,7 +3661,7 @@ fn constraint_list(
         .constraints()
         .map(|(id, c)| (id, constraint_label(c), c.references()))
         .collect();
-    egui::CollapsingHeader::new(format!("Constraints ({})", rows.len()))
+    super::theme::section(format!("Constraints ({})", rows.len()))
         .default_open(false)
         .show(ui, |ui| {
             if rows.is_empty() {
@@ -3714,7 +3751,7 @@ fn parameters_panel(s: &mut super::SketchEditor, ui: &mut egui::Ui, commands: &m
         }
     });
     if let Some(e) = &s.param_error {
-        ui.colored_label(egui::Color32::from_rgb(230, 120, 100), e);
+        ui.colored_label(super::theme::ERROR, e);
     }
     // The document's own table, read-only and visibly apart: these names are in scope
     // here, and a user who cannot see them has no way to know what they may write.

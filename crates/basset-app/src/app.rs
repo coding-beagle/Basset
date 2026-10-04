@@ -106,6 +106,7 @@ impl Gfx {
 
         let viewport = basset_viewport::Renderer::new(&device, srgb, 4);
         let egui_ctx = egui::Context::default();
+        crate::editor::theme::install(&egui_ctx);
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
             egui::ViewportId::ROOT,

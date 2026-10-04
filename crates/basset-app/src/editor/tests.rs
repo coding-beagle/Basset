@@ -4467,7 +4467,7 @@ mod shortcuts {
         h.frame();
         let frame = h.frame();
         let last = frame
-            .rect_of("\u{2714} Finish Sketch")
+            .rect_of("Finish Sketch")
             .unwrap_or_else(|| panic!("the toolbar's last button: {:?}", frame.text()));
         assert!(
             last.max.y < 120.0,

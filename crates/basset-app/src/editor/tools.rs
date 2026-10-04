@@ -1197,7 +1197,7 @@ pub fn dialog(editor: &mut Editor, ctx: &egui::Context) {
                             if over { "only" } else { "up to" }
                         ));
                         ui.label(if over {
-                            text.color(egui::Color32::from_rgb(235, 190, 90))
+                            text.color(super::theme::WARNING)
                         } else {
                             text.weak()
                         });
@@ -1326,11 +1326,11 @@ pub fn dialog(editor: &mut Editor, ctx: &egui::Context) {
             match &status {
                 Some(FeatureStatus::Failed(msg)) => {
                     ui.separator();
-                    ui.colored_label(egui::Color32::from_rgb(230, 120, 100), msg);
+                    ui.colored_label(super::theme::ERROR, msg);
                 }
                 Some(FeatureStatus::Warned(msg)) => {
                     ui.separator();
-                    ui.colored_label(egui::Color32::from_rgb(235, 190, 90), msg);
+                    ui.colored_label(super::theme::WARNING, msg);
                 }
                 _ => {}
             }
@@ -1938,7 +1938,7 @@ fn drag(
     if let Some((f, message)) = &exprs.error
         && *f == field
     {
-        ui.colored_label(egui::Color32::from_rgb(230, 120, 100), message);
+        ui.colored_label(super::theme::ERROR, message);
     }
     changed
 }

@@ -23,6 +23,9 @@ mod simulate;
 mod sketch_mode;
 pub(crate) mod snap;
 mod study_marks;
+mod symbol_data;
+mod symbols;
+pub(crate) mod theme;
 mod tools;
 mod viewcube;
 
@@ -1488,6 +1491,7 @@ impl Editor {
         // The solver's answer is read before the panels are laid out, so the frame that
         // receives it is the frame that shows it.
         self.poll_simulation();
+        theme::install(ui.ctx());
         panels::show(self, ui);
     }
 

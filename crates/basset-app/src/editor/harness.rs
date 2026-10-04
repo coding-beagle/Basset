@@ -91,9 +91,14 @@ impl Harness {
         let mut editor = Editor::new(None);
         editor.set_window_size(WINDOW);
         editor.refresh_cache();
+        // The window installs the theme before its first frame, so the harness does too:
+        // a first frame laid out in egui's default font would put every widget a test
+        // finds through it somewhere the next frame does not.
+        let egui = egui::Context::default();
+        super::theme::install(&egui);
         Self {
             editor,
-            egui: egui::Context::default(),
+            egui,
             last: None,
         }
     }
