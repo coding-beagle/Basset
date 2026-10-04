@@ -433,6 +433,53 @@ fn resize_and_ghost_instances_survive_frames() {
     );
 }
 
+/// A small red cube inside a big grey one: as a ghost it is hidden by the grey cube's
+/// near face, as an overlay it tints the centre red through it. This is what lets a
+/// comparison show the old top of a block inside the taller block that replaced it.
+#[test]
+fn an_overlay_shows_through_the_body_in_front_of_it_and_a_ghost_does_not() {
+    let Some(gpu) = gpu() else { return };
+    let mut renderer = Renderer::new(&gpu.device, FORMAT, 1);
+    renderer.resize(&gpu.device, SIZE);
+    let outer = renderer
+        .upload_mesh(&gpu.device, &gpu.queue, &cube(20.0), &[])
+        .expect("valid cube");
+    let inner = renderer
+        .upload_mesh(&gpu.device, &gpu.queue, &cube(8.0), &[])
+        .expect("valid cube");
+    let camera = looking_at_origin();
+    let centre_with = |renderer: &mut Renderer, style: Option<MeshStyle>| {
+        let mut scene = Scene::new(&camera);
+        scene.background = BACKGROUND;
+        scene.show_grid = false;
+        scene.meshes.push(MeshInstance::new(outer));
+        if let Some(style) = style {
+            scene.meshes.push(MeshInstance {
+                style,
+                color: [1.0, 0.0, 0.0, 1.0],
+                ..MeshInstance::new(inner)
+            });
+        }
+        let pixels = render_with(&gpu, renderer, &scene);
+        pixel(&pixels, SIZE[0] / 2, SIZE[1] / 2)
+    };
+    let plain = centre_with(&mut renderer, None);
+    let ghost = centre_with(&mut renderer, Some(MeshStyle::Ghost));
+    let overlay = centre_with(&mut renderer, Some(MeshStyle::Overlay));
+    assert_eq!(
+        ghost, plain,
+        "a ghost inside the cube is behind its near face and is hidden by it"
+    );
+    assert!(
+        overlay[0] > plain[0] + 20 && overlay[1] < plain[1],
+        "the overlay tints the centre red through the cube: {plain:?} -> {overlay:?}"
+    );
+    assert!(
+        overlay[1] > 10,
+        "but only tints: the grey face is still there under it: {overlay:?}"
+    );
+}
+
 #[test]
 fn tri_batch_fills_a_region_and_lets_the_background_through() {
     let Some(gpu) = gpu() else { return };

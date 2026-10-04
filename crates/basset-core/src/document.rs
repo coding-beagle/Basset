@@ -100,6 +100,12 @@ pub struct Document {
     /// change without turning undo into a slider replay.
     #[serde(skip)]
     in_transaction: bool,
+    /// Counts every change to the timeline or the parameter table, so a reader that
+    /// derives something expensive from the document — a comparison against another
+    /// version of it, say — can tell whether anything moved since it last looked without
+    /// serialising the timeline to find out. Not saved: it means nothing between runs.
+    #[serde(skip)]
+    revision: u64,
 }
 
 /// What one undo step restores.
@@ -132,7 +138,15 @@ impl Document {
             redo: Vec::new(),
             redo_before_transaction: Vec::new(),
             in_transaction: false,
+            revision: 0,
         }
+    }
+
+    /// A number that changes whenever the timeline or the parameter table does, undo and
+    /// redo included. Equal numbers mean the document is as it was; unequal ones mean it
+    /// may not be. Nothing else about the value means anything.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Starts grouping mutations into one undo step. Nested calls are ignored.
@@ -177,6 +191,7 @@ impl Document {
     pub fn set_font(&mut self, font: Option<Arc<Font>>) {
         self.regen.set_font(font);
         self.regen.invalidate_from(0);
+        self.revision += 1;
     }
 
     /// Evaluates the timeline up to the cursor, reusing cached results where inputs are
@@ -193,6 +208,27 @@ impl Document {
         if self.regen.parameters() != &self.parameters {
             self.regen.set_parameters(self.parameters.clone());
         }
+    }
+
+    /// The model with every feature applied, wherever the cursor stands.
+    ///
+    /// What a file *contains* is the whole timeline, so anything that compares two
+    /// versions of a document has to look past the cursor. Rolling the cursor forward for
+    /// the replay and back afterwards is invisible: the cursor is where it was, nothing is
+    /// recorded for undo and the revision does not move. The state is handed back by value
+    /// because the regenerator's cache is cut back to the cursor on its next evaluation,
+    /// which is exactly where a borrow would point.
+    pub fn full_state(&mut self) -> ModelState {
+        let cursor = self.timeline.cursor();
+        let len = self.timeline.len();
+        if cursor == len {
+            return self.state().clone();
+        }
+        self.sync_parameters();
+        self.timeline.set_cursor(len);
+        let state = self.regen.evaluate(&self.timeline).clone();
+        self.timeline.set_cursor(cursor);
+        state
     }
 
     /// The model as it stood just before `id` was applied: what that feature's inputs
@@ -745,6 +781,7 @@ impl Document {
         let parameters = std::mem::replace(&mut self.parameters, snapshot.parameters);
         self.refresh_driven_values();
         self.regen.invalidate_from(0);
+        self.revision += 1;
         Snapshot {
             timeline,
             parameters,
@@ -792,6 +829,9 @@ impl Document {
     /// the redo stack and make the user's next redo do nothing.
     fn push_undo(&mut self, snapshot: Snapshot) {
         const MAX_UNDO: usize = 200;
+        // Every mutation comes through here, inside a transaction or not, so this is
+        // where the document counts itself as changed.
+        self.revision += 1;
         if self.in_transaction {
             return;
         }

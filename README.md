@@ -15,7 +15,7 @@ rewritten when the next tool arrives.
 | Solids | extrude (one side / symmetric / two sides / to a face of another body, clicked while the tool runs), revolve, sweep, loft, from a sketch region or a planar face; join / cut / intersect, each against any number of target bodies chosen from a checklist (a cut through a stack offers the whole stack); fillet, chamfer, thread (ISO metric, on a shaft or in a hole, full length or partial, either hand), combine, move |
 | Construction | offset plane, plane at an angle, sketch on a planar face |
 | Timeline | insert at cursor, edit, suppress, reorder, delete, roll back / forward; edits replay forward with per-feature caching; extrude, revolve, fillet, chamfer, thread and construction-plane values drivable by expression; per-feature failure reporting |
-| Files | `.bass` documents (versioned JSON); STL and 3MF export of bodies and components |
+| Files | `.bass` documents (versioned JSON); STL and 3MF export of bodies and components; git projects: a folder of parts under git, with a Project panel listing the parts and their state, the project's history, any part openable as it was at any commit, commits of any set of parts from the editor, and a comparison with any commit drawn over the model — new faces and bodies in green, gone ones as red ghosts, changed features marked in the timeline |
 | Viewport | wgpu renderer with orbit camera, MSAA, pixel-width lines, view-dependent silhouettes so a curved body is bounded against the background, a grid on any plane, face highlighting, translucent region fills, ray picking |
 | App | winit + egui desktop shell: browser, timeline with rollback marker and context menu, live-preview tool dialogs, viewport transform manipulator (arrows and rotation rings) for sketch and body moves, navigation cube, sketch mode with shape tools, constraint tools and click-to-edit dimensions, native open/save/export dialogs; one declared table of keyboard commands, a shortcut overlay and a fuzzy command palette over it |
 
@@ -217,6 +217,31 @@ must come out with. Those files are the regression suite for sketching and extru
   features are inserted at the marker.
 * **Files**: `.bass` documents through the File menu or `Ctrl+S` / `Ctrl+O`; Export STL /
   3MF writes the selected bodies, or every visible body when nothing is selected.
+* **Git**: a design is a *project* — a folder of `.bass` parts under git. Open a
+  document from inside a repository and the project is open with it; or make one with
+  File › New project… (a folder, made a repository if it is not one) or open one with
+  File › Open project…. The Project panel on the right (`Ctrl+Shift+H`) lists the parts
+  with their state (`●` modified, `+` not yet committed), opens one with a click, and
+  shows the history: every commit with its author, unfolding to the parts it touched,
+  each of which opens as it was then as a document of its own (Save As to keep it).
+  Save and Commit are two different acts: `Ctrl+S` writes the file, and Commit…
+  (`Ctrl+Shift+G`) records the parts you tick with one message, saving the open document
+  first if it is among them, so a half-finished part can be saved for the evening without
+  entering the history. The status bar shows the branch, a dot while the open part
+  differs from the last commit and how many other parts do.
+
+  A `git diff` of a `.bass` file says which numbers changed; the comparison says it in
+  geometry. `Ctrl+G` compares the model with HEAD, the Git menu or a commit's Compare
+  button with any commit that touched the part. Faces and bodies the old version did not
+  have are green; faces and bodies it had and this one does not are drawn where they were
+  as red ghosts, so a taller extrude shows its new sides in green with the old top
+  floating red inside it, and a deleted body stands as a red ghost. Features that were
+  added or edited get a green or amber bar under their timeline chip, and a deleted
+  feature leaves a struck-through red chip where it stood. The whole timeline is
+  compared, wherever the rollback cursor is. The diff follows every edit, a tool dialog's
+  live preview included, so dragging a dimension shows what it changes against the
+  commit. Nothing is written to the repository but by Commit; `git` has to be on the
+  path.
 
 ## Keyboard
 
@@ -243,6 +268,7 @@ takes `Shift+D`. Constraints take shift and a letter of their own name.
 | `Shift+V` | Toggle orthographic |
 | `G` / `N` / `Shift+O` | Show grid / snap to grid / show origin planes and axes |
 | `Ctrl+N` `Ctrl+O` `Ctrl+S` `Ctrl+Shift+S` | New, open, save, save as |
+| `Ctrl+G` / `Ctrl+Shift+G` / `Ctrl+Shift+H` | Compare with git HEAD (again to stop) / commit to git / Project panel |
 | `Ctrl+Z` / `Ctrl+Shift+Z`, `Ctrl+Y` | Undo / redo |
 | `?` or `F1` | Keyboard shortcuts |
 | `Ctrl+P` | Command palette |

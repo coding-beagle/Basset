@@ -15,6 +15,13 @@ impl Editor {
         self.doc = basset_core::Document::new("Untitled");
         self.doc.set_font(self.font.clone());
         self.path = None;
+        // The project stays: a new document is most often a new part of it.
+        if let Some(project) = &mut self.project {
+            project.rel = None;
+            project.file = None;
+        }
+        self.compare = None;
+        self.commit_box = None;
         self.selection.clear();
         self.apply_visibility(&Visibility::default());
         self.active_component = basset_core::ComponentId::ROOT;
@@ -42,6 +49,11 @@ impl Editor {
                 doc.set_font(self.font.clone());
                 self.doc = doc;
                 self.path = Some(path.clone());
+                // A comparison was with the old document's history; the new file has
+                // its own.
+                self.compare = None;
+                self.commit_box = None;
+                self.refresh_project();
                 self.selection.clear();
                 let visibility = self.doc.visibility().clone();
                 self.apply_visibility(&visibility);
@@ -59,11 +71,14 @@ impl Editor {
         let path = match (&self.path, as_new) {
             (Some(p), false) => p.clone(),
             _ => {
-                let Some(p) = rfd::FileDialog::new()
+                let mut dialog = rfd::FileDialog::new()
                     .add_filter("Basset document", &[file::EXTENSION])
-                    .set_file_name(format!("{}.{}", self.doc.name, file::EXTENSION))
-                    .save_file()
-                else {
+                    .set_file_name(format!("{}.{}", self.doc.name, file::EXTENSION));
+                // A new part of an open project belongs in the project's folder.
+                if let Some(root) = self.project_root() {
+                    dialog = dialog.set_directory(root);
+                }
+                let Some(p) = dialog.save_file() else {
                     return;
                 };
                 with_extension(p, file::EXTENSION)
@@ -79,6 +94,7 @@ impl Editor {
                 self.path = Some(path.clone());
                 self.title_dirty = true;
                 self.set_status(format!("Saved {}", path.display()));
+                self.refresh_project();
             }
             Err(e) => self.report_error(format!("could not save: {e}")),
         }

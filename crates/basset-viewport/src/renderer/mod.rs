@@ -85,7 +85,31 @@ struct MeshDrawCall {
     handle: MeshHandle,
     uniform_offset: u32,
     highlight: HighlightKey,
-    translucent: bool,
+    pass: MeshPass,
+}
+
+/// Which of the mesh pipelines a call is drawn with, in the order the passes run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MeshPass {
+    Opaque,
+    /// Translucent over the opaque meshes, depth-tested against them.
+    Ghost,
+    /// Translucent over everything, tested against nothing.
+    Overlay,
+}
+
+impl MeshPass {
+    const ALL: [MeshPass; 3] = [MeshPass::Opaque, MeshPass::Ghost, MeshPass::Overlay];
+
+    fn of(style: MeshStyle) -> Self {
+        if style.shows_through() {
+            MeshPass::Overlay
+        } else if style.is_translucent() {
+            MeshPass::Ghost
+        } else {
+            MeshPass::Opaque
+        }
+    }
 }
 
 struct LineDrawCall {
@@ -338,7 +362,7 @@ impl Renderer {
                     handle: instance.handle,
                     uniform_offset,
                     highlight: key,
-                    translucent,
+                    pass: MeshPass::of(instance.style),
                 });
             }
             if instance.style.draws_edges() && gpu.edges.is_some() {
@@ -632,15 +656,16 @@ impl Renderer {
         pass.set_bind_group(0, &self.globals_bind_group, &[]);
         let draw_uniforms = self.uniforms.bind_group();
 
-        // Opaque first so the translucent styles blend over them, then depth-tested
-        // annotations, then the overlays that must stay visible through geometry.
-        for translucent in [false, true] {
-            pass.set_pipeline(if translucent {
-                &self.pipelines.mesh_ghost
-            } else {
-                &self.pipelines.mesh_opaque
+        // Opaque first so the translucent styles blend over them, then the overlay that
+        // ignores depth; then depth-tested annotations, then the overlays that must stay
+        // visible through geometry.
+        for mesh_pass in MeshPass::ALL {
+            pass.set_pipeline(match mesh_pass {
+                MeshPass::Opaque => &self.pipelines.mesh_opaque,
+                MeshPass::Ghost => &self.pipelines.mesh_ghost,
+                MeshPass::Overlay => &self.pipelines.mesh_overlay,
             });
-            for call in draws.meshes.iter().filter(|c| c.translucent == translucent) {
+            for call in draws.meshes.iter().filter(|c| c.pass == mesh_pass) {
                 let (Some(mesh), Some(highlight)) = (
                     self.meshes.get(&call.handle),
                     self.highlights.get(&call.highlight),

@@ -4,9 +4,10 @@
 //! rebuilding it every frame is cheap and guarantees the picture always matches the
 //! document and selection.
 
+use basset_core::BodyChange;
 use basset_math::{Vec2, Vec3};
 use basset_sketch::{Entity, Tessellation};
-use basset_viewport::{LineBatch, MeshInstance, PointBatch, Scene, TriBatch};
+use basset_viewport::{LineBatch, MeshInstance, MeshStyle, PointBatch, Scene, TriBatch};
 
 use super::selection::Pick;
 use super::tools;
@@ -31,6 +32,22 @@ const SNAP_MARK: [f32; 4] = [0.75, 0.88, 1.0, 0.55];
 /// Half-length of each of those lines, in pixels, so the mark is the same size to read
 /// at any zoom.
 const SNAP_MARK_PX: f64 = 26.0;
+/// What a comparison paints: faces and bodies the compared version did not have, and the
+/// faces and bodies it had that this one does not. The reds are translucent because what
+/// is gone is drawn where it was, through whatever stands there now; the greens are
+/// solid because what is new is the model itself.
+pub(crate) const DIFF_ADDED: [f32; 4] = [0.30, 0.78, 0.38, 1.0];
+/// A whole new body, a shade quieter than a new face so a model of new bodies is still a
+/// model and not a lawn.
+const DIFF_ADDED_BODY: [f32; 4] = [0.42, 0.70, 0.46, 1.0];
+/// The red of a removed face. A highlight colour, which the renderer blends as it is.
+pub(crate) const DIFF_REMOVED: [f32; 4] = [0.92, 0.28, 0.26, 0.55];
+/// The red of a whole removed body. A body colour, which the renderer thins to about a
+/// third for a translucent style, so this starts opaque to land where the face red does.
+const DIFF_REMOVED_BODY: [f32; 4] = [0.92, 0.28, 0.26, 1.0];
+/// A ghost of the whole base body carrying its removed faces: nothing of it shows but the
+/// faces lit red, so the body's unchanged faces do not double what is already drawn.
+const INVISIBLE: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
 
 pub fn build(editor: &Editor) -> Scene<'_> {
     let mut scene = Scene::new(&editor.camera);
@@ -73,7 +90,66 @@ pub fn build(editor: &Editor) -> Scene<'_> {
         {
             instance.highlight_faces.extend(face_index(f.key));
         }
+        // What the comparison has to say about this body. A body with a face selected or
+        // hovered keeps the selection colour: the instance has one highlight colour, and
+        // the user pointing at a face is asking about that face, not about the diff.
+        match editor.compare.as_ref().and_then(|c| c.diff.body(id)) {
+            Some(BodyChange::Added) => {
+                if !selected_body {
+                    instance.color = DIFF_ADDED_BODY;
+                    if bare {
+                        instance.edge_color = DIFF_ADDED;
+                    }
+                }
+            }
+            Some(BodyChange::Modified { added_faces, .. })
+                if instance.highlight_faces.is_empty() =>
+            {
+                instance.highlight_color = DIFF_ADDED;
+                for key in added_faces {
+                    instance.highlight_faces.extend(face_index(*key));
+                }
+            }
+            _ => {}
+        }
         scene.meshes.push(instance);
+    }
+
+    // What the compared version had and this one has not: removed bodies whole, and of
+    // changed bodies the faces that moved or went, each in the shape it had then. Drawn
+    // as overlays rather than ghosts, because the old top of a block that grew taller is
+    // inside the block now, and a depth test would hide exactly the face the user is
+    // looking for. Hidden with the body they belong to, so hiding a body hides its
+    // history too.
+    if let Some(compare) = &editor.compare {
+        for (id, mesh) in editor.base_meshes_iter() {
+            if editor.hidden_bodies.contains(&id) {
+                continue;
+            }
+            let mut ghost = MeshInstance::new(mesh.handle);
+            ghost.style = MeshStyle::Overlay;
+            ghost.highlight_color = DIFF_REMOVED;
+            match compare.diff.body(id) {
+                Some(BodyChange::Removed { .. }) => ghost.color = DIFF_REMOVED_BODY,
+                Some(BodyChange::Modified { removed_faces, .. }) => {
+                    ghost.color = INVISIBLE;
+                    for key in removed_faces {
+                        ghost.highlight_faces.extend(
+                            mesh.tess
+                                .face_keys
+                                .iter()
+                                .position(|k| k == key)
+                                .map(|i| i as u32),
+                        );
+                    }
+                    if ghost.highlight_faces.is_empty() {
+                        continue;
+                    }
+                }
+                _ => continue,
+            }
+            scene.meshes.push(ghost);
+        }
     }
 
     // Edge highlights.

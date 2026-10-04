@@ -4,7 +4,7 @@
 //! the panel closures return. That keeps borrow scopes short and lets any panel trigger
 //! any command without threading `&mut Editor` through egui closures.
 
-use basset_core::{BodyRef, ComponentId, FeatureId, FeatureKind, FeatureStatus, PlaneRef};
+use basset_core::{BodyRef, Change, ComponentId, FeatureId, FeatureKind, FeatureStatus, PlaneRef};
 use basset_viewport::ViewPreset;
 
 use super::commands::{self, Command};
@@ -21,6 +21,21 @@ const WARNING_LABEL: egui::Color32 = egui::Color32::from_rgb(235, 190, 90);
 /// The orange the viewport draws a redundant constraint's badge in, so the row that
 /// names it matches the mark on the drawing.
 const REDUNDANT_LABEL: egui::Color32 = egui::Color32::from_rgb(255, 160, 80);
+/// The green and red of a comparison, matching what the viewport paints new and gone
+/// geometry in (see `scene::DIFF_ADDED` and `scene::DIFF_REMOVED`), so the mark under a
+/// timeline chip and the colour on the body say the same thing. Modified is the mix: a
+/// feature that is in both versions and not the same.
+const DIFF_ADDED_LABEL: egui::Color32 = egui::Color32::from_rgb(110, 210, 120);
+const DIFF_REMOVED_LABEL: egui::Color32 = egui::Color32::from_rgb(235, 100, 90);
+const DIFF_MODIFIED_LABEL: egui::Color32 = egui::Color32::from_rgb(230, 190, 80);
+
+fn change_color(change: Change) -> egui::Color32 {
+    match change {
+        Change::Added => DIFF_ADDED_LABEL,
+        Change::Removed => DIFF_REMOVED_LABEL,
+        Change::Modified => DIFF_MODIFIED_LABEL,
+    }
+}
 
 pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
     let mut commands: Vec<Command> = Vec::new();
@@ -39,6 +54,7 @@ pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
             warning_summary(editor, ui, &mut commands);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(egui::RichText::new(editor.selection.summary()).weak());
+                git_chip(editor, ui, &mut commands);
             });
         });
     });
@@ -52,11 +68,16 @@ pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
         egui::Panel::right("sketch-palette")
             .default_size(210.0)
             .show(ui, |ui| sketch_palette(editor, ui, &mut commands));
+    } else if editor.show_project && editor.project.is_some() {
+        egui::Panel::right("project")
+            .default_size(250.0)
+            .show(ui, |ui| project_panel(editor, ui, &mut commands));
     }
 
     let free = ui.available_rect_before_wrap();
     let ctx = ui.ctx().clone();
     super::viewcube::show(editor, &ctx, free);
+    compare_banner(editor, &ctx, free, &mut commands);
     sketch_operation_dialog(editor, &ctx, free, &mut commands);
     tools::dialog(editor, &ctx);
     super::gizmo::interact(editor, &ctx);
@@ -71,6 +92,7 @@ pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
     command_palette(editor, &ctx, &mut commands);
     error_popup(editor, &ctx);
     rename_popup(editor, &ctx);
+    commit_popup(editor, &ctx, &mut commands);
 
     for c in commands {
         run(editor, c);
@@ -108,6 +130,32 @@ pub(super) fn run(editor: &mut Editor, c: Command) {
         }
         Command::ExportComponent(id, format) => editor.export_component(id, format),
         Command::Quit => editor.quit(),
+        Command::Compare(Some(spec)) => editor.compare_with(&spec),
+        Command::Compare(None) => editor.stop_compare(),
+        Command::ToggleCompare => editor.toggle_compare(),
+        Command::RefreshProject => editor.refresh_project(),
+        Command::Commit => editor.begin_commit(),
+        Command::CommitWith(message, paths) => {
+            editor.commit_box = None;
+            editor.commit_files(&paths, &message);
+        }
+        Command::OpenProject => editor.open_project(),
+        Command::NewProject => editor.new_project(),
+        Command::CloseProject => editor.close_project(),
+        Command::ToggleProjectPanel => {
+            if editor.project.is_none() {
+                editor.report_error("open a project first: File \u{203a} Open project…");
+            } else {
+                editor.show_project = !editor.show_project;
+            }
+        }
+        Command::OpenPart(rel) => editor.open_part(&rel),
+        Command::OpenVersion(rev, rel) => editor.open_version(&rev, &rel),
+        Command::PickCommit(hash) => {
+            if let Some(project) = &mut editor.project {
+                project.picked = hash;
+            }
+        }
         Command::Undo => editor.undo(),
         Command::Redo => editor.redo(),
         Command::Fit => editor.zoom_to_fit(),
@@ -408,6 +456,22 @@ fn menu_bar(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
             {
                 commands.push(Command::Open);
             }
+            ui.separator();
+            if ui
+                .button(format!("New project…{}", commands::hint("project.new")))
+                .on_hover_text("Pick a folder and make it a git repository of parts")
+                .clicked()
+            {
+                commands.push(Command::NewProject);
+            }
+            if ui
+                .button(format!("Open project…{}", commands::hint("project.open")))
+                .on_hover_text("Pick a folder inside a git repository")
+                .clicked()
+            {
+                commands.push(Command::OpenProject);
+            }
+            ui.separator();
             if ui
                 .button(format!("Save{}", commands::hint("file.save")))
                 .clicked()
@@ -452,6 +516,7 @@ fn menu_bar(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
                 commands.push(Command::Redo);
             }
         });
+        git_menu(editor, ui, commands);
         ui.menu_button("View", |ui| {
             if ui
                 .button(format!("Fit{}", commands::hint("view.fit")))
@@ -2113,6 +2178,7 @@ fn timeline(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
     let cursor = timeline.cursor();
     let len = timeline.len();
     let locked = editor.tool.is_some() || editor.is_sketching();
+    let diff = editor.compare.as_ref().map(|c| &c.diff);
     ui.horizontal(|ui| {
         ui.add_enabled_ui(!locked, |ui| {
             if ui.button("⏮").clicked() {
@@ -2132,6 +2198,9 @@ fn timeline(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
                 for (i, f) in timeline.features().iter().enumerate() {
+                    if let Some(diff) = diff {
+                        removed_chips(ui, diff, i);
+                    }
                     if i == cursor {
                         cursor_marker(ui, true);
                     }
@@ -2158,8 +2227,12 @@ fn timeline(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
                     if let Some(fill) = fill {
                         button = button.fill(fill);
                     }
+                    let change = diff.and_then(|d| d.feature(f.id)).map(|c| c.change);
                     let response = ui.add(button).on_hover_ui(|ui| {
                         ui.label(&f.name);
+                        if let Some(change) = change {
+                            ui.colored_label(change_color(change), change_label(change));
+                        }
                         match status {
                             Some(FeatureStatus::Failed(msg)) => {
                                 ui.colored_label(egui::Color32::from_rgb(230, 120, 100), msg);
@@ -2173,6 +2246,9 @@ fn timeline(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
                             _ => {}
                         }
                     });
+                    if let Some(change) = change {
+                        change_mark(ui, response.rect, change);
+                    }
                     if response.clicked() {
                         commands.push(Command::SelectFeature(f.id));
                     }
@@ -2215,12 +2291,52 @@ fn timeline(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
                         }
                     });
                 }
+                if let Some(diff) = diff {
+                    removed_chips(ui, diff, len);
+                }
                 if cursor == len {
                     cursor_marker(ui, true);
                 }
             });
         });
     });
+}
+
+/// The chips for the features the compared version had at `slot` and this one has not:
+/// struck through and red, named on hover, and clickable to nothing, since there is no
+/// feature to select. Drawn before the chip that now stands at `slot`, the way a text
+/// diff shows the old line above the new.
+fn removed_chips(ui: &mut egui::Ui, diff: &basset_core::DocumentDiff, slot: usize) {
+    for gone in diff.removed_features().filter(|f| f.slot == slot) {
+        let text = egui::RichText::new(abbreviation_of(gone.kind))
+            .strikethrough()
+            .color(DIFF_REMOVED_LABEL);
+        let response = ui.add(egui::Button::new(text).frame(false));
+        change_mark(ui, response.rect, Change::Removed);
+        response.on_hover_ui(|ui| {
+            ui.label(&gone.name);
+            ui.colored_label(DIFF_REMOVED_LABEL, change_label(Change::Removed));
+        });
+    }
+}
+
+/// A bar along the foot of a timeline chip in the colour of its change. A bar rather
+/// than a fill, because the fill already says whether the feature failed or warned and a
+/// feature can be both new and broken.
+fn change_mark(ui: &mut egui::Ui, rect: egui::Rect, change: Change) {
+    let bar = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 2.0, rect.bottom() - 3.0),
+        egui::pos2(rect.right() - 2.0, rect.bottom() - 1.0),
+    );
+    ui.painter().rect_filled(bar, 1.0, change_color(change));
+}
+
+fn change_label(change: Change) -> &'static str {
+    match change {
+        Change::Added => "added since the compared version",
+        Change::Removed => "removed since the compared version",
+        Change::Modified => "changed since the compared version",
+    }
 }
 
 fn cursor_marker(ui: &mut egui::Ui, _active: bool) {
@@ -2230,21 +2346,469 @@ fn cursor_marker(ui: &mut egui::Ui, _active: bool) {
 }
 
 fn abbreviation(kind: &FeatureKind) -> &'static str {
+    abbreviation_of(kind.default_name())
+}
+
+/// The chip text for a kind named as [`FeatureKind::default_name`] names it, which is
+/// all a diff keeps of a feature that is gone.
+fn abbreviation_of(kind: &str) -> &'static str {
     match kind {
-        FeatureKind::NewComponent { .. } | FeatureKind::ComponentFromBody { .. } => "Cmp",
-        FeatureKind::Sketch { .. } => "Sk",
-        FeatureKind::OffsetPlane { .. } => "Pl+",
-        FeatureKind::AngledPlane { .. } => "PlA",
-        FeatureKind::Extrude { .. } => "Ext",
-        FeatureKind::Revolve { .. } => "Rev",
-        FeatureKind::Sweep { .. } => "Swp",
-        FeatureKind::Loft { .. } => "Lft",
-        FeatureKind::Fillet { .. } => "Fil",
-        FeatureKind::Chamfer { .. } => "Chm",
-        FeatureKind::Thread { .. } => "Thr",
-        FeatureKind::Combine { .. } => "Cmb",
-        FeatureKind::Move { .. } => "Mov",
+        "Component" | "Component from Body" => "Cmp",
+        "Sketch" => "Sk",
+        "Offset Plane" => "Pl+",
+        "Angled Plane" => "PlA",
+        "Extrude" => "Ext",
+        "Revolve" => "Rev",
+        "Sweep" => "Swp",
+        "Loft" => "Lft",
+        "Fillet" => "Fil",
+        "Chamfer" => "Chm",
+        "Thread" => "Thr",
+        "Combine" => "Cmb",
+        "Move" => "Mov",
+        _ => "?",
     }
+}
+
+/// The Git menu: where the document stands, a commit, and the versions to compare with.
+///
+/// The menu is the one place the log is listed, so it is the one place that asks for a
+/// fresh reading of it: the status is re-read the frame the menu opens, which is the
+/// latest moment that still has it current when the user looks.
+fn git_menu(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
+    let response = ui.menu_button("Git", |ui| {
+        let Some(project) = &editor.project else {
+            ui.label(
+                egui::RichText::new(if editor.path.is_none() {
+                    "Save the document inside a git repository, or open a project, to use git here"
+                } else {
+                    "The document is not in a git repository"
+                })
+                .weak(),
+            );
+            ui.separator();
+            if ui.button("New project…").clicked() {
+                commands.push(Command::NewProject);
+                ui.close();
+            }
+            if ui.button("Open project…").clicked() {
+                commands.push(Command::OpenProject);
+                ui.close();
+            }
+            return;
+        };
+        let branch = project.branch.as_deref().unwrap_or("no commits yet");
+        let where_ = match (&project.rel, project.file) {
+            (Some(rel), Some(state)) => {
+                format!(
+                    "{} \u{b7} {branch} \u{b7} {rel} {}",
+                    project.name(),
+                    state.label()
+                )
+            }
+            _ => format!("{} \u{b7} {branch}", project.name()),
+        };
+        ui.label(egui::RichText::new(where_).weak());
+        ui.separator();
+        if ui
+            .add(
+                egui::Button::new(format!("Project panel{}", commands::hint("project.panel")))
+                    .selected(editor.show_project),
+            )
+            .clicked()
+        {
+            commands.push(Command::ToggleProjectPanel);
+            ui.close();
+        }
+        if ui
+            .button(format!("Commit…{}", commands::hint("file.commit")))
+            .clicked()
+        {
+            commands.push(Command::Commit);
+            ui.close();
+        }
+        ui.separator();
+        ui.label(egui::RichText::new("Compare with").weak());
+        let comparing = editor.compare.as_ref().map(|c| c.spec.as_str());
+        if ui
+            .selectable_label(comparing.is_none(), "Nothing")
+            .clicked()
+        {
+            commands.push(Command::Compare(None));
+            ui.close();
+        }
+        let in_history = project.rel.is_some() && project.branch.is_some();
+        if ui
+            .add_enabled(
+                in_history,
+                egui::Button::new(format!(
+                    "HEAD, the last commit{}",
+                    commands::hint("file.compare")
+                ))
+                .selected(comparing == Some("HEAD")),
+            )
+            .clicked()
+        {
+            commands.push(Command::Compare(Some("HEAD".into())));
+            ui.close();
+        }
+        for commit in project
+            .history_of_document()
+            .take(super::compare::LOG_LENGTH)
+        {
+            let text = format!("{} {}", commit.short, commit.subject);
+            if ui
+                .selectable_label(comparing == Some(commit.hash.as_str()), text)
+                .on_hover_text(format!("{} \u{b7} {}", commit.author, commit.when))
+                .clicked()
+            {
+                commands.push(Command::Compare(Some(commit.hash.clone())));
+                ui.close();
+            }
+        }
+        ui.separator();
+        if ui.button("Close project").clicked() {
+            commands.push(Command::CloseProject);
+            ui.close();
+        }
+    });
+    // Opening the menu is the ask for a fresh status: `clicked` is the press that opened
+    // it (or closed it, which re-reads once more, harmlessly).
+    if response.response.clicked() && editor.project.is_some() {
+        commands.push(Command::RefreshProject);
+    }
+}
+
+/// The status bar's word on git: the branch, whether the document has changed since the
+/// last commit and how many other parts have, or, while comparing, what with and what
+/// differs. Clicking it starts or stops the comparison with HEAD.
+fn git_chip(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
+    let Some(project) = &editor.project else {
+        return;
+    };
+    let (text, color, hover) = match &editor.compare {
+        Some(compare) => (
+            format!("vs {}: {}", compare.label(), compare.diff.summary()),
+            DIFF_MODIFIED_LABEL,
+            "Comparing with a version in git. Click to stop.".to_string(),
+        ),
+        None => (
+            project.chip(),
+            ui.visuals().weak_text_color(),
+            match (&project.rel, project.file) {
+                (Some(rel), Some(state)) => format!(
+                    "{rel} is {} in project {}. Click to compare with HEAD.",
+                    state.label(),
+                    project.name()
+                ),
+                _ => format!(
+                    "Project {}. Save the document into it to compare and commit it.",
+                    project.name()
+                ),
+            },
+        ),
+    };
+    let response = ui
+        .add(egui::Button::new(egui::RichText::new(text).color(color)).frame(false))
+        .on_hover_text(hover);
+    if response.clicked() {
+        commands.push(Command::ToggleCompare);
+    }
+}
+
+/// While comparing, a strip at the top of the viewport that says what the colours mean
+/// and offers the way out. It is the only legend the overlay has, since the colours
+/// alone could as well be a failed feature or a selection.
+fn compare_banner(
+    editor: &Editor,
+    ctx: &egui::Context,
+    free: egui::Rect,
+    commands: &mut Vec<Command>,
+) {
+    let Some(compare) = &editor.compare else {
+        return;
+    };
+    egui::Area::new(egui::Id::new("compare-banner"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::pos2(free.center().x, free.top() + 8.0))
+        .pivot(egui::Align2::CENTER_TOP)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(format!("Comparing with {}", compare.label()));
+                    ui.separator();
+                    ui.colored_label(DIFF_ADDED_LABEL, "\u{25a0} added");
+                    ui.colored_label(DIFF_REMOVED_LABEL, "\u{25a0} removed");
+                    ui.separator();
+                    ui.label(egui::RichText::new(compare.diff.summary()).weak());
+                    if ui.button("Done").clicked() {
+                        commands.push(Command::Compare(None));
+                    }
+                });
+            });
+        });
+}
+
+/// The commit box: a message, the parts to record, and Commit saves the open document if
+/// it is among them and commits what is ticked.
+fn commit_popup(editor: &mut Editor, ctx: &egui::Context, commands: &mut Vec<Command>) {
+    let Some(mut commit_box) = editor.commit_box.clone() else {
+        return;
+    };
+    let Some(project) = &editor.project else {
+        editor.commit_box = None;
+        return;
+    };
+    // What can be ticked: every changed part, and the open document whether or not it
+    // has been saved since it changed — committing it saves it.
+    let mut choices: Vec<(String, &'static str)> = project
+        .changed()
+        .map(|f| (f.path.clone(), f.state.label()))
+        .collect();
+    if let Some(rel) = &project.rel
+        && !choices.iter().any(|(p, _)| p == rel)
+    {
+        choices.insert(0, (rel.clone(), "open"));
+    }
+    let mut done: Option<bool> = None;
+    egui::Window::new("Commit to git")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} \u{b7} {}",
+                    project.name(),
+                    project.branch.as_deref().unwrap_or("first commit")
+                ))
+                .weak(),
+            );
+            if choices.is_empty() {
+                ui.label("Nothing has changed since the last commit.");
+            }
+            for (path, state) in &choices {
+                let mut on = commit_box.include.contains(path);
+                let label = if *state == "open" {
+                    path.clone()
+                } else {
+                    format!("{path}  \u{b7} {state}")
+                };
+                if ui.checkbox(&mut on, label).changed() {
+                    if on {
+                        commit_box.include.insert(path.clone());
+                    } else {
+                        commit_box.include.remove(path);
+                    }
+                }
+            }
+            let response = ui.add(
+                egui::TextEdit::multiline(&mut commit_box.message)
+                    .hint_text("What changed, and why")
+                    .desired_rows(3)
+                    .desired_width(360.0),
+            );
+            if commit_box.message.is_empty() {
+                response.request_focus();
+            }
+            ui.horizontal(|ui| {
+                let n = commit_box.include.len();
+                let label = match n {
+                    0 | 1 => "Commit".to_string(),
+                    n => format!("Commit {n} parts"),
+                };
+                if ui
+                    .add_enabled(
+                        !commit_box.message.trim().is_empty() && n > 0,
+                        egui::Button::new(label),
+                    )
+                    .clicked()
+                {
+                    done = Some(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    done = Some(false);
+                }
+            });
+        });
+    match done {
+        Some(true) => commands.push(Command::CommitWith(
+            commit_box.message.clone(),
+            commit_box.include.iter().cloned().collect(),
+        )),
+        Some(false) => editor.commit_box = None,
+        None => editor.commit_box = Some(commit_box),
+    }
+}
+
+/// The Project panel: the parts of the project with their state, and its history.
+///
+/// A part is opened with a click; a commit unfolds to what it touched, and any part in it
+/// opens as it was then. The panel is the one place the whole project is in view, so the
+/// commit button lives here too, beside the parts it will record.
+fn project_panel(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
+    let Some(project) = &editor.project else {
+        return;
+    };
+    // Truncated, not wrapped and not extended: a panel grows to fit an unbroken line,
+    // and a long folder name would take the viewport with it.
+    ui.add(egui::Label::new(egui::RichText::new(project.name()).heading()).truncate())
+        .on_hover_text(project.repo.root().display().to_string());
+    let changed = project.changed().count();
+    let parts = project.files.len();
+    ui.label(
+        egui::RichText::new(format!(
+            "\u{2387} {} \u{b7} {parts} part{} \u{b7} {changed} changed",
+            project.branch.as_deref().unwrap_or("no commits yet"),
+            if parts == 1 { "" } else { "s" },
+        ))
+        .weak(),
+    );
+    ui.horizontal(|ui| {
+        if ui
+            .button("Commit\u{2026}")
+            .on_hover_text("Record the changed parts in git")
+            .clicked()
+        {
+            commands.push(Command::Commit);
+        }
+        if ui
+            .button("New part")
+            .on_hover_text("A new document; Save puts it in the project's folder")
+            .clicked()
+        {
+            commands.push(Command::New);
+        }
+        if ui
+            .small_button("\u{21bb}")
+            .on_hover_text("Re-read the project from git")
+            .clicked()
+        {
+            commands.push(Command::RefreshProject);
+        }
+        if ui
+            .small_button("\u{2715}")
+            .on_hover_text("Hide the panel (Ctrl+Shift+H brings it back)")
+            .clicked()
+        {
+            commands.push(Command::ToggleProjectPanel);
+        }
+    });
+    ui.separator();
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        egui::CollapsingHeader::new(format!("Parts ({parts})"))
+            .id_salt("project-parts")
+            .default_open(true)
+            .show(ui, |ui| {
+                if project.files.is_empty() {
+                    ui.label(
+                        egui::RichText::new("No parts yet. Save a document into the project.")
+                            .weak(),
+                    );
+                }
+                for file in &project.files {
+                    let current = project.rel.as_deref() == Some(file.path.as_str());
+                    let (mark, color) = match file.state {
+                        super::git::FileState::Modified => ("\u{25cf} ", DIFF_MODIFIED_LABEL),
+                        super::git::FileState::Untracked => ("+ ", DIFF_ADDED_LABEL),
+                        super::git::FileState::Clean => ("", ui.visuals().text_color()),
+                    };
+                    let text = egui::RichText::new(format!("{mark}{}", file.path)).color(color);
+                    if ui
+                        .selectable_label(current, text)
+                        .on_hover_text(format!("{} in git", file.state.label()))
+                        .clicked()
+                        && !current
+                    {
+                        commands.push(Command::OpenPart(file.path.clone()));
+                    }
+                }
+            });
+        egui::CollapsingHeader::new(format!("History ({})", project.log.len()))
+            .id_salt("project-history")
+            .default_open(true)
+            .show(ui, |ui| {
+                if project.log.is_empty() {
+                    ui.label(
+                        egui::RichText::new("No commits yet. Commit… records the parts.").weak(),
+                    );
+                }
+                for commit in &project.log {
+                    history_row(editor, project, commit, ui, commands);
+                }
+            });
+    });
+}
+
+/// One commit in the History section: a line for the commit, and, unfolded, what it
+/// touched and what can be done with it.
+fn history_row(
+    editor: &Editor,
+    project: &super::project::Project,
+    commit: &super::git::Commit,
+    ui: &mut egui::Ui,
+    commands: &mut Vec<Command>,
+) {
+    let picked = project.picked.as_deref() == Some(commit.hash.as_str());
+    let comparing = editor
+        .compare
+        .as_ref()
+        .is_some_and(|c| c.commit.hash == commit.hash);
+    let title = egui::RichText::new(format!("{} {}", commit.short, commit.subject));
+    let title = if comparing {
+        title.color(DIFF_MODIFIED_LABEL)
+    } else {
+        title
+    };
+    if ui.selectable_label(picked, title).clicked() {
+        commands.push(Command::PickCommit(if picked {
+            None
+        } else {
+            Some(commit.hash.clone())
+        }));
+    }
+    ui.label(
+        egui::RichText::new(format!("    {} \u{b7} {}", commit.author, commit.when))
+            .weak()
+            .small(),
+    );
+    if !picked {
+        return;
+    }
+    ui.indent(("commit", &commit.hash), |ui| {
+        let open = project.rel.as_deref();
+        for path in &commit.files {
+            let is_part = std::path::Path::new(path)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case(basset_core::file::EXTENSION));
+            if !is_part {
+                ui.label(egui::RichText::new(path).weak());
+                continue;
+            }
+            ui.horizontal(|ui| {
+                ui.label(path);
+                if ui
+                    .small_button("Open as it was")
+                    .on_hover_text("Open this version as a document of its own")
+                    .clicked()
+                {
+                    commands.push(Command::OpenVersion(commit.hash.clone(), path.clone()));
+                }
+                if open == Some(path.as_str())
+                    && ui
+                        .add(egui::Button::new("Compare").small().selected(comparing))
+                        .on_hover_text("Draw what changed since this commit over the model")
+                        .clicked()
+                {
+                    commands.push(Command::Compare(if comparing {
+                        None
+                    } else {
+                        Some(commit.hash.clone())
+                    }));
+                }
+            });
+        }
+    });
 }
 
 fn sketch_palette(editor: &mut Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {

@@ -11,7 +11,8 @@ basset-sketch    2D sketch entities, constraints, solver, shapes, text, profile 
 basset-kernel    solid modelling: Solid/Face topology, CSG, extrude/revolve/sweep/loft,
                   fillet/chamfer/thread/combine/transform, tessellation, picking, mass properties
 basset-core      Document, Components, Planes/Axes/Sketches/Bodies, document parameters,
-                  Timeline + regeneration, document save/open (.bass JSON)
+                  Timeline + regeneration, document save/open (.bass JSON), the diff
+                  between two versions of a document
 basset-io        STL / 3MF export
 basset-viewport  wgpu renderer: camera, mesh/line/point/triangle batches, grid, selection highlight
 basset-app       winit + egui desktop application (Linux first)
@@ -590,6 +591,54 @@ upright, since yaw and pitch are measured against world +Z.
 
 Panels never hold `&mut Editor` while borrowing document state: they queue commands that
 run after the frame's UI closure returns.
+
+### Comparing with git
+
+A `.bass` file is JSON and diffs as JSON, which tells the user that `12.0` became `15.0`
+somewhere in an extrude. The editor says the same thing in geometry. `basset-core::diff`
+compares two documents: features by id (ids are allotted once and never reused, so the
+same id in two versions is the same feature) with a feature counted as changed when its
+serialised form differs; parameters by name and text; and bodies by the feature that
+made them, face by face. Faces are matched by their `FaceKey` — the operation and role
+that made them, the same names the topological naming scheme already keeps stable
+across edits — and a face under the same key in both versions is compared by its
+quantised vertex set, so a taller extrude reports its side faces and its end cap as
+changed and its start cap as untouched. Both documents are replayed to their full length
+(`Document::full_state`), because the file holds the whole timeline wherever the cursor
+stands.
+
+`basset-app::git` is what the editor needs from the repository, by shelling out to the
+user's own `git`: the repository a folder is in (or `git init` to make one), the `.bass`
+files it holds and the state of each (`ls-files` plus a `status --porcelain -z` pass over
+it), the log with what each commit touched (`--name-only` under a record-separated
+format), the bytes of one version of one file, and a commit of a chosen set of paths.
+Nothing runs on a frame; the project is read when a file is opened, saved or committed
+and when the Git menu opens. `basset-app::project` is the editor's view of it: the
+project is the repository the open document is in, or one opened on purpose, and it
+outlives the document — a new document keeps the project because it is most often a new
+part of it, and Save As opens in the project's folder. The Project panel lists the parts
+and the history from this; opening a part as it was at a commit reads the bytes out of
+git into a document with no path, so looking costs nothing and keeping it is Save As.
+Committing is separate from saving by design: the commit box ticks every changed part,
+saves the open document if it is ticked, and records only what is ticked.
+`basset-app::compare` holds the version being compared with — read from git,
+regenerated — and the diff against the open document, recomputed only when the
+document's revision counter moves (`Document::revision`, bumped by every mutation, undo
+and redo included, inside a transaction or not), so a tool dialog's live preview is
+diffed as it drags and an idle frame costs one integer comparison.
+
+The scene draws the diff with what it already has. A changed body's new faces are its
+instance's highlight set in green; the base solid is uploaded as a second mesh and drawn
+in the `Overlay` style — translucent and not depth-tested, a style added for this — with
+an invisible body colour and its removed faces as a red highlight set, so the old shape
+of every moved face floats where it was *inside* the body that replaced it, which a
+depth-tested ghost would hide. A removed body is the whole overlay in red; a new body is
+tinted green. Selection wins
+over the diff on a body with a face selected or hovered, because an instance has one
+highlight colour and the user pointing at a face is asking about that face. The
+timeline bars each changed chip in the colour of its change and stands a struck-through
+chip in for each removed feature at the slot it occupied, before whatever now stands
+there, as a text diff shows the old line above the new.
 
 ## Driving the modeller from an agent
 

@@ -12,9 +12,12 @@
 //! * `timeline`    — ordering, rollback cursor, insertion at the cursor.
 //! * `regen`       — evaluating features into geometry, with per-feature caching.
 //! * `document`    — the user-facing aggregate with undo/redo.
+//! * `diff`        — what changed between two versions of a document, feature by feature
+//!   and face by face.
 //! * `visibility`  — what the user has hidden, saved but outside the model.
 //! * `file`        — the versioned `.bass` on-disk format.
 
+pub mod diff;
 pub mod document;
 pub mod feature;
 pub mod file;
@@ -27,6 +30,7 @@ pub mod regen;
 pub mod timeline;
 pub mod visibility;
 
+pub use diff::{BodyChange, Change, DocumentDiff, FeatureChange, ParameterChange};
 pub use document::{Document, DocumentError, Units};
 pub use feature::{BodyOp, CombineOp, Extent, Feature, FeatureKind, NumericField};
 pub use ids::{ComponentId, FeatureId};

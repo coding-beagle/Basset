@@ -6,10 +6,13 @@
 //! state every frame, so there is never a second copy of geometry to keep in sync.
 
 pub(crate) mod commands;
+mod compare;
 mod files;
+mod git;
 mod gizmo;
 mod measure;
 mod panels;
+mod project;
 mod scene;
 mod selection;
 mod sketch_mode;
@@ -226,6 +229,19 @@ pub struct Editor {
     /// The body whose browser row is an open name box, and what is typed in it.
     pub(crate) body_rename: Option<panels::BodyRename>,
     meshes: HashMap<BodyRef, BodyMesh>,
+    /// The project — the git repository of parts — the document is in, or that was
+    /// opened on purpose. See [`project`].
+    pub(crate) project: Option<project::Project>,
+    /// Whether the Project panel is up. It is while a project is open and the user has
+    /// not put it away.
+    pub(crate) show_project: bool,
+    /// The version of the document the model is being compared with, while it is.
+    pub(crate) compare: Option<compare::Compare>,
+    /// The commit message being typed and the parts ticked, while the commit box is open.
+    pub(crate) commit_box: Option<project::CommitBox>,
+    /// Meshes of the bodies the compared version has that differ: what is drawn in red.
+    /// Synced beside [`Self::meshes`] and emptied when the comparison stops.
+    base_meshes: HashMap<BodyRef, BodyMesh>,
     /// Bodies as picking sees them, see [`PickBody`]. Refreshed with the cache.
     pick_bodies: HashMap<BodyRef, PickBody>,
     // Read-only copies of the regenerated state for code paths (picking, panels) that
@@ -280,6 +296,11 @@ impl Editor {
             rename: None,
             body_rename: None,
             meshes: HashMap::new(),
+            project: None,
+            show_project: true,
+            compare: None,
+            commit_box: None,
+            base_meshes: HashMap::new(),
             pick_bodies: HashMap::new(),
             cached_planes: Vec::new(),
             cached_sketches: Vec::new(),
@@ -359,6 +380,7 @@ impl Editor {
 
     /// Copies the parts of the regenerated state that panels and picking read.
     pub fn refresh_cache(&mut self) {
+        self.refresh_compare();
         self.refresh_pick_bodies();
         // A sketch being drawn resolves document names through its own copy of the table;
         // this is where that copy catches up with an edit made in the browser panel.
@@ -510,10 +532,71 @@ impl Editor {
                 renderer.remove_mesh(m.handle);
             }
         }
+        self.sync_base_meshes(renderer, device, queue);
+    }
+
+    /// The same for the compared version's solids: one mesh per body the diff has a base
+    /// shape for, kept while the solid is the one the diff names and dropped with the
+    /// comparison. The base document is not edited, so its solids are the same `Arc`s
+    /// from one diff to the next and the uploads happen once.
+    fn sync_base_meshes(
+        &mut self,
+        renderer: &mut basset_viewport::Renderer,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) {
+        let mut live: HashSet<BodyRef> = HashSet::new();
+        let mut uploads = Vec::new();
+        if let Some(compare) = &self.compare {
+            for (id, solid) in compare.base_solids() {
+                live.insert(id);
+                if self
+                    .base_meshes
+                    .get(&id)
+                    .is_some_and(|m| Arc::ptr_eq(&m.solid, solid))
+                {
+                    continue;
+                }
+                uploads.push((id, solid.clone()));
+            }
+        }
+        for (id, solid) in uploads {
+            let tess = Arc::new(solid.tessellate());
+            match renderer.upload_mesh(device, queue, &tess.mesh, &solid.display_edges()) {
+                Ok(handle) => {
+                    if let Some(old) = self.base_meshes.insert(
+                        id,
+                        BodyMesh {
+                            handle,
+                            tess,
+                            solid,
+                        },
+                    ) {
+                        renderer.remove_mesh(old.handle);
+                    }
+                }
+                Err(e) => log::error!("mesh upload failed for compared {id:?}: {e}"),
+            }
+        }
+        let dead: Vec<BodyRef> = self
+            .base_meshes
+            .keys()
+            .filter(|k| !live.contains(k))
+            .copied()
+            .collect();
+        for id in dead {
+            if let Some(m) = self.base_meshes.remove(&id) {
+                renderer.remove_mesh(m.handle);
+            }
+        }
     }
 
     fn meshes_iter(&self) -> impl Iterator<Item = (BodyRef, &BodyMesh)> {
         self.meshes.iter().map(|(id, m)| (*id, m))
+    }
+
+    fn base_meshes_iter(&self) -> impl Iterator<Item = (BodyRef, &BodyMesh)> {
+        self.base_meshes.iter().map(|(id, m)| (*id, m))
     }
 
     pub fn visible_aabb(&mut self) -> Aabb {

@@ -2526,3 +2526,748 @@ fn a_click_on_geometry_beside_a_badge_starts_the_shape_first_time() {
         "a press on the badge itself is egui's"
     );
 }
+
+// --- Git ------------------------------------------------------------------------------
+
+/// A repository with a saved block in it, committed: the starting point of every git
+/// test. `None` when there is no `git` to run.
+fn committed_block(tag: &str) -> Option<(TempDir, Harness, basset_core::BodyRef)> {
+    use super::git::tests::{git_available, init};
+    if !git_available() {
+        return None;
+    }
+    let dir = TempDir::new(tag);
+    assert!(init(&dir), "git init");
+    let path = dir.join("block.bass");
+    let mut h = Harness::new();
+    let body = h.block();
+    h.save_as(&path);
+    h.editor.commit("the block");
+    assert!(h.editor.error.is_none(), "{:?}", h.editor.error);
+    assert!(
+        h.editor.status.starts_with("Committed"),
+        "{}",
+        h.editor.status
+    );
+    Some((dir, h, body))
+}
+
+/// A document saved into a repository knows it is in one, and the status bar says so.
+#[test]
+fn a_saved_document_shows_its_branch_in_the_status_bar() {
+    let Some((_dir, mut h, _)) = committed_block("git-chip") else {
+        return;
+    };
+    let project = h.editor.project.as_ref().expect("the document is in git");
+    assert_eq!(project.file, Some(super::git::FileState::Clean));
+    assert_eq!(project.rel.as_deref(), Some("block.bass"));
+    assert_eq!(project.log.len(), 1);
+    let frame = h.frame();
+    assert!(
+        frame.has_text("\u{2387}"),
+        "the chip shows the branch: {:?}",
+        frame.text()
+    );
+    assert!(
+        !frame.has_text("\u{25cf}"),
+        "nothing has changed since the commit"
+    );
+
+    // An edit saved over the commit is what makes the file modified in git's eyes.
+    let ext = h.editor.doc.timeline().features()[1].id;
+    h.editor
+        .doc
+        .edit_feature(ext, |f| {
+            f.kind
+                .set_numeric_field(basset_core::NumericField::Distance, 9.0);
+        })
+        .unwrap();
+    h.editor.save(false);
+    assert_eq!(
+        h.editor.project.as_ref().and_then(|p| p.file),
+        Some(super::git::FileState::Modified)
+    );
+    assert!(
+        h.frame().has_text("\u{25cf}"),
+        "the dot says the file differs from HEAD"
+    );
+
+    // A new document keeps the project — it is most often a new part of it — but is not
+    // in git itself, so the dot goes and the branch stays.
+    h.editor.new_document();
+    let project = h.editor.project.as_ref().expect("the project stays open");
+    assert_eq!(project.rel, None);
+    assert_eq!(project.file, None);
+    let frame = h.frame();
+    let chip = frame
+        .text()
+        .into_iter()
+        .find(|t| t.starts_with('\u{2387}'))
+        .expect("the chip is still there");
+    assert!(!chip.contains('\u{25cf}'), "{chip}");
+    assert!(
+        chip.contains("1 changed"),
+        "the modified part is counted: {chip}"
+    );
+    // Closing the project is what makes the chip go away.
+    h.editor.close_project();
+    assert!(h.editor.project.is_none());
+    assert!(!h.frame().has_text("\u{2387}"));
+}
+
+/// `Ctrl+G` compares the model with HEAD. The diff follows the document as it is edited
+/// — a live tool dialog included — and the timeline and status bar say what differs.
+#[test]
+fn comparing_with_head_marks_what_changed_and_follows_edits() {
+    let Some((_dir, mut h, body)) = committed_block("git-compare") else {
+        return;
+    };
+    h.ctrl_key("g");
+    let compare = h.editor.compare.as_ref().expect("comparing with HEAD");
+    assert_eq!(compare.spec, "HEAD");
+    assert!(compare.diff.is_empty(), "nothing has changed yet");
+    let frame = h.frame();
+    assert!(frame.has_text("Comparing with HEAD"), "{:?}", frame.text());
+    assert!(frame.has_text("no changes"));
+
+    // Make the block taller. Its sides and top move; its base does not.
+    let ext = h.editor.doc.timeline().features()[1].id;
+    h.editor
+        .doc
+        .edit_feature(ext, |f| {
+            f.kind
+                .set_numeric_field(basset_core::NumericField::Distance, 9.0);
+        })
+        .unwrap();
+    h.frame();
+    let diff = &h.editor.compare.as_ref().unwrap().diff;
+    assert_eq!(
+        diff.feature(ext).map(|c| c.change),
+        Some(basset_core::Change::Modified)
+    );
+    let Some(basset_core::BodyChange::Modified {
+        added_faces,
+        removed_faces,
+        ..
+    }) = diff.body(body)
+    else {
+        panic!("the body changed: {:?}", diff.bodies);
+    };
+    assert_eq!(added_faces.len(), 5);
+    assert_eq!(removed_faces.len(), 5);
+    assert!(
+        h.frame().has_text("features ~1 \u{b7} bodies ~1"),
+        "{:?}",
+        h.frame().text()
+    );
+    // The compared solid is drawn as a ghost where the body used to be.
+    assert_eq!(h.editor.compare.as_ref().unwrap().base_solids().count(), 1);
+
+    // Undo puts the model back and the diff with it.
+    h.ctrl_key("z");
+    h.frame();
+    assert!(h.editor.compare.as_ref().unwrap().diff.is_empty());
+
+    // Deleting the extrude leaves a struck-through chip where it was.
+    let chips = |h: &mut Harness| h.frame().texts.iter().filter(|(_, t)| t == "Ext").count();
+    assert_eq!(chips(&mut h), 1);
+    h.editor.delete_feature(ext);
+    assert_eq!(
+        chips(&mut h),
+        1,
+        "the removed extrude's chip stands in for the one that was deleted"
+    );
+    let diff = &h.editor.compare.as_ref().unwrap().diff;
+    assert_eq!(
+        diff.feature(ext).map(|c| (c.change, c.slot)),
+        Some((basset_core::Change::Removed, 1))
+    );
+    assert!(matches!(
+        diff.body(body),
+        Some(basset_core::BodyChange::Removed { .. })
+    ));
+
+    // The same key stops the comparison.
+    h.ctrl_key("g");
+    assert!(h.editor.compare.is_none());
+    assert!(!h.frame().has_text("Comparing with"));
+    assert_eq!(
+        chips(&mut h),
+        0,
+        "nothing is left of the extrude but its ghost chip"
+    );
+}
+
+/// Committing from the editor saves, commits and restarts a comparison with HEAD, which
+/// is now a comparison with the document itself; the Git menu then lists both commits,
+/// and the older one can be compared with by its hash.
+#[test]
+fn a_commit_from_the_editor_moves_head_and_the_menu_lists_it() {
+    let Some((_dir, mut h, body)) = committed_block("git-commit") else {
+        return;
+    };
+    let first = h.editor.project.as_ref().unwrap().log[0].clone();
+    let ext = h.editor.doc.timeline().features()[1].id;
+    h.editor
+        .doc
+        .edit_feature(ext, |f| {
+            f.kind
+                .set_numeric_field(basset_core::NumericField::Distance, 9.0);
+        })
+        .unwrap();
+    h.editor.compare_with("HEAD");
+    h.frame();
+    assert!(!h.editor.compare.as_ref().unwrap().diff.is_empty());
+
+    // The commit box, through the panel: Ctrl+Shift+G opens it.
+    h.set_modifiers(true, true);
+    h.type_key("G");
+    h.set_modifiers(false, false);
+    let commit_box = h.editor.commit_box.clone().expect("the commit box is open");
+    assert_eq!(commit_box.message, "");
+    assert_eq!(
+        commit_box.include.iter().collect::<Vec<_>>(),
+        ["block.bass"],
+        "the open document is ticked"
+    );
+    // A window takes a frame to appear, as every egui window does.
+    h.frame();
+    assert!(h.frame().has_text("block.bass"), "{:?}", h.frame().text());
+    h.editor.commit_box.as_mut().unwrap().message = "taller".into();
+    assert!(h.click_ui("Commit"), "the box has a Commit button");
+    assert!(h.editor.commit_box.is_none());
+    assert!(h.editor.error.is_none(), "{:?}", h.editor.error);
+    let project = h.editor.project.as_ref().unwrap();
+    assert_eq!(project.file, Some(super::git::FileState::Clean));
+    assert_eq!(project.log.len(), 2);
+    assert_eq!(project.log[0].subject, "taller");
+    assert_eq!(project.log[0].files, ["block.bass"]);
+    // By hash: a commit's `when` is relative, and a second may have passed.
+    assert_eq!(project.log[1].hash, first.hash);
+    let compare = h
+        .editor
+        .compare
+        .as_ref()
+        .expect("still comparing with HEAD");
+    assert!(
+        compare.diff.is_empty(),
+        "HEAD is now this very document: {:?}",
+        compare.diff
+    );
+    assert_ne!(compare.commit.hash, first.hash);
+
+    // The first commit is still there to compare with, by hash.
+    panels::run(&mut h.editor, Command::Compare(Some(first.hash.clone())));
+    h.frame();
+    let compare = h.editor.compare.as_ref().unwrap();
+    assert_eq!(compare.commit.hash, first.hash);
+    assert!(compare.label().starts_with(&first.short));
+    assert!(matches!(
+        compare.diff.body(body),
+        Some(basset_core::BodyChange::Modified { .. })
+    ));
+
+    // The menu offers both commits and the way back to comparing with nothing.
+    assert!(h.click_ui("Git"), "the menu bar has a Git menu");
+    let frame = h.frame();
+    assert!(frame.has_text("taller"), "{:?}", frame.text());
+    assert!(frame.has_text("the block"));
+    assert!(frame.has_text("Nothing"));
+    assert!(h.click_ui("Nothing"));
+    assert!(h.editor.compare.is_none());
+}
+
+/// Without a repository the git commands explain themselves instead of doing nothing.
+#[test]
+fn git_commands_outside_a_repository_say_what_to_do_first() {
+    let mut h = Harness::new();
+    assert!(h.editor.project.is_none());
+    h.ctrl_key("g");
+    assert!(h.editor.compare.is_none());
+    assert!(
+        h.editor
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("git repository")),
+        "{:?}",
+        h.editor.error
+    );
+    h.editor.error = None;
+    panels::run(&mut h.editor, Command::Commit);
+    assert!(h.editor.commit_box.is_none());
+    assert!(h.editor.error.is_some());
+    // The menu is there, and says the same.
+    h.editor.error = None;
+    assert!(h.click_ui("Git"));
+    assert!(
+        h.frame()
+            .has_text("Save the document inside a git repository")
+    );
+}
+
+/// The volume of `body` in `doc`, replayed to its full length.
+fn volume_in(mut doc: basset_core::Document, body: basset_core::BodyRef) -> f64 {
+    doc.full_state()
+        .body(body)
+        .unwrap_or_else(|| panic!("{body:?} is not in the saved model"))
+        .solid
+        .volume()
+}
+
+/// Makes the block taller: the one edit every git test makes, because it changes the
+/// file, the body and nothing else.
+fn make_taller(h: &mut Harness) {
+    let ext = h.editor.doc.timeline().features()[1].id;
+    h.editor
+        .doc
+        .edit_feature(ext, |f| {
+            f.kind
+                .set_numeric_field(basset_core::NumericField::Distance, 9.0);
+        })
+        .unwrap();
+}
+
+/// A project is the folder of parts the document is in. The Project panel lists them
+/// with their state, opens one with a click, and goes away and comes back by key.
+#[test]
+fn a_project_lists_its_parts_and_opens_one_with_a_click() {
+    use super::git::FileState;
+    let Some((dir, mut h, _)) = committed_block("project-parts") else {
+        return;
+    };
+    // A second part, saved into the same folder: the project lists it as new.
+    h.editor.new_document();
+    h.block();
+    h.save_as(&dir.join("lid.bass"));
+    let project = h.editor.project.as_ref().expect("still in the project");
+    let parts: Vec<(&str, FileState)> = project
+        .files
+        .iter()
+        .map(|f| (f.path.as_str(), f.state))
+        .collect();
+    assert_eq!(
+        parts,
+        [
+            ("block.bass", FileState::Clean),
+            ("lid.bass", FileState::Untracked)
+        ]
+    );
+    assert_eq!(project.rel.as_deref(), Some("lid.bass"));
+    let frame = h.frame();
+    assert!(frame.has_text("Parts (2)"), "{:?}", frame.text());
+    assert!(frame.has_text("+ lid.bass"), "a new part is marked as such");
+    assert!(frame.has_text("History (1)"));
+    assert!(frame.has_text("the block"), "the commit is listed");
+
+    // Clicking the other part opens it.
+    assert!(h.click_ui("block.bass"));
+    assert!(
+        h.editor
+            .path
+            .as_deref()
+            .is_some_and(|p| p.ends_with("block.bass")),
+        "{:?}",
+        h.editor.path
+    );
+    assert_eq!(
+        h.editor.project.as_ref().unwrap().rel.as_deref(),
+        Some("block.bass")
+    );
+
+    // Ctrl+Shift+H puts the panel away and brings it back.
+    h.set_modifiers(true, true);
+    h.type_key("H");
+    h.set_modifiers(false, false);
+    assert!(!h.editor.show_project);
+    assert!(!h.frame().has_text("Parts (2)"));
+    h.set_modifiers(true, true);
+    h.type_key("H");
+    h.set_modifiers(false, false);
+    assert!(h.editor.show_project);
+    assert!(h.frame().has_text("Parts (2)"));
+}
+
+/// One commit can record several parts, and a part that is not ticked stays as it was.
+/// Committing the open document saves it first, so what is recorded is what is on screen.
+#[test]
+fn a_commit_can_record_several_parts_at_once() {
+    use super::git::FileState;
+    let Some((dir, mut h, body)) = committed_block("project-commit") else {
+        return;
+    };
+    h.editor.new_document();
+    h.block();
+    h.save_as(&dir.join("lid.bass"));
+    h.editor.open_part("block.bass");
+    make_taller(&mut h);
+    h.editor.save(false);
+    let project = h.editor.project.as_ref().unwrap();
+    assert_eq!(
+        project.changed().map(|f| f.state).collect::<Vec<_>>(),
+        [FileState::Modified, FileState::Untracked]
+    );
+    assert!(h.frame().has_text("\u{2387}"), "{:?}", h.frame().text());
+    assert!(
+        h.frame().has_text("1 changed"),
+        "the chip counts the other changed part: {:?}",
+        h.frame().text()
+    );
+
+    // The box ticks every changed part.
+    panels::run(&mut h.editor, Command::Commit);
+    let commit_box = h.editor.commit_box.clone().unwrap();
+    assert_eq!(
+        commit_box.include.iter().collect::<Vec<_>>(),
+        ["block.bass", "lid.bass"]
+    );
+    h.frame();
+    assert!(
+        h.frame().has_text("Commit 2 parts"),
+        "{:?}",
+        h.frame().text()
+    );
+    panels::run(
+        &mut h.editor,
+        Command::CommitWith("both".into(), vec!["block.bass".into(), "lid.bass".into()]),
+    );
+    assert!(h.editor.error.is_none(), "{:?}", h.editor.error);
+    assert!(h.editor.status.contains("2 parts"), "{}", h.editor.status);
+    let project = h.editor.project.as_ref().unwrap();
+    assert!(project.files.iter().all(|f| f.state == FileState::Clean));
+    assert_eq!(project.log.len(), 2);
+    assert_eq!(project.log[0].files, ["block.bass", "lid.bass"]);
+
+    // An unsaved edit to the open document is saved by the commit that includes it, and
+    // a part that is not ticked is left alone.
+    h.editor.new_document();
+    h.block();
+    h.save_as(&dir.join("base.bass"));
+    make_taller(&mut h);
+    let tall = h.volume(body);
+    std::fs::write(dir.join("lid.bass"), b"{ not a part any more }").unwrap();
+    panels::run(
+        &mut h.editor,
+        Command::CommitWith("base".into(), vec!["base.bass".into()]),
+    );
+    assert!(h.editor.error.is_none(), "{:?}", h.editor.error);
+    let project = h.editor.project.as_ref().unwrap();
+    assert_eq!(project.log[0].files, ["base.bass"]);
+    assert_eq!(project.file, Some(FileState::Clean));
+    let lid = project.files.iter().find(|f| f.path == "lid.bass").unwrap();
+    assert_eq!(lid.state, FileState::Modified, "lid was not ticked");
+    let committed = project.repo.show("HEAD", "base.bass").unwrap();
+    let committed = basset_core::file::read(committed.as_slice()).unwrap();
+    assert!(
+        (volume_in(committed, body) - tall).abs() < 1e-6,
+        "the commit holds the edit that was on screen"
+    );
+}
+
+/// The History section unfolds a commit to the parts it touched; a part opens as it was
+/// then, as a document of its own, and the open part can be compared with that commit.
+#[test]
+fn history_unfolds_a_commit_and_opens_a_part_as_it_was() {
+    let Some((_dir, mut h, body)) = committed_block("project-history") else {
+        return;
+    };
+    let old_volume = h.volume(body);
+    make_taller(&mut h);
+    h.editor.commit("taller");
+    assert!(h.editor.error.is_none(), "{:?}", h.editor.error);
+    assert_ne!(h.volume(body), old_volume);
+    let project = h.editor.project.as_ref().unwrap();
+    assert_eq!(project.log.len(), 2);
+    let first = project.log[1].clone();
+    let frame = h.frame();
+    assert!(frame.has_text("History (2)"), "{:?}", frame.text());
+    assert!(frame.has_text("taller"));
+    assert!(frame.has_text("the block"));
+    assert!(frame.has_text("Basset Test"), "the author is shown");
+    assert!(!frame.has_text("Open as it was"), "nothing is unfolded yet");
+
+    // Unfolding the first commit shows the part it touched and what can be done. (By
+    // its row's text: the status bar mentions the commit too.)
+    assert!(h.click_ui(&format!("{} the block", first.short)));
+    assert_eq!(
+        h.editor.project.as_ref().unwrap().picked.as_deref(),
+        Some(first.hash.as_str())
+    );
+    let frame = h.frame();
+    assert!(frame.has_text("Open as it was"), "{:?}", frame.text());
+    assert!(frame.has_text("Compare"));
+
+    // The old version opens as its own document, named for the commit, with no file.
+    assert!(h.click_ui("Open as it was"));
+    assert!(h.editor.error.is_none(), "{:?}", h.editor.error);
+    assert_eq!(h.editor.path, None);
+    assert_eq!(h.editor.doc.name, format!("block @ {}", first.short));
+    let bodies = h.bodies();
+    assert_eq!(bodies.len(), 1);
+    assert!((h.volume(bodies[0]) - old_volume).abs() < 1e-6);
+    assert!(h.editor.status.contains("Save As"), "{}", h.editor.status);
+    let project = h.editor.project.as_ref().expect("the project stays open");
+    assert_eq!(project.rel, None, "the old version is not the file on disk");
+
+    // Back in the current part, the same row compares it with that commit.
+    h.editor.open_part("block.bass");
+    panels::run(&mut h.editor, Command::PickCommit(Some(first.hash.clone())));
+    h.frame();
+    assert!(h.click_ui("Compare"));
+    let compare = h.editor.compare.as_ref().expect("comparing");
+    assert_eq!(compare.commit.hash, first.hash);
+    assert!(matches!(
+        compare.diff.body(body),
+        Some(basset_core::BodyChange::Modified { .. })
+    ));
+    // And again to stop.
+    assert!(h.click_ui("Compare"));
+    assert!(h.editor.compare.is_none());
+}
+
+/// A project starts as a folder: New project makes it a repository, parts saved into it
+/// are listed, and it opens again later from any folder inside it.
+#[test]
+fn a_project_can_be_started_in_a_folder_and_opened_later() {
+    use super::git::FileState;
+    use super::git::tests::{git_available, identify};
+    if !git_available() {
+        return;
+    }
+    let dir = TempDir::new("project-new");
+    let mut h = Harness::new();
+    h.editor.new_project_path(&dir.join("gearbox"));
+    assert!(h.editor.error.is_none(), "{:?}", h.editor.error);
+    let project = h.editor.project.as_ref().expect("a project");
+    assert_eq!(project.name(), "gearbox");
+    assert_eq!(project.branch, None, "no commits yet");
+    assert!(project.files.is_empty());
+    assert!(identify(project.repo.root()));
+    let frame = h.frame();
+    assert!(frame.has_text("No parts yet"), "{:?}", frame.text());
+    assert!(frame.has_text("No commits yet"));
+
+    // Saving into the folder makes the document a part; committing makes the history.
+    h.block();
+    h.save_as(&dir.join("gearbox/shaft.bass"));
+    let project = h.editor.project.as_ref().unwrap();
+    assert_eq!(project.rel.as_deref(), Some("shaft.bass"));
+    assert_eq!(project.file, Some(FileState::Untracked));
+    h.editor.commit("shaft");
+    assert!(h.editor.error.is_none(), "{:?}", h.editor.error);
+    let project = h.editor.project.as_ref().unwrap();
+    assert!(project.branch.is_some());
+    assert_eq!(project.log.len(), 1);
+    assert_eq!(project.file, Some(FileState::Clean));
+
+    // Closed, then opened again from a folder inside it.
+    h.editor.close_project();
+    assert!(h.editor.project.is_none());
+    std::fs::create_dir_all(dir.join("gearbox/sub")).unwrap();
+    h.editor.open_project_path(&dir.join("gearbox/sub"));
+    let project = h.editor.project.as_ref().expect("opened again");
+    assert_eq!(project.name(), "gearbox");
+    assert_eq!(
+        project.rel.as_deref(),
+        Some("shaft.bass"),
+        "the open document is in it"
+    );
+
+    // A folder that is no repository is refused, and the error says what to do instead.
+    std::fs::create_dir_all(dir.join("elsewhere")).unwrap();
+    h.editor.open_project_path(&dir.join("elsewhere"));
+    assert!(
+        h.editor
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("New project")),
+        "{:?}",
+        h.editor.error
+    );
+}
+
+/// Renders the comparison the way the viewport would and writes the pixels out, for a
+/// look at it without a window. Not a test of anything, so it is ignored; run it with
+/// `BASSET_SHOT=/path/out.rgba cargo test -p basset-app -- --ignored render_a_comparison`.
+/// The file is the width and height as two little-endian u32s, then RGBA8 rows.
+#[test]
+#[ignore]
+fn render_a_comparison_for_a_look() {
+    use basset_core::{BodyOp, ComponentId, Extent, FeatureKind, ProfileRef, RegionRef};
+    use basset_sketch::{Sketch, shapes};
+    let Ok(out) = std::env::var("BASSET_SHOT") else {
+        return;
+    };
+    let Some((_dir, mut h, _)) = committed_block("git-shot") else {
+        return;
+    };
+    // The committed version also has a pillar beside the block, which the working copy
+    // deletes.
+    let mut pillar = Sketch::new();
+    shapes::rectangle_two_point(&mut pillar, Vec2::new(13.0, 0.0), Vec2::new(16.0, 3.0));
+    let pillar_sk = h.editor.doc.add_feature(FeatureKind::Sketch {
+        plane: basset_core::PlaneRef::Origin(OriginPlane::XY),
+        component: ComponentId::ROOT,
+        sketch: pillar,
+    });
+    let pillar = h.editor.doc.add_feature(FeatureKind::Extrude {
+        regions: vec![RegionRef::Profile(ProfileRef::new(
+            pillar_sk,
+            Vec2::new(14.5, 1.5),
+        ))],
+        extent: Extent::OneSide(4.0),
+        operation: BodyOp::NewBody,
+        component: ComponentId::ROOT,
+    });
+    h.editor.save(false);
+    h.editor.commit("block and pillar");
+
+    // The working copy: the block grows taller, gets a hole, loses the pillar and gains
+    // a bar along its side.
+    let block_ext = h.editor.doc.timeline().features()[1].id;
+    h.editor
+        .doc
+        .edit_feature(block_ext, |f| {
+            f.kind
+                .set_numeric_field(basset_core::NumericField::Distance, 5.0);
+        })
+        .unwrap();
+    let mut hole = Sketch::new();
+    shapes::circle_center(&mut hole, Vec2::new(7.0, 7.0), 1.5);
+    let hole_sk = h.editor.doc.add_feature(FeatureKind::Sketch {
+        plane: basset_core::PlaneRef::Origin(OriginPlane::XY),
+        component: ComponentId::ROOT,
+        sketch: hole,
+    });
+    h.editor.doc.add_feature(FeatureKind::Extrude {
+        regions: vec![RegionRef::Profile(ProfileRef::new(
+            hole_sk,
+            Vec2::new(7.0, 7.0),
+        ))],
+        extent: Extent::OneSide(5.0),
+        operation: BodyOp::Cut(vec![basset_core::BodyRef(block_ext)]),
+        component: ComponentId::ROOT,
+    });
+    h.editor.doc.remove_feature(pillar).unwrap();
+    let mut bar = Sketch::new();
+    shapes::rectangle_two_point(&mut bar, Vec2::new(0.0, 12.0), Vec2::new(10.0, 14.0));
+    let bar_sk = h.editor.doc.add_feature(FeatureKind::Sketch {
+        plane: basset_core::PlaneRef::Origin(OriginPlane::XY),
+        component: ComponentId::ROOT,
+        sketch: bar,
+    });
+    h.editor.doc.add_feature(FeatureKind::Extrude {
+        regions: vec![RegionRef::Profile(ProfileRef::new(
+            bar_sk,
+            Vec2::new(5.0, 13.0),
+        ))],
+        extent: Extent::OneSide(1.0),
+        operation: BodyOp::NewBody,
+        component: ComponentId::ROOT,
+    });
+    h.editor.compare_with("HEAD");
+    h.editor.refresh_cache();
+    eprintln!("{}", h.editor.status);
+
+    // A headless device, as the viewport's own GPU tests make one.
+    let size = [1200u32, 800u32];
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let adapter =
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+            .expect("a GPU adapter");
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("basset shot"),
+        required_features: wgpu::Features::empty(),
+        required_limits: wgpu::Limits::downlevel_defaults(),
+        experimental_features: wgpu::ExperimentalFeatures::disabled(),
+        memory_hints: wgpu::MemoryHints::default(),
+        trace: wgpu::Trace::Off,
+    }))
+    .expect("device");
+    let mut renderer = basset_viewport::Renderer::new(&device, format, 4);
+    renderer.resize(&device, size);
+    h.editor.set_window_size(size);
+    h.editor.hidden_sketches = h
+        .editor
+        .doc
+        .timeline()
+        .features()
+        .iter()
+        .filter(|f| matches!(f.kind, FeatureKind::Sketch { .. }))
+        .map(|f| f.id)
+        .collect();
+    h.editor.look_from(basset_viewport::ViewPreset::Isometric);
+    h.editor.zoom_to_fit();
+    h.editor.camera.distance *= 1.15;
+    h.editor.sync_meshes(&mut renderer, &device, &queue);
+    let scene = h.editor.scene();
+
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("shot"),
+        size: wgpu::Extent3d {
+            width: size[0],
+            height: size[1],
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let bytes_per_row = (size[0] * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+        * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: u64::from(bytes_per_row * size[1]),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("shot"),
+    });
+    renderer.render(&device, &queue, &mut encoder, &view, size, &scene);
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: None,
+            },
+        },
+        wgpu::Extent3d {
+            width: size[0],
+            height: size[1],
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit([encoder.finish()]);
+    let slice = readback.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).expect("receiver"));
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+    rx.recv().expect("map callback").expect("mapped");
+    let mapped = slice.get_mapped_range().expect("mapped range");
+    let mut bytes = Vec::with_capacity((size[0] * size[1] * 4) as usize + 8);
+    bytes.extend_from_slice(&size[0].to_le_bytes());
+    bytes.extend_from_slice(&size[1].to_le_bytes());
+    for row in 0..size[1] {
+        let start = (row * bytes_per_row) as usize;
+        bytes.extend_from_slice(&mapped[start..start + (size[0] * 4) as usize]);
+    }
+    drop(mapped);
+    readback.unmap();
+    std::fs::write(&out, bytes).expect("write the shot");
+}

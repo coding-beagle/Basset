@@ -16,6 +16,8 @@ pub(crate) struct Layouts {
 pub(crate) struct Pipelines {
     pub mesh_opaque: wgpu::RenderPipeline,
     pub mesh_ghost: wgpu::RenderPipeline,
+    /// Translucent and not depth-tested: [`MeshStyle::Overlay`](crate::MeshStyle::Overlay).
+    pub mesh_overlay: wgpu::RenderPipeline,
     pub lines_depth: wgpu::RenderPipeline,
     pub lines_overlay: wgpu::RenderPipeline,
     pub points_depth: wgpu::RenderPipeline,
@@ -168,14 +170,14 @@ pub(crate) fn create_pipelines(
         })
     };
 
-    let mesh = |label, depth_write, blend| {
+    let mesh = |label, depth_write, depth_compare, blend| {
         build(PipelineSpec {
             label,
             layout: &mesh_layout,
             module: &mesh_module,
             vertex_layout: MeshVertex::LAYOUT,
             depth_write,
-            depth_compare: wgpu::CompareFunction::Less,
+            depth_compare,
             bias: FACE_DEPTH_BIAS,
             blend,
         })
@@ -200,8 +202,24 @@ pub(crate) fn create_pipelines(
     };
 
     Pipelines {
-        mesh_opaque: mesh("mesh opaque", true, wgpu::BlendState::REPLACE),
-        mesh_ghost: mesh("mesh ghost", false, wgpu::BlendState::ALPHA_BLENDING),
+        mesh_opaque: mesh(
+            "mesh opaque",
+            true,
+            wgpu::CompareFunction::Less,
+            wgpu::BlendState::REPLACE,
+        ),
+        mesh_ghost: mesh(
+            "mesh ghost",
+            false,
+            wgpu::CompareFunction::Less,
+            wgpu::BlendState::ALPHA_BLENDING,
+        ),
+        mesh_overlay: mesh(
+            "mesh overlay",
+            false,
+            wgpu::CompareFunction::Always,
+            wgpu::BlendState::ALPHA_BLENDING,
+        ),
         lines_depth: overlay(
             "lines depth-tested",
             &lines_module,

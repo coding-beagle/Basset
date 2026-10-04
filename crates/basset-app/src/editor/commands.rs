@@ -37,6 +37,31 @@ pub(crate) enum Command {
     /// Export a component's visible bodies, its sub-components' included.
     ExportComponent(basset_core::ComponentId, MeshFormat),
     Quit,
+    /// Compare the model with a version in git: `Some("HEAD")`, `Some(hash)`, or `None`
+    /// to stop comparing.
+    Compare(Option<String>),
+    /// Compare with `HEAD`, or stop comparing if already comparing: what one key means.
+    ToggleCompare,
+    /// Re-read the project: its parts, their states and its history.
+    RefreshProject,
+    /// Open the commit box.
+    Commit,
+    /// Commit the given parts with the message, saving the open document first if it is
+    /// one of them.
+    CommitWith(String, Vec<String>),
+    /// Pick a folder and open the project it is in.
+    OpenProject,
+    /// Pick a folder and make it a project.
+    NewProject,
+    CloseProject,
+    /// Show or hide the Project panel.
+    ToggleProjectPanel,
+    /// Open a part of the project, by its path in it.
+    OpenPart(String),
+    /// Open a part as it was at a commit: `(revision, path)`.
+    OpenVersion(String, String),
+    /// Unfold a commit in the History section, or fold it with `None`.
+    PickCommit(Option<String>),
     Undo,
     Redo,
     Fit,
@@ -376,6 +401,10 @@ impl Binding {
 }
 
 const ALWAYS: fn(&Editor) -> bool = |_| true;
+/// Comparing wants a document that is in the project, or there is nothing to compare
+/// with; committing wants a project, which may have changed parts the document is not.
+const IN_GIT: fn(&Editor) -> bool = |e| e.project.as_ref().is_some_and(|p| p.rel.is_some());
+const IN_PROJECT: fn(&Editor) -> bool = |e| e.project.is_some();
 /// A modelling tool cannot start while another one's dialog is up, exactly as the
 /// toolbar greys out while one is running.
 const IDLE: fn(&Editor) -> bool = |e| e.tool.is_none();
@@ -456,6 +485,51 @@ pub(crate) const BINDINGS: &[Binding] = &[
         live: LiveIn::Both,
         make: || Command::Export3mf,
         enabled: ALWAYS,
+    },
+    Binding {
+        id: "file.compare",
+        label: "Compare with git HEAD",
+        group: Group::File,
+        chords: &[Chord::ctrl('g')],
+        live: LiveIn::Both,
+        make: || Command::ToggleCompare,
+        enabled: IN_GIT,
+    },
+    Binding {
+        id: "file.commit",
+        label: "Commit to git…",
+        group: Group::File,
+        chords: &[Chord::ctrl_shift('g')],
+        live: LiveIn::Both,
+        make: || Command::Commit,
+        enabled: IN_PROJECT,
+    },
+    Binding {
+        id: "project.new",
+        label: "New project…",
+        group: Group::File,
+        chords: &[],
+        live: LiveIn::Both,
+        make: || Command::NewProject,
+        enabled: ALWAYS,
+    },
+    Binding {
+        id: "project.open",
+        label: "Open project…",
+        group: Group::File,
+        chords: &[],
+        live: LiveIn::Both,
+        make: || Command::OpenProject,
+        enabled: ALWAYS,
+    },
+    Binding {
+        id: "project.panel",
+        label: "Project panel",
+        group: Group::File,
+        chords: &[Chord::ctrl_shift('h')],
+        live: LiveIn::Both,
+        make: || Command::ToggleProjectPanel,
+        enabled: IN_PROJECT,
     },
     Binding {
         id: "file.quit",

@@ -31,6 +31,12 @@ pub enum MeshStyle {
     /// Translucent, no depth write: used for bodies hidden behind a tool preview or
     /// components being edited in context.
     Ghost,
+    /// Translucent, no depth write and no depth test: drawn through whatever stands in
+    /// front of it. For geometry that is not in the model but is being shown where it
+    /// was — the faces a compared version of the document had, inside the body that
+    /// replaced them. A ghost would be hidden by that body, which is the one place the
+    /// user is looking.
+    Overlay,
 }
 
 impl MeshStyle {
@@ -59,7 +65,13 @@ impl MeshStyle {
     /// Styles that blend rather than replace and leave the depth buffer alone. They are
     /// drawn after the opaque ones so there is something for them to blend over.
     pub fn is_translucent(self) -> bool {
-        matches!(self, Self::Ghost | Self::XRay)
+        matches!(self, Self::Ghost | Self::XRay | Self::Overlay)
+    }
+
+    /// Whether the style ignores what is in front of it. The one style that does is
+    /// drawn last of the meshes, so there is nothing left for it to be hidden by.
+    pub fn shows_through(self) -> bool {
+        matches!(self, Self::Overlay)
     }
 }
 
@@ -213,6 +225,22 @@ mod tests {
         assert!(!MeshStyle::Wireframe.draws_faces() && MeshStyle::Wireframe.draws_edges());
         assert!(MeshStyle::XRay.draws_faces() && MeshStyle::XRay.draws_edges());
         assert!(MeshStyle::Ghost.draws_faces() && !MeshStyle::Ghost.draws_edges());
+        assert!(MeshStyle::Overlay.draws_faces() && !MeshStyle::Overlay.draws_edges());
+    }
+
+    #[test]
+    fn only_the_overlay_shows_through_and_it_is_translucent() {
+        assert!(MeshStyle::Overlay.shows_through());
+        assert!(MeshStyle::Overlay.is_translucent());
+        for style in [
+            MeshStyle::Shaded,
+            MeshStyle::ShadedWithEdges,
+            MeshStyle::Wireframe,
+            MeshStyle::XRay,
+            MeshStyle::Ghost,
+        ] {
+            assert!(!style.shows_through(), "{style:?}");
+        }
     }
 
     #[test]
@@ -220,15 +248,21 @@ mod tests {
         for style in [MeshStyle::ShadedWithEdges, MeshStyle::XRay] {
             assert!(style.draws_silhouette(), "{style:?}");
         }
-        // Wireframe draws edges but no faces; Shaded and Ghost draw faces but no edges.
-        for style in [MeshStyle::Wireframe, MeshStyle::Shaded, MeshStyle::Ghost] {
+        // Wireframe draws edges but no faces; Shaded, Ghost and Overlay draw faces but no
+        // edges.
+        for style in [
+            MeshStyle::Wireframe,
+            MeshStyle::Shaded,
+            MeshStyle::Ghost,
+            MeshStyle::Overlay,
+        ] {
             assert!(!style.draws_silhouette(), "{style:?}");
         }
     }
 
     #[test]
     fn only_the_see_through_styles_are_translucent() {
-        for style in [MeshStyle::Ghost, MeshStyle::XRay] {
+        for style in [MeshStyle::Ghost, MeshStyle::XRay, MeshStyle::Overlay] {
             assert!(style.is_translucent(), "{style:?}");
         }
         for style in [
