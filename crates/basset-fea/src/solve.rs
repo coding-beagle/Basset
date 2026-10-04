@@ -5,17 +5,57 @@
 //! Jacobi-preconditioned conjugate gradient needs nothing more. Fixed degrees of freedom
 //! are handled by masking: they are dropped from the residual and never move, which is
 //! the same as deleting their rows and columns.
+//!
+//! The pieces are public to the crate rather than one function because topology
+//! optimisation ([`crate::topology`]) solves the same system dozens of times with a
+//! different stiffness scale per element each time, and wants the boundary conditions
+//! built once, the solve warm-started from the last displacement, and the stresses
+//! recovered only at the end.
 
 use basset_math::Vec3;
 
 use crate::element::{Brick, DOF, von_mises};
 use crate::voxel::HexMesh;
-use crate::{FeaError, LoadKind, Results, Study};
+use crate::{FeaError, LoadKind, Phase, Progress, Results, Study};
 
-/// Relative residual at which the conjugate gradient stops.
-const TOLERANCE: f64 = 1e-9;
+/// Relative residual at which a static solve's conjugate gradient stops.
+pub(crate) const TOLERANCE: f64 = 1e-9;
+
+/// How often the conjugate gradient tells its observer where it is. An iteration is a
+/// few milliseconds on a modest mesh; every twenty-five is often enough for a bar and
+/// rarely enough to be free.
+const REPORT_EVERY: usize = 25;
 
 pub fn run(mesh: HexMesh, study: &Study) -> Result<Results, FeaError> {
+    run_with(mesh, study, &mut |_| true)
+}
+
+pub fn run_with(
+    mesh: HexMesh,
+    study: &Study,
+    observer: &mut dyn FnMut(&Progress) -> bool,
+) -> Result<Results, FeaError> {
+    let Boundary { fixed, force } = boundary(&mesh, study)?;
+    let brick = Brick::new(mesh.size, &study.material);
+    let system = System {
+        mesh: &mesh,
+        brick: &brick,
+        fixed: &fixed,
+        scale: None,
+    };
+    let mut u = vec![0.0; force.len()];
+    let iterations = conjugate_gradient(&system, &force, &mut u, TOLERANCE, observer)?;
+    Ok(results(mesh, study, &brick, &fixed, None, &u, iterations))
+}
+
+/// What a study does to a mesh: which degrees of freedom are held and the force at each.
+pub(crate) struct Boundary {
+    pub fixed: Vec<bool>,
+    pub force: Vec<f64>,
+}
+
+/// Attaches a study's fixed faces and loads to the mesh by face key.
+pub(crate) fn boundary(mesh: &HexMesh, study: &Study) -> Result<Boundary, FeaError> {
     let touched = mesh.touched_faces();
     for face in study
         .fixed
@@ -62,18 +102,30 @@ pub fn run(mesh: HexMesh, study: &Study) -> Result<Results, FeaError> {
             }
         }
     }
+    Ok(Boundary { fixed, force })
+}
 
-    let brick = Brick::new(mesh.size, &study.material);
+/// Reactions, stresses and nodal averages from a converged displacement `u`. With a
+/// `scale`, each element's stress is scaled with its stiffness, so an element that
+/// topology optimisation has all but removed carries all but no stress.
+pub(crate) fn results(
+    mesh: HexMesh,
+    study: &Study,
+    brick: &Brick,
+    fixed: &[bool],
+    scale: Option<&[f64]>,
+    u: &[f64],
+    iterations: usize,
+) -> Results {
     let system = System {
         mesh: &mesh,
-        brick: &brick,
-        fixed: &fixed,
+        brick,
+        fixed,
+        scale,
     };
-    let (u, iterations) = conjugate_gradient(&system, &force)?;
-
     // Reactions are what the fixed nodes push back with: the full product at those rows.
-    let mut ku = vec![0.0; ndof];
-    system.multiply(&u, &mut ku, false);
+    let mut ku = vec![0.0; u.len()];
+    system.multiply(u, &mut ku, false);
     let mut reaction = Vec3::ZERO;
     for n in 0..mesh.nodes.len() {
         if fixed[3 * n] {
@@ -87,9 +139,9 @@ pub fn run(mesh: HexMesh, study: &Study) -> Result<Results, FeaError> {
     let mut von = Vec::with_capacity(mesh.elements.len());
     let mut nodal = vec![0.0; mesh.nodes.len()];
     let mut count = vec![0u32; mesh.nodes.len()];
-    for element in &mesh.elements {
-        let ue = gather(element, &u);
-        let s = von_mises(&brick.stress(&ue));
+    for (e, element) in mesh.elements.iter().enumerate() {
+        let ue = gather(element, u);
+        let s = von_mises(&brick.stress(&ue)) * scale.map_or(1.0, |s| s[e]);
         von.push(s);
         for &n in element {
             nodal[n] += s;
@@ -102,7 +154,7 @@ pub fn run(mesh: HexMesh, study: &Study) -> Result<Results, FeaError> {
         }
     }
 
-    Ok(Results {
+    Results {
         mesh,
         material: study.material,
         displacements,
@@ -110,21 +162,28 @@ pub fn run(mesh: HexMesh, study: &Study) -> Result<Results, FeaError> {
         nodal_von_mises: nodal,
         reaction,
         iterations,
-    })
+    }
 }
 
-struct System<'a> {
-    mesh: &'a HexMesh,
-    brick: &'a Brick,
-    fixed: &'a [bool],
+/// The linear system `K·u = f` with fixed degrees of freedom masked out. With a `scale`,
+/// element `e` contributes `scale[e]` times the shared brick stiffness, which is how
+/// topology optimisation softens the elements it is removing without a second stiffness
+/// matrix; a static study passes `None` and pays one multiply by 1.0 per row for the
+/// generality, nothing beside the 24-wide dot product next to it.
+pub(crate) struct System<'a> {
+    pub mesh: &'a HexMesh,
+    pub brick: &'a Brick,
+    pub fixed: &'a [bool],
+    pub scale: Option<&'a [f64]>,
 }
 
 impl System<'_> {
     /// `out = K·u`. With `masked`, fixed rows and columns are treated as deleted.
-    fn multiply(&self, u: &[f64], out: &mut [f64], masked: bool) {
+    pub(crate) fn multiply(&self, u: &[f64], out: &mut [f64], masked: bool) {
         out.fill(0.0);
         let k = &self.brick.stiffness;
-        for element in &self.mesh.elements {
+        for (e, element) in self.mesh.elements.iter().enumerate() {
+            let scale = self.scale.map_or(1.0, |s| s[e]);
             let mut ue = gather(element, u);
             if masked {
                 for (i, &n) in element.iter().enumerate() {
@@ -142,7 +201,7 @@ impl System<'_> {
                     if masked && self.fixed[g] {
                         continue;
                     }
-                    out[g] += k[row].iter().zip(&ue).map(|(a, b)| a * b).sum::<f64>();
+                    out[g] += scale * k[row].iter().zip(&ue).map(|(a, b)| a * b).sum::<f64>();
                 }
             }
         }
@@ -152,10 +211,11 @@ impl System<'_> {
     fn diagonal(&self) -> Vec<f64> {
         let mut diag = vec![0.0; self.fixed.len()];
         let k = &self.brick.stiffness;
-        for element in &self.mesh.elements {
+        for (e, element) in self.mesh.elements.iter().enumerate() {
+            let scale = self.scale.map_or(1.0, |s| s[e]);
             for (i, &n) in element.iter().enumerate() {
                 for d in 0..3 {
-                    diag[3 * n + d] += k[3 * i + d][3 * i + d];
+                    diag[3 * n + d] += scale * k[3 * i + d][3 * i + d];
                 }
             }
         }
@@ -168,7 +228,7 @@ impl System<'_> {
     }
 }
 
-fn gather(element: &[usize; 8], u: &[f64]) -> [f64; DOF] {
+pub(crate) fn gather(element: &[usize; 8], u: &[f64]) -> [f64; DOF] {
     let mut ue = [0.0; DOF];
     for (i, &n) in element.iter().enumerate() {
         ue[3 * i..3 * i + 3].copy_from_slice(&u[3 * n..3 * n + 3]);
@@ -176,12 +236,32 @@ fn gather(element: &[usize; 8], u: &[f64]) -> [f64; DOF] {
     ue
 }
 
+/// Twice the strain energy of one unscaled brick with corner displacements `ue`:
+/// `ueᵀ·k₀·ue`, the quantity every compliance sensitivity is made of.
+pub(crate) fn energy(brick: &Brick, ue: &[f64; DOF]) -> f64 {
+    brick
+        .stiffness
+        .iter()
+        .zip(ue)
+        .map(|(row, &ui)| ui * row.iter().zip(ue).map(|(a, b)| a * b).sum::<f64>())
+        .sum()
+}
+
 fn dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
-/// Jacobi-preconditioned conjugate gradient on the masked system.
-fn conjugate_gradient(system: &System, force: &[f64]) -> Result<(Vec<f64>, usize), FeaError> {
+/// Jacobi-preconditioned conjugate gradient on the masked system, starting from whatever
+/// `u` holds (zero for a cold start, the last answer for a warm one) and stopping when
+/// the residual relative to the load falls below `tolerance`. Returns the iterations
+/// taken. The observer hears from it every [`REPORT_EVERY`] iterations and may stop it.
+pub(crate) fn conjugate_gradient(
+    system: &System,
+    force: &[f64],
+    u: &mut [f64],
+    tolerance: f64,
+    observer: &mut dyn FnMut(&Progress) -> bool,
+) -> Result<usize, FeaError> {
     let n = force.len();
     let fixed = system.fixed;
     let inv_diag: Vec<f64> = system.diagonal().iter().map(|d| 1.0 / d).collect();
@@ -192,15 +272,35 @@ fn conjugate_gradient(system: &System, force: &[f64]) -> Result<(Vec<f64>, usize
         }
     }
     let norm_b = dot(&b, &b).sqrt();
-    let mut u = vec![0.0; n];
     if norm_b == 0.0 {
-        return Ok((u, 0));
+        u.fill(0.0);
+        return Ok(0);
     }
+    for (v, &f) in u.iter_mut().zip(fixed) {
+        if f {
+            *v = 0.0;
+        }
+    }
+    // r = b − K·u₀; for a cold start that is b itself.
     let mut r = b;
+    if u.iter().any(|&v| v != 0.0) {
+        let mut ku = vec![0.0; n];
+        system.multiply(u, &mut ku, true);
+        for (r, k) in r.iter_mut().zip(&ku) {
+            *r -= k;
+        }
+    }
     let mut z: Vec<f64> = r.iter().zip(&inv_diag).map(|(r, d)| r * d).collect();
     let mut p = z.clone();
     let mut rz = dot(&r, &z);
     let mut q = vec![0.0; n];
+    let progress = |step, residual| Progress {
+        phase: Phase::Solving,
+        step,
+        of: None,
+        measure: residual,
+    };
+    crate::report(observer, progress(0, dot(&r, &r).sqrt() / norm_b))?;
     // A floating body never converges; the cap turns that into an error with a hint
     // rather than a hang. Well-posed problems take a small fraction of this.
     let max_iterations = (3 * n).clamp(1_000, 50_000);
@@ -219,8 +319,11 @@ fn conjugate_gradient(system: &System, force: &[f64]) -> Result<(Vec<f64>, usize
             r[i] -= alpha * q[i];
         }
         let residual = dot(&r, &r).sqrt() / norm_b;
-        if residual < TOLERANCE {
-            return Ok((u, it));
+        if residual < tolerance {
+            return Ok(it);
+        }
+        if it % REPORT_EVERY == 0 {
+            crate::report(observer, progress(it, residual))?;
         }
         for i in 0..n {
             z[i] = r[i] * inv_diag[i];
@@ -323,6 +426,45 @@ mod tests {
         // 2 MPa over 1000 mm² is 2000 N downwards; the reaction is upward.
         assert_relative_eq!(r.reaction.z, 2000.0, max_relative = 1e-6);
         assert!(r.max_displacement().1.z > 9.0);
+    }
+
+    #[test]
+    fn progress_is_reported_and_can_cancel() {
+        let study = Study {
+            material: Material::STEEL,
+            fixed: vec![key(FaceRole::Side(3))],
+            loads: vec![Load {
+                face: key(FaceRole::Side(1)),
+                kind: LoadKind::Force(Vec3::new(0.0, 0.0, -100.0)),
+            }],
+            element_size: 5.0,
+        };
+        let mut seen = Vec::new();
+        let r = crate::run_with(&bar(), &study, &mut |p| {
+            seen.push(*p);
+            true
+        })
+        .unwrap();
+        assert_eq!(seen[0].phase, crate::Phase::Meshing);
+        let solving: Vec<_> = seen
+            .iter()
+            .filter(|p| p.phase == crate::Phase::Solving)
+            .collect();
+        // Step 0 and then every 25 iterations, the residual falling as it goes.
+        assert!(solving.len() >= 2, "{seen:?}");
+        assert_eq!(solving[0].step, 0);
+        assert_eq!(solving[1].step, 25);
+        assert!(solving.last().unwrap().measure < solving[0].measure);
+        assert!(solving.last().unwrap().step <= r.iterations);
+
+        // Saying stop after the mesh is built gives Cancelled, not a result.
+        let mut calls = 0;
+        let err = crate::run_with(&bar(), &study, &mut |_| {
+            calls += 1;
+            calls < 2
+        })
+        .unwrap_err();
+        assert_eq!(err, FeaError::Cancelled);
     }
 
     #[test]

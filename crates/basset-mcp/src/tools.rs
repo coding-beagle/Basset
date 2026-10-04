@@ -11,8 +11,9 @@ use basset_core::{
     BodyOp, BodyRef, CombineOp, ComponentId, Document, EdgeRef, Extent, FaceRef, FeatureId,
     FeatureKind, NumericField, ProfileRef, RegionRef, file,
 };
-use basset_fea::{Load, LoadKind, Material, Study};
+use basset_fea::{Load, LoadKind, Material, MaterialGroup, MaterialSpec, Study, TopologyStudy};
 use basset_io::{ExportItem, Unit};
+use basset_kernel::FaceKey;
 use basset_math::{Affine3, Vec2};
 use basset_sketch::Sketch;
 use serde_json::{Value, json};
@@ -36,7 +37,9 @@ whether every shell is closed and which features failed or warned. Units are mil
 angles cross this interface in degrees. Entity and constraint ids are the integers the replies \
 quote; faces are 'feature.sub:Role' strings and edges are two of those joined by '|'. fea_static runs \
 a linear elastic study on a body: fixed faces, forces or pressures on faces, and the displacement \
-and von Mises stress that result.";
+and von Mises stress that result, with the mass and the safety factor against yield when the \
+material is one of the named engineering materials fea_materials lists. fea_topology takes the same \
+study and a volume fraction and finds where in the body that much material is best placed.";
 
 fn tool(name: &str, description: &str, schema: Value) -> Value {
     json!({ "name": name, "description": description, "inputSchema": schema })
@@ -282,13 +285,53 @@ pub fn tool_definitions() -> Vec<Value> {
                             "pressure": { "type": "number", "description": "Pressure in MPa pushing into the face; negative pulls." },
                         }, "required": ["face"] },
                     },
-                    "material": { "type": "string", "enum": ["steel", "aluminium"], "description": "A preset, default steel (E = 200 000 MPa, nu = 0.3)." },
-                    "youngs_modulus": { "type": "number", "description": "MPa; overrides the preset." },
-                    "poisson_ratio": { "type": "number", "description": "Overrides the preset." },
+                    "material": { "type": "string", "description": "A material by name from fea_materials (\"6061-T6\", \"S355\", \"Stainless 304\", \"PEEK\", ...; case, spaces and hyphens do not matter). Default \"steel\" (E = 200 000 MPa, nu = 0.3), a generic grade with no yield strength." },
+                    "youngs_modulus": { "type": "number", "description": "MPa; overrides the material's." },
+                    "poisson_ratio": { "type": "number", "description": "Overrides the material's." },
                     "element_size": { "type": "number", "description": "Brick edge length in mm. Default: a twentieth of the body's longest extent. The solve time follows the element count." },
                     "export": { "type": "string", "description": "Path of a .vtk file to write the mesh, displacements and stresses to." },
                 }),
                 &["body", "fixed", "loads"],
+            ),
+        ),
+        tool(
+            "fea_topology",
+            "Topology optimisation (SIMP) of a body: the same fixed faces, loads, material and mesh as fea_static, plus the fraction of the body's volume the design may keep. Finds the stiffest layout of that much material, reports the compliance before and after and the volume of the elements above the density threshold, and runs a static solve on the result. Elements on fixed or loaded faces are always kept. Optionally writes a legacy VTK file of the whole grid with a density per cell to threshold in a viewer. Time grows with the element count times the iterations.",
+            obj(
+                json!({
+                    "body": { "type": "integer" },
+                    "fixed": { "type": "array", "items": { "type": "string" }, "description": "Face keys held still in every direction." },
+                    "loads": {
+                        "type": "array",
+                        "items": { "type": "object", "properties": {
+                            "face": { "type": "string" },
+                            "force": { "type": "array", "items": { "type": "number" }, "description": "Total force [x, y, z] in newtons, shared over the face by area." },
+                            "pressure": { "type": "number", "description": "Pressure in MPa pushing into the face; negative pulls." },
+                        }, "required": ["face"] },
+                    },
+                    "material": { "type": "string", "description": "A material by name from fea_materials (\"6061-T6\", \"S355\", \"Stainless 304\", \"PEEK\", ...; case, spaces and hyphens do not matter). Default \"steel\" (E = 200 000 MPa, nu = 0.3), a generic grade with no yield strength." },
+                    "youngs_modulus": { "type": "number", "description": "MPa; overrides the material's." },
+                    "poisson_ratio": { "type": "number", "description": "Overrides the material's." },
+                    "element_size": { "type": "number", "description": "Brick edge length in mm. Default: a twentieth of the body's longest extent." },
+                    "volume_fraction": { "type": "number", "description": "Fraction of the meshed volume the design may use, in (0, 1). Default 0.4." },
+                    "iterations": { "type": "integer", "description": "Optimiser updates at most; it stops early once no density moves by more than 0.01. Default 40." },
+                    "penalty": { "type": "number", "description": "SIMP exponent. Default 3." },
+                    "filter_radius": { "type": "number", "description": "Sensitivity filter radius in element sizes; the minimum feature size. Default 1.5." },
+                    "threshold": { "type": "number", "description": "Density at and above which an element counts as kept in the reported volume. Default 0.5." },
+                    "export": { "type": "string", "description": "Path of a .vtk file to write the grid, densities, displacements and stresses to." },
+                }),
+                &["body", "fixed", "loads"],
+            ),
+        ),
+        tool(
+            "fea_materials",
+            "The engineering materials fea_static knows by name, with Young's modulus (MPa), Poisson's ratio, density (g/cm³) and yield strength (MPa), optionally filtered by group (steel, stainless steel, aluminium, titanium, copper alloy, cast iron, magnesium, plastic, other) or by a substring of the name.",
+            obj(
+                json!({
+                    "group": { "type": "string", "description": "Only materials of this group." },
+                    "query": { "type": "string", "description": "Only materials whose name or group contains this text." },
+                }),
+                &[],
             ),
         ),
         tool(
@@ -370,6 +413,8 @@ pub fn call(session: &mut Session, name: &str, args: &Value) -> Result<Value, To
         }
         "set_feature_expr" => set_feature_expr(session, args),
         "fea_static" => fea_static(session, args),
+        "fea_materials" => fea_materials(args),
+        "fea_topology" => fea_topology(session, args),
         "export" => export(session, args),
         "run_script" => run_script(session, args),
         _ => Err(ToolError::bad(format!("unknown tool {name:?}"))),
@@ -1137,45 +1182,12 @@ fn body_info(session: &mut Session, args: &Value) -> Result<Value, ToolError> {
 
 fn fea_static(session: &mut Session, args: &Value) -> Result<Value, ToolError> {
     let id = BodyRef(feature_from_json(field(args, "body")?)?);
-    let fixed: Vec<_> = req_array(args, "fixed")?
-        .iter()
-        .map(|v| {
-            v.as_str()
-                .ok_or_else(|| ToolError::bad(format!("expected a face key string, got {v}")))
-                .and_then(face_key_from_str)
-        })
-        .collect::<Result<_, _>>()?;
-    let mut loads = Vec::new();
-    for l in req_array(args, "loads")? {
-        let face = face_key_from_str(req_str(l, "face")?)?;
-        let kind = match (opt(l, "force"), opt_f64(l, "pressure")?) {
-            (Some(f), None) => LoadKind::Force(req_vec3(l, "force").map_err(|_| {
-                ToolError::bad(format!("a force is [x, y, z] in newtons, got {f}"))
-            })?),
-            (None, Some(p)) => LoadKind::Pressure(p),
-            _ => {
-                return Err(ToolError::bad(
-                    "each load needs exactly one of \"force\" or \"pressure\"",
-                ));
-            }
-        };
-        loads.push(Load { face, kind });
-    }
-    let mut material = match opt_str(args, "material") {
-        None | Some("steel") => Material::STEEL,
-        Some("aluminium") | Some("aluminum") => Material::ALUMINIUM,
-        Some(other) => {
-            return Err(ToolError::bad(format!(
-                "unknown material {other:?}; steel or aluminium, or give youngs_modulus and poisson_ratio"
-            )));
-        }
-    };
-    if let Some(e) = opt_f64(args, "youngs_modulus")? {
-        material.youngs_modulus = e;
-    }
-    if let Some(nu) = opt_f64(args, "poisson_ratio")? {
-        material.poisson_ratio = nu;
-    }
+    let StudyArgs {
+        fixed,
+        loads,
+        material,
+        spec,
+    } = study_args(args)?;
     let export_path = opt_str(args, "export").map(PathBuf::from);
 
     let doc = session.document_mut();
@@ -1201,23 +1213,216 @@ fn fea_static(session: &mut Session, args: &Value) -> Result<Value, ToolError> {
     let results = basset_fea::run(&body.solid, &study)?;
     let (dmax, d_at) = results.max_displacement();
     let (smax, s_at) = results.max_von_mises();
+    // The name is looked up from the numbers actually solved with, not the preset asked
+    // for, so an overridden modulus reports no name rather than a wrong one. Density and
+    // yield come from the preset: an override of E says nothing about them.
     let mut out = json!({
         "body": id.0.0,
         "nodes": results.mesh.nodes.len(),
         "elements": results.mesh.elements.len(),
         "element_size": summary::v3(results.mesh.size),
         "mesh_volume": round(results.mesh.volume()),
-        "material": { "youngs_modulus": material.youngs_modulus, "poisson_ratio": material.poisson_ratio },
+        "material": {
+            "name": MaterialSpec::of(material).map(|m| m.name),
+            "group": spec.group.name(),
+            "youngs_modulus": material.youngs_modulus,
+            "poisson_ratio": material.poisson_ratio,
+            "density": spec.density,
+            "yield_strength": spec.yield_strength,
+        },
+        "mass_kg": results.mass_kg(spec.density),
         "iterations": results.iterations,
         "max_displacement": { "mm": dmax, "at": summary::v3(d_at) },
         "max_von_mises": { "mpa": smax, "at": summary::v3(s_at) },
         "reaction": summary::v3(results.reaction),
     });
+    if let Some(yield_strength) = spec.yield_strength {
+        // Infinite when nothing is stressed; serde_json writes that as null.
+        out["safety_factor"] = json!(basset_fea::safety_factor(yield_strength, smax));
+    }
     if let Some(path) = export_path {
         basset_fea::vtk::write_file(&results, &path)?;
         out["exported"] = Value::String(path.display().to_string());
     }
     Ok(out)
+}
+
+fn fea_topology(session: &mut Session, args: &Value) -> Result<Value, ToolError> {
+    let id = BodyRef(feature_from_json(field(args, "body")?)?);
+    let StudyArgs {
+        fixed,
+        loads,
+        material,
+        ..
+    } = study_args(args)?;
+    let export_path = opt_str(args, "export").map(PathBuf::from);
+    let threshold = opt_f64(args, "threshold")?.unwrap_or(0.5);
+
+    let doc = session.document_mut();
+    let state = doc.state();
+    let body = state.body(id).ok_or_else(|| {
+        let known: Vec<u64> = state.bodies.keys().map(|b| b.0.0).collect();
+        ToolError::bad(format!(
+            "no body {} at the timeline cursor; bodies: {known:?}",
+            id.0.0
+        ))
+    })?;
+    let extent = body.solid.aabb().extent();
+    let element_size = match opt_f64(args, "element_size")? {
+        Some(h) => h,
+        None => extent.x.max(extent.y).max(extent.z) / 20.0,
+    };
+    let mut study = TopologyStudy::new(Study {
+        material,
+        fixed,
+        loads,
+        element_size,
+    });
+    if let Some(f) = opt_f64(args, "volume_fraction")? {
+        study.volume_fraction = f;
+    }
+    if let Some(n) = opt_u64(args, "iterations")? {
+        study.iterations = n as usize;
+    }
+    if let Some(p) = opt_f64(args, "penalty")? {
+        study.penalty = p;
+    }
+    if let Some(r) = opt_f64(args, "filter_radius")? {
+        study.filter_radius = r;
+    }
+    let results = basset_fea::optimise(&body.solid, &study)?;
+    let (dmax, d_at) = results.results.max_displacement();
+    let (smax, s_at) = results.results.max_von_mises();
+    let mut out = json!({
+        "body": id.0.0,
+        "nodes": results.mesh.nodes.len(),
+        "elements": results.mesh.elements.len(),
+        "element_size": summary::v3(results.mesh.size),
+        "iterations": results.iterations,
+        "volume_fraction": results.volume_fraction,
+        "compliance": {
+            "first": results.compliance.first().copied().unwrap_or(0.0),
+            "last": results.compliance.last().copied().unwrap_or(0.0),
+        },
+        "kept_volume": round(results.kept_volume(threshold)),
+        "max_von_mises": { "mpa": smax, "at": summary::v3(s_at) },
+        "max_displacement": { "mm": dmax, "at": summary::v3(d_at) },
+    });
+    if let Some(path) = export_path {
+        basset_fea::vtk::write_topology_file(&results, &path)?;
+        out["exported"] = Value::String(path.display().to_string());
+    }
+    Ok(out)
+}
+
+/// What `study_args` reads.
+struct StudyArgs {
+    fixed: Vec<FaceKey>,
+    loads: Vec<Load>,
+    /// The numbers solved with, after any override.
+    material: Material,
+    /// The library entry they started from.
+    spec: &'static MaterialSpec,
+}
+
+/// The fixed faces, loads and material of a study, shared by `fea_static` and
+/// `fea_topology`. The material comes back twice: the numbers solved with, after any
+/// override, and the library entry they started from, whose density and yield strength
+/// an override of E says nothing about.
+fn study_args(args: &Value) -> Result<StudyArgs, ToolError> {
+    let fixed: Vec<_> = req_array(args, "fixed")?
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .ok_or_else(|| ToolError::bad(format!("expected a face key string, got {v}")))
+                .and_then(face_key_from_str)
+        })
+        .collect::<Result<_, _>>()?;
+    let mut loads = Vec::new();
+    for l in req_array(args, "loads")? {
+        let face = face_key_from_str(req_str(l, "face")?)?;
+        let kind = match (opt(l, "force"), opt_f64(l, "pressure")?) {
+            (Some(f), None) => LoadKind::Force(req_vec3(l, "force").map_err(|_| {
+                ToolError::bad(format!("a force is [x, y, z] in newtons, got {f}"))
+            })?),
+            (None, Some(p)) => LoadKind::Pressure(p),
+            _ => {
+                return Err(ToolError::bad(
+                    "each load needs exactly one of \"force\" or \"pressure\"",
+                ));
+            }
+        };
+        loads.push(Load { face, kind });
+    }
+    let spec = material_arg(args)?;
+    let mut material = spec.material;
+    if let Some(e) = opt_f64(args, "youngs_modulus")? {
+        material.youngs_modulus = e;
+    }
+    if let Some(nu) = opt_f64(args, "poisson_ratio")? {
+        material.poisson_ratio = nu;
+    }
+    Ok(StudyArgs {
+        fixed,
+        loads,
+        material,
+        spec,
+    })
+}
+
+/// The library entry a `material` argument names, generic steel when there is none. The
+/// error on a miss quotes a handful of names so the caller sees the shape of what is
+/// accepted without another round trip.
+fn material_arg(args: &Value) -> Result<&'static MaterialSpec, ToolError> {
+    let Some(name) = opt_str(args, "material") else {
+        return Ok(MaterialSpec::of(Material::STEEL).expect("the library names generic steel"));
+    };
+    basset_fea::find_material(name).ok_or_else(|| {
+        let examples: Vec<&str> = basset_fea::library()
+            .iter()
+            .map(|m| m.name)
+            .filter(|n| matches!(*n, "Steel" | "S355" | "Stainless 304" | "6061-T6" | "Ti-6Al-4V" | "ABS"))
+            .collect();
+        ToolError::bad(format!(
+            "unknown material {name:?}; fea_materials lists the names ({}, ...), or give youngs_modulus and poisson_ratio",
+            examples.join(", ")
+        ))
+    })
+}
+
+/// `fea_materials`: the library, filtered. Both filters are optional and combine.
+fn fea_materials(args: &Value) -> Result<Value, ToolError> {
+    let group = match opt_str(args, "group") {
+        None => None,
+        Some(g) => Some(MaterialGroup::from_name(g).ok_or_else(|| {
+            let names: Vec<&str> = MaterialGroup::ALL.iter().map(|g| g.name()).collect();
+            ToolError::bad(format!(
+                "unknown material group {g:?}; one of {}",
+                names.join(", ")
+            ))
+        })?),
+    };
+    let query = opt_str(args, "query").map(|q| q.to_lowercase());
+    let materials: Vec<Value> = basset_fea::library()
+        .iter()
+        .filter(|m| group.is_none_or(|g| m.group == g))
+        .filter(|m| {
+            query.as_deref().is_none_or(|q| {
+                m.name.to_lowercase().contains(q) || m.group.name().to_lowercase().contains(q)
+            })
+        })
+        .map(|m| {
+            json!({
+                "name": m.name,
+                "group": m.group.name(),
+                "youngs_modulus": m.material.youngs_modulus,
+                "poisson_ratio": m.material.poisson_ratio,
+                "density": m.density,
+                "yield_strength": m.yield_strength,
+            })
+        })
+        .collect();
+    Ok(json!({ "materials": materials }))
 }
 
 fn export(session: &mut Session, args: &Value) -> Result<Value, ToolError> {

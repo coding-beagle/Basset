@@ -499,13 +499,19 @@ pub fn start_tool(editor: &mut Editor, kind: ToolKind) {
     if editor.is_sketching() {
         return;
     }
+    // Modelling belongs to the Design workspace; in Simulation a click on a face is a
+    // pick for the study and must not also feed a tool.
+    if editor.workspace == super::Workspace::Simulation {
+        editor.set_status(super::simulate::REFUSED);
+        editor.request_repaint();
+        return;
+    }
     if editor.tool.is_some() {
         cancel_tool(editor);
     }
     // Measuring and modelling are different jobs: a tool takes over the picking, so the
     // readout would stop agreeing with what a click does.
     super::measure::stop(editor);
-    super::simulate::stop(editor);
     let mut params = Params::default();
     match kind {
         ToolKind::Fillet => params.radius = 2.0,

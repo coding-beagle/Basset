@@ -70,6 +70,11 @@ pub fn start(editor: &mut Editor) {
     if editor.is_sketching() {
         return;
     }
+    if editor.workspace == super::Workspace::Simulation {
+        editor.set_status(super::simulate::REFUSED);
+        editor.request_repaint();
+        return;
+    }
     if editor.tool.is_some() {
         super::tools::cancel_tool(editor);
     }

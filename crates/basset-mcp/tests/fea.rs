@@ -122,3 +122,125 @@ fn a_pressure_exports_vtk_and_a_bad_face_is_named() {
     assert!(err.0.contains("exactly one of"), "{err}");
     let _: Value = out;
 }
+
+#[test]
+fn a_named_material_reports_its_name_mass_and_safety_factor() {
+    let mut session = Session::new();
+    let (body, root, tip) = bar(&mut session);
+    let out = session
+        .call(
+            "fea_static",
+            &json!({
+                "body": body,
+                "fixed": [root],
+                "loads": [{ "face": tip, "force": [0, 0, -100] }],
+                "material": "6061-T6",
+                "element_size": 2.0,
+            }),
+        )
+        .unwrap();
+    assert_eq!(out["material"]["name"], "6061-T6", "{out}");
+    assert_eq!(out["material"]["group"], "Aluminium");
+    assert_eq!(out["material"]["youngs_modulus"], 68900.0);
+    assert_eq!(out["material"]["yield_strength"], 276.0);
+    // 10 000 mm³ of aluminium at 2.70 g/cm³ is 27 g; the bar meshes exactly.
+    assert!(
+        (out["mass_kg"].as_f64().unwrap() - 0.027).abs() < 1e-9,
+        "{out}"
+    );
+    let smax = out["max_von_mises"]["mpa"].as_f64().unwrap();
+    let sf = out["safety_factor"].as_f64().unwrap();
+    assert!((sf - 276.0 / smax).abs() < 1e-9, "{out}");
+
+    // Spelling is forgiven; an overridden modulus is no longer a library entry, and says
+    // so by naming nothing, but keeps the preset's density and yield.
+    let out = session
+        .call(
+            "fea_static",
+            &json!({
+                "body": body,
+                "fixed": [root],
+                "loads": [{ "face": tip, "force": [0, 0, -100] }],
+                "material": "al 6061 t6",
+                "youngs_modulus": 70000,
+                "element_size": 5.0,
+            }),
+        )
+        .unwrap();
+    assert!(out["material"]["name"].is_null(), "{out}");
+    assert_eq!(out["material"]["density"], 2.7);
+    assert!(out["safety_factor"].is_number(), "{out}");
+
+    // The default is generic steel, which has no yield strength and so no safety factor.
+    let out = session
+        .call(
+            "fea_static",
+            &json!({
+                "body": body,
+                "fixed": [root],
+                "loads": [{ "face": tip, "force": [0, 0, -100] }],
+                "element_size": 5.0,
+            }),
+        )
+        .unwrap();
+    assert_eq!(out["material"]["name"], "Steel");
+    assert!(out["material"]["yield_strength"].is_null());
+    assert!(out.get("safety_factor").is_none(), "{out}");
+}
+
+#[test]
+fn the_material_library_lists_and_filters() {
+    let mut session = Session::new();
+    let all = session.call("fea_materials", &json!({})).unwrap();
+    let all = all["materials"].as_array().unwrap();
+    assert!(all.len() >= 20, "{}", all.len());
+    for m in all {
+        assert!(m["name"].is_string() && m["group"].is_string(), "{m}");
+        assert!(m["youngs_modulus"].as_f64().unwrap() > 0.0, "{m}");
+        assert!(m["density"].as_f64().unwrap() > 0.0, "{m}");
+    }
+
+    let plastics = session
+        .call("fea_materials", &json!({ "group": "plastic" }))
+        .unwrap();
+    let plastics = plastics["materials"].as_array().unwrap();
+    assert!(plastics.len() >= 5 && plastics.len() < all.len());
+    assert!(
+        plastics.iter().all(|m| m["group"] == "Plastic"),
+        "{plastics:?}"
+    );
+
+    let stainless = session
+        .call(
+            "fea_materials",
+            &json!({ "group": "stainless", "query": "316" }),
+        )
+        .unwrap();
+    assert_eq!(stainless["materials"][0]["name"], "Stainless 316");
+    assert_eq!(stainless["materials"].as_array().unwrap().len(), 1);
+
+    let err = session
+        .call("fea_materials", &json!({ "group": "wood" }))
+        .unwrap_err();
+    assert!(err.0.contains("unknown material group"), "{err}");
+}
+
+#[test]
+fn an_unknown_material_is_refused_with_names_to_try() {
+    let mut session = Session::new();
+    let (body, root, tip) = bar(&mut session);
+    let err = session
+        .call(
+            "fea_static",
+            &json!({
+                "body": body,
+                "fixed": [root],
+                "loads": [{ "face": tip, "pressure": 1 }],
+                "material": "unobtainium",
+            }),
+        )
+        .unwrap_err();
+    assert!(err.0.contains("unknown material \"unobtainium\""), "{err}");
+    assert!(err.0.contains("fea_materials"), "{err}");
+    assert!(err.0.contains("6061-T6"), "{err}");
+}

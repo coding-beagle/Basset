@@ -5239,18 +5239,24 @@ mod thread {
     }
 }
 
-/// The Simulate tool: a study set up by clicking faces, run from its dialog and read back
-/// as a plot. The bar is 100 × 10 × 10 mm, which beam theory bends 0.2 mm under 100 N at
-/// its free end (δ = FL³/3EI with I = 10⁴/12 mm⁴ and E = 200 GPa), the number the test
-/// pins the solver to.
+/// The Simulation workspace: a study set up by clicking faces, solved on a background
+/// thread and read back as a plot. The bar is 100 × 10 × 10 mm, which beam theory bends
+/// 0.2 mm under 100 N at its free end (δ = FL³/3EI with I = 10⁴/12 mm⁴ and E = 200 GPa),
+/// the number the test pins the solver to.
 mod simulate {
+    use std::time::Duration;
+
     use basset_core::{ComponentId, FeatureKind, OriginPlane, PlaneRef, Sketch};
     use basset_math::{Vec2, Vec3};
     use basset_sketch::shapes;
     use basset_viewport::ViewPreset;
+    use winit::keyboard::NamedKey;
 
-    use crate::editor::harness::Harness;
+    use crate::editor::commands::{self, Command};
+    use crate::editor::harness::{Harness, TempDir};
     use crate::editor::simulate::{self, Armed};
+    use crate::editor::tools::ToolKind;
+    use crate::editor::{Workspace, panels};
 
     /// A bar along x from 0 to 100, 10 square, standing on the XY plane.
     fn bar() -> (Harness, basset_core::BodyRef) {
@@ -5279,17 +5285,21 @@ mod simulate {
         h.click_world(Vec3::new(x, 5.0, 5.0));
     }
 
-    /// Holds one end and loads the other with 100 N downwards, through the dialog's own
-    /// controls, on bricks fine enough for bending to come out right.
+    /// Holds one end and loads the other with 100 N downwards, through the workspace's
+    /// own controls, on bricks fine enough for bending to come out right.
     fn set_up(h: &mut Harness) {
-        assert!(h.click_ui("Simulate"), "the toolbar has the button");
+        assert!(h.click_ui("Simulate"), "the Design toolbar has the button");
+        assert_eq!(h.editor.workspace, Workspace::Simulation);
         assert!(h.editor.simulation.is_some());
         click_end(h, 0.0);
-        // The dialog is laid out afresh each frame, and a click lands on the last one.
+        // The panel is laid out afresh each frame, and a click lands on the last one.
         h.frame();
-        assert!(h.click_ui("Pick loads"), "the dialog arms the load list");
+        assert!(
+            h.click_ui("Pick loads"),
+            "the Study panel arms the load list"
+        );
         click_end(h, 100.0);
-        let sim = h.editor.simulation.as_mut().expect("the dialog is open");
+        let sim = h.editor.simulation.as_mut().expect("the study is up");
         assert_eq!(sim.fixed.len(), 1, "one held face");
         assert_eq!(sim.loaded.len(), 1, "one loaded face");
         assert_ne!(sim.fixed[0], sim.loaded[0]);
@@ -5299,10 +5309,11 @@ mod simulate {
     }
 
     #[test]
-    fn the_toolbar_button_opens_the_dialog_on_the_only_body() {
+    fn the_toolbar_button_enters_the_workspace_on_the_only_body() {
         let (mut h, body) = bar();
         assert!(h.click_ui("Simulate"));
-        let sim = h.editor.simulation.as_ref().expect("opened");
+        assert_eq!(h.editor.workspace, Workspace::Simulation);
+        let sim = h.editor.simulation.as_ref().expect("a study was made");
         assert_eq!(
             sim.body,
             Some(body),
@@ -5311,17 +5322,98 @@ mod simulate {
         let frame = h.frame();
         assert!(frame.has_text("Fixed faces") && frame.has_text("Load faces"));
         assert!(frame.has_text("Run"));
+        assert!(frame.has_text("Study"), "the right-hand panel");
         // Nothing of this touched the document.
         assert!(!h.editor.doc.in_transaction());
         assert_eq!(h.editor.doc.timeline().features().len(), 2);
+    }
+
+    #[test]
+    fn the_tabs_swap_the_browser_and_hide_the_timeline() {
+        let (mut h, _) = bar();
+        let frame = h.frame();
+        assert!(
+            frame.has_text("Design") && frame.has_text("Simulation"),
+            "the tab strip"
+        );
+        assert!(frame.has_text("⏮"), "the timeline is up in Design");
+        assert!(!frame.has_text("Static stress study"));
+        assert!(h.click_ui("Simulation"), "the tab is clickable");
+        assert_eq!(h.editor.workspace, Workspace::Simulation);
+        let frame = h.frame();
+        assert!(frame.has_text("Static stress study"), "the study tree");
+        assert!(frame.has_text("Fixed faces (0)"), "{:?}", frame.text());
+        assert!(frame.has_text("Loads (0)"));
+        assert!(frame.has_text("Results: none yet"));
+        assert!(!frame.has_text("⏮"), "the timeline is hidden");
+        assert!(!frame.has_text("Extrude"), "the modelling toolbar is gone");
+        assert!(h.click_ui("Design"));
+        assert_eq!(h.editor.workspace, Workspace::Design);
+        let frame = h.frame();
+        assert!(frame.has_text("⏮") && frame.has_text("Extrude"));
+        assert!(
+            h.editor.simulation.is_some(),
+            "the study waits for the next visit"
+        );
+    }
+
+    #[test]
+    fn escape_does_not_leave_the_workspace() {
+        let (mut h, _) = bar();
+        h.enter_simulation();
         h.editor.cancel();
-        assert!(h.editor.simulation.is_none(), "Escape closes it");
+        assert_eq!(h.editor.workspace, Workspace::Simulation);
+        h.key(NamedKey::Escape);
+        assert_eq!(h.editor.workspace, Workspace::Simulation);
+        assert!(h.editor.simulation.is_some());
+        assert_eq!(h.editor.status, simulate::PROMPT);
+    }
+
+    #[test]
+    fn modelling_is_refused_in_the_simulation_workspace() {
+        let (mut h, _) = bar();
+        h.enter_simulation();
+        // Straight to the tool.
+        h.start_tool(ToolKind::Fillet);
+        assert!(h.editor.tool.is_none());
+        assert_eq!(h.editor.status, simulate::REFUSED);
+        // Through the command path a key or a menu takes.
+        h.editor.set_status("");
+        panels::run(&mut h.editor, Command::Tool(ToolKind::Extrude));
+        assert!(h.editor.tool.is_none());
+        assert_eq!(h.editor.status, simulate::REFUSED);
+        // The key itself is not even bound here, and the palette does not list it.
+        h.editor.set_status("");
+        h.type_key("e");
+        assert!(h.editor.tool.is_none());
+        assert!(
+            commands::search(&h.editor, "extrude").is_empty(),
+            "the palette hides modelling commands"
+        );
+        assert!(
+            commands::search(&h.editor, "undo")
+                .iter()
+                .any(|b| b.id == "edit.undo"),
+            "undo is not modelling"
+        );
+        panels::run(&mut h.editor, Command::ToggleMeasure);
+        assert!(h.editor.measure.is_none());
+        // Back in Design, everything is on again and the study is still there.
+        h.editor.set_workspace(Workspace::Design);
+        assert!(!commands::search(&h.editor, "extrude").is_empty());
+        h.start_tool(ToolKind::Fillet);
+        assert!(h.editor.tool.is_some(), "Design is unaffected");
+        assert!(
+            h.editor.simulation.is_some(),
+            "a modelling tool no longer closes the study"
+        );
+        h.cancel_tool();
     }
 
     #[test]
     fn a_face_clicked_twice_leaves_the_list_and_a_face_moves_between_lists() {
         let (mut h, _) = bar();
-        simulate::start(&mut h.editor);
+        h.enter_simulation();
         click_end(&mut h, 0.0);
         assert_eq!(h.editor.simulation.as_ref().unwrap().fixed.len(), 1);
         click_end(&mut h, 0.0);
@@ -5341,6 +5433,12 @@ mod simulate {
             h.editor.selection.faces.is_empty(),
             "a study's picks are not a selection"
         );
+        // In Design the same click is a selection, and the study is untouched.
+        h.editor.set_workspace(Workspace::Design);
+        click_end(&mut h, 0.0);
+        assert_eq!(h.editor.selection.faces.len(), 1);
+        let sim = h.editor.simulation.as_ref().unwrap();
+        assert!(sim.fixed.is_empty() && sim.loaded.len() == 1);
     }
 
     #[test]
@@ -5356,7 +5454,7 @@ mod simulate {
         });
         h.editor.refresh_cache();
         let other = h.extrude(Vec2::new(5.0, 35.0), 10.0);
-        simulate::start(&mut h.editor);
+        h.enter_simulation();
         assert_eq!(
             h.editor.simulation.as_ref().unwrap().body,
             None,
@@ -5380,9 +5478,23 @@ mod simulate {
         let (mut h, body) = bar();
         set_up(&mut h);
         h.frame();
-        assert!(h.click_ui("Run"), "the dialog's Run button");
+        assert!(h.click_ui("Run"), "the toolbar's Run button");
+        // The answer comes from another thread; until it does the study says so.
+        {
+            let sim = h.editor.simulation.as_ref().expect("still up");
+            assert!(
+                sim.solving() || sim.outcome.is_some(),
+                "a job was started: {}",
+                sim.message
+            );
+        }
+        assert!(
+            h.wait_for_solve(Duration::from_secs(120)),
+            "the solve did not finish"
+        );
         let revision = h.editor.doc.revision();
-        let sim = h.editor.simulation.as_ref().expect("still open");
+        let sim = h.editor.simulation.as_ref().expect("still up");
+        assert!(!sim.solving());
         let outcome = sim
             .outcome
             .as_ref()
@@ -5401,7 +5513,7 @@ mod simulate {
         assert_eq!(sim.plotted(revision).map(|(b, _)| b), Some(body));
         assert!(sim.scale > 1.0, "microns are exaggerated to be seen");
 
-        // The dialog reports the run.
+        // The panel and the tree report the run.
         let frame = h.frame();
         assert!(frame.has_text("Max displacement"), "{:?}", frame.text());
         assert!(frame.has_text("Max von Mises"));
@@ -5409,6 +5521,7 @@ mod simulate {
         assert!(frame.has_text("iterations"));
         assert!(frame.has_text("Show results"));
         assert!(frame.has_text("MPa"), "the legend is labelled");
+        assert!(frame.has_text("Results: fresh"), "the study tree");
 
         // With the plot up the body is not drawn and neither is the load fill; headless
         // there is no GPU copy of the plot, so what shows is nothing at all.
@@ -5429,10 +5542,46 @@ mod simulate {
     }
 
     #[test]
+    fn results_persist_across_a_tab_flip_but_are_only_drawn_in_simulation() {
+        let (mut h, body) = bar();
+        set_up(&mut h);
+        h.solve();
+        let revision = h.editor.doc.revision();
+        assert!(h.editor.simulation.as_ref().unwrap().outcome.is_some());
+        assert!(h.frame().has_text("Max displacement"));
+        assert!(h.click_ui("Design"));
+        assert_eq!(h.editor.workspace, Workspace::Design);
+        let sim = h.editor.simulation.as_ref().expect("kept");
+        assert!(sim.outcome.is_some(), "the results survive the flip");
+        assert_eq!(
+            sim.plotted(revision).map(|(b, _)| b),
+            Some(body),
+            "the study itself still has a plot to offer"
+        );
+        assert!(
+            h.editor.study_view().is_none(),
+            "but the viewport is not shown it in Design"
+        );
+        let scene = h.editor.scene();
+        assert!(
+            scene.tris.is_empty(),
+            "no load fill in Design: the viewport is the model's"
+        );
+        assert!(!h.frame().has_text("Max displacement"));
+        assert!(h.click_ui("Simulation"));
+        assert!(h.editor.study_view().is_some());
+        assert!(
+            h.frame().has_text("Max displacement"),
+            "the same results, back"
+        );
+        assert!(!h.editor.simulation.as_ref().unwrap().is_stale(revision));
+    }
+
+    #[test]
     fn an_edit_marks_the_results_stale() {
         let (mut h, body) = bar();
         set_up(&mut h);
-        simulate::run(&mut h.editor);
+        h.solve();
         let before = h.editor.doc.revision();
         assert!(h.editor.simulation.as_ref().unwrap().outcome.is_some());
         assert!(h.frame().has_text("Max displacement"));
@@ -5452,7 +5601,7 @@ mod simulate {
         let scene = h.editor.scene();
         assert_eq!(scene.tris.len(), 1);
         // Running again clears it.
-        simulate::run(&mut h.editor);
+        h.solve();
         let sim = h.editor.simulation.as_ref().unwrap();
         assert!(!sim.is_stale(h.editor.doc.revision()));
         assert_eq!(
@@ -5462,13 +5611,61 @@ mod simulate {
     }
 
     #[test]
+    fn an_edit_while_solving_leaves_the_answer_stale() {
+        let (mut h, _) = bar();
+        set_up(&mut h);
+        simulate::run(&mut h.editor);
+        assert!(h.editor.simulation.as_ref().unwrap().solving());
+        // The model moves under the solver: the answer is of the body it was given.
+        h.editor
+            .doc
+            .set_parameter("w", "12")
+            .expect("a new parameter");
+        assert!(h.wait_for_solve(Duration::from_secs(120)));
+        let revision = h.editor.doc.revision();
+        let sim = h.editor.simulation.as_ref().unwrap();
+        assert!(sim.outcome.is_some(), "{}", sim.message);
+        assert!(sim.is_stale(revision), "tagged with the revision at launch");
+        assert!(sim.plotted(revision).is_none());
+    }
+
+    #[test]
+    fn stop_abandons_the_solve_and_run_starts_again() {
+        let (mut h, _) = bar();
+        set_up(&mut h);
+        simulate::run(&mut h.editor);
+        {
+            let sim = h.editor.simulation.as_ref().unwrap();
+            assert!(sim.solving());
+            assert_eq!(sim.message, "Solving…");
+        }
+        let frame = h.frame();
+        assert!(frame.has_text("Stop"));
+        assert!(frame.has_text("Results: solving…"), "{:?}", frame.text());
+        assert!(h.click_ui("Stop"));
+        let sim = h.editor.simulation.as_ref().unwrap();
+        assert!(!sim.solving(), "the job is gone");
+        assert!(
+            sim.outcome.is_none(),
+            "and so is any answer it would have given"
+        );
+        assert_eq!(sim.message, "Stopped");
+        // Polling afterwards finds nothing to take, however long the thread runs on.
+        std::thread::sleep(Duration::from_millis(50));
+        h.editor.poll_simulation();
+        assert!(h.editor.simulation.as_ref().unwrap().outcome.is_none());
+        // A fresh run is unaffected by the one thrown away.
+        h.solve();
+        assert!(h.editor.simulation.as_ref().unwrap().outcome.is_some());
+    }
+
+    #[test]
     fn the_solver_s_refusal_is_shown_verbatim() {
         let (mut h, _) = bar();
-        simulate::start(&mut h.editor);
-        // A new egui window sizes itself on its first frame and paints on its second.
-        h.frame();
+        h.enter_simulation();
         h.frame();
         assert!(h.click_ui("Run"));
+        assert!(h.wait_for_solve(Duration::from_secs(30)));
         let sim = h.editor.simulation.as_ref().unwrap();
         assert!(sim.outcome.is_none());
         assert_eq!(
@@ -5479,11 +5676,657 @@ mod simulate {
     }
 
     #[test]
-    fn starting_a_modelling_tool_closes_the_study() {
+    fn the_results_export_as_vtk() {
         let (mut h, _) = bar();
-        simulate::start(&mut h.editor);
-        h.start_tool(crate::editor::tools::ToolKind::Fillet);
+        set_up(&mut h);
+        let dir = TempDir::new("vtk");
+        let path = dir.join("bar.vtk");
+        simulate::export_vtk_to(&mut h.editor, &path);
+        assert!(!path.exists(), "nothing to export before a run");
+        assert!(h.editor.status.contains("Run the study"));
+        h.solve();
+        simulate::export_vtk_to(&mut h.editor, &path);
+        let text = std::fs::read_to_string(&path).expect("the file was written");
+        assert!(
+            text.starts_with("# vtk DataFile"),
+            "{}",
+            &text[..40.min(text.len())]
+        );
+        assert!(h.editor.status.contains("Wrote"));
+    }
+
+    #[test]
+    fn a_new_document_drops_the_study_and_returns_to_design() {
+        let (mut h, _) = bar();
+        set_up(&mut h);
+        h.solve();
+        h.editor.new_document();
         assert!(h.editor.simulation.is_none());
-        h.cancel_tool();
+        assert_eq!(h.editor.workspace, Workspace::Design);
+        // And a sketch in progress refuses the switch rather than losing its transaction.
+        h.start_sketch(PlaneRef::Origin(OriginPlane::XY));
+        h.editor.set_workspace(Workspace::Simulation);
+        assert_eq!(h.editor.workspace, Workspace::Design);
+        assert!(h.editor.status.contains("sketch"));
+        h.finish_sketch(false);
+    }
+
+    // --- Materials, colour-by, topology, progress ---------------------------------------
+
+    #[test]
+    fn a_library_material_sets_the_numbers_and_the_readout_weighs_the_part() {
+        let (mut h, _) = bar();
+        set_up(&mut h);
+        // Through the combo: the filter is state on the study, so the popup is short
+        // enough for the entry to be on screen when it opens.
+        h.editor.simulation.as_mut().unwrap().material_filter = "6061".into();
+        h.frame();
+        assert!(h.click_ui("Steel"), "the combo shows the default by name");
+        assert!(h.click_ui("6061-T6"), "the filtered popup lists the alloy");
+        {
+            let sim = h.editor.simulation.as_ref().unwrap();
+            assert_eq!(sim.material_name(), "6061-T6");
+            assert_eq!(sim.material.youngs_modulus, 68_900.0);
+            assert_eq!(sim.material.poisson_ratio, 0.33);
+            assert_eq!(sim.density(), Some(2.70));
+            assert_eq!(sim.yield_strength(), Some(276.0));
+        }
+        assert!(h.frame().has_text("Material: 6061-T6"), "the study tree");
+        h.solve();
+        let (mass, factor) = {
+            let sim = h.editor.simulation.as_ref().unwrap();
+            let outcome = sim.outcome.as_ref().expect("solved");
+            (
+                outcome.mass_kg(2.70, sim.threshold),
+                basset_fea::safety_factor(276.0, outcome.results.max_von_mises().0),
+            )
+        };
+        // 100 × 10 × 10 mm of aluminium at 2.70 g/cm³ is 27 g.
+        assert!((mass - 0.027).abs() < 1e-6, "{mass} kg");
+        assert!(factor > 2.0 && factor < 10.0, "{factor}");
+        let frame = h.frame();
+        assert!(frame.has_text("Mass 27.0 g"), "{:?}", frame.text());
+        assert!(
+            frame.has_text(&format!("Safety factor {factor:.2}")),
+            "{:?}",
+            frame.text()
+        );
+        // Typing over the modulus makes the name Custom but keeps the data sheet.
+        let sim = h.editor.simulation.as_mut().unwrap();
+        sim.material.youngs_modulus = 70_000.0;
+        assert_eq!(sim.material_name(), "Custom");
+        assert_eq!(sim.density(), Some(2.70));
+        assert_eq!(sim.yield_strength(), Some(276.0));
+        assert!(h.frame().has_text("Material: Custom"));
+        // Back to steel's exact numbers, the generic entry names itself again.
+        let sim = h.editor.simulation.as_mut().unwrap();
+        sim.material = basset_fea::Material::STEEL;
+        assert_eq!(sim.material_name(), "Steel");
+    }
+
+    #[test]
+    fn colour_by_displacement_changes_the_plot_and_the_legend() {
+        use crate::editor::simulate::Quantity;
+        let (mut h, _) = bar();
+        set_up(&mut h);
+        h.solve();
+        let sim = h.editor.simulation.as_ref().unwrap();
+        let outcome = sim.outcome.as_ref().unwrap();
+        let mut spec = sim.plot_spec();
+        assert_eq!(spec.quantity, Quantity::VonMises, "the default");
+        let (mesh_vm, by_stress) = outcome.plot(&spec);
+        spec.quantity = Quantity::Displacement;
+        let (mesh_disp, by_displacement) = outcome.plot(&spec);
+        assert_eq!(
+            mesh_vm.positions, mesh_disp.positions,
+            "the same deformed skin"
+        );
+        assert_eq!(by_stress.len(), by_displacement.len());
+        assert_ne!(by_stress, by_displacement, "coloured by something else");
+        // The free end moves most and is stressed least: hot by displacement, cold by
+        // stress. The surface's values are what the colours are read from.
+        let (_, values) = outcome.surface(&spec);
+        let (lo, hi) = outcome.range(&spec);
+        let max_disp = outcome.results.max_displacement().0;
+        assert!((hi - max_disp).abs() < 1e-9, "the range is the plot's own");
+        assert!(values.iter().all(|v| *v >= lo - 1e-12 && *v <= hi + 1e-12));
+        // Safety factor is not offered for a material without a yield strength.
+        assert!(!Quantity::SafetyFactor.available(false, false));
+        assert!(Quantity::SafetyFactor.available(false, true));
+        assert!(!Quantity::Density.available(false, true));
+        // Chosen in the panel, the legend follows the quantity's unit.
+        h.editor.simulation.as_mut().unwrap().quantity = Quantity::Displacement;
+        let label = Quantity::Displacement.format(hi);
+        let frame = h.frame();
+        assert!(
+            frame.text().iter().any(|t| t.trim() == label),
+            "legend {label:?} in {:?}",
+            frame.text()
+        );
+        assert!(frame.has_text("Displacement"), "the combo");
+        // An unavailable choice falls back rather than erroring.
+        let sim = h.editor.simulation.as_mut().unwrap();
+        sim.quantity = Quantity::Density;
+        assert_eq!(sim.quantity_shown(), Quantity::VonMises);
+        sim.quantity = Quantity::SafetyFactor;
+        assert_eq!(
+            sim.quantity_shown(),
+            Quantity::VonMises,
+            "steel has no yield"
+        );
+        h.choose_material("S355");
+        let sim = h.editor.simulation.as_ref().unwrap();
+        assert_eq!(sim.quantity_shown(), Quantity::SafetyFactor);
+        let spec = sim.plot_spec();
+        let (lo, hi) = sim.outcome.as_ref().unwrap().range(&spec);
+        assert!(lo > 1.0 && hi <= simulate::SAFETY_FACTOR_CAP, "{lo}..{hi}");
+        let colors = sim.outcome.as_ref().unwrap().plot(&spec).1;
+        let (_, values) = sim.outcome.as_ref().unwrap().surface(&spec);
+        // The inverted ramp: the least safe vertex is the red one.
+        let (i, _) =
+            values.iter().enumerate().fold(
+                (0, f64::INFINITY),
+                |b, (i, &v)| if v < b.1 { (i, v) } else { b },
+            );
+        assert_eq!(colors[i], [1.0, 0.0, 0.0]);
+    }
+
+    /// The 10×10×2 block held along one side and pushed down on the other, as a
+    /// topology study on bricks coarse enough for the test to be quick.
+    fn topology_block(h: &mut Harness) {
+        h.block();
+        h.enter_simulation();
+        h.editor.look_from(ViewPreset::Left);
+        h.editor.zoom_to_fit();
+        h.click_world(Vec3::new(0.0, 5.0, 1.0));
+        h.editor.simulation.as_mut().unwrap().armed = Armed::Load;
+        h.editor.look_from(ViewPreset::Right);
+        h.editor.zoom_to_fit();
+        h.click_world(Vec3::new(10.0, 5.0, 1.0));
+        let sim = h.editor.simulation.as_mut().unwrap();
+        assert_eq!((sim.fixed.len(), sim.loaded.len()), (1, 1));
+        sim.kind = simulate::StudyKind::Topology;
+        sim.element_size = 0.5;
+        sim.iterations = 6;
+        sim.volume_fraction = 0.4;
+        sim.force = Vec3::new(0.0, 0.0, -10.0);
+    }
+
+    #[test]
+    fn a_topology_study_keeps_the_target_fraction_and_plots_the_kept_elements() {
+        use crate::editor::simulate::Quantity;
+        let mut h = Harness::new();
+        topology_block(&mut h);
+        let frame = h.frame();
+        assert!(
+            frame.has_text("Topology optimisation study"),
+            "{:?}",
+            frame.text()
+        );
+        assert!(frame.has_text("Volume fraction"));
+        let started = std::time::Instant::now();
+        h.solve();
+        let took = started.elapsed();
+        let revision = h.editor.doc.revision();
+        let sim = h.editor.simulation.as_ref().unwrap();
+        let outcome = sim
+            .outcome
+            .as_ref()
+            .unwrap_or_else(|| panic!("the run failed: {}", sim.message));
+        let t = outcome.topology.as_ref().expect("a topology outcome");
+        assert_eq!(
+            outcome.results.mesh.elements.len(),
+            1600,
+            "20 × 20 × 4 bricks"
+        );
+        assert!(took < Duration::from_secs(60), "{took:?}");
+        assert!(
+            (t.volume_fraction - 0.4).abs() < 0.05,
+            "volume fraction {}",
+            t.volume_fraction
+        );
+        assert_eq!(t.iterations, 6);
+        assert!(
+            outcome.results.max_von_mises().0 > 0.0,
+            "the static results are of the final design"
+        );
+        let (surface, density) = t.surface(0.5);
+        assert!(!surface.positions.is_empty(), "something is kept at 0.5");
+        assert_eq!(surface.face_ids.len() * 3, density.len());
+        // The threshold slider moves the kept volume: fewer elements survive a higher bar.
+        let total = t.mesh.volume();
+        let kept_low = t.kept_volume(0.1);
+        let kept_mid = t.kept_volume(0.5);
+        let kept_high = t.kept_volume(0.9);
+        assert!(
+            kept_low >= kept_mid && kept_mid >= kept_high,
+            "{kept_low} {kept_mid} {kept_high}"
+        );
+        assert!(kept_low > kept_high, "the optimiser graded the densities");
+        assert!(kept_mid > 0.2 * total && kept_mid < 0.8 * total);
+        // The plot is of the kept elements, coloured by density, undeformed.
+        assert_eq!(sim.quantity_shown(), Quantity::Density);
+        let spec = sim.plot_spec();
+        assert_eq!(spec.threshold, 0.5);
+        let (mesh, colors) = outcome.plot(&spec);
+        assert_eq!(mesh.positions, surface.positions);
+        assert_eq!(colors.len(), density.len());
+        assert!(sim.plotted(revision).is_some());
+        let frame = h.frame();
+        assert!(frame.has_text("Kept volume"), "{:?}", frame.text());
+        assert!(frame.has_text("Threshold"));
+        assert!(frame.has_text("Density"), "the colour-by combo");
+        assert!(frame.has_text("of the volume kept"), "the study tree");
+        // Raising the threshold in the panel shrinks what is kept and what is massed.
+        let sim = h.editor.simulation.as_mut().unwrap();
+        let before = sim.outcome.as_ref().unwrap().mass_kg(7.85, sim.threshold);
+        sim.threshold = 0.9;
+        let after = sim.outcome.as_ref().unwrap().mass_kg(7.85, sim.threshold);
+        assert!(after < before, "{after} < {before}");
+        assert!(
+            h.frame()
+                .has_text(&format!("Kept volume {:.0}%", kept_high / total * 100.0))
+        );
+        // The export carries the densities for the viewer's own threshold.
+        let dir = TempDir::new("vtk-topology");
+        let path = dir.join("block.vtk");
+        simulate::export_vtk_to(&mut h.editor, &path);
+        let text = std::fs::read_to_string(&path).expect("written");
+        assert!(text.contains("density"), "{}", &text[..200.min(text.len())]);
+        // Results of this kind go stale like any other.
+        h.editor.doc.set_parameter("w", "12").expect("a parameter");
+        let sim = h.editor.simulation.as_ref().unwrap();
+        assert!(sim.is_stale(h.editor.doc.revision()));
+        assert!(sim.plotted(h.editor.doc.revision()).is_none());
+        eprintln!("topology study of 1600 elements, 6 iterations: {took:?}");
+    }
+
+    #[test]
+    fn stop_cancels_the_solver_thread() {
+        let (mut h, _) = bar();
+        set_up(&mut h);
+        // Fine enough that a solve left to run would take many seconds: 80 000 bricks.
+        h.editor.simulation.as_mut().unwrap().element_size = 0.5;
+        simulate::run(&mut h.editor);
+        assert!(h.editor.simulation.as_ref().unwrap().solving());
+        let started = std::time::Instant::now();
+        h.stop_and_join();
+        let sim = h.editor.simulation.as_ref().unwrap();
+        assert!(!sim.solving());
+        assert!(sim.outcome.is_none());
+        assert_eq!(sim.message, simulate::STOPPED);
+        // The thread gave up at its first report rather than meshing and solving.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        let frame = h.frame();
+        assert!(frame.has_text("Stopped"));
+        assert!(!frame.has_text("cancelled"), "a stop is not an error");
+        // Stopping a topology run is the same.
+        let sim = h.editor.simulation.as_mut().unwrap();
+        sim.kind = simulate::StudyKind::Topology;
+        sim.iterations = 500;
+        simulate::run(&mut h.editor);
+        assert_eq!(h.editor.simulation.as_ref().unwrap().message, "Optimising…");
+        h.stop_and_join();
+        let sim = h.editor.simulation.as_ref().unwrap();
+        assert_eq!(sim.message, simulate::STOPPED);
+        assert!(sim.outcome.is_none());
+    }
+
+    #[test]
+    fn progress_is_reported_while_solving() {
+        use basset_fea::{Phase, Progress};
+        let (mut h, _) = bar();
+        set_up(&mut h);
+        // 10 000 bricks: a solve of a few hundred iterations, long enough to be seen
+        // from a frame between reports.
+        h.editor.simulation.as_mut().unwrap().element_size = 1.0;
+        simulate::run(&mut h.editor);
+        let mut seen = Vec::new();
+        let mut shown = false;
+        let started = std::time::Instant::now();
+        loop {
+            h.editor.poll_simulation();
+            let sim = h.editor.simulation.as_ref().unwrap();
+            let Some(job) = sim.job.as_ref() else { break };
+            if let Some(p) = job.progress.clone() {
+                if seen.last() != Some(&p) {
+                    seen.push(p.clone());
+                }
+                if !shown && h.frame().has_text(&p) {
+                    shown = true;
+                }
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(120),
+                "the solve hung"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let sim = h.editor.simulation.as_ref().unwrap();
+        assert!(sim.outcome.is_some(), "{}", sim.message);
+        assert!(!seen.is_empty(), "no progress was reported");
+        assert!(seen.iter().any(|p| p.starts_with("Solving: ")), "{seen:?}");
+        assert!(shown, "the panel showed it: {seen:?}");
+        // The text as the solver's reports are worded.
+        assert_eq!(
+            simulate::progress_text(&Progress {
+                phase: Phase::Solving,
+                step: 1250,
+                of: None,
+                measure: 3.2e-5,
+            }),
+            "Solving: 1 250 iterations, residual 3.2e-5"
+        );
+        assert_eq!(
+            simulate::progress_text(&Progress {
+                phase: Phase::Optimising,
+                step: 12,
+                of: Some(40),
+                measure: 15.1,
+            }),
+            "Optimising: iteration 12 of 40, compliance 15.100"
+        );
+        assert_eq!(
+            simulate::progress_text(&Progress {
+                phase: Phase::Meshing,
+                step: 0,
+                of: None,
+                measure: 0.0,
+            }),
+            "Meshing…"
+        );
+    }
+
+    #[test]
+    fn a_topology_run_reports_its_iterations_and_a_fraction() {
+        let mut h = Harness::new();
+        topology_block(&mut h);
+        simulate::run(&mut h.editor);
+        let mut fractions = Vec::new();
+        let mut optimising = false;
+        loop {
+            h.editor.poll_simulation();
+            let sim = h.editor.simulation.as_ref().unwrap();
+            let Some(job) = sim.job.as_ref() else { break };
+            if let Some(f) = job.fraction
+                && fractions.last() != Some(&f)
+            {
+                fractions.push(f);
+            }
+            if job
+                .progress
+                .as_ref()
+                .is_some_and(|p| p.starts_with("Optimising: iteration"))
+            {
+                optimising = true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let sim = h.editor.simulation.as_ref().unwrap();
+        assert!(sim.outcome.is_some(), "{}", sim.message);
+        assert!(optimising, "the optimiser's reports were shown");
+        assert!(!fractions.is_empty(), "the bar had something to show");
+        assert!(fractions.windows(2).all(|w| w[0] <= w[1]), "{fractions:?}");
+        assert!(fractions.iter().all(|f| (0.0..=1.0).contains(f)));
+    }
+}
+
+mod study_marks {
+    use basset_core::{ComponentId, FeatureKind, OriginPlane, PlaneRef, Sketch};
+    use basset_kernel::FaceKey;
+    use basset_math::{Vec2, Vec3};
+    use basset_sketch::shapes;
+    use basset_viewport::ViewPreset;
+
+    use crate::editor::harness::Harness;
+    use crate::editor::simulate::LoadForm;
+    use crate::editor::study_marks::{self, FIXED_MARK, LOAD_ARROW, RESULT_MARK};
+    use crate::editor::{Workspace, gizmo::Axis, scene};
+
+    /// A bar along x from 0 to 100, 10 square, standing on the XY plane, in the
+    /// Simulation workspace with the x = 0 end held and the x = 100 end loaded, written
+    /// straight into the study: what the clicks do is the simulate module's to test.
+    fn loaded_bar() -> Harness {
+        let mut h = Harness::new();
+        let mut sketch = Sketch::new();
+        shapes::rectangle_two_point(&mut sketch, Vec2::ZERO, Vec2::new(100.0, 10.0));
+        h.editor.doc.add_feature(FeatureKind::Sketch {
+            plane: PlaneRef::Origin(OriginPlane::XY),
+            component: ComponentId::ROOT,
+            sketch,
+        });
+        h.editor.refresh_cache();
+        let body = h.extrude(Vec2::new(50.0, 5.0), 10.0);
+        h.enter_simulation();
+        let held = end_face(&h, 0.0);
+        let loaded = end_face(&h, 100.0);
+        let sim = h.editor.simulation.as_mut().expect("the study is up");
+        assert_eq!(sim.body, Some(body));
+        sim.fixed.push(held);
+        sim.loaded.push(loaded);
+        sim.force = Vec3::new(0.0, 0.0, -100.0);
+        sim.element_size = 2.5;
+        h.editor.look_from(ViewPreset::Right);
+        h.editor.zoom_to_fit();
+        h
+    }
+
+    fn end_face(h: &Harness, x: f64) -> FaceKey {
+        let body = h.editor.simulation.as_ref().unwrap().body.unwrap();
+        h.editor
+            .pick_body(body)
+            .expect("the bar is cached")
+            .solid
+            .faces
+            .iter()
+            .find(|f| (f.centroid().x - x).abs() < 1e-6)
+            .unwrap_or_else(|| panic!("no end face at x = {x}"))
+            .key
+    }
+
+    /// Whether any segment of a batch in `color` has an end, or its middle (a cross is
+    /// two segments through its point), within `within` of `at`.
+    fn drawn_near(h: &Harness, color: [f32; 4], at: Vec3, within: f64) -> bool {
+        scene::build(&h.editor)
+            .lines
+            .iter()
+            .filter(|l| l.color == color)
+            .flat_map(|l| l.segments.iter())
+            .any(|[a, b]| {
+                a.distance(at) < within
+                    || b.distance(at) < within
+                    || ((*a + *b) * 0.5).distance(at) < within
+            })
+    }
+
+    #[test]
+    fn the_loaded_face_has_arrows_and_the_held_face_a_ground_mark() {
+        let h = loaded_bar();
+        let loaded = Vec3::new(100.0, 5.0, 5.0);
+        let held = Vec3::new(0.0, 5.0, 5.0);
+        assert!(
+            drawn_near(&h, LOAD_ARROW, loaded, 1e-6),
+            "the resultant stands on the loaded face's centroid"
+        );
+        assert!(
+            !drawn_near(&h, LOAD_ARROW, held, 1e-6),
+            "nothing orange on the held face"
+        );
+        assert!(
+            drawn_near(&h, FIXED_MARK, held, 1e-6),
+            "the ground mark's apex is on the held face"
+        );
+        // The force pulls along -Z across the +X face, so the arrow leaves the centroid
+        // downwards and the label sits at its free end, reading the force.
+        let g = study_marks::manipulator(&h.editor).expect("a force has a manipulator");
+        assert_eq!(g.origin, loaded);
+        assert_eq!(g.dir, -Vec3::Z);
+        assert!(g.resultant_grip().z < loaded.z);
+        let labels = study_marks::labels(&h.editor);
+        assert!(
+            labels.iter().any(|l| l.text == "100 N"),
+            "{:?}",
+            labels.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_pressure_draws_into_the_face_and_has_no_manipulator() {
+        let mut h = loaded_bar();
+        {
+            let sim = h.editor.simulation.as_mut().unwrap();
+            sim.load_form = LoadForm::Pressure;
+            sim.pressure = 2.5;
+        }
+        assert!(study_marks::manipulator(&h.editor).is_none());
+        let loaded = Vec3::new(100.0, 5.0, 5.0);
+        let arrows: Vec<[Vec3; 2]> = scene::build(&h.editor)
+            .lines
+            .iter()
+            .filter(|l| l.color == LOAD_ARROW)
+            .flat_map(|l| l.segments.iter().copied())
+            .collect();
+        // The shaft ends on the face and starts outside the body, along +X.
+        assert!(
+            arrows
+                .iter()
+                .any(|[tail, head]| head.distance(loaded) < 1e-6 && tail.x > 100.0),
+            "{arrows:?}"
+        );
+        let labels = study_marks::labels(&h.editor);
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].text, "2.5 MPa");
+    }
+
+    #[test]
+    fn dragging_the_z_grip_moves_only_the_z_component() {
+        let mut h = loaded_bar();
+        let ppp = h.points_per_pixel();
+        // The grips exist only once the panels have run a frame.
+        h.frame();
+        let g = study_marks::manipulator(&h.editor).expect("a manipulator");
+        let from = h
+            .at_world(g.axis_tip(Axis::Z), ppp)
+            .expect("the Z grip is on screen");
+        // Up on screen is +Z from the Right view.
+        let to = from + egui::vec2(0.0, -40.0);
+        let during = h.drag_ui(from, to, egui::Modifiers::default());
+        let force = h.editor.simulation.as_ref().unwrap().force;
+        assert_eq!((force.x, force.y), (0.0, 0.0), "x and y were not touched");
+        assert!(
+            force.z > -100.0 && force.z < 0.0,
+            "the drag up lightened the downward load: {force}"
+        );
+        assert_eq!(
+            force.z,
+            force.z.round(),
+            "whole newtons while the grid holds"
+        );
+        assert!(
+            during.iter().any(|t| t.contains(" N")),
+            "the drag names its number: {during:?}"
+        );
+        // Typing is the other way of saying the same thing: the arrow reads the box.
+        h.editor.simulation.as_mut().unwrap().force = Vec3::new(0.0, 0.0, -250.0);
+        h.frame();
+        assert!(h.frame().has_text("250 N"));
+    }
+
+    #[test]
+    fn dragging_the_resultant_scales_the_force_along_itself() {
+        let mut h = loaded_bar();
+        let ppp = h.points_per_pixel();
+        h.frame();
+        let g = study_marks::manipulator(&h.editor).expect("a manipulator");
+        let from = h
+            .at_world(g.resultant_grip(), ppp)
+            .expect("the grip is on screen");
+        // The resultant points down; dragging its end further down lengthens it.
+        h.drag_ui(
+            from,
+            from + egui::vec2(0.0, 30.0),
+            egui::Modifiers::default(),
+        );
+        let force = h.editor.simulation.as_ref().unwrap().force;
+        assert_eq!((force.x, force.y), (0.0, 0.0));
+        assert!(force.z < -100.0, "the load grew: {force}");
+    }
+
+    #[test]
+    fn after_a_run_the_maxima_and_the_reaction_are_labelled() {
+        let mut h = loaded_bar();
+        h.solve();
+        let sim = h.editor.simulation.as_ref().unwrap();
+        assert!(sim.outcome.is_some(), "{}", sim.message);
+        h.frame();
+        let frame = h.frame();
+        let texts: Vec<&str> = frame.text();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with("max ") && t.ends_with(" MPa")),
+            "{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with("max ") && t.ends_with(" mm")),
+            "{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with("reaction ") && t.ends_with(" N")),
+            "{texts:?}"
+        );
+        // The markers stand on the deformed plot: the displacement maximum is at the
+        // loaded end, moved down by the plotted exaggeration.
+        let sim = h.editor.simulation.as_ref().unwrap();
+        let results = &sim.outcome.as_ref().unwrap().results;
+        let (d, at) = results.max_displacement();
+        assert!(d > 0.0);
+        let moved = results
+            .mesh
+            .nodes
+            .iter()
+            .zip(&results.displacements)
+            .find(|(n, _)| **n == at)
+            .map(|(_, disp)| *disp)
+            .expect("the maximum is at a node");
+        let plotted = at + moved * sim.scale;
+        assert!(plotted.z < at.z, "the loaded end sags in the plot");
+        assert!(
+            drawn_near(&h, RESULT_MARK, plotted, 1e-6),
+            "no marker at {plotted}"
+        );
+        assert!(
+            !drawn_near(&h, RESULT_MARK, at, 1e-6),
+            "the marker is on the plot, not on the undeformed body"
+        );
+    }
+
+    #[test]
+    fn nothing_is_drawn_in_the_design_workspace() {
+        let mut h = loaded_bar();
+        h.solve();
+        h.editor.set_workspace(Workspace::Design);
+        assert!(h.editor.simulation.is_some(), "the study is kept");
+        assert!(study_marks::lines(&h.editor).is_empty());
+        assert!(study_marks::labels(&h.editor).is_empty());
+        assert!(study_marks::manipulator(&h.editor).is_none());
+        for color in [LOAD_ARROW, FIXED_MARK, RESULT_MARK] {
+            assert!(
+                scene::build(&h.editor)
+                    .lines
+                    .iter()
+                    .all(|l| l.color != color)
+            );
+        }
+        let frame = h.frame();
+        assert!(!frame.has_text("100 N"), "{:?}", frame.text());
     }
 }

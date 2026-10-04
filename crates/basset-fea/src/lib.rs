@@ -29,9 +29,20 @@
 //!
 //! Units follow the rest of Basset: millimetres and newtons, so moduli and stresses are
 //! in megapascals and a pressure is N/mm².
+//!
+//! A solve of any size takes a while, so every entry point has a `_with` twin that takes
+//! an observer ([`run_with`], [`optimise_with`]): a closure handed a [`Progress`] every
+//! so often that returns `false` to stop the work. [`topology`] builds on the same solver
+//! to ask a different question: given this much material, where should it go.
+//!
+//! [`materials`] is a library of named engineering materials — the solver's two numbers
+//! with a density and a yield strength beside them — so a study can be set up by name and
+//! its result read as a mass and a safety factor.
 
 pub mod element;
+pub mod materials;
 pub mod solve;
+pub mod topology;
 pub mod voxel;
 pub mod vtk;
 
@@ -39,9 +50,47 @@ use basset_kernel::{FaceKey, Solid};
 use basset_math::{TriMesh, Vec3};
 use serde::{Deserialize, Serialize};
 
+pub use materials::{MaterialGroup, MaterialSpec, find as find_material, library, safety_factor};
+pub use topology::{TopologyResults, TopologyStudy, optimise, optimise_with};
 pub use voxel::HexMesh;
 
-/// Isotropic linear elastic material. Steel by default.
+/// Where a solve has got to. Handed to the observer of [`run_with`] and
+/// [`optimise_with`] at every phase change and every few dozen conjugate gradient
+/// iterations: often enough for a progress bar, rarely enough to cost nothing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Progress {
+    pub phase: Phase,
+    /// Iterations done in this phase.
+    pub step: usize,
+    /// How many there will be at most, when that is known.
+    pub of: Option<usize>,
+    /// What the phase is driving down: the relative residual while solving, the
+    /// compliance while optimising, zero while meshing.
+    pub measure: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Meshing,
+    Solving,
+    Optimising,
+}
+
+/// Hands `progress` to the observer and turns a `false` into [`FeaError::Cancelled`],
+/// so a solver loop can stop with a plain `?`.
+pub(crate) fn report(
+    observer: &mut dyn FnMut(&Progress) -> bool,
+    progress: Progress,
+) -> Result<(), FeaError> {
+    if observer(&progress) {
+        Ok(())
+    } else {
+        Err(FeaError::Cancelled)
+    }
+}
+
+/// Isotropic linear elastic material. Steel by default. The named materials of
+/// [`materials::library`] wrap one of these with a density and a yield strength.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Material {
     /// Young's modulus in MPa (N/mm²).
@@ -51,10 +100,12 @@ pub struct Material {
 }
 
 impl Material {
+    /// Generic steel; the library's `Steel` entry carries exactly these numbers.
     pub const STEEL: Material = Material {
         youngs_modulus: 200_000.0,
         poisson_ratio: 0.3,
     };
+    /// Generic aluminium; the library's `Aluminium` entry carries exactly these numbers.
     pub const ALUMINIUM: Material = Material {
         youngs_modulus: 69_000.0,
         poisson_ratio: 0.33,
@@ -128,6 +179,14 @@ pub enum FeaError {
         "the solve did not converge in {iterations} iterations (relative residual {residual:.3e}); the fixed faces may leave the body free to move as a whole"
     )]
     DidNotConverge { iterations: usize, residual: f64 },
+    #[error("the solve was cancelled")]
+    Cancelled,
+    #[error("{name} must lie in {range}, got {value}")]
+    BadTopologyParameter {
+        name: &'static str,
+        range: &'static str,
+        value: f64,
+    },
 }
 
 /// The largest mesh a study will build. Beyond this the conjugate gradient would run for
@@ -201,6 +260,29 @@ impl Results {
 
 /// Runs a study on a solid.
 pub fn run(solid: &Solid, study: &Study) -> Result<Results, FeaError> {
+    run_with(solid, study, &mut |_| true)
+}
+
+/// Runs a study on a solid, telling `observer` how it is getting on. The observer
+/// returns `false` to stop, and the result is then [`FeaError::Cancelled`]. It is a plain
+/// `FnMut` with no `Send` demanded of it: a caller that wants the solve off the UI thread
+/// spawns the thread and hands in whatever channel it likes.
+pub fn run_with(
+    solid: &Solid,
+    study: &Study,
+    observer: &mut dyn FnMut(&Progress) -> bool,
+) -> Result<Results, FeaError> {
+    let mesh = mesh_for(solid, study, observer)?;
+    solve::run_with(mesh, study, observer)
+}
+
+/// Checks a study's material and boundary conditions and meshes the solid: the part of a
+/// static study and a topology optimisation that is the same.
+pub(crate) fn mesh_for(
+    solid: &Solid,
+    study: &Study,
+    observer: &mut dyn FnMut(&Progress) -> bool,
+) -> Result<HexMesh, FeaError> {
     if study.material.youngs_modulus.is_nan() || study.material.youngs_modulus <= 0.0 {
         return Err(FeaError::BadModulus(study.material.youngs_modulus));
     }
@@ -213,6 +295,14 @@ pub fn run(solid: &Solid, study: &Study) -> Result<Results, FeaError> {
     if study.loads.is_empty() {
         return Err(FeaError::NothingLoaded);
     }
-    let mesh = voxel::mesh(solid, study.element_size)?;
-    solve::run(mesh, study)
+    report(
+        observer,
+        Progress {
+            phase: Phase::Meshing,
+            step: 0,
+            of: None,
+            measure: 0.0,
+        },
+    )?;
+    voxel::mesh(solid, study.element_size)
 }

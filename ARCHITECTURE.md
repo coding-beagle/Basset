@@ -15,7 +15,7 @@ basset-core      Document, Components, Planes/Axes/Sketches/Bodies, document par
                   between two versions of a document
 basset-io        STL / 3MF export
 basset-fea       basic finite element analysis: voxel brick mesh of a Solid, linear elastic
-                  static solve, von Mises stresses, legacy VTK output
+                  static solve, von Mises stresses, SIMP topology optimisation, legacy VTK output
 basset-viewport  wgpu renderer: camera, mesh/line/point/triangle batches, grid, selection highlight,
                   meshes with a colour per vertex and the ramp a stress plot paints with
 basset-app       winit + egui desktop application (Linux first)
@@ -594,27 +594,92 @@ camera's `roll` angle about the view axis is what lets a square-on view be turne
 at a time (the cube's curved arrows, `Shift+←`/`Shift+→`). Orbiting stands the view back
 upright, since yaw and pitch are measured against world +Z.
 
-The Simulate dialog (`editor::simulate`) runs a linear elastic study of one body with
-`basset-fea`: two face lists, held and loaded, each with a button that arms it so the next
-faces clicked in the viewport join it (a face clicked again leaves; a face is never in
-both); a force or a pressure; a material preset or its two numbers typed over; the brick
-size, defaulting to a twentieth of the body's longest side; Run; and, after a run, the
-maxima, the reaction, the element and iteration counts, a deformation scale, a Show
-toggle and a legend painted with the renderer's own `stress_ramp`. A study is editor
-state, not a timeline feature, for the reason Measure is: it changes nothing about the
-model, and a feature that regenerates to no geometry would cost an undo step for every
-retyped load and sit in the history as a step that does nothing. The editor therefore
-holds one `Simulation` beside the Measure tool, its picks never reach the selection, and
-no transaction is opened. What a feature would have given for free — staying true to the
-model — the study has to earn: the results carry the document revision they were computed
-at, and any edit since marks them stale, at which point the dialog says so and the
-viewport goes back to the plain body rather than keep colouring it with stresses of a body
-that no longer exists. While the plot is up the body's own mesh is not drawn and a mesh of
-the deformed brick surface, uploaded through `upload_colored_mesh` with one colour per
-vertex and re-uploaded only when the run or the scale changes, is drawn in its place.
-While it is down, the held faces take the body's one highlight colour and the loaded ones
-are a depth-tested fill over the face, because a second instance of the same geometry
-would lose the depth test to the first.
+The Simulation workspace (`editor::simulate`) runs a study of one body with `basset-fea`:
+a static stress study, or a topology optimisation of the same set-up (`StudyKind`). The
+editor has two *workspaces*, Design and Simulation, chosen by a pair of tabs at the left of
+the menu bar the way Fusion's workspace selector works; `Workspace` is a property of the
+view, not of the document, so a switch is neither saved nor undoable. Design is the
+modeller described above. Simulation keeps the viewport and the menus but swaps the
+toolbar for Study / Solve / Results groups (the kind of study, arming the fixed or loaded
+face list, the material, the brick size and, for a topology study, the volume fraction;
+Run and Stop with a spinner, the elapsed time, the solver's last report and a progress
+bar; the plot toggle, what to colour it by, the deformation scale or density threshold,
+and a VTK export), the browser for a *study tree* (the kind of study, the body, the
+material by name, each held face and each loaded face with a remove button, the mesh, the
+optimiser's target, and whether the results are fresh or stale), hides the timeline, and
+puts a Study side panel on the right with every setting in full: two face lists each with
+a button that arms it so the next faces clicked in the viewport join it (a face clicked
+again leaves; a face is never in both); a force or a pressure; the material; the brick
+size, defaulting to a twentieth of the body's longest side; the volume fraction and
+iteration count of a topology study; and, after a run, the readout and a legend. In the
+Simulation workspace the modelling tools, Measure and the timeline edits are refused —
+every path a command can arrive by (key, menu, palette) goes through one gate on
+`Command::is_modelling`, and the palette and the shortcut overlay hide what it would
+refuse — so a face clicked there is only ever a pick for the study. Escape does not leave
+the workspace; the Design tab does. Undo and redo stay on, since a study whose body was
+undone is simply stale.
+
+The material is picked from `fea::materials` by name: a combo grouped by family with a
+filter box at the top, in the toolbar and the panel alike, showing the chosen entry's name
+or "Custom" once E or ν has been typed over. The `Simulation` keeps the chosen
+`MaterialSpec` beside the solver's two numbers, so a user who nudges the modulus of
+6061-T6 is still weighing aluminium: the readout gives the mass (of the mesh, or of the
+kept elements of a topology result, in grams or kilograms as the size warrants) and, where
+the entry has a yield strength, the safety factor against it, red below one and amber
+below two. The plot is coloured by a `Quantity` — von Mises stress by default, the
+displacement magnitude, the safety factor (yield over nodal von Mises, capped at ten and
+on the inverted ramp so the hot end is the end about to fail; offered only when the
+material has a yield point), or for a topology result the density, which is its default.
+The legend lies across the panel under the readings, hot at the right, and takes its
+unit and its end labels from the quantity, so the bar and the body cannot disagree.
+
+A study is editor state, not a timeline feature, for the reason Measure is: it changes
+nothing about the model, and a feature that regenerates to no geometry would cost an undo
+step for every retyped load and sit in the history as a step that does nothing. The
+editor therefore holds one `Simulation` beside the Measure tool, its picks never reach
+the selection, and no transaction is opened. Entering the workspace creates the study
+(of the one selected body, or the only body) if there is none, and going back to Design
+keeps it, results and all, so the user can edit the part and come back to re-run; the
+viewport shows the study — its highlighted faces or its plot — only while the Simulation
+workspace is up, and only a new or opened document drops it. What a feature would have
+given for free — staying true to the model — the study has to earn: the results carry
+the document revision they were computed at, and any edit since marks them stale, at
+which point the panel and the tree say so and the viewport goes back to the plain body
+rather than keep colouring it with stresses of a body that no longer exists. Results of
+either kind go stale the same way.
+
+The solve runs on a thread of its own. `simulate::run` hands a clone of the body's
+`Arc<Solid>` and the `Study` (or the `TopologyStudy` built from it) to
+`std::thread::spawn` and keeps a `Job` — the start time, the document revision captured
+at launch, the receiving end of an `mpsc` channel, a cancel flag and the thread's handle
+— on the `Simulation`. The thread calls `run_with` or `optimise_with` with an observer
+that sends every `Progress` down the channel and returns the inverse of the flag, and
+sends the answer last. `Editor::poll_simulation`, called at the top of every frame,
+drains the channel: each report becomes the text under the spinner ("Solving: 1 250
+iterations, residual 3.2e-5", "Optimising: iteration 12 of 40, compliance 15.1") and,
+when the phase knows its length — an optimisation does, a conjugate gradient does not —
+the fraction a progress bar shows; while the job is live it asks for another frame,
+which is what animates the spinner and the clock in the toolbar, the panel and the tree.
+Run is disabled and Stop enabled meanwhile. The answer is tagged with the revision the
+solid was taken at, so a model edited while the solver was running simply gets stale
+results, by the same rule as an edit after a run. Stop drops the job, which raises the
+flag and drops the receiver: the observer returns `false` at its next report — the first
+comes before the mesh is built, so a job stopped at once does no work — and the thread
+gets `FeaError::Cancelled`, which the panel reads as "Stopped" rather than as an error,
+and exits. The editor never joins the thread; the harness's `stop_and_join` does, so a
+test can know the cancellation reached the solver. Headless, the harness's
+`wait_for_solve` is the poll loop the event loop would otherwise be. A topology run ends
+in an `Outcome` whose `results` are the static solve on the final design, so every reader
+of stresses and displacements reads the same field for either kind, with the
+`TopologyResults` beside it; its VTK export writes the whole grid with a density per
+cell. While the plot is up the body's own mesh is not drawn and a mesh of the plotted
+surface — the deformed brick skin of a static study, or the kept elements of a topology
+study at the panel's threshold, undeformed — is uploaded through `upload_colored_mesh`
+with one colour per vertex and drawn in its place, re-uploaded only when the run or any
+part of the `PlotSpec` (quantity, scale, threshold, yield strength) changes. While it is
+down, the held faces take the body's one highlight colour and the loaded ones are a
+depth-tested fill over the face, because a second instance of the same geometry would
+lose the depth test to the first.
 
 The renderer learned one thing for this: a mesh may be uploaded with a linear RGB colour
 per vertex (`Renderer::upload_colored_mesh`), and an instance of such a mesh ignores its
@@ -625,6 +690,29 @@ flag tells the shader which colour to read. `basset_viewport::stress_ramp` is th
 ramp, kept in the viewport rather than in `fea` because it is about looking, not about
 stress, and the legend in the dialog is painted with the same function so the bar and the
 body cannot disagree.
+
+The study's marks (`editor::study_marks`) are what says *how* a face is loaded, which a
+highlighted face cannot: an orange arrow on each loaded face in the direction of the
+force — the resultant at the faces' combined centroid, a shorter one at the centroid of
+each polygon of a large face — or, for a pressure, a short arrow along every polygon's
+normal, into the face for a positive pressure and out of it for suction; a ground mark
+(triangle, base line and hatching) on each held face; and, while results are plotted, a
+cross at the stress maximum and at the displacement maximum with "max 123.4 MPa" /
+"max 0.0123 mm" beside them and the reaction drawn as an arrow leaving the held faces.
+The markers stand on the *deformed* plot, so each is moved by its node's displacement —
+the mean of its brick's eight for a stress, read at the brick's centre — times the plot
+scale. All of it is derived from the `Simulation` every frame, so the arrows cannot
+disagree with the panel's boxes. A force also gets a manipulator: three axis arrows with
+grips at the resultant's foot, and a grip at the resultant's free end, reusing the move
+gizmo's `grip_drag` and `along_axis` because it is the same gesture on a different
+number. A pixel has to mean something in newtons, and the rule is that one arm's length
+is the force's present magnitude (10 N at least), so the handle feels the same on a 10 N
+study and a 10 kN one; the components snap to whole newtons through the same `Snapping`
+every other handle answers to, and the resultant's grip dragged back through zero
+reverses the force rather than stopping. The grips are egui areas, so they take the
+press before a face pick can, as the move gizmo's do; the labels are not interactable,
+so a label over the body never takes a click meant for the face under it. Nothing is
+drawn in Design, where `study_view()` is `None`.
 
 Panels never hold `&mut Editor` while borrowing document state: they queue commands that
 run after the frame's UI closure returns.
@@ -716,7 +804,56 @@ Results go out as legacy ASCII VTK (`fea::vtk`), which every viewer reads and ne
 dependency, and as a deformed surface mesh with a stress value per vertex
 (`Results::deformed_surface`) with a stress value per vertex, which the editor's Simulate
 dialog colours with `stress_ramp` and draws in the body's place. The `fea_static` tool of
-the MCP server and that dialog are the two callers.
+the MCP server and that dialog are the two callers. Every entry point has a `_with` twin
+(`run_with`, `optimise_with`) that takes an observer closure, handed a `Progress` (phase,
+step, and the residual or compliance it is driving down) at every phase change and every
+twenty-five conjugate gradient iterations, and returning `false` to stop the solve with
+`FeaError::Cancelled`; it is a plain `FnMut`, so the caller decides which thread it runs on.
+
+### Topology optimisation
+
+`fea::topology` asks the inverse question: given a fraction of the body's volume, where
+should the material go. It is SIMP — Solid Isotropic Material with Penalisation — the
+method every commercial tool grew from: each element gets a density between almost nothing
+and one, its stiffness is scaled by the density to a power (three), and the densities are
+moved to minimise the compliance `fᵀu` under a volume constraint. The penalty makes an
+element of middling density poor value for its volume, so the result tends to solid and
+empty rather than a fog. A step is one static solve on the current densities, the
+compliance sensitivities, which cost nothing beyond the element strain energies that solve
+already gives, Sigmund's sensitivity filter over a ball a few elements wide, and an
+optimality-criteria update with a move limit, damping and a bisection on the Lagrange
+multiplier that lands the volume on target. The filter is what keeps the answer
+mesh-independent and free of checkerboards, and it sets the minimum feature size.
+
+The voxel solver takes to this well. The only change it needs is an optional stiffness
+scale per element in `solve::System`, and the regular grid gives the filter's
+neighbourhoods by index rather than by search. Elements with a facet on a fixed or loaded
+face are passive — held at full density — so the boundary conditions cannot be optimised
+away. Each solve is warm-started from the last and run to a looser tolerance than a static
+study, with a tight final solve so the stresses reported on the finished design are as
+good as `fea_static`'s. The stiffness of an empty element has a floor of one part in a
+thousand rather than the `ρ_min^p` of the textbook, because a matrix-free conjugate
+gradient crawls at a contrast of a billion and the answer is the same. `TopologyResults`
+carries a density per element, the compliance at every solve, the static results on the
+final design, and `surface(threshold)`: the skin of the kept elements, including the new
+faces between kept and removed ones, with a density per vertex, in the shape of
+`Results::deformed_surface` so the same code draws it. `vtk::write_topology` writes the
+whole grid with a density per cell so the threshold can be chosen in the viewer.
+
+### Materials
+
+`Material` stays the two numbers the solver reads. `fea::materials` wraps them in a
+`MaterialSpec` — a name, a group, a density and a yield strength — for about thirty common
+engineering materials (structural and alloy steels, stainless, wrought and cast aluminium,
+Ti-6Al-4V, copper alloys, cast irons, magnesium, the usual thermoplastics) with textbook
+room-temperature values. Density and yield are what turn a study's answer into the two
+numbers a designer asks for, a mass (`Results::mass_kg`) and a safety factor against yield
+(`safety_factor`); they live beside `Material` rather than on it because the solver never
+reads them. `find` resolves a typed name forgiving case, spaces, hyphens and `aluminum`,
+and `MaterialSpec::of` names a pair of numbers that is a library entry so a UI can show
+"Custom" otherwise. The generic `Steel` and `Aluminium` entries carry exactly
+`Material::STEEL` and `Material::ALUMINIUM`, so documents and tool calls from before the
+library existed resolve as they always did.
 
 ## Driving the modeller from an agent
 
@@ -731,7 +868,10 @@ curve signature exactly as a click would; `body_info` and `check_document` retur
 the regenerator and the kernel can say about the result — statuses, volumes, bounding
 boxes, face and edge keys, and whether every shell is closed — so a failure that the
 viewport would show as a yellow badge comes back as data; `fea_static` runs a study on a
-body by face keys and reports the maxima and the reaction. Entities and constraints are
+body by face keys and reports the maxima, the reaction, the mass and the safety factor
+against yield, with the material named from the library `fea_materials` lists, and
+`fea_topology` optimises the layout of a given fraction of the body's material under the
+same study. Entities and constraints are
 named by their slot index, resolved against the live sketch, since a wire id is meant to
 be read back and quoted; faces are `feature.sub:Role` and edges two of those joined by
 `|`, the parts a `FaceKey` is made of. `.mcp.json` at the workspace root registers the

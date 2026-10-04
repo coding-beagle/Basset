@@ -221,7 +221,7 @@ pub fn mesh(solid: &Solid, element_size: f64) -> Result<HexMesh, FeaError> {
 
 /// The four corners of a brick's facet on one side, counter-clockwise about its outward
 /// normal.
-fn facet_corners(axis: usize, positive: bool) -> [usize; 4] {
+pub(crate) fn facet_corners(axis: usize, positive: bool) -> [usize; 4] {
     match (axis, positive) {
         (0, false) => [0, 4, 7, 3],
         (0, true) => [1, 2, 6, 5],

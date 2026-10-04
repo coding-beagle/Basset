@@ -60,17 +60,16 @@ pub fn build(editor: &Editor) -> Scene<'_> {
     scene.show_grid = editor.show_grid;
     scene.show_grid_axes = editor.show_axes;
 
-    // The study, if one is open: the body the plot stands in for, and the faces picked
-    // for it to light up while the plot is down.
+    // The study, in the Simulation workspace: the body the plot stands in for, and the
+    // faces picked for it to light up while the plot is down. In Design the study is
+    // kept but the viewport is the model's alone.
     let revision = editor.doc.revision();
     let plotted = editor
-        .simulation
-        .as_ref()
+        .study_view()
         .and_then(|s| s.plotted(revision))
         .map(|(body, _)| body);
     let study = editor
-        .simulation
-        .as_ref()
+        .study_view()
         .filter(|_| plotted.is_none())
         .and_then(|s| s.body.map(|b| (b, s)));
 
@@ -470,6 +469,11 @@ pub fn build(editor: &Editor) -> Scene<'_> {
             scene.lines.push(ring);
         }
     }
+
+    // The study's marks: arrows on the loaded faces, ground marks on the held ones, the
+    // force manipulator's arms, and after a run the maxima and the reaction. Nothing in
+    // the Design workspace.
+    scene.lines.extend(super::study_marks::lines(editor));
 
     // The offset's handle: a leader from the geometry out to the grip, so the gap the
     // user is dragging reads as the distance it is.

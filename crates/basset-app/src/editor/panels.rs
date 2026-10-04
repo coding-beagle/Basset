@@ -11,7 +11,7 @@ use super::commands::{self, Command};
 use super::files::MeshFormat;
 use super::sketch_mode::{self, SketchTool, ToolGroup, edit_text, parse_value};
 use super::tools::{self, ToolKind};
-use super::{DisplayMode, Editor, Mode, SelectMode};
+use super::{DisplayMode, Editor, Mode, SelectMode, Workspace};
 
 /// The blue the viewport draws under-constrained geometry in, so the words that explain it
 /// match what the user is looking at.
@@ -44,9 +44,18 @@ pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
     // hanging over geometry nobody is touching.
     editor.snap_hint = None;
 
+    let simulation = editor.workspace == Workspace::Simulation;
     egui::Panel::top("menu").show(ui, |ui| {
-        menu_bar(editor, ui, &mut commands);
-        toolbar(editor, ui, &mut commands);
+        ui.horizontal(|ui| {
+            workspace_tabs(editor, ui, &mut commands);
+            ui.separator();
+            menu_bar(editor, ui, &mut commands);
+        });
+        if simulation {
+            super::simulate::toolbar(editor, ui, &mut commands);
+        } else {
+            toolbar(editor, ui, &mut commands);
+        }
     });
     egui::Panel::bottom("status").show(ui, |ui| {
         ui.horizontal(|ui| {
@@ -58,13 +67,29 @@ pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
             });
         });
     });
-    egui::Panel::bottom("timeline")
-        .default_size(64.0)
-        .show(ui, |ui| timeline(editor, ui, &mut commands));
+    // The timeline is the Design workspace's: a study has no history to walk, and a
+    // cursor dragged while results were up would only make them stale.
+    if !simulation {
+        egui::Panel::bottom("timeline")
+            .default_size(64.0)
+            .show(ui, |ui| timeline(editor, ui, &mut commands));
+    }
     egui::Panel::left("browser")
         .default_size(230.0)
-        .show(ui, |ui| browser(editor, ui, &mut commands));
-    if editor.is_sketching() {
+        .show(ui, |ui| {
+            if simulation {
+                super::simulate::study_tree(editor, ui);
+            } else {
+                browser(editor, ui, &mut commands);
+            }
+        });
+    if simulation {
+        egui::Panel::right("study")
+            .default_size(250.0)
+            .show(ui, |ui| {
+                super::simulate::study_panel(editor, ui, &mut commands)
+            });
+    } else if editor.is_sketching() {
         egui::Panel::right("sketch-palette")
             .default_size(210.0)
             .show(ui, |ui| sketch_palette(editor, ui, &mut commands));
@@ -80,14 +105,15 @@ pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
     compare_banner(editor, &ctx, free, &mut commands);
     sketch_operation_dialog(editor, &ctx, free, &mut commands);
     tools::dialog(editor, &ctx);
-    super::simulate::dialog(editor, &ctx);
     super::gizmo::interact(editor, &ctx);
+    super::study_marks::interact(editor, &ctx);
     if let Some(hint) = &editor.snap_hint {
         super::snap::paint(&ctx, &editor.camera, editor.window_px, hint);
     }
     entry_overlay(editor, &ctx, &mut commands);
     dimension_overlay(editor, &ctx, &mut commands);
     measure_overlay(editor, &ctx);
+    super::study_marks::overlay(editor, &ctx);
     constraint_overlay(editor, &ctx, &mut commands);
     shortcut_overlay(editor, &ctx);
     command_palette(editor, &ctx, &mut commands);
@@ -101,6 +127,13 @@ pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
 }
 
 pub(super) fn run(editor: &mut Editor, c: Command) {
+    // One gate for every way a modelling command can arrive — key, menu, palette — so
+    // the Simulation workspace cannot be modelled in by a path the toolbar forgot.
+    if editor.workspace == Workspace::Simulation && c.is_modelling() {
+        editor.set_status(super::simulate::REFUSED);
+        editor.request_repaint();
+        return;
+    }
     match c {
         Command::Tool(kind) => tools::start_tool(editor, kind),
         Command::Measure(on) => {
@@ -117,20 +150,11 @@ pub(super) fn run(editor: &mut Editor, c: Command) {
                 super::measure::start(editor)
             }
         }
-        Command::Simulate(on) => {
-            if on {
-                super::simulate::start(editor)
-            } else {
-                super::simulate::stop(editor)
-            }
-        }
-        Command::ToggleSimulate => {
-            if editor.simulation.is_some() {
-                super::simulate::stop(editor)
-            } else {
-                super::simulate::start(editor)
-            }
-        }
+        Command::Workspace(workspace) => editor.set_workspace(workspace),
+        Command::ToggleWorkspace => editor.toggle_workspace(),
+        Command::RunStudy => super::simulate::run(editor),
+        Command::StopStudy => super::simulate::stop_run(editor),
+        Command::ExportVtk => super::simulate::export_vtk(editor),
         Command::New => editor.new_document(),
         Command::Open => editor.open(),
         Command::Save(as_new) => editor.save(as_new),
@@ -456,6 +480,34 @@ pub(super) fn run(editor: &mut Editor, c: Command) {
     editor.request_repaint();
 }
 
+/// The workspace tabs, Fusion-style, at the left of the menu bar: the active one is
+/// drawn as the selected tab and the other is a click away. They share the menu bar's
+/// row rather than taking one of their own because every row the top panel grows is a
+/// row off the viewport, and they sit before the menus because they are not commands
+/// among commands: they decide which commands there are.
+fn workspace_tabs(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
+    ui.spacing_mut().item_spacing.x = 2.0;
+    for workspace in Workspace::ALL {
+        let active = editor.workspace == workspace;
+        let text = egui::RichText::new(workspace.title());
+        let text = if active { text.strong() } else { text };
+        let button = egui::Button::new(text)
+            .selected(active)
+            .min_size(egui::vec2(84.0, 0.0));
+        if ui
+            .add(button)
+            .on_hover_text(match workspace {
+                Workspace::Design => "Model the part: sketches, features, the timeline",
+                Workspace::Simulation => "Study one body under load; the model is not changed",
+            })
+            .clicked()
+            && !active
+        {
+            commands.push(Command::Workspace(workspace));
+        }
+    }
+}
+
 fn menu_bar(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
     egui::MenuBar::new().ui(ui, |ui| {
         ui.menu_button("File", |ui| {
@@ -663,7 +715,7 @@ fn menu_bar(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
                 ],
                 commands,
             );
-            let label = format!("Simulate{}", commands::hint("modify.simulate"));
+            let label = format!("Simulation workspace{}", commands::hint("modify.simulate"));
             if tool_button(
                 ui,
                 "modify-menu",
@@ -674,7 +726,7 @@ fn menu_bar(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
             )
             .clicked()
             {
-                commands.push(Command::ToggleSimulate);
+                commands.push(Command::Workspace(Workspace::Simulation));
                 ui.close();
             }
         });
@@ -743,22 +795,23 @@ fn toolbar(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
         if measure_button(ui, !busy, measuring) {
             commands.push(Command::Measure(!measuring));
         }
-        let simulating = editor.simulation.is_some();
+        // The way into the other workspace from the toolbar, beside the tool it most
+        // resembles: it studies the model and changes nothing.
         if tool_button(
             ui,
             "toolbar",
             AnyTool::Simulate,
             Some("Simulate"),
-            simulating,
+            false,
             !busy,
         )
         .on_hover_text(format!(
-            "Simulate: a linear elastic study of one body (no change to the model){}",
+            "Simulation workspace: a linear elastic study of one body (no change to the model){}",
             commands::hint("modify.simulate")
         ))
         .clicked()
         {
-            commands.push(Command::Simulate(!simulating));
+            commands.push(Command::Workspace(Workspace::Simulation));
         }
         ui.separator();
         if ui
@@ -1142,7 +1195,8 @@ fn constraint_button(
 pub(crate) enum AnyTool {
     Sketch(SketchTool),
     Model(ToolKind),
-    /// The study dialog, which is neither: it is a button with a symbol all the same.
+    /// The way into the Simulation workspace, which is neither: it is a button with a
+    /// symbol all the same.
     Simulate,
 }
 
@@ -4116,7 +4170,7 @@ fn shortcut_overlay(editor: &mut Editor, ctx: &egui::Context) {
                     for (i, group) in commands::Group::ALL.iter().enumerate() {
                         let rows: Vec<_> = commands::BINDINGS
                             .iter()
-                            .filter(|b| b.group == *group && b.live.covers(sketching))
+                            .filter(|b| b.group == *group && commands::available(b, editor))
                             .collect();
                         if rows.is_empty() {
                             continue;

@@ -27,7 +27,7 @@ use super::{Editor, Mode};
 
 /// Screen length of an arrow, and radius of a ring, in pixels. Constant on screen so the
 /// manipulator is the same size to grab whatever the zoom is.
-const ARM_PX: f64 = 78.0;
+pub(super) const ARM_PX: f64 = 78.0;
 const RING_PX: f64 = 58.0;
 /// Size of a grip's clickable square, in egui points.
 const GRIP: f32 = 20.0;
@@ -333,7 +333,10 @@ pub fn interact(editor: &mut Editor, ctx: &egui::Context) -> bool {
 
 /// A draggable dot at `at`, returning the drag in physical pixels when it is being
 /// dragged. `None` covers both "not dragged" and "off screen".
-fn grip_drag(
+///
+/// Shared with the study's force manipulator (`study_marks`), which is the same grip on
+/// a different number.
+pub(super) fn grip_drag(
     ctx: &egui::Context,
     camera: &Camera,
     window: [u32; 2],
@@ -393,7 +396,13 @@ fn grip_drag(
 ///
 /// `None` when the axis points at or away from the camera, where it is drawn as a dot
 /// and there is no direction on screen to drag it along.
-fn along_axis(camera: &Camera, window: [u32; 2], at: Vec3, dir: Vec3, delta: Vec2) -> Option<f64> {
+pub(super) fn along_axis(
+    camera: &Camera,
+    window: [u32; 2],
+    at: Vec3,
+    dir: Vec3,
+    delta: Vec2,
+) -> Option<f64> {
     let here = camera.world_to_screen(at, window)?;
     let ahead = camera.world_to_screen(at + dir, window)?;
     let drawn = Vec2::new(ahead[0] - here[0], ahead[1] - here[1]);

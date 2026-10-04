@@ -22,8 +22,9 @@ impl Editor {
         }
         self.compare = None;
         self.commit_box = None;
-        // A study was of a body of the old document.
-        self.simulation = None;
+        // A study was of a body of the old document, and a new document starts in Design.
+        super::simulate::stop(self);
+        self.workspace = super::Workspace::Design;
         self.selection.clear();
         self.apply_visibility(&Visibility::default());
         self.active_component = basset_core::ComponentId::ROOT;
@@ -55,7 +56,8 @@ impl Editor {
                 // its own.
                 self.compare = None;
                 self.commit_box = None;
-                self.simulation = None;
+                super::simulate::stop(self);
+                self.workspace = super::Workspace::Design;
                 self.refresh_project();
                 self.selection.clear();
                 let visibility = self.doc.visibility().clone();

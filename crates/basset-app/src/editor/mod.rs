@@ -4,6 +4,10 @@
 //! drives the modelling tools; *Sketch* mode hands pointer input to a [`SketchEditor`]
 //! that draws on one plane. Both build the 3D scene from the document's regenerated
 //! state every frame, so there is never a second copy of geometry to keep in sync.
+//!
+//! Above the modes sits the [`Workspace`]: Design, which is everything above, and
+//! Simulation, which trades the modelling toolbar and the component tree for a study's
+//! and gives a click on a face to the study. See [`simulate`].
 
 pub(crate) mod commands;
 mod compare;
@@ -18,6 +22,7 @@ mod selection;
 mod simulate;
 mod sketch_mode;
 pub(crate) mod snap;
+mod study_marks;
 mod tools;
 mod viewcube;
 
@@ -109,6 +114,32 @@ pub enum Mode {
     Sketch(Box<SketchEditor>),
 }
 
+/// Which of the two jobs the window is set up for, as Fusion's workspace tabs have it.
+///
+/// A workspace is a property of the view, not of the document: it decides which toolbar
+/// and browser are shown and what a click on a face means, and switching it is neither
+/// saved nor undoable. Design is the modeller; Simulation is the study of one body
+/// described in [`simulate`], where the modelling tools and their keys are unavailable,
+/// so that a face clicked to hold it can never also start a fillet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Workspace {
+    #[default]
+    Design,
+    Simulation,
+}
+
+impl Workspace {
+    /// In the order the tab strip shows them.
+    pub const ALL: [Workspace; 2] = [Workspace::Design, Workspace::Simulation];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Workspace::Design => "Design",
+            Workspace::Simulation => "Simulation",
+        }
+    }
+}
+
 /// How bodies are drawn in the viewport. It is a property of the view, not of the
 /// document, so it is neither saved nor undoable: switching to wireframe to see through a
 /// part and back again should not put anything in the timeline.
@@ -168,6 +199,9 @@ pub struct ModelDrags {
     pub translate: [snap::Drag; 3],
     pub rotate: [snap::Drag; 3],
     pub slide: snap::Drag,
+    /// The study's force manipulator: one per axis arrow and one for the resultant's
+    /// grip. See [`study_marks`].
+    pub force: [snap::Drag; 4],
 }
 
 impl ModelDrags {
@@ -178,6 +212,7 @@ impl ModelDrags {
             .iter_mut()
             .chain(self.rotate.iter_mut())
             .chain(std::iter::once(&mut self.slide))
+            .chain(self.force.iter_mut())
         {
             drag.release();
         }
@@ -207,6 +242,8 @@ pub struct Editor {
     /// is being dragged and cleared at the top of the next pass.
     pub(crate) snap_hint: Option<snap::Hint>,
     pub display: DisplayMode,
+    /// Design or Simulation; see [`Workspace`].
+    pub workspace: Workspace,
     pub selection: Selection,
     /// What a click may land on. Narrows a running tool's own filter.
     pub select_mode: SelectMode,
@@ -216,8 +253,9 @@ pub struct Editor {
     /// The Measure tool, which is not a [`Tool`]: it owns no feature and never writes to
     /// the document. See [`measure`].
     pub measure: Option<Measure>,
-    /// The Simulate tool, likewise not a [`Tool`]: a study of one body that is editor
-    /// state rather than a timeline feature. See [`simulate`].
+    /// The Simulation workspace's study, likewise not a [`Tool`]: a study of one body
+    /// that is editor state rather than a timeline feature. It is kept across a return to
+    /// Design, so `Some` does not mean the workspace is Simulation. See [`simulate`].
     pub simulation: Option<Simulation>,
     pub selected_feature: Option<FeatureId>,
     pub status: String,
@@ -288,6 +326,7 @@ impl Editor {
             drags: ModelDrags::default(),
             snap_hint: None,
             display: DisplayMode::default(),
+            workspace: Workspace::default(),
             selection: Selection::default(),
             select_mode: SelectMode::default(),
             hover: None,
@@ -384,6 +423,34 @@ impl Editor {
 
     pub fn cycle_display_mode(&mut self) {
         self.set_display_mode(self.display.next());
+    }
+
+    /// Changes workspace, as a tab click does. Entering Simulation puts down any
+    /// modelling tool and makes sure there is a study; going back to Design keeps the
+    /// study for the next visit. A sketch holds an open transaction and is finished
+    /// where it is, so the switch is refused while one is open.
+    pub fn set_workspace(&mut self, workspace: Workspace) {
+        if self.workspace == workspace {
+            return;
+        }
+        if self.is_sketching() {
+            self.set_status("Finish the sketch before changing workspace");
+            self.repaint = true;
+            return;
+        }
+        self.workspace = workspace;
+        match workspace {
+            Workspace::Simulation => simulate::enter(self),
+            Workspace::Design => simulate::leave(self),
+        }
+        self.repaint = true;
+    }
+
+    pub fn toggle_workspace(&mut self) {
+        self.set_workspace(match self.workspace {
+            Workspace::Design => Workspace::Simulation,
+            Workspace::Simulation => Workspace::Design,
+        });
     }
 
     // --- State cache ----------------------------------------------------------------
@@ -791,7 +858,7 @@ impl Editor {
             self.repaint = true;
             return;
         }
-        if let Some(binding) = commands::lookup(key, ctrl, shift, self.is_sketching()) {
+        if let Some(binding) = commands::lookup(key, ctrl, shift, self) {
             panels::run(self, (binding.make)());
         }
         self.repaint = true;
@@ -887,7 +954,9 @@ impl Editor {
         match (self.tool.as_ref(), self.measure.is_some()) {
             (Some(tool), _) => self.select_mode.narrow(tool.filter()),
             (None, true) => self.select_mode.narrow(measure::FILTER),
-            (None, false) if self.simulation.is_some() => self.select_mode.narrow(simulate::FILTER),
+            (None, false) if self.study_view().is_some() => {
+                self.select_mode.narrow(simulate::FILTER)
+            }
             (None, false) => self.select_mode.filter(),
         }
     }
@@ -956,8 +1025,12 @@ impl Editor {
             Mode::Model => {
                 if self.measure.is_some() {
                     measure::stop(self);
-                } else if self.simulation.is_some() {
-                    simulate::stop(self);
+                } else if self.workspace == Workspace::Simulation {
+                    // Escape does not leave the workspace — the tab does, and a key that
+                    // threw away the view the user was looking at would be a trap. It
+                    // only puts the prompt back.
+                    self.hover = None;
+                    self.set_status(simulate::PROMPT);
                 } else if self.tool.is_some() {
                     tools::cancel_tool(self);
                 } else {
@@ -1115,8 +1188,11 @@ impl Editor {
         if self.tool.is_some() || self.is_sketching() {
             return;
         }
+        if self.workspace == Workspace::Simulation {
+            self.set_status(simulate::REFUSED);
+            return;
+        }
         measure::stop(self);
-        simulate::stop(self);
         let Some(feature) = self.doc.timeline().get(id) else {
             return;
         };
@@ -1409,6 +1485,9 @@ impl Editor {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        // The solver's answer is read before the panels are laid out, so the frame that
+        // receives it is the frame that shows it.
+        self.poll_simulation();
         panels::show(self, ui);
     }
 

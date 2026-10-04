@@ -16,7 +16,7 @@ use winit::keyboard::{Key, NamedKey};
 use super::files::MeshFormat;
 use super::sketch_mode::{ConstraintKind, SketchPick, SketchTool, ToolGroup};
 use super::tools::ToolKind;
-use super::{DisplayMode, Editor, Mode, SelectMode};
+use super::{DisplayMode, Editor, Mode, SelectMode, Workspace};
 use basset_viewport::ViewPreset;
 
 /// Deferred commands, so panel code never needs `&mut Editor` while it borrows state.
@@ -27,10 +27,16 @@ pub(crate) enum Command {
     Measure(bool),
     /// Leave it if it is running, start it if it is not: what one key has to mean.
     ToggleMeasure,
-    /// Open or close the Simulate dialog, which owns no feature either; see
-    /// [`super::simulate`].
-    Simulate(bool),
-    ToggleSimulate,
+    /// Go to a workspace, as its tab does; see [`Workspace`] and [`super::simulate`].
+    Workspace(Workspace),
+    /// Design to Simulation and back: what one key has to mean.
+    ToggleWorkspace,
+    /// Solve the study, on a thread of its own.
+    RunStudy,
+    /// Abandon the solve in flight.
+    StopStudy,
+    /// Write the study's results as legacy VTK, to a file the user picks.
+    ExportVtk,
     New,
     Open,
     Save(bool),
@@ -304,6 +310,33 @@ fn named_label(key: NamedKey) -> &'static str {
         // Nothing else is bound to a named key; a new one shows as its debug name rather
         // than as a lie.
         _ => "(key)",
+    }
+}
+
+impl Command {
+    /// Whether this is a modelling command: one that starts a tool, measures, or edits
+    /// the timeline. These are refused in the Simulation workspace and hidden from its
+    /// palette and overlay, so a click on a face there can only ever be a pick for the
+    /// study. Undo and redo are not modelling: a study whose body was undone is simply
+    /// stale, and a user who sees that wants the undo back without changing tab.
+    pub fn is_modelling(&self) -> bool {
+        matches!(
+            self,
+            Command::Tool(_)
+                | Command::Measure(true)
+                | Command::ToggleMeasure
+                | Command::Edit(_)
+                | Command::Suppress(..)
+                | Command::Delete(_)
+                | Command::Rename(_)
+                | Command::DeleteSelected
+                | Command::SetCursor(_)
+                | Command::BeginBodyRename(_)
+                | Command::RenameBody(..)
+                | Command::ComponentsFromBodies(_)
+                | Command::ComponentsFromSelectedBodies
+                | Command::Activate(_)
+        )
     }
 }
 
@@ -942,12 +975,12 @@ pub(crate) const BINDINGS: &[Binding] = &[
     },
     Binding {
         id: "modify.simulate",
-        label: "Simulate",
+        label: "Simulation workspace",
         group: Group::Modify,
         chords: &[],
         live: LiveIn::Model,
-        make: || Command::ToggleSimulate,
-        enabled: IDLE,
+        make: || Command::ToggleWorkspace,
+        enabled: ALWAYS,
     },
     // --- Sketch tools. Each key opens the tool the toolbar's button for that shape is
     // showing, so the key and the button draw the same thing.
@@ -1265,16 +1298,24 @@ pub(crate) struct Palette {
     pub just_opened: bool,
 }
 
-/// The binding a keystroke runs, or `None` when the key means nothing in this mode.
+/// Whether a binding is on offer right now: live in this mode, and not a modelling
+/// command while the Simulation workspace is up. The one test the key handler, the
+/// palette and the overlay all ask, so none of them can list what another refuses.
+pub(crate) fn available(binding: &Binding, editor: &Editor) -> bool {
+    binding.live.covers(editor.is_sketching())
+        && !(editor.workspace == Workspace::Simulation && (binding.make)().is_modelling())
+}
+
+/// The binding a keystroke runs, or `None` when the key means nothing right now.
 pub(crate) fn lookup(
     key: &Key,
     ctrl: bool,
     shift: bool,
-    sketching: bool,
+    editor: &Editor,
 ) -> Option<&'static Binding> {
     BINDINGS
         .iter()
-        .find(|b| b.live.covers(sketching) && b.chords.iter().any(|c| c.matches(key, ctrl, shift)))
+        .find(|b| available(b, editor) && b.chords.iter().any(|c| c.matches(key, ctrl, shift)))
 }
 
 /// The binding for a command id, for menus and tooltips that want to print its key.
@@ -1371,11 +1412,10 @@ fn subsequence_score(haystack: &str, needle: &str) -> Option<i32> {
 /// What the palette lists: everything live in this mode that matches, best first, ties
 /// broken by the table's own order so the list does not reshuffle under the pointer.
 pub(crate) fn search(editor: &Editor, query: &str) -> Vec<&'static Binding> {
-    let sketching = editor.is_sketching();
     let mut hits: Vec<(i32, usize, &'static Binding)> = BINDINGS
         .iter()
         .enumerate()
-        .filter(|(_, b)| b.live.covers(sketching))
+        .filter(|(_, b)| available(b, editor))
         .filter_map(|(i, b)| score(b, query).map(|s| (s, i, b)))
         .collect();
     hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));

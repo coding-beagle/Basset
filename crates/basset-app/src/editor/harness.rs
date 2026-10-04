@@ -23,6 +23,7 @@
 //! ```
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use basset_core::{
     BodyOp, BodyRef, ComponentId, Extent, FaceKey, FaceRef, FaceRole, FeatureKind, PlaneRef,
@@ -37,7 +38,7 @@ use winit::keyboard::{Key, NamedKey};
 
 use super::sketch_mode::{self, SketchEditor, SketchTool};
 use super::tools::{self, ToolKind};
-use super::{Editor, Mode};
+use super::{Editor, Mode, Workspace, simulate};
 
 /// Window size every harness starts with. Fixed, because picking tolerances are in
 /// pixels and a test that draws at (10, 10) mm must land on the same pixel every run.
@@ -592,6 +593,62 @@ impl Harness {
 
     pub fn bodies(&mut self) -> Vec<BodyRef> {
         self.editor.doc.state().bodies.keys().copied().collect()
+    }
+
+    // --- Simulation -------------------------------------------------------------------
+
+    /// Goes to the Simulation workspace, as its tab does.
+    pub fn enter_simulation(&mut self) {
+        self.editor.set_workspace(Workspace::Simulation);
+        self.editor.refresh_cache();
+    }
+
+    /// Polls the solve in flight until it finishes or `timeout` passes, and says which.
+    /// There is no event loop here to call [`Editor::poll_simulation`] once a frame, so
+    /// this is the loop; the sleep is short so a sub-second solve costs a test little.
+    pub fn wait_for_solve(&mut self, timeout: Duration) -> bool {
+        let started = Instant::now();
+        loop {
+            self.editor.poll_simulation();
+            if !self.editor.simulation.as_ref().is_some_and(|s| s.solving()) {
+                return true;
+            }
+            if started.elapsed() > timeout {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Runs the study and waits for the answer. A solve that takes two minutes is a test
+    /// that has gone wrong, and failing beats hanging the suite.
+    pub fn solve(&mut self) {
+        simulate::run(&mut self.editor);
+        assert!(
+            self.wait_for_solve(Duration::from_secs(120)),
+            "the solve did not finish in time"
+        );
+    }
+
+    /// Stops the solve in flight and waits for its thread to notice and exit, which the
+    /// UI never does: a test that wants to know the cancellation reached the solver has
+    /// to see the thread gone, not just the job.
+    pub fn stop_and_join(&mut self) {
+        let handle = self.editor.simulation.as_mut().and_then(|s| s.stop_job());
+        if let Some(handle) = handle {
+            handle.join().expect("the solver thread panicked");
+        }
+    }
+
+    /// Picks a material from the library by name, as the combo does.
+    pub fn choose_material(&mut self, name: &str) {
+        let spec = basset_fea::find_material(name)
+            .unwrap_or_else(|| panic!("{name} is not in the material library"));
+        self.editor
+            .simulation
+            .as_mut()
+            .expect("a study is up")
+            .choose_material(spec);
     }
 
     // --- Documents --------------------------------------------------------------------
