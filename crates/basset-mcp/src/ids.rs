@@ -101,6 +101,7 @@ pub fn face_key_from_str(s: &str) -> Result<FaceKey, ToolError> {
         r if r.starts_with("Fillet") => FaceRole::Fillet(payload("Fillet")?),
         r if r.starts_with("Chamfer") => FaceRole::Chamfer(payload("Chamfer")?),
         r if r.starts_with("Generic") => FaceRole::Generic(payload("Generic")?),
+        r if r.starts_with("Thread") => FaceRole::Thread(payload("Thread")?),
         _ => return Err(bad()),
     };
     Ok(FaceKey::new(OpId::new(feature).with_sub(sub), role))
@@ -214,6 +215,7 @@ mod tests {
             FaceRole::Fillet(0),
             FaceRole::Chamfer(2),
             FaceRole::Generic(9),
+            FaceRole::Thread(1),
         ] {
             let key = FaceKey::new(OpId::new(12).with_sub(3), role);
             assert_eq!(face_key_from_str(&face_key_to_string(key)).unwrap(), key);

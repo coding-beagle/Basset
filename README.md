@@ -12,9 +12,9 @@ rewritten when the next tool arrives.
 | --- | --- |
 | Object model | Document, Components, origin & construction Planes/Axes, Sketches, Bodies; a document-wide table of named parameters every sketch and every feature can read |
 | Sketching | points, lines, arcs, circles, construction geometry, text; rectangles (2-point, centre), circles (centre, 2-point, 3-point), polygons, slots, arcs; geometric constraints and driving dimensions; Levenberg–Marquardt solver that names both the loose geometry and, when a sketch will not solve, the constraints that disagree; selection / hit testing including box select; snapping to the grid and to what the drawing names — endpoints, midpoints, centres, crossings, the nearest point on a curve, the origin, alignment with a touched point, a line's own extension, tangent and perpendicular — ranked, held steady and marked on screen; closed-region detection with curves split at their crossings; trim and break; rectangular and circular patterns with a live preview; offset with rounded or squared corners; dimensions driven by expressions over the sketch's own named parameters and the document's |
-| Solids | extrude (one side / symmetric / two sides / to a face of another body, clicked while the tool runs), revolve, sweep, loft, from a sketch region or a planar face; join / cut / intersect, each against any number of target bodies chosen from a checklist (a cut through a stack offers the whole stack); fillet, chamfer, combine, move |
+| Solids | extrude (one side / symmetric / two sides / to a face of another body, clicked while the tool runs), revolve, sweep, loft, from a sketch region or a planar face; join / cut / intersect, each against any number of target bodies chosen from a checklist (a cut through a stack offers the whole stack); fillet, chamfer, thread (ISO metric, on a shaft or in a hole, full length or partial, either hand), combine, move |
 | Construction | offset plane, plane at an angle, sketch on a planar face |
-| Timeline | insert at cursor, edit, suppress, reorder, delete, roll back / forward; edits replay forward with per-feature caching; extrude, revolve, fillet, chamfer and construction-plane values drivable by expression; per-feature failure reporting |
+| Timeline | insert at cursor, edit, suppress, reorder, delete, roll back / forward; edits replay forward with per-feature caching; extrude, revolve, fillet, chamfer, thread and construction-plane values drivable by expression; per-feature failure reporting |
 | Files | `.bass` documents (versioned JSON); STL and 3MF export of bodies and components |
 | Viewport | wgpu renderer with orbit camera, MSAA, pixel-width lines, view-dependent silhouettes so a curved body is bounded against the background, a grid on any plane, face highlighting, translucent region fills, ray picking |
 | App | winit + egui desktop shell: browser, timeline with rollback marker and context menu, live-preview tool dialogs, viewport transform manipulator (arrows and rotation rings) for sketch and body moves, navigation cube, sketch mode with shape tools, constraint tools and click-to-edit dimensions, native open/save/export dialogs; one declared table of keyboard commands, a shortcut overlay and a fuzzy command palette over it |
@@ -171,15 +171,16 @@ must come out with. Those files are the regression suite for sketching and extru
   could click. With a tool dialog open, click in the viewport to select what it asks for
   (for Extrude/Revolve/Sweep/Loft either a closed sketch region — every region enclosed
   by the curves, including the ones their crossings make — or a planar face of a body;
-  edges for Fillet/Chamfer, or a face to take every edge around it; planes for Offset
+  edges for Fillet/Chamfer, or a face to take every edge around it; one cylindrical face
+  for Thread, a shaft or a hole, whose size sets the default pitch; planes for Offset
   Plane, bodies for Combine/Move). The feature appears as soon as the input is complete
   and follows the dialog's parameters live; OK keeps it, Cancel removes it. Extrude,
   Fillet, Chamfer and Offset Plane also show an arrow in the viewport: drag its tip to
   set the distance or radius. Move shows the full manipulator — an arrow per axis and a
   ring per axis of rotation — driving the same numbers as its dialog. Almost every number
   in those dialogs has an ƒ beside it: press it and the box becomes an expression field, so
-  an extrude distance, a revolve angle, a fillet radius, a chamfer distance and the
-  distance or angle of a construction plane can each be stated as `wall * 3` rather than
+  an extrude distance, a revolve angle, a fillet radius, a chamfer distance, a thread's
+  pitch and length, and the distance or angle of a construction plane can each be stated as `wall * 3` rather than
   as a number. While an expression drives a value the box shows what it works out to and
   cannot be dragged, because there the expression is what you said and the number only its
   result; pressing the ƒ again hands the value back as a

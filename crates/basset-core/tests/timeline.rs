@@ -1538,3 +1538,115 @@ fn a_point_only_region_follows_its_curves_when_the_sketch_moves() {
     assert_eq!(doc.state().status(cut), Some(&FeatureStatus::Ok));
     assert_relative_eq!(volume(&mut doc, block), 2000.0 - hole, epsilon = 0.5);
 }
+
+/// A 10 mm rod, 20 long, standing on the XY plane, with an M10 thread down all of it.
+/// Returns the document, the extrude, the thread and the rod's cylindrical face.
+fn threaded_rod() -> (Document, FeatureId, FeatureId, FaceRef) {
+    let mut doc = Document::new("test");
+    let mut sketch = Sketch::new();
+    let circle = shapes::circle_center(&mut sketch, Vec2::ZERO, 5.0);
+    sketch
+        .add_constraint(Constraint::Fix(circle.center))
+        .unwrap();
+    sketch
+        .add_constraint(Constraint::Diameter {
+            curve: circle.circle,
+            value: 10.0,
+        })
+        .unwrap();
+    let sk = sketch_on(&mut doc, PlaneRef::Origin(OriginPlane::XY), sketch);
+    let ex = extrude(&mut doc, sk, Vec2::ZERO, 20.0, BodyOp::NewBody);
+    let side = doc
+        .state()
+        .body(BodyRef(ex))
+        .unwrap()
+        .solid
+        .faces
+        .iter()
+        .find(|f| matches!(f.surface, basset_kernel::SurfaceKind::Cylindrical { .. }))
+        .map(|f| f.key)
+        .expect("the rod's side");
+    let face = FaceRef {
+        body: BodyRef(ex),
+        key: side,
+    };
+    let th = doc.add_feature(FeatureKind::Thread {
+        face,
+        pitch: 1.5,
+        length: None,
+        left_handed: false,
+        reversed: false,
+    });
+    (doc, ex, th, face)
+}
+
+#[test]
+fn a_thread_follows_its_rod_through_edits_and_a_round_trip() {
+    let (mut doc, ex, th, _) = threaded_rod();
+    assert_eq!(doc.state().status(th), Some(&FeatureStatus::Ok));
+    let plain = PI * 25.0 * 20.0;
+    let threaded = volume(&mut doc, ex);
+    assert!(
+        threaded < plain - 20.0,
+        "the groove took {:.1} mm³",
+        plain - threaded
+    );
+    assert!(
+        doc.state()
+            .body(BodyRef(ex))
+            .unwrap()
+            .solid
+            .face(FaceKey::new(OpId::new(th.0), FaceRole::Thread(0)))
+            .is_some(),
+        "the groove's root is named after the thread"
+    );
+
+    // A longer rod is threaded all the way along it.
+    doc.edit_feature_kind(ex, |k| {
+        k.set_numeric_field(NumericField::Distance, 30.0);
+    })
+    .unwrap();
+    assert_eq!(doc.state().status(th), Some(&FeatureStatus::Ok));
+    let longer = volume(&mut doc, ex);
+    assert_relative_eq!(
+        PI * 25.0 * 30.0 - longer,
+        (plain - threaded) * 1.5,
+        max_relative = 0.1
+    );
+
+    // The pitch is a number a parameter can drive.
+    doc.set_parameter("pitch", "1.25").unwrap();
+    doc.set_feature_expr(th, NumericField::Pitch, "pitch")
+        .unwrap();
+    assert_eq!(
+        doc.timeline()
+            .get(th)
+            .unwrap()
+            .kind
+            .numeric_field(NumericField::Pitch),
+        Some(1.25)
+    );
+    assert_eq!(doc.state().status(th), Some(&FeatureStatus::Ok));
+    let finer = volume(&mut doc, ex);
+    assert!(finer > longer, "a finer pitch cuts a shallower groove");
+
+    let mut bytes = Vec::new();
+    basset_core::file::write(&mut bytes, &doc).unwrap();
+    let mut loaded = basset_core::file::read(bytes.as_slice()).unwrap();
+    assert_relative_eq!(volume(&mut loaded, ex), finer, epsilon = 1e-9);
+}
+
+#[test]
+fn a_thread_on_a_flat_face_fails_with_its_reason() {
+    let (mut doc, ex, th, _) = threaded_rod();
+    doc.edit_feature_kind(th, |k| {
+        if let FeatureKind::Thread { face, .. } = k {
+            face.key = FaceKey::new(OpId::new(ex.0), FaceRole::EndCap);
+        }
+    })
+    .unwrap();
+    match doc.state().status(th) {
+        Some(FeatureStatus::Failed(msg)) => assert!(msg.contains("not cylindrical"), "{msg}"),
+        other => panic!("expected a failure, got {other:?}"),
+    }
+}

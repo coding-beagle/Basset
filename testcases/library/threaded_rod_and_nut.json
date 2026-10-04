@@ -1,0 +1,23 @@
+{
+  "description": "An M10 rod and a nut plate drilled at M10's tap size, both threaded at the default (ISO coarse) pitch: the rod on its outside, the nut inside its bore. Both shells must stay closed.",
+  "calls": [
+    { "tool": "create_sketch", "arguments": { "plane": "XY" } },
+    { "tool": "sketch_ops", "arguments": { "sketch": "$0", "ops": [ { "op": "circle", "center": [0, 0], "radius": 5 } ] } },
+    { "tool": "extrude", "arguments": { "sketch": "$0", "regions": "all", "distance": 20 } },
+    { "tool": "thread", "arguments": { "body": "$2", "face": "${2}.0:Side(2)" } },
+    { "tool": "create_sketch", "arguments": { "plane": "XY" } },
+    { "tool": "sketch_ops", "arguments": { "sketch": "$4", "ops": [
+      { "op": "rectangle", "a": [20, -8], "b": [36, 8] },
+      { "op": "circle", "center": [28, 0], "radius": 4.188 }
+    ] } },
+    { "tool": "extrude", "arguments": { "sketch": "$4", "regions": [[34, 6]], "distance": 8 } },
+    { "tool": "thread", "arguments": { "body": "$6", "face": "${6}.0:Side(10)" } }
+  ],
+  "expect": {
+    "ok": true,
+    "bodies": {
+      "$2": { "volume": 1296.22, "volume_tol": 3.0, "closed": true },
+      "$6": { "volume": 1529.5, "volume_tol": 3.0, "closed": true, "aabb": [[20, -8, 0], [36, 8, 8]] }
+    }
+  }
+}

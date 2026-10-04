@@ -26,6 +26,7 @@ pub enum ToolKind {
     Loft,
     Fillet,
     Chamfer,
+    Thread,
     Combine,
     Move,
     OffsetPlane,
@@ -43,6 +44,7 @@ impl ToolKind {
             ToolKind::Loft => "Loft",
             ToolKind::Fillet => "Fillet",
             ToolKind::Chamfer => "Chamfer",
+            ToolKind::Thread => "Thread",
             ToolKind::Combine => "Combine",
             ToolKind::Move => "Move",
             ToolKind::OffsetPlane => "Offset Plane",
@@ -60,6 +62,7 @@ impl ToolKind {
             ToolKind::Loft => "Select two or more regions in order",
             ToolKind::Fillet => "Select edges to round",
             ToolKind::Chamfer => "Select edges to chamfer",
+            ToolKind::Thread => "Select a cylindrical face: a shaft to thread, or a hole to tap",
             ToolKind::Combine => "Select the target body first, then tool bodies",
             ToolKind::Move => "Select a body to move",
             ToolKind::OffsetPlane => "Select the base plane or face",
@@ -111,6 +114,15 @@ pub struct Params {
     /// Fillet and Chamfer: one pick takes the whole tangentially continuous run of
     /// edges, as Fusion's tangent chain does. Ctrl-clicking overrides it for one pick.
     pub tangent_chain: bool,
+    /// Thread: advance per turn. Follows the ISO coarse pitch of whatever face is picked
+    /// until the user types one, as Fusion's size list does.
+    pub pitch: f64,
+    pub pitch_chosen: bool,
+    /// Thread: all of the face, or `distance` of it from the end it opens out of.
+    pub full_length: bool,
+    pub left_handed: bool,
+    /// Thread: measure the length from the face's other end.
+    pub reversed: bool,
 }
 
 impl Default for Params {
@@ -131,17 +143,23 @@ impl Default for Params {
             axis: None,
             name: "Component".into(),
             tangent_chain: true,
+            pitch: 1.0,
+            pitch_chosen: false,
+            full_length: true,
+            left_handed: false,
+            reversed: false,
         }
     }
 }
 
 /// Every field a dialog can offer, so a tool that stops offering one can take back the
 /// expression that was driving it.
-const FIELDS: [NumericField; 4] = [
+const FIELDS: [NumericField; 5] = [
     NumericField::Distance,
     NumericField::Negative,
     NumericField::Angle,
     NumericField::Radius,
+    NumericField::Pitch,
 ];
 
 /// The expressions driving a running tool's numbers.
@@ -247,6 +265,9 @@ pub struct Tool {
     /// edges, which is nothing beside a boolean but too much to spend on every frame of
     /// a drag, so it is kept until the selection itself moves on.
     limit: (Vec<EdgeRef>, BlendLimits),
+    /// Thread: the picked face read as a cylinder, for the dialog to say what size it is
+    /// and for the default pitch. Read once per pick, since it walks the body's edges.
+    pub thread_face: Option<(FaceRef, basset_kernel::CylinderFace)>,
 }
 
 /// How far a blend's handle may go each way on the selection it is running on.
@@ -281,6 +302,10 @@ impl Tool {
             ToolKind::Fillet | ToolKind::Chamfer => SelectionFilter {
                 faces: true,
                 ..SelectionFilter::EDGES
+            },
+            ToolKind::Thread => SelectionFilter {
+                faces: true,
+                ..SelectionFilter::NONE
             },
             ToolKind::Combine | ToolKind::Move => SelectionFilter::BODIES,
             ToolKind::Component => SelectionFilter::NONE,
@@ -410,6 +435,13 @@ impl Tool {
                 edges: (!sel.edges.is_empty()).then(|| sel.edges.clone())?,
                 distance: p.radius,
             },
+            ToolKind::Thread => FeatureKind::Thread {
+                face: self.thread_face?.0,
+                pitch: p.pitch,
+                length: (!p.full_length).then_some(p.distance),
+                left_handed: p.left_handed,
+                reversed: p.reversed,
+            },
             ToolKind::Combine => {
                 let target = *sel.bodies.first()?;
                 let tools: Vec<BodyRef> = sel.bodies[1..].to_vec();
@@ -491,6 +523,7 @@ pub fn start_tool(editor: &mut Editor, kind: ToolKind) {
         restore_cursor: None,
         op_chosen: false,
         limit: (Vec::new(), BlendLimits::default()),
+        thread_face: None,
     }
     .filter();
     let mut sel = Selection::default();
@@ -520,6 +553,11 @@ pub fn start_tool(editor: &mut Editor, kind: ToolKind) {
             sel.planes.push(PlaneRef::Face(*f));
         }
     }
+    if kind == ToolKind::Thread {
+        // A face picked before the tool, as Fusion takes one; only the last, since a
+        // thread goes on one face.
+        sel.faces.extend(editor.selection.faces.last().copied());
+    }
     editor.selection = sel;
     editor.tool = Some(Tool {
         kind,
@@ -529,6 +567,7 @@ pub fn start_tool(editor: &mut Editor, kind: ToolKind) {
         restore_cursor: None,
         op_chosen: false,
         limit: (Vec::new(), BlendLimits::default()),
+        thread_face: None,
     });
     if kind == ToolKind::Component {
         editor.doc.begin_transaction();
@@ -616,6 +655,22 @@ pub fn edit_existing(editor: &mut Editor, id: FeatureId, previous_cursor: usize)
             params.radius = *distance;
             ToolKind::Chamfer
         }
+        FeatureKind::Thread {
+            face,
+            pitch,
+            length,
+            left_handed,
+            reversed,
+        } => {
+            sel.faces = vec![*face];
+            params.pitch = *pitch;
+            params.pitch_chosen = true;
+            params.full_length = length.is_none();
+            params.distance = length.unwrap_or(params.distance);
+            params.left_handed = *left_handed;
+            params.reversed = *reversed;
+            ToolKind::Thread
+        }
         FeatureKind::Combine {
             target,
             tools,
@@ -670,6 +725,7 @@ pub fn edit_existing(editor: &mut Editor, id: FeatureId, previous_cursor: usize)
         // An existing feature's operation was decided when it was made.
         op_chosen: true,
         limit: (Vec::new(), BlendLimits::default()),
+        thread_face: None,
     });
     editor.set_status(format!("Editing {}", feature.name));
 }
@@ -751,6 +807,7 @@ pub fn sync_tool(editor: &mut Editor) {
         }
     }
     refresh_blend_limit(editor);
+    refresh_thread_face(editor);
     let tool = editor.tool.as_ref().unwrap();
     let Some(kind) = tool.build_kind(editor) else {
         return;
@@ -867,6 +924,67 @@ fn refresh_blend_limit(editor: &mut Editor) {
     }
 }
 
+/// Reads the face a thread is on, if the pick has moved since it was last read, and
+/// takes the pitch from its size unless the user has given one.
+///
+/// The body is read as picking sees it, before the thread is cut: the face being threaded
+/// is the plain cylinder, which is what the size and the ends are read from.
+fn refresh_thread_face(editor: &mut Editor) {
+    let Some(tool) = editor.tool.as_ref() else {
+        return;
+    };
+    if tool.kind != ToolKind::Thread {
+        return;
+    }
+    let picked = editor.selection.faces.last().copied();
+    if tool.thread_face.map(|(f, _)| f) == picked {
+        return;
+    }
+    let read = picked.and_then(|face| {
+        let body = editor.pick_body(face.body)?;
+        basset_kernel::cylinder_face(&body.solid, face.key)
+            .ok()
+            .map(|c| (face, c))
+    });
+    if let Some(tool) = editor.tool.as_mut() {
+        tool.thread_face = read;
+        if let Some((_, cylinder)) = read {
+            if !tool.params.pitch_chosen {
+                tool.params.pitch = cylinder.coarse_pitch();
+            }
+            // A length typed for a longer face would be refused outright on this one.
+            tool.params.distance = tool.params.distance.min(cylinder.length());
+        }
+    }
+}
+
+/// Thread takes one face, and only a cylinder: a click on another face moves the thread
+/// there, a click on its own face takes it back out, and a flat face is turned away with
+/// the reason rather than selected for a thread that cannot be cut. Returns whether the
+/// pick was consumed this way.
+pub fn take_thread_pick(editor: &mut Editor, pick: &Pick) -> bool {
+    if editor.tool.as_ref().map(|t| t.kind) != Some(ToolKind::Thread) {
+        return false;
+    }
+    let Pick::Face(face, _) = pick else {
+        return false;
+    };
+    if editor.selection.faces.contains(face) {
+        editor.selection.faces.clear();
+        return true;
+    }
+    let cylindrical = editor
+        .pick_body(face.body)
+        .and_then(|b| b.solid.face(face.key))
+        .is_some_and(|f| matches!(f.surface, basset_kernel::SurfaceKind::Cylindrical { .. }));
+    if cylindrical {
+        editor.selection.faces = vec![*face];
+    } else {
+        editor.set_status("A thread goes on a cylindrical face: pick a shaft or a hole");
+    }
+    true
+}
+
 pub fn confirm_tool(editor: &mut Editor) {
     let Some(tool) = editor.tool.take() else {
         return;
@@ -919,6 +1037,7 @@ pub fn dialog(editor: &mut Editor, ctx: &egui::Context) {
         .feature
         .and_then(|id| editor.cached_statuses.get(&id).cloned());
     let blend_limit = tool.blend_limit();
+    let thread_face = tool.thread_face.map(|(_, c)| c);
     let bodies: Vec<(BodyRef, String)> = editor.cached_bodies.clone();
     let selection_text = editor.selection.summary();
     let edge_count = editor.selection.edges.len();
@@ -1076,6 +1195,74 @@ pub fn dialog(editor: &mut Editor, ctx: &egui::Context) {
                             text.weak()
                         });
                     }
+                }
+                ToolKind::Thread => {
+                    match thread_face {
+                        Some(c) => {
+                            ui.label(format!(
+                                "M{} \u{d7} {} {}, {:.2} mm long",
+                                trim_mm(c.nominal_diameter(p.pitch)),
+                                trim_mm(p.pitch),
+                                if c.external {
+                                    "on a shaft"
+                                } else {
+                                    "in a hole"
+                                },
+                                c.length()
+                            ));
+                        }
+                        None => {
+                            ui.label(egui::RichText::new("Click a shaft or a hole").weak());
+                        }
+                    }
+                    let before = p.pitch;
+                    changed |= drag(
+                        ui,
+                        ex,
+                        &parameters,
+                        NumericField::Pitch,
+                        "Pitch",
+                        &mut p.pitch,
+                        0.05,
+                        "mm",
+                    );
+                    if p.pitch != before {
+                        p.pitch_chosen = true;
+                    }
+                    if let Some(c) = thread_face {
+                        let coarse = c.coarse_pitch();
+                        if p.pitch != coarse
+                            && ui
+                                .small_button(format!("Coarse pitch ({})", trim_mm(coarse)))
+                                .on_hover_text("The ISO metric coarse pitch for this size")
+                                .clicked()
+                        {
+                            p.pitch = coarse;
+                            p.pitch_chosen = false;
+                            changed = true;
+                        }
+                    }
+                    changed |= ui.checkbox(&mut p.full_length, "Full length").changed();
+                    if !p.full_length {
+                        changed |= drag(
+                            ui,
+                            ex,
+                            &parameters,
+                            NumericField::Distance,
+                            "Length",
+                            &mut p.distance,
+                            0.5,
+                            "mm",
+                        );
+                        changed |= ui
+                            .checkbox(&mut p.reversed, "From the other end")
+                            .on_hover_text(
+                                "Measure the length from the face's other end; by \
+                                 default it starts at the end that opens out",
+                            )
+                            .changed();
+                    }
+                    changed |= ui.checkbox(&mut p.left_handed, "Left-handed").changed();
                 }
                 ToolKind::Combine => {
                     ui.horizontal(|ui| {
@@ -1267,7 +1454,8 @@ fn params_field(kind: ToolKind, params: &mut Params, field: NumericField) -> Opt
         (_, NumericField::Distance) => Some(&mut params.distance),
         (_, NumericField::Negative) => Some(&mut params.negative),
         (_, NumericField::Angle) => Some(&mut params.angle_deg),
-        (_, NumericField::Radius) => None,
+        (ToolKind::Thread, NumericField::Pitch) => Some(&mut params.pitch),
+        (_, NumericField::Radius | NumericField::Pitch) => None,
     }
 }
 
@@ -1668,6 +1856,12 @@ impl Editor {
             }
         }
     }
+}
+
+/// A size as a thread designation writes it: `M10 × 1.5`, not `M10.00 × 1.50`.
+fn trim_mm(v: f64) -> String {
+    let s = format!("{v:.2}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 /// One number of a dialog: a drag box, or the expression driving it.

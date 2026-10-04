@@ -44,6 +44,8 @@ pub enum FaceRole {
     Chamfer(u32),
     /// Anything without a more specific meaning (loft hole strips, tool scaffolding).
     Generic(u32),
+    /// A surface of a modelled thread's groove: see [`crate::thread`] for which is which.
+    Thread(u32),
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd, Debug, Serialize, Deserialize)]

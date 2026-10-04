@@ -408,6 +408,29 @@ impl Regenerator {
                     body.solid = Arc::new(solid);
                 }
             }
+            FeatureKind::Thread {
+                face,
+                pitch,
+                length,
+                left_handed,
+                reversed,
+            } => {
+                let body = state
+                    .bodies
+                    .get_mut(&face.body)
+                    .ok_or(RegenError::MissingBody(face.body.0))?;
+                if body.solid.face(face.key).is_none() {
+                    return Err(RegenError::MissingTargetFace(format!("{:?}", face.key)));
+                }
+                let spec = kernel::ThreadSpec {
+                    pitch: *pitch,
+                    length: *length,
+                    left_handed: *left_handed,
+                    reversed: *reversed,
+                };
+                let solid = kernel::thread(op_id(id, 0), &body.solid, face.key, &spec)?;
+                body.solid = Arc::new(solid);
+            }
             FeatureKind::Combine {
                 target,
                 tools,

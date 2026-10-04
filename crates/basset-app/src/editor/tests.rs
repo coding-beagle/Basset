@@ -5137,3 +5137,104 @@ mod bodies {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
+
+/// The thread tool: one cylindrical face, a pitch that follows the face's size until the
+/// user types one, and a flat face turned away with the reason.
+mod thread {
+    use basset_core::{
+        ComponentId, FeatureKind, FeatureStatus, NumericField, OriginPlane, PlaneRef, Sketch,
+    };
+    use basset_math::{Vec2, Vec3};
+    use basset_sketch::shapes;
+
+    use crate::editor::harness::Harness;
+    use crate::editor::tools::{self, ToolKind};
+
+    /// A rod of `diameter` and 20 mm long standing on the XY plane, built in the editor.
+    fn rod(diameter: f64) -> (Harness, basset_core::BodyRef) {
+        let mut h = Harness::new();
+        let mut sketch = Sketch::new();
+        shapes::circle_center(&mut sketch, Vec2::ZERO, diameter / 2.0);
+        h.editor.doc.add_feature(FeatureKind::Sketch {
+            plane: PlaneRef::Origin(OriginPlane::XY),
+            component: ComponentId::ROOT,
+            sketch,
+        });
+        h.editor.refresh_cache();
+        let body = h.extrude(Vec2::ZERO, 20.0);
+        (h, body)
+    }
+
+    #[test]
+    fn a_click_on_a_shaft_threads_it_at_its_coarse_pitch() {
+        let (mut h, body) = rod(10.0);
+        let plain = h.volume(body);
+        h.start_tool(ToolKind::Thread);
+        // The side facing the camera, half way up.
+        h.click_world(Vec3::new(0.0, -5.0, 10.0));
+        let tool = h.editor.tool.as_ref().expect("the thread tool is running");
+        assert_eq!(
+            h.editor.selection.faces.len(),
+            1,
+            "one face, the rod's side"
+        );
+        assert_eq!(tool.params.pitch, 1.5, "M10 is coarse at 1.5");
+        let (_, cylinder) = tool.thread_face.expect("the face was read as a cylinder");
+        assert!(cylinder.external);
+        let id = tool
+            .feature
+            .expect("the thread previews as soon as it has a face");
+        h.confirm_tool();
+        assert_eq!(h.editor.doc.state().status(id), Some(&FeatureStatus::Ok));
+        assert!(h.volume(body) < plain - 100.0);
+        assert!(matches!(
+            h.editor.doc.timeline().get(id).map(|f| &f.kind),
+            Some(FeatureKind::Thread {
+                length: None,
+                left_handed: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_flat_face_is_turned_away_and_a_typed_pitch_stays_put() {
+        let (mut h, _) = rod(6.0);
+        h.start_tool(ToolKind::Thread);
+        h.click_world(Vec3::new(0.0, 0.0, 20.0));
+        assert!(
+            h.editor.selection.faces.is_empty(),
+            "the end cap is not a thread's"
+        );
+        assert!(h.editor.tool.as_ref().unwrap().feature.is_none());
+
+        h.click_world(Vec3::new(0.0, -3.0, 10.0));
+        assert_eq!(h.editor.tool.as_ref().unwrap().params.pitch, 1.0, "M6");
+        assert!(tools::type_expression(
+            &mut h.editor,
+            NumericField::Pitch,
+            "0.75"
+        ));
+        let id = h.editor.tool.as_ref().unwrap().feature.unwrap();
+        h.confirm_tool();
+        assert_eq!(
+            h.editor
+                .doc
+                .timeline()
+                .get(id)
+                .unwrap()
+                .kind
+                .numeric_field(NumericField::Pitch),
+            Some(0.75)
+        );
+        assert_eq!(h.editor.doc.state().status(id), Some(&FeatureStatus::Ok));
+
+        // Re-opened, the dialog holds the pitch it was given rather than the size's.
+        h.editor.edit_feature(id);
+        h.sync_tool();
+        let tool = h.editor.tool.as_ref().unwrap();
+        assert_eq!(tool.kind, ToolKind::Thread);
+        assert_eq!(tool.params.pitch, 0.75);
+        h.cancel_tool();
+    }
+}

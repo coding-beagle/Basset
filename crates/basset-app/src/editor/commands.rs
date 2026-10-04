@@ -827,6 +827,15 @@ pub(crate) const BINDINGS: &[Binding] = &[
         enabled: IDLE,
     },
     Binding {
+        id: "modify.thread",
+        label: "Thread",
+        group: Group::Modify,
+        chords: &[],
+        live: LiveIn::Model,
+        make: || Command::Tool(ToolKind::Thread),
+        enabled: IDLE,
+    },
+    Binding {
         id: "modify.combine",
         label: "Combine",
         group: Group::Modify,
