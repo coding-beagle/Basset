@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::document::Document;
 
-pub const FORMAT_VERSION: u32 = 9;
+pub const FORMAT_VERSION: u32 = 10;
 pub const EXTENSION: &str = "bass";
 
 #[derive(Serialize, Deserialize)]
@@ -52,7 +52,14 @@ pub fn read<R: Read>(r: R) -> Result<Document, FileError> {
         });
     }
     let value = migrate(file.format_version, file.document);
-    Ok(serde_json::from_value(value)?)
+    let mut doc: Document = serde_json::from_value(value)?;
+    // Where a face puts a sketch's origin changed in version 10, and where the old rule
+    // put it is a matter of geometry, which only a replay can tell; see
+    // [`Document::convert_face_frames_from_v9`].
+    if file.format_version < 10 {
+        doc.convert_face_frames_from_v9();
+    }
+    Ok(doc)
 }
 
 pub fn save(path: impl AsRef<Path>, doc: &Document) -> Result<(), FileError> {
@@ -93,8 +100,21 @@ fn migrate_step(mut value: serde_json::Value, version: u32) -> serde_json::Value
         6 => migrate_v6_offset_dimension(value),
         7 => migrate_v7_body_names(value),
         8 => migrate_v8_region_curves(value),
+        9 => migrate_v9_face_frames(value),
         _ => value,
     }
+}
+
+/// Version 10 moved the origin of a sketch on a face from the average of the face's
+/// vertices, which moved whenever the face changed shape, to where the world origin falls
+/// on the face's plane; and it links a sketch's copy of its face's outline to the face.
+///
+/// Nothing to rewrite in the JSON: the links are additive, and moving each sketch into
+/// its new frame needs the geometry, so [`read`] does it on the document once it is
+/// built. Bumped so an older build refuses a file whose sketches it would put in the
+/// wrong place.
+fn migrate_v9_face_frames(value: serde_json::Value) -> serde_json::Value {
+    value
 }
 
 /// Version 9 added the curve-set signature a region reference carries beside its sample

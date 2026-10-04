@@ -57,12 +57,22 @@ region with a warning, since it was once inside one and the drawing moved under 
 point-only reference (files from before the signature existed) that encloses nothing
 fails as it always did, because guessing a region for a point never known to be inside
 anything would turn a typo into a body. Planar faces used
-as sketch planes get a frame anchored at the face centroid. A sketch started on a face
-also opens with the face's outline copied in (`core::project_face`): the kernel's
-`face_profile` is turned back into lines, arcs and circles — a run of boundary pieces
-bordering one neighbour is one curve — with every point fixed and a circle's diameter
-written, so the face is a reference the sketch can dimension from, snap to and extrude,
-and not a loose drawing the timeline would warn about. A generator's inputs are
+as sketch planes get a frame whose origin is where the world origin falls on the face's
+plane, as in Fusion: nothing about the face's extent goes into it, so a sketch on a wall
+stays where it was drawn when an edit upstream makes the wall taller. (Before format 10
+the origin was the face's vertex average, which moved with every such edit and took the
+sketch along; reading an older file replays it once the old way to learn where each
+sketch sat and moves it into the new frame, see `Document::convert_face_frames_from_v9`.)
+A sketch started on a face also opens with the face's outline copied in
+(`core::project_face`): the kernel's `face_profile` is turned back into lines, arcs and
+circles — a run of boundary pieces bordering one neighbour is one curve — with every
+point fixed and a circle's diameter written, so the face is a reference the sketch can
+dimension from, snap to and extrude, and not a loose drawing the timeline would warn
+about. The copy is linked: each point and circle carries a key naming what it is on the
+face (the corner between the stretches bordering two neighbours, the centre of the arc
+along one), and every replay re-traces the face and moves the pinned copy to match
+(`core::refresh_face_outline`) before the sketch is solved. A corner the face no longer
+has stays where it was and the sketch warns; a point the user unpinned is theirs. A generator's inputs are
 `RegionRef`s, so the same feature takes either a sketch region or a planar face; a face
 used as a region tags each stretch of its outline with a hash of the face it borders, so
 the lateral faces the generator grows there keep their keys when the body below changes.

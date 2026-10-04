@@ -52,6 +52,12 @@ pub struct Sketch {
     /// Dimensions driven by an expression instead of a typed number.
     #[serde(default)]
     pub(crate) dimension_exprs: SecondaryMap<ConstraintId, String>,
+    /// Entities copied in from something outside the sketch — the outline of the face it
+    /// sits on — each with the key that finds it there again, so the copy can be brought
+    /// up to date when that thing changes. The sketch does not know what the keys mean;
+    /// whoever made the copy does.
+    #[serde(default, skip_serializing_if = "SecondaryMap::is_empty")]
+    pub(crate) links: SecondaryMap<EntityId, u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -222,6 +228,40 @@ impl Sketch {
         }
         for e in doomed {
             self.entities.remove(e);
+            self.links.remove(e);
+        }
+    }
+
+    /// Records that `id` is a copy of something outside the sketch, found there by `key`.
+    pub fn link(&mut self, id: EntityId, key: u64) -> Result<(), SketchError> {
+        if !self.entities.contains_key(id) {
+            return Err(SketchError::UnknownEntity(id));
+        }
+        self.links.insert(id, key);
+        Ok(())
+    }
+
+    /// The key `id` was linked with, if it is a copy of something outside the sketch.
+    pub fn link_key(&self, id: EntityId) -> Option<u64> {
+        self.links.get(id).copied()
+    }
+
+    /// Every linked entity with its key.
+    pub fn links(&self) -> impl Iterator<Item = (EntityId, u64)> + '_ {
+        self.links.iter().map(|(id, key)| (id, *key))
+    }
+
+    /// Moves everything in the sketch by `offset`: every point, and every dimension label
+    /// the user placed. Dimensions are relative, so they read the same afterwards; this is
+    /// how a sketch is carried into a frame whose origin sits somewhere else.
+    pub fn translate(&mut self, offset: Vec2) {
+        for data in self.entities.values_mut() {
+            if let Entity::Point { pos } = &mut data.entity {
+                *pos += offset;
+            }
+        }
+        for label in self.labels.values_mut() {
+            *label += offset;
         }
     }
 

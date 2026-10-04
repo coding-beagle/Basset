@@ -66,6 +66,10 @@ pub struct Regenerator {
     parameters: Parameters,
     tessellation: Tessellation,
     kernel_tessellation: kernel::Tessellation,
+    /// Puts a sketch on a face where files before format version 10 put it, at the
+    /// average of the face's vertices. Only converting such a file sets it: it replays the
+    /// file as it was written to learn where each sketch sat.
+    pub(crate) legacy_face_frames: bool,
 }
 
 impl Regenerator {
@@ -229,12 +233,43 @@ impl Regenerator {
                 component,
                 sketch,
             } => {
-                let frame = resolve_plane(state, plane)?;
+                let frame = resolve_plane(state, plane, self.legacy_face_frames)?;
                 if !state.components.contains_key(component) {
                     return Err(RegenError::MissingComponent(*component));
                 }
                 let mut solved = sketch.clone();
                 solved.set_font(self.font.clone());
+                // The face's outline in the sketch follows the face: an edit upstream that
+                // moved a corner moves the copy of it before anything is solved against it.
+                if let PlaneRef::Face(face) = plane
+                    && solved.links().next().is_some()
+                {
+                    let outline = state
+                        .bodies
+                        .get(&face.body)
+                        .ok_or(RegenError::MissingBody(face.body.0))?
+                        .solid
+                        .face_profile(face.key);
+                    match outline {
+                        Ok(profile) => {
+                            let gone = crate::project::refresh_face_outline(&mut solved, &profile)?;
+                            if !gone.is_empty() {
+                                warnings.push(match gone.len() {
+                                    1 => "1 piece of the face's outline in this sketch is no \
+                                          longer on the face, and stays where it was"
+                                        .to_string(),
+                                    n => format!(
+                                        "{n} pieces of the face's outline in this sketch are no \
+                                         longer on the face, and stay where they were"
+                                    ),
+                                });
+                            }
+                        }
+                        Err(e) => warnings.push(format!(
+                            "the face's outline could not be read, so the copy of it was left where it was: {e}"
+                        )),
+                    }
+                }
                 // The document's table sits behind the sketch's own, so a dimension bound
                 // to a document parameter is re-driven here, on every replay.
                 let outer = self.parameters.lookup();
@@ -258,11 +293,11 @@ impl Regenerator {
                 );
             }
             FeatureKind::OffsetPlane { base, distance } => {
-                let frame = resolve_plane(state, base)?.offset(*distance);
+                let frame = resolve_plane(state, base, self.legacy_face_frames)?.offset(*distance);
                 state.planes.insert(id, frame);
             }
             FeatureKind::AngledPlane { base, axis, angle } => {
-                let frame = resolve_plane(state, base)?;
+                let frame = resolve_plane(state, base, self.legacy_face_frames)?;
                 let axis = resolve_axis(state, axis)?;
                 state
                     .planes
@@ -580,7 +615,11 @@ fn check_edges_exist(solid: &Solid, keys: &[kernel::EdgeKey]) -> Result<(), Rege
     Ok(())
 }
 
-pub(crate) fn resolve_plane(state: &ModelState, plane: &PlaneRef) -> Result<Frame, RegenError> {
+pub(crate) fn resolve_plane(
+    state: &ModelState,
+    plane: &PlaneRef,
+    legacy: bool,
+) -> Result<Frame, RegenError> {
     match plane {
         PlaneRef::Origin(p) => Ok(match p {
             crate::refs::OriginPlane::XY => Frame::XY,
@@ -601,14 +640,19 @@ pub(crate) fn resolve_plane(state: &ModelState, plane: &PlaneRef) -> Result<Fram
                 .solid
                 .face(face.key)
                 .ok_or_else(|| RegenError::NotAPlanarFace(format!("{:?}", face.key)))?;
-            face_frame(f).ok_or_else(|| RegenError::NotAPlanarFace(format!("{:?}", face.key)))
+            let frame = if legacy {
+                f.legacy_frame()
+            } else {
+                face_frame(f)
+            };
+            frame.ok_or_else(|| RegenError::NotAPlanarFace(format!("{:?}", face.key)))
         }
     }
 }
 
-/// The sketch frame a planar face provides: anchored at the face centroid so sketch
-/// coordinates are intuitive and independent of polygon fragmentation after booleans.
-/// `None` for curved faces. The application uses this too, so what the user sees when
+/// The sketch frame a planar face provides: the face's plane, with the origin where the
+/// world origin falls on it, so nothing drawn on the face moves when the face changes
+/// shape. `None` for curved faces. The application uses this too, so what the user sees when
 /// picking a face is exactly what a sketch on it will use.
 pub fn face_frame(face: &kernel::Face) -> Option<Frame> {
     face.frame()

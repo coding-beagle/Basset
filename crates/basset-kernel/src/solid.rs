@@ -297,15 +297,35 @@ impl Face {
         if total > 0.0 { sum / total } else { Vec3::ZERO }
     }
 
-    /// Frame of a planar face, anchored at the average of its vertices so the origin is
-    /// independent of how booleans happened to fragment the face. `None` for curved faces.
+    /// Frame of a planar face: its plane, with the origin where the world origin falls on
+    /// it, as Fusion places a sketch on a face. `None` for curved faces.
     ///
-    /// This is both the frame of a sketch drawn on the face and the frame of the profile
-    /// the face yields, so what the user sees when they pick it is what they get.
+    /// Nothing about the face's extent goes into the origin, so a sketch on the face stays
+    /// where it was drawn when an edit upstream grows, shrinks or notches the face; only
+    /// moving the plane itself moves it. This is both the frame of a sketch drawn on the
+    /// face and the frame of the profile the face yields, so what the user sees when they
+    /// pick it is what they get.
     pub fn frame(&self) -> Option<Frame> {
         let SurfaceKind::Planar { normal } = self.surface else {
             return None;
         };
+        let on_plane = self.vertex_average()?;
+        let z = normal.normalize();
+        Some(Frame::from_normal(z * z.dot(on_plane), z))
+    }
+
+    /// The frame faces had before format version 10, anchored at the average of the
+    /// face's vertices. That point moves whenever the face changes shape, carrying every
+    /// sketch on the face with it; it is kept only so files written then can be converted
+    /// without anything in them moving.
+    pub fn legacy_frame(&self) -> Option<Frame> {
+        let SurfaceKind::Planar { normal } = self.surface else {
+            return None;
+        };
+        Some(Frame::from_normal(self.vertex_average()?, normal))
+    }
+
+    fn vertex_average(&self) -> Option<Vec3> {
         let mut sum = Vec3::ZERO;
         let mut n = 0usize;
         for poly in &self.polygons {
@@ -314,7 +334,7 @@ impl Face {
                 n += 1;
             }
         }
-        (n > 0).then(|| Frame::from_normal(sum / n as f64, normal))
+        (n > 0).then(|| sum / n as f64)
     }
 }
 

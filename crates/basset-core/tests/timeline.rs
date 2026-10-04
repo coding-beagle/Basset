@@ -177,10 +177,11 @@ fn rollback_inserts_at_cursor_and_replays_forward() {
         doc.state().status(fi).is_none(),
         "rolled-back features are not evaluated"
     );
-    // Face frames are centred on the face, so the origin is the middle of the top.
+    // A face frame's origin is where the world origin falls on the face, so the middle
+    // of the 10 × 5 top is (5, 2.5).
     let cut_sketch = {
         let mut s = Sketch::new();
-        shapes::circle_center(&mut s, Vec2::ZERO, 1.0);
+        shapes::circle_center(&mut s, Vec2::new(5.0, 2.5), 1.0);
         s
     };
     let top = PlaneRef::Face(FaceRef {
@@ -191,7 +192,7 @@ fn rollback_inserts_at_cursor_and_replays_forward() {
     let hole = extrude(
         &mut doc,
         sk2,
-        Vec2::ZERO,
+        Vec2::new(5.0, 2.5),
         -4.0,
         BodyOp::Cut(vec![BodyRef(ex)]),
     );
@@ -458,14 +459,14 @@ fn sketch_on_face_and_join() {
     });
     let boss = {
         let mut s = Sketch::new();
-        shapes::circle_center(&mut s, Vec2::ZERO, 2.0);
+        shapes::circle_center(&mut s, Vec2::new(5.0, 5.0), 2.0);
         s
     };
     let sk2 = sketch_on(&mut doc, top, boss);
     let _ = extrude(
         &mut doc,
         sk2,
-        Vec2::ZERO,
+        Vec2::new(5.0, 5.0),
         5.0,
         BodyOp::Join(vec![BodyRef(base)]),
     );
@@ -478,7 +479,8 @@ fn sketch_on_face_and_join() {
     let solid = &state.body(BodyRef(base)).unwrap().solid;
     assert_relative_eq!(solid.volume(), 200.0 + PI * 4.0 * 5.0, epsilon = 0.5);
     assert!(solid.is_closed());
-    // The face frame is centred on the face, so the boss stands at the block's middle.
+    // The face frame's origin is where the world origin falls on the top, so the boss
+    // drawn at (5, 5) stands at the block's middle.
     assert_relative_eq!(solid.aabb().max.z, 7.0);
     assert_relative_eq!(solid.centroid().x, 5.0, epsilon = 1e-6);
 }
@@ -1370,14 +1372,14 @@ fn a_boss_foot_and_rim_round_together_through_the_document() {
     });
     let boss = {
         let mut s = Sketch::new();
-        shapes::circle_center(&mut s, Vec2::ZERO, 5.0);
+        shapes::circle_center(&mut s, Vec2::new(10.0, 10.0), 5.0);
         s
     };
     let sk2 = sketch_on(&mut doc, top, boss);
     let boss = extrude(
         &mut doc,
         sk2,
-        Vec2::ZERO,
+        Vec2::new(10.0, 10.0),
         5.0,
         BodyOp::Join(vec![BodyRef(block)]),
     );
