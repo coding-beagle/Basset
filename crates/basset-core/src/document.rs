@@ -6,7 +6,10 @@
 //! this is cheaper and far less error-prone than inverse operations, and it means undo can
 //! never disagree with what regeneration produces.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+
+use basset_math::{Frame, Vec2};
 
 use basset_sketch::{Font, SketchError, expr};
 use serde::{Deserialize, Serialize};
@@ -15,8 +18,8 @@ use crate::feature::{Feature, FeatureKind, NumericField};
 use crate::ids::{ComponentId, FeatureId};
 use crate::model::ModelState;
 use crate::parameters::Parameters;
-use crate::refs::BodyRef;
-use crate::regen::Regenerator;
+use crate::refs::{BodyRef, PlaneRef, RegionRef};
+use crate::regen::{Regenerator, resolve_plane};
 use crate::timeline::{ReorderError, Timeline};
 use crate::visibility::Visibility;
 
@@ -522,6 +525,88 @@ impl Document {
             .ok_or(DocumentError::UnknownFeature(id))?;
         self.regen.invalidate_from(index);
         Ok(true)
+    }
+
+    /// Carries a document written before format version 10 into the frame a face gives a
+    /// sketch now, without moving anything in it.
+    ///
+    /// Those files put a sketch on a face with its origin at the average of the face's
+    /// vertices, a point that moved every time the face changed shape and took the sketch
+    /// with it. Now the origin is where the world origin falls on the face's plane. Each
+    /// sketch whose origin differs is moved by the difference — its points, its dimension
+    /// labels and the sample points of the regions picked from it — so it sits in the world
+    /// exactly where it did. The old origin can only be learned by replaying the file the
+    /// way it was written, so this replays it twice: once the old way to read where every
+    /// sketch sat, and once the new way, sketch by sketch, each converted before the replay
+    /// reaches the next so that every face is where it was.
+    ///
+    /// A sketch on a face also gets its copy of the face's outline linked, where the copy
+    /// still lies on the face, so it follows the face from now on.
+    pub(crate) fn convert_face_frames_from_v9(&mut self) {
+        let cursor = self.timeline.cursor();
+        let mut timeline = self.timeline.clone();
+        timeline.set_cursor(timeline.len());
+        let mut legacy = Regenerator::default();
+        legacy.legacy_face_frames = true;
+        legacy.set_parameters(self.parameters.clone());
+        let was: HashMap<FeatureId, Frame> = legacy
+            .evaluate(&timeline)
+            .sketches
+            .iter()
+            .map(|(id, s)| (*id, s.frame))
+            .collect();
+        let mut modern = Regenerator::default();
+        modern.set_parameters(self.parameters.clone());
+        for index in 0..timeline.len() {
+            let feature = &timeline.features()[index];
+            let FeatureKind::Sketch { plane, .. } = &feature.kind else {
+                continue;
+            };
+            let (id, plane) = (feature.id, *plane);
+            let Some(was) = was.get(&id) else {
+                continue;
+            };
+            let state = modern.evaluate_prefix(&timeline, index);
+            let Ok(now) = resolve_plane(state, &plane, false) else {
+                continue;
+            };
+            let shift = was.origin - now.origin;
+            let offset = Vec2::new(shift.dot(now.x), shift.dot(now.y));
+            let outline = match plane {
+                PlaneRef::Face(f) => state
+                    .body(f.body)
+                    .and_then(|b| b.solid.face_profile(f.key).ok()),
+                _ => None,
+            };
+            let moved = offset.length() > 0.0;
+            if !moved && outline.is_none() {
+                continue;
+            }
+            timeline.edit(id, |f| {
+                if let FeatureKind::Sketch { sketch, .. } = &mut f.kind {
+                    sketch.translate(offset);
+                    if let Some(outline) = &outline {
+                        // An outline that cannot be matched stays as it was: pinned.
+                        let _ = crate::project::adopt_face_outline(sketch, outline);
+                    }
+                }
+            });
+            if moved {
+                for f in timeline.features_mut() {
+                    for region in f.kind.regions_mut() {
+                        if let RegionRef::Profile(p) = region
+                            && p.sketch == id
+                        {
+                            p.sample += offset;
+                        }
+                    }
+                }
+            }
+            modern.invalidate_from(index);
+        }
+        timeline.set_cursor(cursor);
+        self.timeline = timeline;
+        self.regen.invalidate_from(0);
     }
 
     /// Edits a sketch feature with the document's parameter table in hand.

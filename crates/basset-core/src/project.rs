@@ -1,4 +1,5 @@
-//! Copies a planar face's outline into a sketch drawn on that face.
+//! Copies a planar face's outline into a sketch drawn on that face, and keeps the copy on
+//! the face as the face changes.
 //!
 //! A sketch started on a face opens with the face already in it: every edge of the face
 //! is a sketch curve, pinned where the body puts it, so the user can dimension from the
@@ -8,28 +9,222 @@
 //! turns those pieces back into the curves the user would have drawn: one line for a run
 //! of collinear pieces, one arc or circle for a run that lies on a circle, and a polyline
 //! for anything else.
+//!
+//! The copy is linked, not traced once. Every point and circle it makes carries a key
+//! saying what it is on the face — the corner where the stretch bordering one neighbour
+//! meets the stretch bordering the next, the centre of the arc along a stretch — and
+//! [`refresh_face_outline`] uses those keys on every replay to put the copy back on the
+//! face as it now is. A neighbour is named by the tag `face_profile` gives its stretch,
+//! which survives edits of the body, so a wall extruded taller keeps the names of its
+//! corners and its copy simply follows it up.
+
+use std::collections::{HashMap, HashSet};
 
 use basset_kernel::{Contour, Profile};
 use basset_math::Vec2;
-use basset_sketch::{Constraint, EntityId, Sketch, SketchError};
+use basset_sketch::{Constraint, Entity, EntityId, Sketch, SketchError};
 
 /// How far a boundary vertex may sit off the line or circle its run is fitted to before
 /// the run is drawn as it came. The kernel's healed shells agree to `MERGE_TOL` (1 µm),
 /// so this is generous for a fit and still far under anything a sketch can see.
 const FIT_TOL: f64 = 1e-5;
 
-/// Adds the profile's outline to `sketch` and pins it in place. Returns every curve it
-/// made, so a caller can tell projected geometry from what the user draws afterwards.
+/// How close a pinned point of an old, unlinked copy must sit to a point of the face's
+/// outline to be taken for a copy of it. Converting an old file moves the sketch by a
+/// computed offset, so the two agree to rounding, not exactly.
+const ADOPT_TOL: f64 = 1e-6;
+
+/// Adds the profile's outline to `sketch`, pins it in place and links it to the face.
+/// Returns every curve it made, so a caller can tell projected geometry from what the
+/// user draws afterwards.
 ///
 /// Points are fixed rather than dimensioned because the face is the reference, not a
 /// thing the sketch drives: a circle's diameter is the one dimension written, because a
 /// radius has no point to pin.
 pub fn project_face(sketch: &mut Sketch, profile: &Profile) -> Result<Vec<EntityId>, SketchError> {
+    let mut seen = Seen::default();
     let mut curves = Vec::new();
     for contour in profile.loops() {
-        curves.extend(project_loop(sketch, contour)?);
+        curves.extend(project_loop(sketch, contour, &mut seen)?);
     }
     Ok(curves)
+}
+
+/// Moves a sketch's linked copy of a face's outline to where `profile` — the face as it
+/// is now, in the sketch's frame — puts it.
+///
+/// A pinned point goes where the face has it, and a circle takes the face's diameter.
+/// A point the user has unpinned is theirs now and is left alone. Returns the linked
+/// entities the face no longer has — a corner a later edit took away — which stay where
+/// they were, for the caller to say so.
+pub fn refresh_face_outline(
+    sketch: &mut Sketch,
+    profile: &Profile,
+) -> Result<Vec<EntityId>, SketchError> {
+    if sketch.links().next().is_none() {
+        return Ok(Vec::new());
+    }
+    let mut face = Sketch::new();
+    project_face(&mut face, profile)?;
+    let found: HashMap<u64, EntityId> = face.links().map(|(id, key)| (key, id)).collect();
+    let pinned = pinned_points(sketch);
+    let mut missing = Vec::new();
+    for (id, key) in sketch.links().collect::<Vec<_>>() {
+        let (Some(mine), Some(theirs)) = (
+            sketch.entity(id).map(|e| e.entity.clone()),
+            found.get(&key).and_then(|f| face.entity(*f)),
+        ) else {
+            missing.push(id);
+            continue;
+        };
+        match (mine, &theirs.entity) {
+            (Entity::Point { .. }, Entity::Point { pos }) => {
+                if pinned.contains(&id) {
+                    sketch.set_point_pos(id, *pos)?;
+                }
+            }
+            (Entity::Circle { .. }, Entity::Circle { radius, .. }) => {
+                let diameters: Vec<_> = sketch
+                    .constraints()
+                    .filter(|(_, c)| {
+                        matches!(c, Constraint::Diameter { curve, value }
+                            if *curve == id && (value - 2.0 * radius).abs() > f64::EPSILON)
+                    })
+                    .map(|(c, _)| c)
+                    .collect();
+                for c in diameters {
+                    sketch.set_dimension_value(c, 2.0 * radius)?;
+                }
+            }
+            _ => missing.push(id),
+        }
+    }
+    Ok(missing)
+}
+
+/// Links an old, unlinked copy of a face's outline — one made before copies were linked —
+/// so it follows the face from now on. Returns how many entities it linked.
+///
+/// The copy has no keys, so it is recognised by where it is: a pinned point sitting on a
+/// point of the face's outline as `profile` has it now is taken for a copy of that point,
+/// and a circle whose centre was so taken and whose radius matches for a copy of that
+/// circle. A copy the face has since moved away from is not recognised and stays as it
+/// was, pinned where it was drawn.
+pub fn adopt_face_outline(sketch: &mut Sketch, profile: &Profile) -> Result<usize, SketchError> {
+    let mut face = Sketch::new();
+    project_face(&mut face, profile)?;
+    let mut taken: HashSet<u64> = sketch.links().map(|(_, key)| key).collect();
+    let mut adopted = 0;
+    let mut centres: HashMap<EntityId, EntityId> = HashMap::new();
+    for id in pinned_points(sketch) {
+        if sketch.link_key(id).is_some() {
+            continue;
+        }
+        let Some(pos) = sketch.point_pos(id) else {
+            continue;
+        };
+        let twin = face.links().find(|(f, key)| {
+            !taken.contains(key)
+                && face
+                    .point_pos(*f)
+                    .is_some_and(|p| p.distance(pos) <= ADOPT_TOL)
+        });
+        if let Some((f, key)) = twin {
+            sketch.link(id, key)?;
+            taken.insert(key);
+            centres.insert(id, f);
+            adopted += 1;
+        }
+    }
+    let circles: Vec<(EntityId, EntityId, f64)> = sketch
+        .entities()
+        .filter_map(|(id, e)| match e.entity {
+            Entity::Circle { center, radius } if sketch.link_key(id).is_none() => {
+                Some((id, center, radius))
+            }
+            _ => None,
+        })
+        .collect();
+    for (id, center, radius) in circles {
+        let Some(face_centre) = centres.get(&center) else {
+            continue;
+        };
+        let twin = face.links().find(|(f, key)| {
+            !taken.contains(key)
+                && matches!(face.entity(*f).map(|e| &e.entity),
+                    Some(Entity::Circle { center: c, radius: r })
+                        if c == face_centre && (r - radius).abs() <= ADOPT_TOL)
+        });
+        if let Some((_, key)) = twin {
+            sketch.link(id, key)?;
+            taken.insert(key);
+            adopted += 1;
+        }
+    }
+    Ok(adopted)
+}
+
+fn pinned_points(sketch: &Sketch) -> Vec<EntityId> {
+    let mut pinned: Vec<EntityId> = sketch
+        .constraints()
+        .filter_map(|(_, c)| match c {
+            Constraint::Fix(p) => Some(*p),
+            _ => None,
+        })
+        .collect();
+    pinned.sort_unstable();
+    pinned.dedup();
+    pinned
+}
+
+/// What a linked entity is on the face, before it is hashed into a key.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Place {
+    /// Where the stretch bordering `before` gives way to the one bordering `after`.
+    Corner { before: u32, after: u32 },
+    /// The `index`th joint along a stretch drawn piece by piece.
+    Vertex { run: u32, index: u32 },
+    /// The centre of the arc or circle along a stretch.
+    Centre { run: u32 },
+    /// The circle a whole loop bordering one neighbour makes.
+    Circle { run: u32 },
+}
+
+/// Counts the places already keyed, so a face bordering the same neighbour along two
+/// separate stretches — a U-shaped neighbour — gives each its own keys.
+#[derive(Default)]
+struct Seen(HashMap<Place, u32>);
+
+impl Seen {
+    /// How many times `place` has come up before this one.
+    fn nth(&mut self, place: Place) -> u32 {
+        let count = self.0.entry(place).or_insert(0);
+        *count += 1;
+        *count - 1
+    }
+}
+
+/// FNV-1a over the place, rather than `DefaultHasher`, because the key is written into
+/// the file and has to mean the same thing to a future build.
+fn place_key(place: Place, nth: u32) -> u64 {
+    let (kind, a, b) = match place {
+        Place::Corner { before, after } => (0u8, before, after),
+        Place::Vertex { run, index } => (1, run, index),
+        Place::Centre { run } => (2, run, 0),
+        Place::Circle { run } => (3, run, 0),
+    };
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |byte: u8| {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    eat(kind);
+    for word in [a, b, nth] {
+        for byte in word.to_le_bytes() {
+            eat(byte);
+        }
+    }
+    hash
 }
 
 /// A stretch of one loop that borders a single neighbouring face: the pieces between
@@ -39,7 +234,11 @@ struct Run {
     points: Vec<usize>,
 }
 
-fn project_loop(sketch: &mut Sketch, contour: &Contour) -> Result<Vec<EntityId>, SketchError> {
+fn project_loop(
+    sketch: &mut Sketch,
+    contour: &Contour,
+    seen: &mut Seen,
+) -> Result<Vec<EntityId>, SketchError> {
     let n = contour.points.len();
     if n < 2 || contour.segments.len() != contour.edge_count() {
         return Ok(Vec::new());
@@ -73,10 +272,51 @@ fn project_loop(sketch: &mut Sketch, contour: &Contour) -> Result<Vec<EntityId>,
         }
     };
 
+    let single = runs.len() == 1 && contour.closed;
+    // Name every point before drawing anything: a corner by the two stretches meeting
+    // there, a joint inside a stretch by its place along it. An open loop's two ends
+    // border nothing on their outer side.
+    let mut keys: Vec<u64> = vec![0; n];
+    let mut run_keys: Vec<u32> = Vec::with_capacity(runs.len());
+    for (r, run) in runs.iter().enumerate() {
+        let here = tag(run.points[0]);
+        // A stretch's own places are told apart from another stretch bordering the same
+        // neighbour by which stretch it is, so they need no counting of their own.
+        let nth = seen.nth(Place::Centre { run: here });
+        run_keys.push(nth);
+        let inner = if single {
+            &run.points[..run.points.len() - 1]
+        } else {
+            let before = match r {
+                0 if !contour.closed => u32::MAX,
+                0 => tag(runs[runs.len() - 1].points[0]),
+                _ => tag(runs[r - 1].points[0]),
+            };
+            let corner = Place::Corner {
+                before,
+                after: here,
+            };
+            keys[run.points[0]] = place_key(corner, seen.nth(corner));
+            if r == runs.len() - 1 && !contour.closed {
+                let end = Place::Corner {
+                    before: here,
+                    after: u32::MAX,
+                };
+                keys[*run.points.last().unwrap()] = place_key(end, seen.nth(end));
+            }
+            &run.points[1..run.points.len() - 1]
+        };
+        let skip = usize::from(!single);
+        for (k, &i) in inner.iter().enumerate() {
+            let index = (k + skip) as u32;
+            keys[i] = place_key(Place::Vertex { run: here, index }, nth);
+        }
+    }
+
     let mut ids: Vec<Option<EntityId>> = vec![None; n];
     let mut curves = Vec::new();
-    let single = runs.len() == 1 && contour.closed;
-    for run in &runs {
+    for (run, nth) in runs.iter().zip(run_keys) {
+        let here = tag(run.points[0]);
         let pts: Vec<Vec2> = run.points.iter().map(|&i| contour.points[i]).collect();
         let mut point = |i: usize, sketch: &mut Sketch| -> Result<EntityId, SketchError> {
             if let Some(id) = ids[i] {
@@ -84,8 +324,15 @@ fn project_loop(sketch: &mut Sketch, contour: &Contour) -> Result<Vec<EntityId>,
             }
             let id = sketch.add_point(contour.points[i]);
             sketch.add_constraint(Constraint::Fix(id))?;
+            sketch.link(id, keys[i])?;
             ids[i] = Some(id);
             Ok(id)
+        };
+        let centre = |sketch: &mut Sketch, at: Vec2| -> Result<EntityId, SketchError> {
+            let c = sketch.add_point(at);
+            sketch.add_constraint(Constraint::Fix(c))?;
+            sketch.link(c, place_key(Place::Centre { run: here }, nth))?;
+            Ok(c)
         };
         // A loop with one neighbour all the way round is a circle if the points say so.
         // The fitter sees the first pieces again at the end, so the closing joint is
@@ -96,9 +343,9 @@ fn project_loop(sketch: &mut Sketch, contour: &Contour) -> Result<Vec<EntityId>,
             .copied()
             .collect();
         if single && let Some((center, radius)) = fit_circle(&wrapped) {
-            let c = sketch.add_point(center);
-            sketch.add_constraint(Constraint::Fix(c))?;
+            let c = centre(sketch, center)?;
             let circle = sketch.add_circle(c, radius)?;
+            sketch.link(circle, place_key(Place::Circle { run: here }, nth))?;
             sketch.add_constraint(Constraint::Diameter {
                 curve: circle,
                 value: 2.0 * radius,
@@ -116,8 +363,7 @@ fn project_loop(sketch: &mut Sketch, contour: &Contour) -> Result<Vec<EntityId>,
         if pts.len() >= 3
             && let Some((center, _)) = fit_circle(&pts)
         {
-            let c = sketch.add_point(center);
-            sketch.add_constraint(Constraint::Fix(c))?;
+            let c = centre(sketch, center)?;
             let a = point(first, sketch)?;
             let b = point(last, sketch)?;
             // A sketch arc runs counter-clockwise from start to end, so a run that
@@ -355,6 +601,78 @@ mod tests {
             "{}",
             profiles[0].area()
         );
+    }
+
+    fn rectangle(w: f64, h: f64, tags: [u32; 4]) -> Profile {
+        let contour = Contour {
+            points: vec![
+                Vec2::new(0.0, 0.0),
+                Vec2::new(w, 0.0),
+                Vec2::new(w, h),
+                Vec2::new(0.0, h),
+            ],
+            segments: tags.map(Segment::line).to_vec(),
+            closed: true,
+        };
+        Profile::new(Frame::XY, contour)
+    }
+
+    /// The face grows taller: the pinned corners go with it, a corner the user unpinned
+    /// stays theirs, and corners whose neighbours changed are reported, not guessed at.
+    #[test]
+    fn a_refresh_moves_pinned_corners_and_reports_the_ones_that_are_gone() {
+        let mut sketch = Sketch::new();
+        project_face(&mut sketch, &rectangle(10.0, 4.0, [1, 2, 3, 4])).unwrap();
+        let corner_at = |sketch: &Sketch, at: Vec2| {
+            sketch
+                .links()
+                .map(|(id, _)| id)
+                .find(|id| sketch.point_pos(*id).unwrap().distance(at) < 1e-9)
+                .unwrap()
+        };
+        let freed = corner_at(&sketch, Vec2::new(0.0, 4.0));
+        let pin = sketch
+            .constraints()
+            .find_map(|(c, k)| matches!(k, Constraint::Fix(p) if *p == freed).then_some(c))
+            .unwrap();
+        sketch.remove_constraint(pin);
+
+        let gone = refresh_face_outline(&mut sketch, &rectangle(10.0, 8.0, [1, 2, 3, 4])).unwrap();
+        assert!(gone.is_empty(), "{gone:?}");
+        let tops: Vec<f64> = sketch
+            .links()
+            .filter_map(|(id, _)| sketch.point_pos(id))
+            .map(|p| p.y)
+            .collect();
+        assert!(tops.contains(&8.0), "the pinned top corner rose: {tops:?}");
+        assert_eq!(sketch.point_pos(freed), Some(Vec2::new(0.0, 4.0)));
+
+        // The top now borders a different neighbour: both top corners lost their names.
+        let gone = refresh_face_outline(&mut sketch, &rectangle(10.0, 8.0, [1, 2, 9, 4])).unwrap();
+        assert_eq!(gone.len(), 2, "{gone:?}");
+    }
+
+    /// An old copy, pinned but never linked, is recognised where it still lies on the face.
+    #[test]
+    fn an_unlinked_copy_is_adopted_where_it_matches_the_face() {
+        let mut sketch = Sketch::new();
+        let r = basset_sketch::shapes::rectangle_two_point(
+            &mut sketch,
+            Vec2::ZERO,
+            Vec2::new(10.0, 4.0),
+        );
+        for c in r.corners {
+            sketch.add_constraint(Constraint::Fix(c)).unwrap();
+        }
+        // A pinned point of the user's own, nowhere on the outline.
+        let own = sketch.add_point(Vec2::new(3.0, 1.0));
+        sketch.add_constraint(Constraint::Fix(own)).unwrap();
+        let adopted = adopt_face_outline(&mut sketch, &rectangle(10.0, 4.0, [1, 2, 3, 4])).unwrap();
+        assert_eq!(adopted, 4);
+        assert!(sketch.link_key(own).is_none());
+        assert!(r.corners.iter().all(|c| sketch.link_key(*c).is_some()));
+        refresh_face_outline(&mut sketch, &rectangle(10.0, 8.0, [1, 2, 3, 4])).unwrap();
+        assert_eq!(sketch.point_pos(r.corners[2]), Some(Vec2::new(10.0, 8.0)));
     }
 
     /// Pieces that are neither straight nor circular are kept as they are, and still

@@ -1655,6 +1655,8 @@ impl Editor {
             RegionRef::Face(f) => {
                 let body = self.pick_body(f.body)?;
                 let face = body.solid.face(f.key)?;
+                // The frame's origin is where the world origin falls on the plane, which
+                // can be well off the face; the handle belongs on the face.
                 let frame = face.frame()?;
                 let mut aabb = Aabb::empty();
                 for poly in &face.polygons {
@@ -1662,7 +1664,7 @@ impl Editor {
                         aabb.include(*v);
                     }
                 }
-                Some((frame.origin, frame.z, aabb))
+                Some((face.centroid(), frame.z, aabb))
             }
         }
     }

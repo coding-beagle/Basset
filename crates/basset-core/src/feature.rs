@@ -230,6 +230,17 @@ pub enum FeatureKind {
 }
 
 impl FeatureKind {
+    /// The regions a generator builds from; empty for every other kind of feature.
+    pub fn regions_mut(&mut self) -> &mut [RegionRef] {
+        match self {
+            FeatureKind::Extrude { regions, .. }
+            | FeatureKind::Revolve { regions, .. }
+            | FeatureKind::Sweep { regions, .. }
+            | FeatureKind::Loft { regions, .. } => regions,
+            _ => &mut [],
+        }
+    }
+
     /// Human-readable default name used when the user does not provide one.
     pub fn default_name(&self) -> &'static str {
         match self {

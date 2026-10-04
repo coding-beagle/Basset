@@ -5222,6 +5222,21 @@ pub fn enter_existing(editor: &mut Editor, id: FeatureId, previous_cursor: usize
         editor.report_error("the sketch plane no longer exists");
         return;
     };
+    // The copy of the face's outline is brought up to date as a replay does it, so the
+    // sketch opens with the face where the model has it, not where it was when drawn.
+    let mut sketch = sketch;
+    if let PlaneRef::Face(face) = &plane
+        && let Some(Ok(profile)) = editor
+            .doc
+            .state()
+            .body(face.body)
+            .map(|b| b.solid.face_profile(face.key))
+        && let Err(e) = basset_core::refresh_face_outline(&mut sketch, &profile)
+    {
+        editor.report_error(format!(
+            "the face's outline was not brought up to date: {e}"
+        ));
+    }
     editor.doc.begin_transaction();
     start(editor, id, frame, sketch, Some(previous_cursor));
 }

@@ -32,7 +32,7 @@ pub use feature::{BodyOp, CombineOp, Extent, Feature, FeatureKind, NumericField}
 pub use ids::{ComponentId, FeatureId};
 pub use model::{Body, Component, FeatureStatus, ModelState, SolvedSketch};
 pub use parameters::Parameters;
-pub use project::project_face;
+pub use project::{adopt_face_outline, project_face, refresh_face_outline};
 pub use refs::{
     AxisRef, BodyRef, EdgeRef, FaceRef, OriginAxis, OriginPlane, PathRef, PlaneRef, ProfileRef,
     RegionRef,

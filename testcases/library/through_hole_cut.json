@@ -1,5 +1,5 @@
 {
-  "description": "A sketch on the top face of a block (its frame sits at the face centroid) with a circle cut down through the whole block.",
+  "description": "A sketch on the top face of a block (its frame's origin is where the world origin falls on the face) with a circle cut down through the whole block's middle.",
   "calls": [
     {
       "tool": "create_sketch",
@@ -51,8 +51,8 @@
           {
             "op": "circle",
             "center": [
-              0,
-              0
+              10,
+              10
             ],
             "radius": 3
           }
@@ -64,8 +64,8 @@
       "arguments": {
         "regions": [
           [
-            0,
-            0
+            10,
+            10
           ]
         ],
         "sketch": "$3",

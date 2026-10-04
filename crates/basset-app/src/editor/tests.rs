@@ -994,12 +994,14 @@ fn a_sketch_on_a_face_opens_with_the_face_copied_in() {
                 .any(|(_, c)| matches!(c, Constraint::Fix(f) if f == p)),
             "corner {p:?} is pinned"
         );
-        // The face frame sits at the face centroid, so the 10×10 top's corners land at
-        // ±5 in sketch coordinates.
+        // The face frame's origin is where the world origin falls on the face, so the
+        // corners of the top, which spans 0 to 10 in x and y, land at 0 or 10.
         let pos = s.sketch.point_pos(*p).unwrap();
+        let on_grid = |v: f64| v.abs() < 1e-6 || (v - 10.0).abs() < 1e-6;
+        assert!(on_grid(pos.x) && on_grid(pos.y), "{pos:?}");
         assert!(
-            (pos.x.abs() - 5.0).abs() < 1e-6 && (pos.y.abs() - 5.0).abs() < 1e-6,
-            "{pos:?}"
+            s.sketch.link_key(*p).is_some(),
+            "corner {p:?} is linked to the face"
         );
     }
     let profiles = s.sketch.profiles(&basset_sketch::Tessellation::default());
