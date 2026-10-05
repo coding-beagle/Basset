@@ -15,12 +15,13 @@ rewritten when the next tool arrives.
 | Solids | extrude (one side / symmetric / two sides / to a face of another body, clicked while the tool runs), revolve, sweep, loft, from a sketch region or a planar face; join / cut / intersect, each against any number of target bodies chosen from a checklist (a cut through a stack offers the whole stack); fillet, chamfer, thread (ISO metric, on a shaft or in a hole, full length or partial, either hand), combine, move |
 | Construction | offset plane, plane at an angle, sketch on a planar face |
 | Simulation | A Simulation workspace, chosen by a tab beside Design: a static stress study or a topology optimisation of one body on a voxel mesh — faces held and loaded by clicking them, with ground marks on the held faces and load arrows plus a draggable force manipulator on the loaded ones, force or pressure, a material from a library of about thirty engineering alloys and plastics (or typed moduli) — solved on a background thread with live progress, a progress bar and a Stop button that really cancels, the maxima, reaction, mass and safety factor against yield reported in a study tree and side panel, the body redrawn deformed and coloured by von Mises stress, displacement or safety factor with a legend, a topology result shown as the kept elements at a density threshold, and results exportable as VTK; results go stale when the model is edited and survive a flip back to Design |
+| Render | A Render workspace beside Design and Simulation: an appearance library of about a hundred finishes (metals polished, satin, brushed and anodized; gloss, matte, metallic and powder-coat paints; plastics, rubber, glass, wood, stone, carbon fibre, LEDs) painted onto bodies or single faces with a click, editable "in this design" so every body wearing one follows; eight procedural environments (Photo Booth, Sharp Highlights, Clear Sky, Dusk, …) with brightness, rotation, a sky or solid background, a shadow-catching ground plane with optional reflections, and depth of field; a physically based raster preview under that lighting, a progressive in-canvas path-traced render over it, and final renders at any size into a rendering gallery, saved as PNG. Appearances also show in Design, are saved in the file and are undoable without regenerating the model |
 | Timeline | insert at cursor, edit, suppress, reorder, delete, roll back / forward; edits replay forward with per-feature caching; extrude, revolve, fillet, chamfer, thread and construction-plane values drivable by expression; per-feature failure reporting |
 | Files | `.bass` documents (versioned JSON); STL and 3MF export of bodies and components; git projects: a folder of parts under git, with a Project panel listing the parts and their state, the project's history, any part openable as it was at any commit, commits of any set of parts from the editor, and a comparison with any commit drawn over the model — new faces and bodies in green, gone ones as red ghosts, changed features marked in the timeline |
 | Viewport | wgpu renderer with orbit camera, MSAA, pixel-width lines, view-dependent silhouettes so a curved body is bounded against the background, a grid on any plane, face highlighting, translucent region fills, ray picking |
 | App | winit + egui desktop shell: browser, timeline with rollback marker and context menu, live-preview tool dialogs, viewport transform manipulator (arrows and rotation rings) for sketch and body moves, navigation cube, sketch mode with shape tools, constraint tools and click-to-edit dimensions, native open/save/export dialogs; one declared table of keyboard commands, a shortcut overlay and a fuzzy command palette over it |
 
-| Automation | `basset-mcp`, a Model Context Protocol server over stdio that builds and inspects documents — sketches, extrudes and the rest of the timeline, body volumes and shells, a whole-document check, a linear elastic study of a body (`fea_static`) and the material library it draws on (`fea_materials`) and a topology optimisation of it (`fea_topology`) — so an agent can model with and test the modeller; `testcases/library/`, a library of test geometries written in that protocol with the results they must produce |
+| Automation | `basset-mcp`, a Model Context Protocol server over stdio that builds and inspects documents — sketches, extrudes and the rest of the timeline, body volumes and shells, a whole-document check, a linear elastic study of a body (`fea_static`) and the material library it draws on (`fea_materials`) and a topology optimisation of it (`fea_topology`), and appearances, the render scene and path-traced PNG renders (`appearance_library`, `set_appearance`, `define_appearance`, `scene_settings`, `render_image`) — so an agent can model with and test the modeller; `testcases/library/`, a library of test geometries written in that protocol with the results they must produce |
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the crate layout, identity strategy and the
 honest list of kernel limitations.
@@ -218,6 +219,18 @@ must come out with. Those files are the regression suite for sketching and extru
   features are inserted at the marker.
 * **Files**: `.bass` documents through the File menu or `Ctrl+S` / `Ctrl+O`; Export STL /
   3MF writes the selected bodies, or every visible body when nothing is selected.
+* **Render**: the Render tab. Click a swatch in the Appearance panel's library to pick
+  it up as a brush, then click bodies (or, with *Apply to: Faces*, single faces) to paint
+  them; Esc puts the brush down. Without a brush a click selects, and the panel shows what
+  the selection wears with a button to take it off. *In this design* lists the document's
+  own copies: click one to edit its colour, metalness, roughness, transmission, clear
+  coat, emission and pattern, and every body wearing it follows. The Scene panel picks
+  the environment, brightness, rotation, background, floor and depth of field. *Start*
+  in the ribbon path-traces the view in place, refining while the view is still, at the
+  chosen quality; *Render…* renders the view at a chosen size and sample count into the
+  gallery along the bottom, where a finished render opens and saves as a PNG.
+  `cargo run --release -p basset-render --example showcase -- out.png "Clear Sky"`
+  renders a row of library finishes without the editor.
 * **Git**: a design is a *project* — a folder of `.bass` parts under git. Open a
   document from inside a repository and the project is open with it; or make one with
   File › New project… (a folder, made a repository if it is not one) or open one with
@@ -315,6 +328,7 @@ crates/
   basset-core      document, timeline, regeneration, .bass files
   basset-io        STL / 3MF export
   basset-fea       basic finite element analysis (voxel mesh, linear static, topology optimisation, VTK)
+  basset-render    appearances and their library, environments, CPU path tracer, PNG output
   basset-viewport  wgpu renderer
   basset-app       desktop application
 ```

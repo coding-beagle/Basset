@@ -9,11 +9,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use basset_kernel::FaceKey;
 use basset_math::{Frame, Vec2};
+use basset_render::{Appearance, SceneSettings};
 
 use basset_sketch::{Font, SketchError, expr};
 use serde::{Deserialize, Serialize};
 
+use crate::appearances::Appearances;
 use crate::feature::{Feature, FeatureKind, NumericField};
 use crate::ids::{ComponentId, FeatureId};
 use crate::model::ModelState;
@@ -63,6 +66,10 @@ pub enum DocumentError {
     BodyNotPresent(BodyRef),
     #[error("a name cannot be empty")]
     EmptyName,
+    #[error("no appearance named {0:?} in this design")]
+    UnknownAppearance(String),
+    #[error("this design already has an appearance named {0:?}")]
+    AppearanceExists(String),
     #[error(transparent)]
     Reorder(#[from] ReorderError),
     #[error(transparent)]
@@ -83,6 +90,17 @@ pub struct Document {
     /// not an edit, and undo stepping through visibility toggles would bury the edits.
     #[serde(default)]
     visibility: Visibility,
+    /// What bodies and faces look like. Part of [`Snapshot`], unlike visibility: painting
+    /// a body is an edit, and Ctrl+Z after painting the wrong one must take the paint
+    /// back rather than the fillet before it. Not part of the model, so undoing it does
+    /// not regenerate anything; see [`Document::model_stamp`].
+    #[serde(default)]
+    appearances: Appearances,
+    /// The render's lighting, backdrop and floor. Saved, and outside the undo history for
+    /// the reason visibility is: dragging the brightness is looking at the part, not
+    /// changing it, and a hundred undo steps of it would bury the edits.
+    #[serde(default)]
+    scene: SceneSettings,
     #[serde(skip)]
     regen: Regenerator,
     #[serde(skip)]
@@ -106,6 +124,24 @@ pub struct Document {
     /// serialising the timeline to find out. Not saved: it means nothing between runs.
     #[serde(skip)]
     revision: u64,
+    /// Names the content of the timeline and parameter table: changed by every model
+    /// mutation, carried by every snapshot. A snapshot with the stamp the document has
+    /// now holds the same model, so restoring it — undoing an appearance change — needs
+    /// no regeneration and moves no [`Self::revision`], which keeps a stress plot fresh
+    /// and a comparison uncomputed across a change of colour.
+    #[serde(skip)]
+    model_stamp: u64,
+    #[serde(skip)]
+    next_stamp: u64,
+    /// Counts changes to [`Self::appearances`] and [`Self::scene`], for whoever caches
+    /// what the model looks like rendered.
+    #[serde(skip)]
+    appearance_revision: u64,
+    /// The appearance whose definition the last undo entry was recorded for, while no
+    /// other edit has happened since. Dragging a roughness slider edits the definition on
+    /// every frame of the drag, and the drag is one change to the user.
+    #[serde(skip)]
+    editing_appearance: Option<String>,
 }
 
 /// What one undo step restores.
@@ -117,6 +153,8 @@ pub struct Document {
 struct Snapshot {
     timeline: Timeline,
     parameters: Parameters,
+    appearances: Appearances,
+    model_stamp: u64,
 }
 
 impl Default for Document {
@@ -133,12 +171,18 @@ impl Document {
             timeline: Timeline::new(),
             parameters: Parameters::new(),
             visibility: Visibility::default(),
+            appearances: Appearances::default(),
+            scene: SceneSettings::default(),
             regen: Regenerator::default(),
             undo: Vec::new(),
             redo: Vec::new(),
             redo_before_transaction: Vec::new(),
             in_transaction: false,
             revision: 0,
+            model_stamp: 0,
+            next_stamp: 0,
+            appearance_revision: 0,
+            editing_appearance: None,
         }
     }
 
@@ -394,6 +438,160 @@ impl Document {
 
     pub fn set_visibility(&mut self, visibility: Visibility) {
         self.visibility = visibility;
+    }
+
+    // ----- appearances and the render scene ---------------------------------------------
+
+    pub fn appearances(&self) -> &Appearances {
+        &self.appearances
+    }
+
+    /// A number that changes whenever the appearances or the scene settings do, undo and
+    /// redo included: the key a cached render of the model is invalidated by, beside
+    /// [`Self::revision`] for the geometry.
+    pub fn appearance_revision(&self) -> u64 {
+        self.appearance_revision
+    }
+
+    /// Paints a body, taking a copy of the appearance into the design if it has none of
+    /// that name; `None` takes the body's own appearance off, so it wears the document's
+    /// default again. Faces given appearances of their own keep them, as in Fusion.
+    pub fn set_body_appearance(&mut self, body: BodyRef, appearance: Option<&Appearance>) {
+        let wanted = appearance.map(|a| a.display_name().to_owned());
+        if self.appearances.bodies.get(&body) == wanted.as_ref()
+            && appearance.is_none_or(|a| self.appearances.get(a.display_name()).is_some())
+        {
+            return;
+        }
+        self.record_appearance_undo(None);
+        match appearance {
+            Some(a) => {
+                let name = self.appearances.define(a);
+                self.appearances.bodies.insert(body, name);
+            }
+            None => {
+                self.appearances.bodies.remove(&body);
+            }
+        }
+    }
+
+    /// Paints one face of a body, or with `None` hands it back to its body's appearance.
+    pub fn set_face_appearance(
+        &mut self,
+        body: BodyRef,
+        face: FaceKey,
+        appearance: Option<&Appearance>,
+    ) {
+        let current = self
+            .appearances
+            .face_assignment(body, face)
+            .map(str::to_owned);
+        let wanted = appearance.map(|a| a.display_name().to_owned());
+        if current == wanted
+            && appearance.is_none_or(|a| self.appearances.get(a.display_name()).is_some())
+        {
+            return;
+        }
+        self.record_appearance_undo(None);
+        let name = appearance.map(|a| self.appearances.define(a));
+        self.appearances.assign_face(body, face, name);
+    }
+
+    /// Takes a copy of an appearance into the design without applying it anywhere, so it
+    /// is in "In this design" ready to paint with. A name the design already has is left
+    /// as it is; [`Self::edit_appearance`] changes a definition.
+    pub fn define_appearance(&mut self, appearance: &Appearance) -> String {
+        let name = appearance.display_name().to_owned();
+        if self.appearances.get(&name).is_none() {
+            self.record_appearance_undo(None);
+            self.appearances.define(appearance);
+        }
+        name
+    }
+
+    /// Takes every face appearance off a body, as Fusion's "remove face appearances".
+    pub fn clear_face_appearances(&mut self, body: BodyRef) {
+        if self.appearances.face_overrides(body).next().is_none() {
+            return;
+        }
+        self.record_appearance_undo(None);
+        self.appearances.faces.retain(|f| f.body != body);
+    }
+
+    /// What every body without an appearance of its own wears; `None` is the default
+    /// grey.
+    pub fn set_default_appearance(&mut self, appearance: Option<&Appearance>) {
+        let wanted = appearance.map(|a| a.display_name().to_owned());
+        if self.appearances.default == wanted
+            && appearance.is_none_or(|a| self.appearances.get(a.display_name()).is_some())
+        {
+            return;
+        }
+        self.record_appearance_undo(None);
+        self.appearances.default = appearance.map(|a| self.appearances.define(a));
+    }
+
+    /// Replaces the definition of an appearance in the design, so every body and face
+    /// wearing it changes together. A new name renames it, and the assignments follow;
+    /// a name another definition already has is refused.
+    pub fn edit_appearance(
+        &mut self,
+        name: &str,
+        appearance: Appearance,
+    ) -> Result<(), DocumentError> {
+        let Some(current) = self.appearances.get(name) else {
+            return Err(DocumentError::UnknownAppearance(name.to_owned()));
+        };
+        let mut appearance = appearance.sanitised();
+        let new_name = appearance.name.trim().to_owned();
+        if new_name.is_empty() {
+            return Err(DocumentError::EmptyName);
+        }
+        appearance.name = new_name.clone();
+        if *current == appearance {
+            return Ok(());
+        }
+        if new_name != name && self.appearances.defined.contains_key(&new_name) {
+            return Err(DocumentError::AppearanceExists(new_name));
+        }
+        // A rename is its own step; a run of value edits to one appearance is one.
+        let coalesce = (new_name == name).then_some(name);
+        self.record_appearance_undo(coalesce);
+        self.appearances.defined.remove(name);
+        self.appearances
+            .defined
+            .insert(new_name.clone(), appearance);
+        if new_name != name {
+            self.appearances.rename_references(name, &new_name);
+        }
+        Ok(())
+    }
+
+    /// Takes an appearance out of the design, and off everything wearing it.
+    pub fn remove_appearance(&mut self, name: &str) -> bool {
+        if !self.appearances.defined.contains_key(name) {
+            return false;
+        }
+        self.record_appearance_undo(None);
+        self.appearances.defined.remove(name);
+        self.appearances.bodies.retain(|_, n| n != name);
+        self.appearances.faces.retain(|f| f.appearance != name);
+        if self.appearances.default.as_deref() == Some(name) {
+            self.appearances.default = None;
+        }
+        true
+    }
+
+    pub fn scene(&self) -> &SceneSettings {
+        &self.scene
+    }
+
+    /// Changes the render's scene settings. Not undoable; see the field.
+    pub fn set_scene(&mut self, scene: SceneSettings) {
+        if self.scene != scene {
+            self.scene = scene;
+            self.appearance_revision += 1;
+        }
     }
 
     // ----- parameters -------------------------------------------------------------------
@@ -777,14 +975,23 @@ impl Document {
 
     /// Swaps a snapshot in and hands back the one it replaced.
     fn restore(&mut self, snapshot: Snapshot) -> Snapshot {
+        let same_model = snapshot.model_stamp == self.model_stamp;
         let timeline = std::mem::replace(&mut self.timeline, snapshot.timeline);
         let parameters = std::mem::replace(&mut self.parameters, snapshot.parameters);
-        self.refresh_driven_values();
-        self.regen.invalidate_from(0);
-        self.revision += 1;
+        let appearances = std::mem::replace(&mut self.appearances, snapshot.appearances);
+        let model_stamp = std::mem::replace(&mut self.model_stamp, snapshot.model_stamp);
+        if !same_model {
+            self.refresh_driven_values();
+            self.regen.invalidate_from(0);
+            self.revision += 1;
+        }
+        self.appearance_revision += 1;
+        self.editing_appearance = None;
         Snapshot {
             timeline,
             parameters,
+            appearances,
+            model_stamp,
         }
     }
 
@@ -832,6 +1039,9 @@ impl Document {
         // Every mutation comes through here, inside a transaction or not, so this is
         // where the document counts itself as changed.
         self.revision += 1;
+        self.next_stamp += 1;
+        self.model_stamp = self.next_stamp;
+        self.editing_appearance = None;
         if self.in_transaction {
             return;
         }
@@ -846,6 +1056,31 @@ impl Document {
         Snapshot {
             timeline: self.timeline.clone(),
             parameters: self.parameters.clone(),
+            appearances: self.appearances.clone(),
+            model_stamp: self.model_stamp,
         }
+    }
+
+    /// Records an undo entry for a change to the appearances alone. Unlike
+    /// [`Self::push_undo`] it leaves the model stamp and the revision where they are,
+    /// because the model has not changed. `coalesce` names an appearance whose definition
+    /// is being edited: a run of edits to the same one with nothing in between is one
+    /// entry, so a slider drag undoes in one step.
+    fn record_appearance_undo(&mut self, coalesce: Option<&str>) {
+        self.appearance_revision += 1;
+        if self.in_transaction {
+            return;
+        }
+        if coalesce.is_some() && self.editing_appearance.as_deref() == coalesce {
+            return;
+        }
+        const MAX_UNDO: usize = 200;
+        let snapshot = self.snapshot();
+        self.undo.push(snapshot);
+        if self.undo.len() > MAX_UNDO {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+        self.editing_appearance = coalesce.map(str::to_owned);
     }
 }

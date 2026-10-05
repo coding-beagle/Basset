@@ -9,12 +9,13 @@
 //!
 //! [`protocol`] is the JSON-RPC framing, [`tools`] the catalogue and dispatch, [`sketch`]
 //! the batch of drawing operations one `sketch_ops` call applies, [`summary`] the JSON
-//! view of features, bodies, faces and edges, and [`ids`] how all of those are named on
-//! the wire.
+//! view of features, bodies, faces and edges, [`ids`] how all of those are named on the
+//! wire, and [`render`] appearances, the scene and rendered pictures.
 
 pub mod args;
 pub mod ids;
 pub mod protocol;
+pub mod render;
 pub mod sketch;
 pub mod summary;
 pub mod tools;

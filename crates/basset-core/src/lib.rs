@@ -15,8 +15,11 @@
 //! * `diff`        — what changed between two versions of a document, feature by feature
 //!   and face by face.
 //! * `visibility`  — what the user has hidden, saved but outside the model.
+//! * `appearances` — what bodies and faces look like, and building a scene for the path
+//!   tracer from them.
 //! * `file`        — the versioned `.bass` on-disk format.
 
+pub mod appearances;
 pub mod diff;
 pub mod document;
 pub mod feature;
@@ -30,6 +33,7 @@ pub mod regen;
 pub mod timeline;
 pub mod visibility;
 
+pub use appearances::{Appearances, FaceAppearance, trace_scene};
 pub use diff::{BodyChange, Change, DocumentDiff, FeatureChange, ParameterChange};
 pub use document::{Document, DocumentError, Units};
 pub use feature::{BodyOp, CombineOp, Extent, Feature, FeatureKind, NumericField};

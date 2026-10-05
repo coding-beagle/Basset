@@ -9,11 +9,15 @@ pub(crate) struct Layouts {
     pub globals: wgpu::BindGroupLayout,
     /// Group 1: per-draw uniforms selected by dynamic offset.
     pub draw: wgpu::BindGroupLayout,
-    /// Group 2 (mesh only): highlight bit set indexed by face id.
-    pub highlight: wgpu::BindGroupLayout,
+    /// Group 2 (mesh only): the highlight bits at binding 0 and the face mask bits at
+    /// binding 1, both indexed by face id.
+    pub face_bits: wgpu::BindGroupLayout,
 }
 
 pub(crate) struct Pipelines {
+    /// The sky gradient of [`EnvironmentLight::sky_background`](crate::EnvironmentLight::sky_background),
+    /// drawn first over the whole target.
+    pub sky: wgpu::RenderPipeline,
     pub mesh_opaque: wgpu::RenderPipeline,
     pub mesh_ghost: wgpu::RenderPipeline,
     /// Translucent and not depth-tested: [`MeshStyle::Overlay`](crate::MeshStyle::Overlay).
@@ -29,6 +33,8 @@ pub(crate) struct Pipelines {
 pub(crate) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 const COMMON_WGSL: &str = include_str!("../shaders/common.wgsl");
+const ENVIRONMENT_WGSL: &str = include_str!("../shaders/environment.wgsl");
+const SKY_WGSL: &str = include_str!("../shaders/sky.wgsl");
 const MESH_WGSL: &str = include_str!("../shaders/mesh.wgsl");
 const LINES_WGSL: &str = include_str!("../shaders/lines.wgsl");
 const POINTS_WGSL: &str = include_str!("../shaders/points.wgsl");
@@ -59,23 +65,24 @@ pub(crate) fn create_layouts(device: &wgpu::Device) -> Layouts {
             }],
         })
     };
-    let highlight = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("highlight bits"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        }],
+    let face_bits_entry = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::VERTEX,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let face_bits = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("face bits"),
+        entries: &[face_bits_entry(0), face_bits_entry(1)],
     });
     Layouts {
         globals: uniform("globals", false),
         draw: uniform("per-draw", true),
-        highlight,
+        face_bits,
     }
 }
 
@@ -83,7 +90,8 @@ struct PipelineSpec<'a> {
     label: &'a str,
     layout: &'a wgpu::PipelineLayout,
     module: &'a wgpu::ShaderModule,
-    vertex_layout: wgpu::VertexBufferLayout<'a>,
+    /// `None` for a pass that makes its vertices from their index alone.
+    vertex_layout: Option<wgpu::VertexBufferLayout<'a>>,
     depth_write: bool,
     depth_compare: wgpu::CompareFunction,
     bias: wgpu::DepthBiasState,
@@ -102,7 +110,8 @@ pub(crate) fn create_pipelines(
             source: wgpu::ShaderSource::Wgsl(format!("{COMMON_WGSL}\n{body}").into()),
         })
     };
-    let mesh_module = shader("mesh", MESH_WGSL);
+    let mesh_module = shader("mesh", &format!("{ENVIRONMENT_WGSL}\n{MESH_WGSL}"));
+    let sky_module = shader("sky", &format!("{ENVIRONMENT_WGSL}\n{SKY_WGSL}"));
     let lines_module = shader("lines", LINES_WGSL);
     let points_module = shader("points", POINTS_WGSL);
     let tris_module = shader("tris", TRIS_WGSL);
@@ -112,8 +121,13 @@ pub(crate) fn create_pipelines(
         bind_group_layouts: &[
             Some(&layouts.globals),
             Some(&layouts.draw),
-            Some(&layouts.highlight),
+            Some(&layouts.face_bits),
         ],
+        immediate_size: 0,
+    });
+    let sky_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("sky"),
+        bind_group_layouts: &[Some(&layouts.globals)],
         immediate_size: 0,
     });
     let overlay_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -130,7 +144,7 @@ pub(crate) fn create_pipelines(
                 module: spec.module,
                 entry_point: Some("vs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[Some(spec.vertex_layout)],
+                buffers: &[spec.vertex_layout],
             },
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
@@ -175,7 +189,7 @@ pub(crate) fn create_pipelines(
             label,
             layout: &mesh_layout,
             module: &mesh_module,
-            vertex_layout: MeshVertex::LAYOUT,
+            vertex_layout: Some(MeshVertex::LAYOUT),
             depth_write,
             depth_compare,
             bias: FACE_DEPTH_BIAS,
@@ -187,7 +201,7 @@ pub(crate) fn create_pipelines(
             label,
             layout: &overlay_layout,
             module,
-            vertex_layout,
+            vertex_layout: Some(vertex_layout),
             // Lines and points never write depth: they are annotations, and letting them
             // occlude each other by depth would make dense sketches flicker.
             depth_write: false,
@@ -202,12 +216,26 @@ pub(crate) fn create_pipelines(
     };
 
     Pipelines {
+        // The sky stands infinitely far behind everything, so it neither tests nor writes
+        // depth: whatever is drawn after it is in front of it.
+        sky: build(PipelineSpec {
+            label: "sky",
+            layout: &sky_layout,
+            module: &sky_module,
+            vertex_layout: None,
+            depth_write: false,
+            depth_compare: wgpu::CompareFunction::Always,
+            bias: wgpu::DepthBiasState::default(),
+            blend: wgpu::BlendState::REPLACE,
+        }),
         mesh_opaque: mesh(
             "mesh opaque",
             true,
             wgpu::CompareFunction::Less,
             wgpu::BlendState::REPLACE,
         ),
+        // Ghost, x-ray and translucent faces: blended, hidden by the opaque meshes in front
+        // of them, and leaving depth alone so what is behind them still draws.
         mesh_ghost: mesh(
             "mesh ghost",
             false,

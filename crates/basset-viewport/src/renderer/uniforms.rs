@@ -15,6 +15,28 @@ pub(crate) struct Globals {
     pub camera_pos: [f32; 4],
     pub key_light: [f32; 4],
     pub viewport: [f32; 4],
+    /// Clip to world, for the sky pass to turn a pixel back into a view ray.
+    pub inv_view_proj: [[f32; 4]; 4],
+    /// `[environment, exposure, light_count, 0]`: `environment` is 1 under
+    /// [`Lighting::Environment`](crate::Lighting::Environment), and the rest of the
+    /// environment fields below are read only then.
+    pub environment: [f32; 4],
+    pub sky_zenith: [f32; 4],
+    pub sky_horizon: [f32; 4],
+    pub sky_nadir: [f32; 4],
+    /// The sky's irradiance over π in Legendre polynomials P0, P1, P2, P4 of the normal's
+    /// height, one RGB per row; see `lighting::sky_irradiance_coefficients`.
+    pub sky_irradiance: [[f32; 4]; 4],
+    pub lights: [LightUniform; 4],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct LightUniform {
+    /// `xyz`: unit vector towards the light, `w`: its angular radius in radians.
+    pub direction: [f32; 4],
+    /// `rgb`: irradiance at normal incidence, as [`crate::DistantLight::irradiance`].
+    pub irradiance: [f32; 4],
 }
 
 #[repr(C)]
@@ -24,8 +46,13 @@ pub(crate) struct MeshDraw {
     pub normal_matrix: [[f32; 4]; 4],
     pub color: [f32; 4],
     pub highlight_color: [f32; 4],
-    /// `[use_vertex_color, 0, 0, 0]`: 1 when the mesh's own vertex colours replace `color`.
+    /// `[use_vertex_color, use_face_mask, 0, 0]`: 1 when the mesh's own vertex colours
+    /// replace `color`, and 1 when only the faces in the mask bits are drawn.
     pub params: [f32; 4],
+    /// `[metallic, roughness, clearcoat, 0]`.
+    pub material: [f32; 4],
+    /// `rgb`: emitted radiance.
+    pub emission: [f32; 4],
 }
 
 #[repr(C)]
@@ -52,6 +79,19 @@ pub(crate) struct TriDraw {
     /// Unused; the uniform is padded to the 16-byte multiple WGSL requires.
     pub params: [f32; 4],
 }
+
+// WGSL lays a uniform struct out in 16-byte steps; these fail the build if a field is
+// added that breaks the match with the shader structs.
+const _: () = {
+    assert!(size_of::<LightUniform>() == 32);
+    assert!(size_of::<Globals>() == 432);
+    assert!(size_of::<Globals>().is_multiple_of(16));
+    assert!(size_of::<MeshDraw>() == 208);
+    assert!(size_of::<MeshDraw>().is_multiple_of(16));
+    assert!(size_of::<LineDraw>().is_multiple_of(16));
+    assert!(size_of::<PointDraw>().is_multiple_of(16));
+    assert!(size_of::<TriDraw>().is_multiple_of(16));
+};
 
 /// Append-only staging area flushed to a GPU buffer once per frame. Used both for uniform
 /// slots and for the line/point instance streams; growing doubles the buffer so a busy

@@ -16,16 +16,24 @@ basset-core      Document, Components, Planes/Axes/Sketches/Bodies, document par
 basset-io        STL / 3MF export
 basset-fea       basic finite element analysis: voxel brick mesh of a Solid, linear elastic
                   static solve, von Mises stresses, SIMP topology optimisation, legacy VTK output
+basset-render    appearances (metallic–roughness, transmission, clear coat, patterns) and their
+                  library, procedural environments, scene settings, a progressive CPU path
+                  tracer and PNG output
 basset-viewport  wgpu renderer: camera, mesh/line/point/triangle batches, grid, selection highlight,
-                  meshes with a colour per vertex and the ramp a stress plot paints with
+                  meshes with a colour per vertex and the ramp a stress plot paints with,
+                  physically based environment shading, per-face material masks
 basset-app       winit + egui desktop application (Linux first)
 basset-mcp       Model Context Protocol server over stdio: the document model driven by an agent
 ```
 
-Dependency direction is strictly downward: `math ← sketch, kernel ← core ← io, viewport ← app`;
+Dependency direction is strictly downward: `math ← sketch, kernel, render ← core ← io, viewport ← app`;
 `basset-mcp` sits beside the app, over `core`, `io` and `fea`, and knows nothing of the viewport.
 `basset-fea` sits over `kernel` alone: it takes a `Solid` and face keys and knows nothing of
 documents, so a study can be run on any body the kernel can make.
+`basset-render` sits over `math` alone, like `fea` over `kernel`: it takes triangle meshes
+with a face id per triangle and is told which appearance each face id wears, so it knows
+nothing of documents or the kernel; `core` stores appearances as its types and builds a
+trace scene from bodies' tessellations (`core::trace_scene`).
 `sketch` and `kernel` do not know about each other; `core` converts sketch profiles into
 kernel profiles. This keeps both testable in isolation and lets the kernel be replaced.
 Where `core` has to put something of its own *into* a sketch — the document's parameter
@@ -855,6 +863,115 @@ and `MaterialSpec::of` names a pair of numbers that is a library entry so a UI c
 `Material::STEEL` and `Material::ALUMINIUM`, so documents and tool calls from before the
 library existed resolve as they always did.
 
+## Rendering
+
+### Appearances in the document
+
+An appearance is not a physical material: the density and stiffness a study reads come
+from `basset-fea`'s library, and a part painted red is still steel. `basset_render::
+Appearance` is the metallic–roughness model every real-time engine shares — base colour,
+metallic, roughness — plus transmission and an index of refraction (glass, clear
+plastic), a clear coat (gloss paint, varnished wood), emission (LEDs) and a procedural
+pattern (brushed, wood grain, carbon weave, speckle) evaluated from world position,
+because kernel faces have no texture coordinates to wrap an image with. Colours are
+eight-bit sRGB and save as `#rrggbb`: that is what a swatch and a colour picker hand over,
+and it round-trips exactly. The library (`basset_render::library`, `find`) gives metals
+their measured reflectance at normal incidence as colour, so polish versus satin is a
+matter of roughness alone.
+
+`core::Appearances` is Fusion's arrangement: applying a library entry copies it *into the
+design* by name, and assignments — a document default, one per body, overrides per face —
+name the copy, so editing it repaints everything wearing it. Assignments are keyed by
+`BodyRef` and `FaceKey`, the names the rest of the document already keeps stable, so a
+painted top face stays painted when its extrude grows. An assignment to a body that is
+gone is kept, so undoing the delete brings the body back in its colour.
+
+Appearances are in the undo snapshot, because Ctrl+Z after painting the wrong body must
+take back the paint and not the fillet before it, but they are not the model, and
+undoing a colour must not replay the timeline. The document therefore stamps the model's
+content (`model_stamp`, renewed by every model mutation in `push_undo` and carried by
+every snapshot); `restore` regenerates, and bumps `revision`, only when the snapshot's
+stamp differs from the current one. A paint is recorded by `record_appearance_undo`,
+which leaves stamp and revision alone, so a stress plot stays fresh and a git comparison
+is not recomputed across a change of colour. A run of edits to one appearance's
+definition with nothing in between is one entry, so a roughness slider dragged across a
+hundred frames undoes in one step. The scene settings (environment, brightness,
+background, floor, depth of field) are saved but outside undo, as visibility is: dragging
+the brightness is looking at the part, not changing it. `appearance_revision` counts both,
+for whoever caches a picture of the model. Format 12 added all of it with an identity
+migration.
+
+### Environments
+
+Fusion lights renders with photographed HDR panoramas; those would be the only binary
+assets in the repository, so environments are described instead: a sky that is a gradient
+from horizon to zenith and from horizon to nadir (`t = √|z|`, so the horizon band is
+narrow), a few distant lights that are discs of uniform radiance (soft boxes a few tens of
+degrees across, a sun a degree and a half), and a floor albedo. That is most of what makes a
+product shot — the boxes' long reflections along a polished edge, the gradient in a curved
+face — and it is exactly what both renderers can evaluate: the tracer samples the discs
+directly and meets the sky by escaping into it, and the viewport shades the same gradient
+and discs in closed form, so a highlight in the preview is where the render puts it. A
+disc's irradiance on a facing surface is `L·π·sin²θ` in both.
+
+### The path tracer
+
+`basset-render` traces on the CPU, as the FEA solver solves on it: the GPU belongs to the
+viewport, and a CPU tracer is the one that runs headless, in the MCP server and in tests.
+A binned-SAH BVH (children side by side, iterative traversal) over `f64` triangles; a
+unidirectional path tracer with next-event estimation towards the environment's discs,
+combined with BSDF sampling by the power heuristic; the opaque lobes — Lambert weighted by
+one minus metallic, GGX sampled through its visible normals, a smooth clear coat over both
+— sampled and evaluated as one mixture so their combined density is what MIS sees; and,
+with probability `transmission`, a rough dielectric interface treated as a delta for MIS.
+Shadow rays pass through transmissive surfaces tinted rather than refracted, so glass casts
+a tinted shadow instead of needing caustics. Fireflies are clamped per sample.
+
+The floor is a shadow catcher, because Fusion's is invisible except for what the model
+does to it. A camera ray that lands on it is shaded twice in one go — with the model in
+the world and with only the environment — and the pixel keeps the background scaled by the
+ratio of the two sums over all its samples (a ratio of sums converges; a mean of noisy
+per-sample ratios would not). Under the model the ratio drops (the shadow), where the model
+reflects in a glossy floor it moves, and far away the two agree and the floor vanishes into
+the background with no fade to tune. Secondary rays meet the floor as a real surface, so a
+chrome part reflects a floor and the floor bounces light into its underside. A solid
+background is stored as the radiance the tone curve maps to the picked colour
+(`aces_inverse`), so it comes out exactly as picked. Everything ends in ACES (Narkowicz's
+fit) and sRGB.
+
+Rendering is progressive (`RenderJob`): passes of one sample per pixel on scoped workers
+taking rows from a shared iterator, accumulated, tone mapped and published after every
+early pass and a few times a second after that; cancelling is a flag checked per row, so a
+camera drag that restarts the in-canvas render every frame does not queue passes. Seeds
+come from the pixel and the pass, so a render is the same image every time.
+
+### The Render workspace
+
+`editor::render` is the third workspace. Its click is the appearance *brush*: a swatch
+clicked in the library arms it, a face clicked in the viewport is painted (or its body, by
+the panel's Apply to), Escape puts it down; without a brush a click selects. It shares the
+Simulation workspace's gate — modelling commands are refused by `Workspace::models` on
+every path a command arrives by — and its viewport is the picture: environment lighting
+(`Scene::lighting`), the sky or the solid background, no grid, planes, sketches or edges.
+Appearances draw in Design too, under the studio lighting with their metallic, roughness
+and clear coat modulating it (the default material reproduces the old shading bit for
+bit); Simulation keeps the plain grey, where a face's colour is what the study says. A body
+with face overrides is several instances of one mesh, each masked to its faces by a face
+bitset beside the highlight bitset (`MeshInstance::face_mask`), only the first carrying the
+edges; glass is `MeshStyle::Translucent`, blended at its own alpha.
+
+The in-canvas render is a `RenderJob` at a fraction of the window's resolution (the
+quality), restarted whenever its `CanvasKey` — camera, window, quality, model revision,
+appearance revision, hidden bodies — changes, and painted under the panels over the whole
+window, the same pixels the camera is measured in. Until the restarted job's first pass
+arrives the raster preview shows through, so orbiting stays fluid. The traced scene is
+cached under the key minus the camera, since the camera is what moves most and the BVH is
+the costly part of a restart. Final renders are jobs of their own into a gallery that
+belongs to the document, shown along the bottom in place of the timeline, opened in a
+viewer and saved as PNG. The `snapshot_of_the_render_viewport` test (ignored; set
+`BASSET_SNAPSHOT=out.png`) draws the workspace's raster preview through the real renderer
+on a headless GPU.
+
 ## Driving the modeller from an agent
 
 `basset-mcp` is a Model Context Protocol server: JSON-RPC over stdin and stdout, one
@@ -871,7 +988,9 @@ viewport would show as a yellow badge comes back as data; `fea_static` runs a st
 body by face keys and reports the maxima, the reaction, the mass and the safety factor
 against yield, with the material named from the library `fea_materials` lists, and
 `fea_topology` optimises the layout of a given fraction of the body's material under the
-same study. Entities and constraints are
+same study. `set_appearance`, `define_appearance` and `scene_settings` paint and light the
+model as the Render workspace does, and `render_image` path traces it to a PNG framed from
+a named view, because a file is the only way an agent can look at the picture. Entities and constraints are
 named by their slot index, resolved against the live sketch, since a wire id is meant to
 be read back and quoted; faces are `feature.sub:Role` and edges two of those joined by
 `|`, the parts a `FaceKey` is made of. `.mcp.json` at the workspace root registers the

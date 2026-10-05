@@ -18,6 +18,7 @@ basset-core = { workspace = true }
 basset-io = { workspace = true }
 basset-viewport = { workspace = true }
 basset-fea = { workspace = true }
+basset-render = { workspace = true }
 wgpu = { workspace = true }
 winit = { workspace = true }
 egui = { workspace = true }

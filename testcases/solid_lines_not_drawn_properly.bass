@@ -1,0 +1,471 @@
+{
+  "format_version": 11,
+  "generator": "basset 0.1.0",
+  "document": {
+    "name": "solid_lines_not_drawn_properly",
+    "parameters": [],
+    "timeline": {
+      "cursor": 4,
+      "features": [
+        {
+          "id": 1,
+          "kind": {
+            "Sketch": {
+              "component": 0,
+              "plane": {
+                "Origin": "XY"
+              },
+              "sketch": {
+                "constraints": [
+                  {
+                    "value": null,
+                    "version": 0
+                  },
+                  {
+                    "value": {
+                      "Horizontal": {
+                        "idx": 5,
+                        "version": 1
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "Vertical": {
+                        "idx": 6,
+                        "version": 1
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "Horizontal": {
+                        "idx": 7,
+                        "version": 1
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "Vertical": {
+                        "idx": 8,
+                        "version": 1
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "Midpoint": {
+                        "line": {
+                          "idx": 10,
+                          "version": 1
+                        },
+                        "point": {
+                          "idx": 9,
+                          "version": 1
+                        }
+                      }
+                    },
+                    "version": 1
+                  }
+                ],
+                "dimension_exprs": [
+                  {
+                    "value": null,
+                    "version": 0
+                  }
+                ],
+                "entities": [
+                  {
+                    "value": null,
+                    "version": 0
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Point": {
+                          "pos": [
+                            -60.0,
+                            -60.0
+                          ]
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Point": {
+                          "pos": [
+                            60.0,
+                            -60.0
+                          ]
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Point": {
+                          "pos": [
+                            60.0,
+                            60.0
+                          ]
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Point": {
+                          "pos": [
+                            -60.0,
+                            60.0
+                          ]
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Line": {
+                          "end": {
+                            "idx": 2,
+                            "version": 1
+                          },
+                          "start": {
+                            "idx": 1,
+                            "version": 1
+                          }
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Line": {
+                          "end": {
+                            "idx": 3,
+                            "version": 1
+                          },
+                          "start": {
+                            "idx": 2,
+                            "version": 1
+                          }
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Line": {
+                          "end": {
+                            "idx": 4,
+                            "version": 1
+                          },
+                          "start": {
+                            "idx": 3,
+                            "version": 1
+                          }
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": false,
+                      "entity": {
+                        "Line": {
+                          "end": {
+                            "idx": 1,
+                            "version": 1
+                          },
+                          "start": {
+                            "idx": 4,
+                            "version": 1
+                          }
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": true,
+                      "entity": {
+                        "Point": {
+                          "pos": [
+                            0.0,
+                            0.0
+                          ]
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": true,
+                      "entity": {
+                        "Line": {
+                          "end": {
+                            "idx": 3,
+                            "version": 1
+                          },
+                          "start": {
+                            "idx": 1,
+                            "version": 1
+                          }
+                        }
+                      }
+                    },
+                    "version": 1
+                  },
+                  {
+                    "value": {
+                      "construction": true,
+                      "entity": {
+                        "Line": {
+                          "end": {
+                            "idx": 4,
+                            "version": 1
+                          },
+                          "start": {
+                            "idx": 2,
+                            "version": 1
+                          }
+                        }
+                      }
+                    },
+                    "version": 1
+                  }
+                ],
+                "labels": [
+                  {
+                    "value": null,
+                    "version": 0
+                  }
+                ],
+                "parameters": []
+              }
+            }
+          },
+          "name": "Sketch1",
+          "suppressed": false
+        },
+        {
+          "id": 2,
+          "kind": {
+            "Extrude": {
+              "component": 0,
+              "extent": {
+                "OneSide": 120.0
+              },
+              "operation": "NewBody",
+              "regions": [
+                {
+                  "Profile": {
+                    "curves": 2426953839697244457,
+                    "sample": [
+                      0.0,
+                      0.0
+                    ],
+                    "sketch": 1
+                  }
+                }
+              ]
+            }
+          },
+          "name": "Extrude2",
+          "suppressed": false
+        },
+        {
+          "id": 3,
+          "kind": {
+            "Fillet": {
+              "edges": [
+                {
+                  "body": 2,
+                  "key": {
+                    "a": {
+                      "op": {
+                        "feature": 2,
+                        "sub": 0
+                      },
+                      "role": {
+                        "Side": 5
+                      }
+                    },
+                    "b": {
+                      "op": {
+                        "feature": 2,
+                        "sub": 0
+                      },
+                      "role": {
+                        "Side": 8
+                      }
+                    }
+                  }
+                }
+              ],
+              "radius": 60.0
+            }
+          },
+          "name": "Fillet3",
+          "suppressed": false
+        },
+        {
+          "id": 4,
+          "kind": {
+            "Fillet": {
+              "edges": [
+                {
+                  "body": 2,
+                  "key": {
+                    "a": {
+                      "op": {
+                        "feature": 2,
+                        "sub": 0
+                      },
+                      "role": "EndCap"
+                    },
+                    "b": {
+                      "op": {
+                        "feature": 2,
+                        "sub": 0
+                      },
+                      "role": {
+                        "Side": 5
+                      }
+                    }
+                  }
+                },
+                {
+                  "body": 2,
+                  "key": {
+                    "a": {
+                      "op": {
+                        "feature": 2,
+                        "sub": 0
+                      },
+                      "role": "EndCap"
+                    },
+                    "b": {
+                      "op": {
+                        "feature": 2,
+                        "sub": 0
+                      },
+                      "role": {
+                        "Side": 6
+                      }
+                    }
+                  }
+                },
+                {
+                  "body": 2,
+                  "key": {
+                    "a": {
+                      "op": {
+                        "feature": 2,
+                        "sub": 0
+                      },
+                      "role": "EndCap"
+                    },
+                    "b": {
+                      "op": {
+                        "feature": 2,
+                        "sub": 0
+                      },
+                      "role": {
+                        "Side": 7
+                      }
+                    }
+                  }
+                },
+                {
+                  "body": 2,
+                  "key": {
+                    "a": {
+                      "op": {
+                        "feature": 2,
+                        "sub": 0
+                      },
+                      "role": "EndCap"
+                    },
+                    "b": {
+                      "op": {
+                        "feature": 2,
+                        "sub": 0
+                      },
+                      "role": {
+                        "Side": 8
+                      }
+                    }
+                  }
+                },
+                {
+                  "body": 2,
+                  "key": {
+                    "a": {
+                      "op": {
+                        "feature": 2,
+                        "sub": 0
+                      },
+                      "role": "EndCap"
+                    },
+                    "b": {
+                      "op": {
+                        "feature": 3,
+                        "sub": 0
+                      },
+                      "role": {
+                        "Fillet": 0
+                      }
+                    }
+                  }
+                }
+              ],
+              "radius": 35.0
+            }
+          },
+          "name": "Fillet4",
+          "suppressed": false
+        }
+      ],
+      "next_id": 5
+    },
+    "units": "Millimeters",
+    "visibility": {
+      "hidden_bodies": [],
+      "hidden_sketches": [
+        1
+      ],
+      "show_axes": true,
+      "show_grid": true,
+      "show_origin": false
+    }
+  }
+}

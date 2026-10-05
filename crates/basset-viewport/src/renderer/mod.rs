@@ -13,16 +13,20 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use basset_math::{Mat4, TriMesh, Vec3};
+use bytemuck::Zeroable;
 
 use crate::camera::Camera;
 use crate::error::ViewportError;
 use crate::grid;
+use crate::lighting::{EnvironmentLight, Lighting, sky_irradiance_coefficients};
 use crate::scene::{LineBatch, MeshHandle, MeshInstance, MeshStyle, PointBatch, Scene, TriBatch};
 use crate::silhouette::{SilhouetteCache, ViewPoint};
 
 use gpu_mesh::{GpuMesh, SegmentInstance};
 use pipelines::{DEPTH_FORMAT, Layouts, Pipelines};
-use uniforms::{Globals, LineDraw, MeshDraw, PointDraw, StreamBuffer, TriDraw, UniformArena};
+use uniforms::{
+    Globals, LightUniform, LineDraw, MeshDraw, PointDraw, StreamBuffer, TriDraw, UniformArena,
+};
 
 const EDGE_WIDTH_PX: f32 = 1.2;
 const DASH_PX: f32 = 8.0;
@@ -41,11 +45,11 @@ pub struct Renderer {
     targets: Option<FrameTargets>,
     meshes: HashMap<MeshHandle, GpuMesh>,
     next_handle: u64,
-    highlights: HashMap<HighlightKey, HighlightBits>,
-    /// One silhouette per drawn instance, keyed as the highlights are. Per instance
+    face_bits: HashMap<FaceBitsKey, FaceBits>,
+    /// One silhouette per drawn instance, keyed as the face bits are. Per instance
     /// rather than per mesh because the answer depends on where the body is standing as
     /// well as where the camera is.
-    silhouettes: HashMap<HighlightKey, SilhouetteCache>,
+    silhouettes: HashMap<FaceBitsKey, SilhouetteCache>,
     uniforms: UniformArena,
     line_instances: StreamBuffer,
     point_instances: StreamBuffer,
@@ -60,17 +64,36 @@ struct FrameTargets {
     msaa_view: Option<wgpu::TextureView>,
 }
 
-/// Highlight state is cached per (mesh, ordinal of that mesh within the frame's instance
-/// list). The ordinal lets two instances of one mesh carry different selections while
-/// still reusing buffers frame to frame, which is the common case.
-type HighlightKey = (MeshHandle, u32);
+/// Per-face state is cached per (mesh, ordinal of that mesh within the frame's instance
+/// list). The ordinal lets two instances of one mesh carry different selections and
+/// masks while still reusing buffers frame to frame, which is the common case.
+type FaceBitsKey = (MeshHandle, u32);
 
-/// One bit per face id, rebuilt only when the instance's `highlight_faces` changes.
-struct HighlightBits {
-    faces: Vec<u32>,
-    buffer: wgpu::Buffer,
+/// An instance's two sets of faces, one bit per face id (see [`face_bits`]): the ones its
+/// highlight paints and the ones its mask lets through. Each buffer is rewritten only when
+/// its list changes.
+struct FaceBits {
+    highlight_faces: Vec<u32>,
+    highlight_buffer: wgpu::Buffer,
+    /// The faces the mask buffer holds. An instance without a mask leaves the buffer as it
+    /// was, since the draw's flag tells the shader not to read it.
+    mask_faces: Vec<u32>,
+    mask_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     used_this_frame: bool,
+}
+
+/// One bit per face id in `words` little-endian `u32`s: face `f` is bit `f % 32` of word
+/// `f / 32`, as the mesh shader reads it. Ids beyond the mesh's largest are dropped, and
+/// would not be on any of its triangles anyway.
+fn face_bits(faces: &[u32], words: u32) -> Vec<u32> {
+    let mut bits = vec![0u32; words as usize];
+    for &face in faces {
+        if let Some(word) = bits.get_mut((face / 32) as usize) {
+            *word |= 1 << (face % 32);
+        }
+    }
+    bits
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -84,7 +107,7 @@ enum SegmentSource {
 struct MeshDrawCall {
     handle: MeshHandle,
     uniform_offset: u32,
-    highlight: HighlightKey,
+    face_bits: FaceBitsKey,
     pass: MeshPass,
 }
 
@@ -92,7 +115,8 @@ struct MeshDrawCall {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MeshPass {
     Opaque,
-    /// Translucent over the opaque meshes, depth-tested against them.
+    /// Translucent over the opaque meshes, depth-tested against them: ghost, x-ray and
+    /// translucent styles.
     Ghost,
     /// Translucent over everything, tested against nothing.
     Overlay,
@@ -133,6 +157,8 @@ struct TriDrawCall {
 
 #[derive(Default)]
 struct FrameDraws {
+    /// Draw the sky gradient behind everything instead of leaving the clear colour.
+    sky: bool,
     meshes: Vec<MeshDrawCall>,
     lines: Vec<LineDrawCall>,
     points: Vec<PointDrawCall>,
@@ -181,7 +207,7 @@ impl Renderer {
             targets: None,
             meshes: HashMap::new(),
             next_handle: 1,
-            highlights: HashMap::new(),
+            face_bits: HashMap::new(),
             silhouettes: HashMap::new(),
             uniforms: UniformArena::new(),
             line_instances: StreamBuffer::new("line instances", wgpu::BufferUsages::VERTEX),
@@ -253,7 +279,7 @@ impl Renderer {
 
     pub fn remove_mesh(&mut self, handle: MeshHandle) {
         self.meshes.remove(&handle);
-        self.highlights.retain(|(h, _), _| *h != handle);
+        self.face_bits.retain(|(h, _), _| *h != handle);
         self.silhouettes.retain(|(h, _), _| *h != handle);
     }
 
@@ -261,8 +287,9 @@ impl Renderer {
         self.meshes.contains_key(&handle)
     }
 
-    /// Draws the scene into `target`, clearing it with `scene.background`. `target` must
-    /// have the renderer's colour format, a single sample, and `size` pixels.
+    /// Draws the scene into `target`, clearing it with `scene.background` (or, under an
+    /// environment with [`EnvironmentLight::sky_background`], painting the sky over it).
+    /// `target` must have the renderer's colour format, a single sample, and `size` pixels.
     pub fn render(
         &mut self,
         device: &wgpu::Device,
@@ -313,13 +340,20 @@ impl Renderer {
         });
     }
 
-    fn write_globals(&self, queue: &wgpu::Queue, camera: &Camera, size: [u32; 2]) {
+    fn write_globals(
+        &self,
+        queue: &wgpu::Queue,
+        camera: &Camera,
+        size: [u32; 2],
+        lighting: &Lighting,
+    ) {
         let aspect = f64::from(size[0]) / f64::from(size[1]);
         // Key light sits above and to the left of the eye so it follows the orbit: a
         // world-fixed light would leave the model dark from half the view directions.
         let key_light = (-camera.right() * 0.5 + camera.up() * 0.7 - camera.forward()).normalize();
-        let globals = Globals {
-            view_proj: camera.view_projection(aspect).as_mat4().to_cols_array_2d(),
+        let view_proj = camera.view_projection(aspect);
+        let mut globals = Globals {
+            view_proj: view_proj.as_mat4().to_cols_array_2d(),
             camera_pos: camera.eye().as_vec3().extend(1.0).to_array(),
             key_light: key_light.as_vec3().extend(0.0).to_array(),
             viewport: [
@@ -328,7 +362,19 @@ impl Renderer {
                 1.0 / size[0] as f32,
                 1.0 / size[1] as f32,
             ],
+            // Inverted in f64 and only then narrowed: the far plane is many times the eye
+            // distance away, and an inverse taken in f32 loses the sky's direction.
+            inv_view_proj: view_proj.inverse().as_mat4().to_cols_array_2d(),
+            environment: [0.0; 4],
+            sky_zenith: [0.0; 4],
+            sky_horizon: [0.0; 4],
+            sky_nadir: [0.0; 4],
+            sky_irradiance: [[0.0; 4]; 4],
+            lights: [LightUniform::zeroed(); 4],
         };
+        if let Lighting::Environment(env) = lighting {
+            write_environment(&mut globals, env);
+        }
         queue.write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));
     }
 
@@ -339,19 +385,22 @@ impl Renderer {
         size: [u32; 2],
         scene: &Scene<'_>,
     ) -> FrameDraws {
-        self.write_globals(queue, scene.camera, size);
+        self.write_globals(queue, scene.camera, size, &scene.lighting);
         self.uniforms.begin();
         self.line_instances.clear();
         self.point_instances.clear();
         self.tri_vertices.clear();
-        for entry in self.highlights.values_mut() {
+        for entry in self.face_bits.values_mut() {
             entry.used_this_frame = false;
         }
         for entry in self.silhouettes.values_mut() {
             entry.used_this_frame = false;
         }
 
-        let mut draws = FrameDraws::default();
+        let mut draws = FrameDraws {
+            sky: matches!(&scene.lighting, Lighting::Environment(env) if env.sky_background),
+            ..FrameDraws::default()
+        };
         let mut ordinals: HashMap<MeshHandle, u32> = HashMap::new();
         for instance in &scene.meshes {
             let Some(gpu) = self.meshes.get(&instance.handle) else {
@@ -362,12 +411,15 @@ impl Renderer {
             let key = (instance.handle, *ordinal);
             *ordinal += 1;
 
-            let translucent = instance.style.is_translucent();
-            if instance.style.draws_faces() {
+            // A mask of no faces draws nothing, so it needs no draw call; its bits are still
+            // kept up to date below so the cache entry survives the frame.
+            let masked_out = instance.face_mask.as_ref().is_some_and(Vec::is_empty);
+            if instance.style.draws_faces() && !masked_out {
                 let mut color = instance.color;
-                if translucent {
+                if instance.style.fades() {
                     color[3] *= 0.35;
                 }
+                let material = &instance.material;
                 let uniform_offset = self.uniforms.push(&MeshDraw {
                     model: instance.transform.as_mat4().to_cols_array_2d(),
                     normal_matrix: normal_matrix(&instance.transform)
@@ -375,12 +427,33 @@ impl Renderer {
                         .to_cols_array_2d(),
                     color,
                     highlight_color: instance.highlight_color,
-                    params: [if gpu.vertex_colored { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+                    params: [
+                        if gpu.vertex_colored { 1.0 } else { 0.0 },
+                        if instance.face_mask.is_some() {
+                            1.0
+                        } else {
+                            0.0
+                        },
+                        0.0,
+                        0.0,
+                    ],
+                    material: [
+                        material.metallic,
+                        material.roughness,
+                        material.clearcoat,
+                        0.0,
+                    ],
+                    emission: [
+                        material.emission[0],
+                        material.emission[1],
+                        material.emission[2],
+                        0.0,
+                    ],
                 });
                 draws.meshes.push(MeshDrawCall {
                     handle: instance.handle,
                     uniform_offset,
-                    highlight: key,
+                    face_bits: key,
                     pass: MeshPass::of(instance.style),
                 });
             }
@@ -404,9 +477,9 @@ impl Renderer {
             if instance.style.draws_silhouette() {
                 self.push_silhouette(instance, key, scene.camera, &mut draws);
             }
-            self.sync_highlight(device, queue, key, words, &instance.highlight_faces);
+            self.sync_face_bits(device, queue, key, words, instance);
         }
-        self.highlights.retain(|_, entry| entry.used_this_frame);
+        self.face_bits.retain(|_, entry| entry.used_this_frame);
         self.silhouettes.retain(|_, entry| entry.used_this_frame);
 
         // The grid goes first so model lines drawn later paint over it where they coincide.
@@ -441,7 +514,7 @@ impl Renderer {
     fn push_silhouette(
         &mut self,
         instance: &MeshInstance,
-        key: HighlightKey,
+        key: FaceBitsKey,
         camera: &Camera,
         draws: &mut FrameDraws,
     ) {
@@ -565,54 +638,70 @@ impl Renderer {
         });
     }
 
-    /// Creates or updates the highlight bit buffer for one instance. The buffer is sized by
-    /// the mesh, so a changed selection is a `write_buffer`, never a reallocation.
-    fn sync_highlight(
+    /// Creates or updates the highlight and mask bit buffers for one instance. The buffers
+    /// are sized by the mesh, so a changed selection or mask is a `write_buffer`, never a
+    /// reallocation.
+    fn sync_face_bits(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        key: HighlightKey,
+        key: FaceBitsKey,
         words: u32,
-        faces: &[u32],
+        instance: &MeshInstance,
     ) {
-        let bits = |faces: &[u32]| {
-            let mut bits = vec![0u32; words as usize];
-            for &face in faces {
-                if let Some(word) = bits.get_mut((face / 32) as usize) {
-                    *word |= 1 << (face % 32);
-                }
-            }
-            bits
-        };
-        match self.highlights.get_mut(&key) {
+        let highlight = instance.highlight_faces.as_slice();
+        let mask = instance.face_mask.as_deref();
+        match self.face_bits.get_mut(&key) {
             Some(entry) => {
-                if entry.faces != faces {
-                    queue.write_buffer(&entry.buffer, 0, bytemuck::cast_slice(&bits(faces)));
-                    entry.faces = faces.to_vec();
+                if entry.highlight_faces != highlight {
+                    let bits = face_bits(highlight, words);
+                    queue.write_buffer(&entry.highlight_buffer, 0, bytemuck::cast_slice(&bits));
+                    entry.highlight_faces = highlight.to_vec();
+                }
+                if let Some(mask) = mask
+                    && entry.mask_faces != mask
+                {
+                    let bits = face_bits(mask, words);
+                    queue.write_buffer(&entry.mask_buffer, 0, bytemuck::cast_slice(&bits));
+                    entry.mask_faces = mask.to_vec();
                 }
                 entry.used_this_frame = true;
             }
             None => {
-                let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("highlight bits"),
-                    size: u64::from(words) * 4,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&bits(faces)));
+                let make = |label, faces: &[u32]| {
+                    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some(label),
+                        size: u64::from(words) * 4,
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&face_bits(faces, words)));
+                    buffer
+                };
+                let mask_faces = mask.unwrap_or_default();
+                let highlight_buffer = make("highlight bits", highlight);
+                let mask_buffer = make("face mask bits", mask_faces);
                 let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("highlight bits"),
-                    layout: &self.layouts.highlight,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: buffer.as_entire_binding(),
-                    }],
+                    label: Some("face bits"),
+                    layout: &self.layouts.face_bits,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: highlight_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: mask_buffer.as_entire_binding(),
+                        },
+                    ],
                 });
-                self.highlights.insert(
+                self.face_bits.insert(
                     key,
-                    HighlightBits {
-                        faces: faces.to_vec(),
-                        buffer,
+                    FaceBits {
+                        highlight_faces: highlight.to_vec(),
+                        highlight_buffer,
+                        mask_faces: mask_faces.to_vec(),
+                        mask_buffer,
                         bind_group,
                         used_this_frame: true,
                     },
@@ -675,6 +764,11 @@ impl Renderer {
         pass.set_bind_group(0, &self.globals_bind_group, &[]);
         let draw_uniforms = self.uniforms.bind_group();
 
+        if draws.sky {
+            pass.set_pipeline(&self.pipelines.sky);
+            pass.draw(0..3, 0..1);
+        }
+
         // Opaque first so the translucent styles blend over them, then the overlay that
         // ignores depth; then depth-tested annotations, then the overlays that must stay
         // visible through geometry.
@@ -685,14 +779,14 @@ impl Renderer {
                 MeshPass::Overlay => &self.pipelines.mesh_overlay,
             });
             for call in draws.meshes.iter().filter(|c| c.pass == mesh_pass) {
-                let (Some(mesh), Some(highlight)) = (
+                let (Some(mesh), Some(face_bits)) = (
                     self.meshes.get(&call.handle),
-                    self.highlights.get(&call.highlight),
+                    self.face_bits.get(&call.face_bits),
                 ) else {
                     continue;
                 };
                 pass.set_bind_group(1, draw_uniforms, &[call.uniform_offset]);
-                pass.set_bind_group(2, &highlight.bind_group, &[]);
+                pass.set_bind_group(2, &face_bits.bind_group, &[]);
                 pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..mesh.index_count, 0, 0..1);
@@ -747,6 +841,26 @@ impl Renderer {
     }
 }
 
+/// Fills the environment fields of the frame's globals. Directions are normalised and
+/// radii clamped here, once, so the shader can trust them.
+fn write_environment(globals: &mut Globals, env: &EnvironmentLight) {
+    let rgb = |c: [f32; 3]| [c[0], c[1], c[2], 0.0];
+    let lights = &env.lights[..env.lights.len().min(EnvironmentLight::MAX_LIGHTS)];
+    globals.environment = [1.0, env.exposure, lights.len() as f32, 0.0];
+    globals.sky_zenith = rgb(env.zenith);
+    globals.sky_horizon = rgb(env.horizon);
+    globals.sky_nadir = rgb(env.nadir);
+    globals.sky_irradiance = sky_irradiance_coefficients(env).map(rgb);
+    for (slot, light) in globals.lights.iter_mut().zip(lights) {
+        let direction = light.direction.normalize_or_zero().as_vec3();
+        let radius = light.angular_radius.clamp(0.0, std::f32::consts::FRAC_PI_2);
+        *slot = LightUniform {
+            direction: direction.extend(radius).to_array(),
+            irradiance: rgb(light.irradiance()),
+        };
+    }
+}
+
 /// Inverse transpose for transforming normals; falls back to the model matrix itself when
 /// it is singular (a zero-scale preview) rather than propagating NaNs into the shader.
 fn normal_matrix(model: &Mat4) -> Mat4 {
@@ -761,4 +875,24 @@ fn normal_matrix(model: &Mat4) -> Mat4 {
         inverse_transpose.z_axis.truncate().extend(0.0),
         Vec3::ZERO.extend(1.0),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn face_bits_set_one_bit_per_face_in_the_shaders_layout() {
+        assert_eq!(face_bits(&[], 2), vec![0, 0]);
+        assert_eq!(face_bits(&[0], 1), vec![1]);
+        assert_eq!(face_bits(&[31], 1), vec![1 << 31]);
+        // Face 32 is the first bit of the second word, as `face_id / 32u` reads it.
+        assert_eq!(face_bits(&[3, 32, 33, 3], 2), vec![1 << 3, 0b11]);
+    }
+
+    #[test]
+    fn face_bits_drop_faces_the_mesh_does_not_have() {
+        // A stale selection naming a face beyond the mesh must not write past its buffer.
+        assert_eq!(face_bits(&[1, 64, 1000], 2), vec![0b10, 0]);
+    }
 }

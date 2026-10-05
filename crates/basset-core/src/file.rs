@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::document::Document;
 
-pub const FORMAT_VERSION: u32 = 11;
+pub const FORMAT_VERSION: u32 = 12;
 pub const EXTENSION: &str = "bass";
 
 #[derive(Serialize, Deserialize)]
@@ -102,8 +102,19 @@ fn migrate_step(mut value: serde_json::Value, version: u32) -> serde_json::Value
         8 => migrate_v8_region_curves(value),
         9 => migrate_v9_face_frames(value),
         10 => migrate_v10_threads(value),
+        11 => migrate_v11_appearances(value),
         _ => value,
     }
+}
+
+/// Version 12 added appearances — the design's copies of library appearances and which
+/// bodies and faces wear them — and the render's scene settings.
+///
+/// Additive and defaulted, so a version 11 document opens with every body in the default
+/// grey under the Photo Booth, which is how it always rendered. Bumped so an older build
+/// refuses the file instead of dropping the appearances and saving it back unpainted.
+fn migrate_v11_appearances(value: serde_json::Value) -> serde_json::Value {
+    value
 }
 
 /// Version 11 added the thread step.

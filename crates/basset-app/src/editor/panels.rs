@@ -44,8 +44,13 @@ pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
     // The hint belongs to the drag happening now; a stale one would leave a number
     // hanging over geometry nobody is touching.
     editor.snap_hint = None;
+    // The in-canvas render catches up with the view, and its picture goes down first,
+    // under every panel, over the whole window the camera's pixels are measured in.
+    super::render::poll(editor, ui.ctx());
+    super::render::paint_canvas(editor, ui);
 
     let simulation = editor.workspace == Workspace::Simulation;
+    let rendering = editor.workspace == Workspace::Render;
     egui::Panel::top("menu")
         .frame(super::theme::menu_frame())
         .show_separator_line(false)
@@ -61,6 +66,8 @@ pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
         .show(ui, |ui| {
             if simulation {
                 super::simulate::toolbar(editor, ui, &mut commands);
+            } else if rendering {
+                super::render::toolbar(editor, ui, &mut commands);
             } else {
                 toolbar(editor, ui, &mut commands);
             }
@@ -75,7 +82,7 @@ pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(egui::RichText::new(editor.selection.summary()).weak());
                     git_chip(editor, ui, &mut commands);
-                    if !editor.is_sketching() && !simulation {
+                    if !editor.is_sketching() && editor.workspace.models() {
                         ui.label(
                             egui::RichText::new("Right-drag orbit · middle-drag pan · wheel zoom")
                                 .small()
@@ -86,12 +93,18 @@ pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
             });
         });
     // The timeline is the Design workspace's: a study has no history to walk, and a
-    // cursor dragged while results were up would only make them stale.
-    if !simulation {
+    // cursor dragged while results were up would only make them stale. The Render
+    // workspace has the rendering gallery in its place, once there is something in it.
+    if editor.workspace.models() {
         egui::Panel::bottom("timeline")
             .frame(super::theme::timeline_frame())
             .default_size(64.0)
             .show(ui, |ui| timeline(editor, ui, &mut commands));
+    } else if rendering && !editor.render.gallery.is_empty() {
+        egui::Panel::bottom("gallery")
+            .frame(super::theme::timeline_frame())
+            .default_size(130.0)
+            .show(ui, |ui| super::render::gallery(editor, ui, &mut commands));
     }
     egui::Panel::left("browser")
         .frame(super::theme::side_frame())
@@ -99,11 +112,18 @@ pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
         .show(ui, |ui| {
             if simulation {
                 super::simulate::study_tree(editor, ui);
+            } else if rendering {
+                super::render::tree(editor, ui, &mut commands);
             } else {
                 browser(editor, ui, &mut commands);
             }
         });
-    if simulation {
+    if rendering {
+        egui::Panel::right("render")
+            .frame(super::theme::side_frame())
+            .default_size(290.0)
+            .show(ui, |ui| super::render::panel(editor, ui, &mut commands));
+    } else if simulation {
         egui::Panel::right("study")
             .frame(super::theme::side_frame())
             .default_size(250.0)
@@ -139,6 +159,7 @@ pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
     super::study_marks::overlay(editor, &ctx);
     constraint_overlay(editor, &ctx, &mut commands);
     shortcut_overlay(editor, &ctx);
+    super::render::windows(editor, &ctx, &mut commands);
     command_palette(editor, &ctx, &mut commands);
     error_popup(editor, &ctx);
     rename_popup(editor, &ctx);
@@ -151,9 +172,10 @@ pub fn show(editor: &mut Editor, ui: &mut egui::Ui) {
 
 pub(super) fn run(editor: &mut Editor, c: Command) {
     // One gate for every way a modelling command can arrive — key, menu, palette — so
-    // the Simulation workspace cannot be modelled in by a path the toolbar forgot.
-    if editor.workspace == Workspace::Simulation && c.is_modelling() {
-        editor.set_status(super::simulate::REFUSED);
+    // the Simulation and Render workspaces cannot be modelled in by a path the toolbar
+    // forgot.
+    if !editor.workspace.models() && c.is_modelling() {
+        editor.set_status(editor.workspace.refusal());
         editor.request_repaint();
         return;
     }
@@ -178,6 +200,34 @@ pub(super) fn run(editor: &mut Editor, c: Command) {
         Command::RunStudy => super::simulate::run(editor),
         Command::StopStudy => super::simulate::stop_run(editor),
         Command::ExportVtk => super::simulate::export_vtk(editor),
+        Command::Brush(a) => super::render::arm(editor, a.map(|a| *a)),
+        Command::Paint(target, a) => super::render::paint(editor, target, a.as_deref()),
+        Command::ClearFaceAppearances(body) => {
+            if editor.doc.in_transaction() {
+                editor.set_status("Finish or cancel the sketch or tool first");
+            } else {
+                editor.doc.clear_face_appearances(body);
+            }
+        }
+        Command::EditAppearance(name, a) => {
+            let renamed = a.name.trim() != name;
+            let new_name = a.name.trim().to_owned();
+            match editor.doc.edit_appearance(&name, *a) {
+                Ok(()) if renamed => editor.render.editing = Some(new_name),
+                Ok(()) => {}
+                Err(e) => editor.report_error(e),
+            }
+        }
+        Command::RemoveAppearance(name) => {
+            if editor.doc.remove_appearance(&name) {
+                editor.set_status(format!("Removed {name} from the design"));
+            }
+        }
+        Command::SetScene(s) => editor.doc.set_scene(*s),
+        Command::ToggleInCanvas => super::render::toggle_in_canvas(editor),
+        Command::StartRender(settings) => super::render::start_final(editor, settings),
+        Command::SaveRender(i) => super::render::save_final(editor, i),
+        Command::RemoveRender(i) => super::render::remove_final(editor, i),
         Command::New => editor.new_document(),
         Command::Open => editor.open(),
         Command::Save(as_new) => editor.save(as_new),
@@ -520,6 +570,9 @@ fn workspace_tabs(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command
             .on_hover_text(match workspace {
                 Workspace::Design => "Model the part: sketches, features, the timeline",
                 Workspace::Simulation => "Study one body under load; the model is not changed",
+                Workspace::Render => {
+                    "Give bodies appearances, light the scene, and render pictures of it"
+                }
             })
             .clicked()
             && editor.workspace != workspace
@@ -748,6 +801,17 @@ fn menu_bar(editor: &Editor, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
             .clicked()
             {
                 commands.push(Command::Workspace(Workspace::Simulation));
+                ui.close();
+            }
+            if ui
+                .button(format!(
+                    "Render workspace…{}",
+                    commands::hint("render.workspace")
+                ))
+                .on_hover_text("Appearances, the scene, and rendered pictures")
+                .clicked()
+            {
+                commands.push(Command::Workspace(Workspace::Render));
                 ui.close();
             }
         });

@@ -3,7 +3,8 @@
 
 use basset_math::{TriMesh, Vec3};
 use basset_viewport::{
-    Camera, LineBatch, MeshInstance, MeshStyle, PointBatch, Renderer, Scene, TriBatch, ViewPreset,
+    Camera, DistantLight, EnvironmentLight, Lighting, LineBatch, Material, MeshInstance, MeshStyle,
+    PointBatch, Renderer, Scene, TriBatch, ViewPreset,
 };
 
 const SIZE: [u32; 2] = [128, 96];
@@ -722,5 +723,318 @@ fn a_cylinder_is_bounded_against_the_background() {
     assert!(
         outlined + 30 < plain,
         "the wall's boundary should darken to the edge colour: {outlined} against {plain}"
+    );
+}
+
+/// A sky brighter above than below, with one soft box over the camera's shoulder.
+fn environment(sky_background: bool) -> Lighting {
+    Lighting::Environment(EnvironmentLight {
+        zenith: [0.9, 0.9, 1.0],
+        horizon: [0.5, 0.5, 0.5],
+        nadir: [0.02, 0.02, 0.02],
+        lights: vec![DistantLight {
+            // Front view looks along +Y, so the camera is towards -Y.
+            direction: Vec3::new(-0.3, -1.0, 0.4).normalize(),
+            angular_radius: 0.2,
+            radiance: [8.0, 8.0, 8.0],
+        }],
+        exposure: 1.0,
+        sky_background,
+    })
+}
+
+fn brightness(p: [u8; 4]) -> u32 {
+    u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2])
+}
+
+/// One body in two appearances: two instances of one mesh, each masked to its own faces.
+/// The front face shows the colour of the instance that owns it, and an instance whose
+/// faces are all out of sight, or which owns none, draws nothing.
+#[test]
+fn a_face_mask_draws_only_its_faces() {
+    let Some(gpu) = gpu() else { return };
+    let mut renderer = Renderer::new(&gpu.device, FORMAT, 1);
+    let handle = renderer
+        .upload_mesh(&gpu.device, &gpu.queue, &cube(20.0), &cube_edges(20.0))
+        .expect("valid cube");
+    let camera = looking_at_origin();
+    let centre_with = |renderer: &mut Renderer, masks: &[(Vec<u32>, [f32; 4])]| {
+        let mut scene = Scene::new(&camera);
+        scene.background = BACKGROUND;
+        scene.show_grid = false;
+        scene.lighting = environment(false);
+        for (faces, color) in masks {
+            scene.meshes.push(MeshInstance {
+                face_mask: Some(faces.clone()),
+                color: *color,
+                ..MeshInstance::new(handle)
+            });
+        }
+        let pixels = render_with(&gpu, renderer, &scene);
+        pixel(&pixels, SIZE[0] / 2, SIZE[1] / 2)
+    };
+    let red = [0.8, 0.05, 0.05, 1.0];
+    let blue = [0.05, 0.05, 0.8, 1.0];
+
+    // Face id 2 is the -Y face, which the Front view looks straight at.
+    let front_red = centre_with(
+        &mut renderer,
+        &[(vec![2], red), (vec![0, 1, 3, 4, 5], blue)],
+    );
+    assert!(
+        front_red[0] > front_red[2] + 60,
+        "the front face belongs to the red instance: {front_red:?}"
+    );
+    let front_blue = centre_with(
+        &mut renderer,
+        &[(vec![0, 1, 3, 4, 5], red), (vec![2], blue)],
+    );
+    assert!(
+        front_blue[2] > front_blue[0] + 60,
+        "and to the blue one when the masks swap: {front_blue:?}"
+    );
+    // The top and bottom are edge-on to the Front view, so with only them let through
+    // nothing covers the centre.
+    let top_and_bottom = centre_with(&mut renderer, &[(vec![0, 1], red)]);
+    assert!(
+        is_background(top_and_bottom),
+        "faces outside the mask are not drawn: {top_and_bottom:?}"
+    );
+    let nothing = centre_with(&mut renderer, &[(vec![], red)]);
+    assert!(
+        is_background(nothing),
+        "an empty mask draws no faces: {nothing:?}"
+    );
+}
+
+#[test]
+fn the_sky_background_is_brighter_above_the_horizon_than_below() {
+    let Some(gpu) = gpu() else { return };
+    let mut camera = looking_at_origin();
+    for orthographic in [false, true] {
+        if orthographic {
+            camera.set_orthographic();
+        }
+        let mut scene = Scene::new(&camera);
+        scene.background = BACKGROUND;
+        scene.show_grid = false;
+        scene.lighting = environment(true);
+        let pixels = render_to_pixels(&gpu, 1, &scene);
+        let top = pixel(&pixels, SIZE[0] / 2, 1);
+        let middle = pixel(&pixels, SIZE[0] / 2, SIZE[1] / 2);
+        let bottom = pixel(&pixels, SIZE[0] / 2, SIZE[1] - 2);
+        assert!(!is_background(middle), "the sky replaces the clear colour");
+        if orthographic {
+            // Every ray of an orthographic view is the view direction, level here, so
+            // the whole background is the horizon. The tolerance is for the unprojection
+            // in f32, which the square root in the sky amplifies just off the horizon.
+            for (a, b) in [(top, middle), (bottom, middle)] {
+                assert!(
+                    a.iter().zip(&b).all(|(x, y)| x.abs_diff(*y) <= 2),
+                    "orthographic rays are parallel: {top:?} {middle:?} {bottom:?}"
+                );
+            }
+        } else {
+            assert!(
+                brightness(top) > brightness(middle) && brightness(middle) > brightness(bottom),
+                "zenith over horizon over nadir: {top:?} {middle:?} {bottom:?}"
+            );
+            // Neutral sky, neutral pixels: the tone map works per channel alike.
+            assert!(middle[0].abs_diff(middle[2]) <= 1, "{middle:?}");
+        }
+    }
+
+    // Without the flag the environment still lights meshes but the clear colour stays.
+    let mut scene = Scene::new(&camera);
+    scene.background = BACKGROUND;
+    scene.show_grid = false;
+    scene.lighting = environment(false);
+    let pixels = render_to_pixels(&gpu, 1, &scene);
+    assert!(is_background(pixel(&pixels, SIZE[0] / 2, 1)));
+}
+
+/// Glass is as see-through as its colour says. A translucent cube lets the background
+/// through, as a ghost does, but by its own alpha rather than a ghost's fixed fade, so at
+/// alpha 0.8 it hides more of what is behind it than the ghost of the same colour.
+#[test]
+fn a_translucent_body_blends_by_its_own_alpha() {
+    let Some(gpu) = gpu() else { return };
+    let mut renderer = Renderer::new(&gpu.device, FORMAT, 1);
+    let handle = renderer
+        .upload_mesh(&gpu.device, &gpu.queue, &cube(20.0), &cube_edges(20.0))
+        .expect("valid cube");
+    let camera = looking_at_origin();
+    let centre_with = |renderer: &mut Renderer, style: MeshStyle| {
+        let mut scene = Scene::new(&camera);
+        scene.background = BACKGROUND;
+        scene.show_grid = false;
+        scene.lighting = environment(false);
+        scene.meshes.push(MeshInstance {
+            style,
+            color: [0.9, 0.9, 0.1, 0.8],
+            ..MeshInstance::new(handle)
+        });
+        let pixels = render_with(&gpu, renderer, &scene);
+        pixel(&pixels, SIZE[0] / 2, SIZE[1] / 2)
+    };
+    let opaque = centre_with(&mut renderer, MeshStyle::Shaded);
+    let translucent = centre_with(&mut renderer, MeshStyle::Translucent);
+    let ghost = centre_with(&mut renderer, MeshStyle::Ghost);
+    assert!(
+        !is_background(translucent),
+        "the body shades: {translucent:?}"
+    );
+    // Blue is where the background and the yellow body differ most.
+    let background_blue = srgb_encode(BACKGROUND[2]);
+    assert!(
+        translucent[2] > opaque[2] && translucent[2] < background_blue,
+        "the background shows through: {opaque:?} < {translucent:?} < {background_blue}"
+    );
+    assert!(
+        translucent[2] < ghost[2],
+        "but less than through a ghost: {translucent:?} against {ghost:?}"
+    );
+}
+
+/// A UV sphere of radius `r` with smooth normals, all one face.
+fn sphere(r: f64) -> TriMesh {
+    let (rings, segments) = (48u32, 96u32);
+    let point = |i: u32, j: u32| {
+        let theta = std::f64::consts::PI * f64::from(i) / f64::from(rings);
+        let phi = 2.0 * std::f64::consts::PI * f64::from(j) / f64::from(segments);
+        Vec3::new(
+            theta.sin() * phi.cos(),
+            theta.sin() * phi.sin(),
+            theta.cos(),
+        )
+    };
+    let mut mesh = TriMesh::default();
+    for i in 0..=rings {
+        for j in 0..=segments {
+            let n = point(i, j);
+            mesh.positions.push(n * r);
+            mesh.normals.push(n);
+        }
+    }
+    let index = |i: u32, j: u32| i * (segments + 1) + j;
+    for i in 0..rings {
+        for j in 0..segments {
+            let (a, b, c, d) = (
+                index(i, j),
+                index(i + 1, j),
+                index(i + 1, j + 1),
+                index(i, j + 1),
+            );
+            mesh.indices.extend([a, b, c, a, c, d]);
+            mesh.face_ids.extend([0, 0]);
+        }
+    }
+    mesh
+}
+
+/// What the soft-box widening is for: a polished metal ball shows the box as a bright,
+/// soft-edged patch, not a single hot pixel and not nothing, and a matte one of the same
+/// colour shows no such patch.
+#[test]
+fn a_soft_box_makes_a_soft_highlight_on_polished_metal() {
+    let Some(gpu) = gpu() else { return };
+    let mut renderer = Renderer::new(&gpu.device, FORMAT, 1);
+    let handle = renderer
+        .upload_mesh(&gpu.device, &gpu.queue, &sphere(15.0), &[])
+        .expect("valid sphere");
+    let camera = looking_at_origin();
+    let mut scene = Scene::new(&camera);
+    scene.background = BACKGROUND;
+    scene.show_grid = false;
+    scene.lighting = Lighting::Environment(EnvironmentLight {
+        zenith: [0.05; 3],
+        horizon: [0.05; 3],
+        nadir: [0.05; 3],
+        lights: vec![DistantLight {
+            // Straight behind the camera: the highlight sits in the middle of the ball.
+            direction: -Vec3::Y,
+            angular_radius: 0.25,
+            radiance: [4.0; 3],
+        }],
+        exposure: 1.0,
+        sky_background: false,
+    });
+    let mut highlight_size = |renderer: &mut Renderer, roughness: f32| {
+        scene.meshes = vec![MeshInstance {
+            color: [0.9, 0.6, 0.3, 1.0],
+            material: Material {
+                metallic: 1.0,
+                roughness,
+                ..Material::DEFAULT
+            },
+            ..MeshInstance::new(handle)
+        }];
+        let pixels = render_with(&gpu, renderer, &scene);
+        let row = SIZE[1] / 2;
+        let lit: Vec<bool> = (0..SIZE[0])
+            .map(|x| brightness(pixel(&pixels, x, row)) > 400)
+            .collect();
+        let centre = pixel(&pixels, SIZE[0] / 2, row);
+        let rim = pixel(&pixels, SIZE[0] / 2 + 14, row);
+        (lit.iter().filter(|on| **on).count(), centre, rim)
+    };
+    let (polished, centre, rim) = highlight_size(&mut renderer, 0.05);
+    assert!(
+        polished >= 3,
+        "the soft box shows as a patch several pixels wide, not a point: {polished} \
+         ({centre:?})"
+    );
+    assert!(
+        brightness(rim) + 150 < brightness(centre),
+        "and the rest of the ball reflects the dark sky: {rim:?} against {centre:?}"
+    );
+    let (matte, ..) = highlight_size(&mut renderer, 1.0);
+    assert!(
+        matte < polished,
+        "a matte ball spreads the light out: {matte} against {polished}"
+    );
+}
+
+/// The Studio lighting's highlight is shaped by the material, but the default material is
+/// the look every body has always had.
+#[test]
+fn the_material_shapes_the_studio_highlight() {
+    let Some(gpu) = gpu() else { return };
+    let mut renderer = Renderer::new(&gpu.device, FORMAT, 1);
+    let handle = renderer
+        .upload_mesh(&gpu.device, &gpu.queue, &sphere(15.0), &[])
+        .expect("valid sphere");
+    let camera = looking_at_origin();
+    let mut render = |material: Material| {
+        let mut scene = Scene::new(&camera);
+        scene.background = BACKGROUND;
+        scene.show_grid = false;
+        scene.meshes.push(MeshInstance {
+            material,
+            ..MeshInstance::new(handle)
+        });
+        render_with(&gpu, &mut renderer, &scene)
+    };
+    let plain = render(Material::DEFAULT);
+    let glowing = render(Material {
+        emission: [0.0, 0.5, 0.0],
+        ..Material::DEFAULT
+    });
+    let centre = |pixels: &[[u8; 4]]| pixel(pixels, SIZE[0] / 2, SIZE[1] / 2);
+    assert!(
+        centre(&glowing)[1] > centre(&plain)[1] + 20,
+        "emission is added: {:?} against {:?}",
+        centre(&glowing),
+        centre(&plain)
+    );
+    let metal = render(Material {
+        metallic: 1.0,
+        ..Material::DEFAULT
+    });
+    assert!(
+        brightness(centre(&metal)) < brightness(centre(&plain)),
+        "a metal gives up its diffuse colour: {:?} against {:?}",
+        centre(&metal),
+        centre(&plain)
     );
 }

@@ -10,6 +10,7 @@
 use basset_math::{Frame, Mat4, Vec3};
 
 use crate::camera::Camera;
+use crate::lighting::Lighting;
 
 /// Identifies a mesh uploaded with [`crate::Renderer::upload_mesh`]. Handles are never
 /// reused, so a stale handle draws nothing rather than someone else's geometry.
@@ -37,6 +38,11 @@ pub enum MeshStyle {
     /// replaced them. A ghost would be hidden by that body, which is the one place the
     /// user is looking.
     Overlay,
+    /// Shaded faces blended by the instance colour's own alpha, hidden by what stands in
+    /// front of them and writing no depth, with no edges and no silhouette: how glass and
+    /// clear plastic look. Unlike a ghost the alpha is taken as given, because here it is
+    /// the material's opacity rather than a request to fade the body out.
+    Translucent,
 }
 
 impl MeshStyle {
@@ -65,13 +71,57 @@ impl MeshStyle {
     /// Styles that blend rather than replace and leave the depth buffer alone. They are
     /// drawn after the opaque ones so there is something for them to blend over.
     pub fn is_translucent(self) -> bool {
-        matches!(self, Self::Ghost | Self::XRay | Self::Overlay)
+        matches!(
+            self,
+            Self::Ghost | Self::XRay | Self::Overlay | Self::Translucent
+        )
+    }
+
+    /// Whether the style thins the instance colour's alpha so the body reads as faded. The
+    /// see-through styles other than [`Self::Translucent`] do, so that a body given an
+    /// opaque colour is still see-through in them.
+    pub(crate) fn fades(self) -> bool {
+        self.is_translucent() && self != Self::Translucent
     }
 
     /// Whether the style ignores what is in front of it. The one style that does is
     /// drawn last of the meshes, so there is nothing left for it to be hidden by.
     pub fn shows_through(self) -> bool {
         matches!(self, Self::Overlay)
+    }
+}
+
+/// How a surface responds to light, beyond its colour. Under [`Lighting::Environment`] it
+/// is the metallic-roughness model; under [`Lighting::Studio`] the same numbers shape the
+/// highlight, so a part looks like the right material in the modelling view too, and
+/// [`Material::DEFAULT`] looks exactly as every body always has.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Material {
+    /// 0 for a dielectric (plastic, paint), 1 for a bare metal, whose reflections take
+    /// the base colour and which has no diffuse colour of its own.
+    pub metallic: f32,
+    /// Perceptual roughness in `[0, 1]`: 0 is a mirror, 1 completely matte. Values below
+    /// 0.03 are treated as 0.03, below which a highlight from a small light vanishes
+    /// between pixels.
+    pub roughness: f32,
+    /// Weight of a smooth, clear lacquer over the surface: car paint, varnish.
+    pub clearcoat: f32,
+    /// Linear radiance the surface emits of itself, added to whatever it reflects.
+    pub emission: [f32; 3],
+}
+
+impl Material {
+    pub const DEFAULT: Self = Self {
+        metallic: 0.0,
+        roughness: 0.5,
+        clearcoat: 0.0,
+        emission: [0.0; 3],
+    };
+}
+
+impl Default for Material {
+    fn default() -> Self {
+        Self::DEFAULT
     }
 }
 
@@ -84,11 +134,21 @@ pub struct MeshInstance {
     /// used for selection and hover feedback.
     pub highlight_faces: Vec<u32>,
     pub highlight_color: [f32; 4],
+    /// Kernel face ids this instance draws; `None` draws every face, and `Some` of an
+    /// empty list draws none. This is how one body shows several appearances: one
+    /// instance per appearance, all of the same mesh, each masked to its faces.
+    ///
+    /// The mask governs the faces only. Feature edges and the silhouette belong to the
+    /// whole mesh and are drawn by any instance whose style draws them, so of a set of
+    /// instances that split a body between them exactly one should have a style with
+    /// edges, or the edges are drawn once per instance.
+    pub face_mask: Option<Vec<u32>>,
     /// Colour of the feature edges the style draws. It is per instance because an edge
     /// that reads well over a lit face is invisible over the background, and the
     /// edges-only styles have nothing but the background behind them.
     pub edge_color: [f32; 4],
     pub style: MeshStyle,
+    pub material: Material,
 }
 
 impl MeshInstance {
@@ -104,8 +164,10 @@ impl MeshInstance {
             color: Self::DEFAULT_COLOR,
             highlight_faces: Vec::new(),
             highlight_color: Self::DEFAULT_HIGHLIGHT,
+            face_mask: None,
             edge_color: Self::DEFAULT_EDGE,
             style: MeshStyle::Shaded,
+            material: Material::DEFAULT,
         }
     }
 }
@@ -190,6 +252,7 @@ pub struct Scene<'a> {
     /// Plane the grid lies on. Sketch mode puts it on the sketch plane so the lines the
     /// user snaps to are the lines they can see.
     pub grid_frame: Frame,
+    pub lighting: Lighting,
 }
 
 impl<'a> Scene<'a> {
@@ -206,6 +269,7 @@ impl<'a> Scene<'a> {
             show_grid: true,
             show_grid_axes: true,
             grid_frame: Frame::XY,
+            lighting: Lighting::Studio,
         }
     }
 }
@@ -226,6 +290,7 @@ mod tests {
         assert!(MeshStyle::XRay.draws_faces() && MeshStyle::XRay.draws_edges());
         assert!(MeshStyle::Ghost.draws_faces() && !MeshStyle::Ghost.draws_edges());
         assert!(MeshStyle::Overlay.draws_faces() && !MeshStyle::Overlay.draws_edges());
+        assert!(MeshStyle::Translucent.draws_faces() && !MeshStyle::Translucent.draws_edges());
     }
 
     #[test]
@@ -238,6 +303,7 @@ mod tests {
             MeshStyle::Wireframe,
             MeshStyle::XRay,
             MeshStyle::Ghost,
+            MeshStyle::Translucent,
         ] {
             assert!(!style.shows_through(), "{style:?}");
         }
@@ -248,13 +314,14 @@ mod tests {
         for style in [MeshStyle::ShadedWithEdges, MeshStyle::XRay] {
             assert!(style.draws_silhouette(), "{style:?}");
         }
-        // Wireframe draws edges but no faces; Shaded, Ghost and Overlay draw faces but no
-        // edges.
+        // Wireframe draws edges but no faces; Shaded, Ghost, Overlay and Translucent draw
+        // faces but no edges.
         for style in [
             MeshStyle::Wireframe,
             MeshStyle::Shaded,
             MeshStyle::Ghost,
             MeshStyle::Overlay,
+            MeshStyle::Translucent,
         ] {
             assert!(!style.draws_silhouette(), "{style:?}");
         }
@@ -262,7 +329,12 @@ mod tests {
 
     #[test]
     fn only_the_see_through_styles_are_translucent() {
-        for style in [MeshStyle::Ghost, MeshStyle::XRay, MeshStyle::Overlay] {
+        for style in [
+            MeshStyle::Ghost,
+            MeshStyle::XRay,
+            MeshStyle::Overlay,
+            MeshStyle::Translucent,
+        ] {
             assert!(style.is_translucent(), "{style:?}");
         }
         for style in [
@@ -280,5 +352,34 @@ mod tests {
         assert_eq!(instance.style, MeshStyle::Shaded);
         assert_eq!(instance.edge_color, MeshInstance::DEFAULT_EDGE);
         assert_eq!(instance.transform, Mat4::IDENTITY);
+        assert_eq!(instance.material, Material::DEFAULT);
+        assert_eq!(instance.face_mask, None);
+    }
+
+    #[test]
+    fn only_translucent_keeps_its_alpha() {
+        // Glass is as opaque as its colour says; the other see-through styles fade a body
+        // whatever its colour, and the opaque ones have no alpha to speak of.
+        for style in [MeshStyle::Ghost, MeshStyle::XRay, MeshStyle::Overlay] {
+            assert!(style.fades(), "{style:?}");
+        }
+        for style in [
+            MeshStyle::Translucent,
+            MeshStyle::Shaded,
+            MeshStyle::ShadedWithEdges,
+            MeshStyle::Wireframe,
+        ] {
+            assert!(!style.fades(), "{style:?}");
+        }
+    }
+
+    #[test]
+    fn the_default_material_is_the_plain_one() {
+        assert_eq!(Material::default(), Material::DEFAULT);
+        assert_eq!(Material::DEFAULT.roughness, 0.5);
+        assert_eq!(
+            Scene::new(&Camera::new_default()).lighting,
+            Lighting::Studio
+        );
     }
 }

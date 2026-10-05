@@ -17,6 +17,7 @@ basset-kernel = { workspace = true }
 basset-core = { workspace = true }
 basset-io = { workspace = true }
 basset-fea = { workspace = true }
+basset-render = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 slotmap = { workspace = true }

@@ -1003,7 +1003,7 @@ impl Editor {
     pub(super) fn study_view(&self) -> Option<&Simulation> {
         match self.workspace {
             Workspace::Simulation => self.simulation.as_ref(),
-            Workspace::Design => None,
+            Workspace::Design | Workspace::Render => None,
         }
     }
 }

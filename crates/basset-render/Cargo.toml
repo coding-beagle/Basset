@@ -1,6 +1,6 @@
 [package]
-name = "basset-core"
-description = "Document model, timeline, and regeneration engine for Basset."
+name = "basset-render"
+description = "Photorealistic rendering for Basset: appearances and their library, studio and sky environments, and a progressive path tracer that writes PNG images."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,14 +8,11 @@ rust-version.workspace = true
 
 [dependencies]
 basset-math = { workspace = true }
-basset-sketch = { workspace = true }
-basset-kernel = { workspace = true }
-basset-render = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
-slotmap = { workspace = true }
+png = { workspace = true }
 
 [dev-dependencies]
 approx = { workspace = true }
+serde_json = { workspace = true }

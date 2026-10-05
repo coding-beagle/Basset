@@ -70,8 +70,8 @@ pub fn start(editor: &mut Editor) {
     if editor.is_sketching() {
         return;
     }
-    if editor.workspace == super::Workspace::Simulation {
-        editor.set_status(super::simulate::REFUSED);
+    if !editor.workspace.models() {
+        editor.set_status(editor.workspace.refusal());
         editor.request_repaint();
         return;
     }

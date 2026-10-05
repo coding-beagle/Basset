@@ -500,9 +500,9 @@ pub fn start_tool(editor: &mut Editor, kind: ToolKind) {
         return;
     }
     // Modelling belongs to the Design workspace; in Simulation a click on a face is a
-    // pick for the study and must not also feed a tool.
-    if editor.workspace == super::Workspace::Simulation {
-        editor.set_status(super::simulate::REFUSED);
+    // pick for the study, in Render a stroke of the brush, and must not also feed a tool.
+    if !editor.workspace.models() {
+        editor.set_status(editor.workspace.refusal());
         editor.request_repaint();
         return;
     }

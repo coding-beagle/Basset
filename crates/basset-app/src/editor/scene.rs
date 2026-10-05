@@ -11,7 +11,7 @@ use basset_viewport::{LineBatch, MeshInstance, MeshStyle, PointBatch, Scene, Tri
 
 use super::selection::Pick;
 use super::tools;
-use super::{DisplayMode, Editor, Mode};
+use super::{DisplayMode, Editor, Mode, Workspace, render};
 
 const SELECT: [f32; 4] = [0.25, 0.6, 1.0, 1.0];
 const HOVER: [f32; 4] = [1.0, 0.85, 0.3, 1.0];
@@ -59,6 +59,21 @@ pub fn build(editor: &Editor) -> Scene<'_> {
     let mut scene = Scene::new(&editor.camera);
     scene.show_grid = editor.show_grid;
     scene.show_grid_axes = editor.show_axes;
+    // The Render workspace's view is the picture: lit by the scene's environment, in
+    // front of its sky or backdrop, with none of the modelling furniture — grid, planes,
+    // sketches, edges — that would not be in a photograph.
+    let rendering = editor.workspace == Workspace::Render;
+    let painted = render::shows_appearances(editor);
+    let appearances = editor.doc.appearances();
+    if rendering {
+        let settings = editor.doc.scene();
+        scene.lighting = render::viewport_lighting(settings);
+        if let Some(c) = render::background_color(settings) {
+            scene.background = c;
+        }
+        scene.show_grid = false;
+    }
+    let hovered_body = render::hovered_body(editor);
 
     // The study, in the Simulation workspace: the body the plot stands in for, and the
     // faces picked for it to light up while the plot is down. In Design the study is
@@ -79,10 +94,18 @@ pub fn build(editor: &Editor) -> Scene<'_> {
             continue;
         }
         let mut instance = MeshInstance::new(mesh.handle);
-        instance.style = editor.display.mesh_style();
-        let bare = matches!(editor.display, DisplayMode::Wireframe | DisplayMode::XRay);
+        instance.style = if rendering {
+            MeshStyle::Shaded
+        } else {
+            editor.display.mesh_style()
+        };
+        let bare =
+            matches!(editor.display, DisplayMode::Wireframe | DisplayMode::XRay) && !rendering;
         if bare {
             instance.edge_color = BARE_EDGE;
+        }
+        if painted {
+            wear(&mut instance, appearances.body(id));
         }
         let selected_body = editor.selection.bodies.contains(&id)
             && editor.selection.faces.iter().all(|f| f.body != id);
@@ -108,6 +131,12 @@ pub fn build(editor: &Editor) -> Scene<'_> {
             && f.body == id
         {
             instance.highlight_faces.extend(face_index(f.key));
+        }
+        // A brush that paints whole bodies lights the whole body it is over.
+        if hovered_body == Some(id) {
+            instance
+                .highlight_faces
+                .extend(0..mesh.tess.face_keys.len() as u32);
         }
         if let Some((body, sim)) = study
             && body == id
@@ -140,7 +169,17 @@ pub fn build(editor: &Editor) -> Scene<'_> {
             }
             _ => {}
         }
-        scene.meshes.push(instance);
+        if painted && appearances.face_overrides(id).next().is_some() {
+            scene.meshes.extend(split_by_face_appearance(
+                instance,
+                id,
+                mesh,
+                editor,
+                selected_body,
+            ));
+        } else {
+            scene.meshes.push(instance);
+        }
     }
 
     // The stress plot in the studied body's place. Headless there is no GPU copy, and the
@@ -255,7 +294,7 @@ pub fn build(editor: &Editor) -> Scene<'_> {
     let mut selected_planes = LineBatch::new(SELECT);
     selected_planes.width_px = 2.5;
     selected_planes.depth_test = false;
-    for (plane, frame, half) in editor.visible_planes() {
+    for (plane, frame, half) in editor.visible_planes().into_iter().filter(|_| !rendering) {
         let corners = [
             Vec2::new(-half, -half),
             Vec2::new(half, -half),
@@ -276,7 +315,7 @@ pub fn build(editor: &Editor) -> Scene<'_> {
             ]);
         }
     }
-    if editor.show_origin
+    if !rendering && editor.show_origin
         || editor.tool.as_ref().is_some_and(|t| {
             matches!(
                 t.kind,
@@ -310,7 +349,7 @@ pub fn build(editor: &Editor) -> Scene<'_> {
     hover_lines.depth_test = false;
     let mut selected_fill = TriBatch::new(SELECT_FILL);
     let mut hover_fill = TriBatch::new(HOVER_FILL);
-    for (id, solved) in editor.visible_sketches() {
+    for (id, solved) in editor.visible_sketches().into_iter().filter(|_| !rendering) {
         let to3 = |p: Vec2| solved.frame.to_world(p);
         for (eid, data) in solved.sketch.entities() {
             if let Entity::Point { .. } = data.entity {
@@ -396,7 +435,7 @@ pub fn build(editor: &Editor) -> Scene<'_> {
             }
         }
     }
-    if filter.points {
+    if filter.points && !rendering {
         for (id, solved) in editor.visible_sketches() {
             for (eid, data) in solved.sketch.entities() {
                 let Entity::Point { pos } = data.entity else {
@@ -548,6 +587,79 @@ pub fn build(editor: &Editor) -> Scene<'_> {
     scene.lines.retain(|l| !l.segments.is_empty());
     scene.points.retain(|p: &PointBatch| !p.points.is_empty());
     scene
+}
+
+/// Gives an instance an appearance's colour and shading. Glass and clear plastic are
+/// drawn see-through, unless the display mode already draws the body without faces.
+fn wear(instance: &mut MeshInstance, appearance: &basset_render::Appearance) {
+    let (color, material) = render::viewport_look(appearance);
+    instance.color = color;
+    instance.material = material;
+    if appearance.is_transmissive()
+        && matches!(
+            instance.style,
+            MeshStyle::Shaded | MeshStyle::ShadedWithEdges
+        )
+    {
+        instance.style = MeshStyle::Translucent;
+    }
+}
+
+/// One body drawn in several appearances: the instance as built, masked to the faces
+/// that wear the body's appearance, and one more instance per appearance its faces have
+/// of their own, masked to those faces. Only the first keeps the body's edges, which
+/// belong to the mesh rather than to any face; the rest are plain shaded.
+fn split_by_face_appearance(
+    instance: MeshInstance,
+    body: basset_core::BodyRef,
+    mesh: &super::BodyMesh,
+    editor: &Editor,
+    selected: bool,
+) -> Vec<MeshInstance> {
+    let appearances = editor.doc.appearances();
+    let mut groups: Vec<(&str, Vec<u32>)> = Vec::new();
+    let mut overridden = std::collections::HashSet::new();
+    for (i, key) in mesh.tess.face_keys.iter().enumerate() {
+        let Some(name) = appearances.face_assignment(body, *key) else {
+            continue;
+        };
+        overridden.insert(i as u32);
+        match groups.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, faces)) => faces.push(i as u32),
+            None => groups.push((name, vec![i as u32])),
+        }
+    }
+    let mut out = Vec::with_capacity(groups.len() + 1);
+    for (name, faces) in groups {
+        let mut part = instance.clone();
+        part.style = match instance.style {
+            MeshStyle::ShadedWithEdges | MeshStyle::Translucent => MeshStyle::Shaded,
+            other => other,
+        };
+        let face = mesh
+            .tess
+            .face_keys
+            .get(faces[0] as usize)
+            .copied()
+            .expect("a face of the mesh");
+        let a = appearances.face(body, face);
+        debug_assert_eq!(a.display_name(), name);
+        // A selected body keeps its selection tint on every face, painted or not.
+        if !selected {
+            wear(&mut part, a);
+        }
+        part.face_mask = Some(faces);
+        out.push(part);
+    }
+    let mut rest = instance;
+    rest.face_mask = Some(
+        (0..mesh.tess.face_keys.len() as u32)
+            .filter(|i| !overridden.contains(i))
+            .collect(),
+    );
+    // The body's own instance goes first so it is the one carrying the edges.
+    out.insert(0, rest);
+    out
 }
 
 fn push_edge(editor: &Editor, batch: &mut LineBatch, e: &basset_core::EdgeRef) {

@@ -335,6 +335,84 @@ pub fn tool_definitions() -> Vec<Value> {
             ),
         ),
         tool(
+            "appearance_library",
+            "The appearance library the Render workspace paints with: name, category (Metal, Paint, Plastic, Rubber, Glass, Wood, Stone & ceramic, Emissive, Other), colour (#rrggbb sRGB), metallic, roughness, transmission, ior, clearcoat, emission and procedural pattern. Optionally filtered by category or by a substring of the name.",
+            obj(
+                json!({
+                    "category": { "type": "string" },
+                    "query": { "type": "string", "description": "Only appearances whose name contains this text, e.g. \"anodized\" or \"walnut\"." },
+                }),
+                &[],
+            ),
+        ),
+        tool(
+            "set_appearance",
+            "Paint a body, one face of it, or with default: true every body that has no appearance of its own. The appearance is named from the library (\"Aluminium - Anodized Red\", \"Chrome\", \"Glass - Clear\"; case, spaces and hyphens forgiven) or the design's own, and is copied into the design; null takes the body's or face's own appearance off. Undoable; does not change the geometry.",
+            obj(
+                json!({
+                    "body": { "type": "integer" },
+                    "face": { "type": "string", "description": "A face key of the body, feature.sub:Role. Without it the whole body is painted." },
+                    "appearance": { "type": ["string", "null"] },
+                    "default": { "type": "boolean" },
+                }),
+                &["appearance"],
+            ),
+        ),
+        tool(
+            "define_appearance",
+            "Create or change an appearance in the design. Starts from base (a library or design appearance), from the design's appearance of that name, or from the default grey, with any field overridden. Changing a design appearance changes every body and face wearing it.",
+            obj(
+                json!({
+                    "name": { "type": "string" },
+                    "base": { "type": "string" },
+                    "color": { "type": "string", "description": "#rrggbb, sRGB." },
+                    "metallic": { "type": "number", "description": "0 dielectric to 1 bare metal." },
+                    "roughness": { "type": "number", "description": "0 mirror to 1 matte." },
+                    "transmission": { "type": "number", "description": "0 opaque to 1 clear glass." },
+                    "ior": { "type": "number" },
+                    "clearcoat": { "type": "number", "description": "Weight of a smooth lacquer over it." },
+                    "emission": { "type": "number", "description": "Light given off, as a multiple of the colour." },
+                    "pattern": { "type": "string", "description": "None, Brushed, Wood grain, Carbon weave or Speckle." },
+                    "color2": { "type": "string", "description": "The pattern's second colour, #rrggbb." },
+                    "pattern_scale": { "type": "number", "description": "Period of the pattern in mm." },
+                }),
+                &["name"],
+            ),
+        ),
+        tool(
+            "scene_settings",
+            "Read, or change any of, the render's scene: environment (Photo Booth, Sharp Highlights, Grey Room, Warm Light, Cool Light, Clear Sky, Dusk, Dark Room), brightness in stops, rotation of the lights in degrees, background (\"environment\" or #rrggbb), the ground plane that catches the shadow, its reflections and their roughness, and depth of field focused on the model's centre with an aperture as a fraction of the focus distance.",
+            obj(
+                json!({
+                    "environment": { "type": "string" },
+                    "brightness": { "type": "number" },
+                    "rotation": { "type": "number" },
+                    "background": { "type": "string" },
+                    "ground_plane": { "type": "boolean" },
+                    "ground_reflections": { "type": "boolean" },
+                    "ground_roughness": { "type": "number" },
+                    "depth_of_field": { "type": "boolean" },
+                    "aperture": { "type": "number" },
+                }),
+                &[],
+            ),
+        ),
+        tool(
+            "render_image",
+            "Path trace the visible bodies in their appearances under the scene settings and write a PNG, framed to the model from a named view (iso, front, back, left, right, top, bottom) or a direction [x, y, z] from the model to the eye. 128 samples is a clean draft; 512 a final.",
+            obj(
+                json!({
+                    "path": { "type": "string" },
+                    "width": { "type": "integer", "description": "Default 1200." },
+                    "height": { "type": "integer", "description": "Default 800." },
+                    "samples": { "type": "integer", "description": "Per pixel. Default 128." },
+                    "view": { "description": "A view name or [x, y, z]. Default iso." },
+                    "fov": { "type": "number", "description": "Vertical field of view, degrees. Default 30." },
+                }),
+                &["path"],
+            ),
+        ),
+        tool(
             "export",
             "Write bodies to an STL or 3MF file.",
             obj(
@@ -415,6 +493,11 @@ pub fn call(session: &mut Session, name: &str, args: &Value) -> Result<Value, To
         "fea_static" => fea_static(session, args),
         "fea_materials" => fea_materials(args),
         "fea_topology" => fea_topology(session, args),
+        "appearance_library" => crate::render::appearance_library(args),
+        "set_appearance" => crate::render::set_appearance(session, args),
+        "define_appearance" => crate::render::define_appearance(session, args),
+        "scene_settings" => crate::render::scene_settings(session, args),
+        "render_image" => crate::render::render_image(session, args),
         "export" => export(session, args),
         "run_script" => run_script(session, args),
         _ => Err(ToolError::bad(format!("unknown tool {name:?}"))),

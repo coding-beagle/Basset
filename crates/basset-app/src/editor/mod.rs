@@ -5,9 +5,10 @@
 //! that draws on one plane. Both build the 3D scene from the document's regenerated
 //! state every frame, so there is never a second copy of geometry to keep in sync.
 //!
-//! Above the modes sits the [`Workspace`]: Design, which is everything above, and
+//! Above the modes sits the [`Workspace`]: Design, which is everything above;
 //! Simulation, which trades the modelling toolbar and the component tree for a study's
-//! and gives a click on a face to the study. See [`simulate`].
+//! and gives a click on a face to the study (see [`simulate`]); and Render, which gives
+//! it to the appearance brush and lights the view as a photograph (see [`render`]).
 
 pub(crate) mod commands;
 mod compare;
@@ -17,6 +18,7 @@ mod gizmo;
 mod measure;
 mod panels;
 mod project;
+pub(crate) mod render;
 mod scene;
 mod selection;
 mod simulate;
@@ -122,23 +124,39 @@ pub enum Mode {
 /// A workspace is a property of the view, not of the document: it decides which toolbar
 /// and browser are shown and what a click on a face means, and switching it is neither
 /// saved nor undoable. Design is the modeller; Simulation is the study of one body
-/// described in [`simulate`], where the modelling tools and their keys are unavailable,
-/// so that a face clicked to hold it can never also start a fillet.
+/// described in [`simulate`], and Render the appearances and pictures of [`render`]. In
+/// both of those the modelling tools and their keys are unavailable, so that a face
+/// clicked to hold it or paint it can never also start a fillet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Workspace {
     #[default]
     Design,
     Simulation,
+    Render,
 }
 
 impl Workspace {
     /// In the order the tab strip shows them.
-    pub const ALL: [Workspace; 2] = [Workspace::Design, Workspace::Simulation];
+    pub const ALL: [Workspace; 3] = [Workspace::Design, Workspace::Simulation, Workspace::Render];
 
     pub fn title(self) -> &'static str {
         match self {
             Workspace::Design => "Design",
             Workspace::Simulation => "Simulation",
+            Workspace::Render => "Render",
+        }
+    }
+
+    /// Whether the model may be edited from here: only in Design.
+    pub fn models(self) -> bool {
+        self == Workspace::Design
+    }
+
+    /// What the status line says when a modelling command is refused here.
+    pub fn refusal(self) -> &'static str {
+        match self {
+            Workspace::Render => render::REFUSED,
+            _ => simulate::REFUSED,
         }
     }
 }
@@ -260,6 +278,9 @@ pub struct Editor {
     /// that is editor state rather than a timeline feature. It is kept across a return to
     /// Design, so `Some` does not mean the workspace is Simulation. See [`simulate`].
     pub simulation: Option<Simulation>,
+    /// The Render workspace's brush, panels, in-canvas render and gallery, kept across a
+    /// return to Design. See [`render`].
+    pub render: render::Studio,
     pub selected_feature: Option<FeatureId>,
     pub status: String,
     pub error: Option<String>,
@@ -337,6 +358,7 @@ impl Editor {
             tool: None,
             measure: None,
             simulation: None,
+            render: render::Studio::default(),
             selected_feature: None,
             status: "Ready".into(),
             error: None,
@@ -441,10 +463,16 @@ impl Editor {
             self.repaint = true;
             return;
         }
-        self.workspace = workspace;
+        let previous = std::mem::replace(&mut self.workspace, workspace);
+        match previous {
+            Workspace::Simulation => simulate::leave(self),
+            Workspace::Render => render::leave(self),
+            Workspace::Design => {}
+        }
         match workspace {
             Workspace::Simulation => simulate::enter(self),
-            Workspace::Design => simulate::leave(self),
+            Workspace::Render => render::enter(self),
+            Workspace::Design => self.set_status("Design workspace"),
         }
         self.repaint = true;
     }
@@ -452,7 +480,7 @@ impl Editor {
     pub fn toggle_workspace(&mut self) {
         self.set_workspace(match self.workspace {
             Workspace::Design => Workspace::Simulation,
-            Workspace::Simulation => Workspace::Design,
+            Workspace::Simulation | Workspace::Render => Workspace::Design,
         });
     }
 
@@ -941,6 +969,7 @@ impl Editor {
                 // selection any later tool should act on, so they never reach
                 // `apply_pick`.
                 if !simulate::clicked(self, pick.as_ref())
+                    && !render::clicked(self, pick.as_ref())
                     && !measure::clicked(self, pick.as_ref(), self.pointer.ctrl)
                 {
                     self.apply_pick(pick, shift);
@@ -959,6 +988,9 @@ impl Editor {
             (None, true) => self.select_mode.narrow(measure::FILTER),
             (None, false) if self.study_view().is_some() => {
                 self.select_mode.narrow(simulate::FILTER)
+            }
+            (None, false) if self.workspace == Workspace::Render => {
+                self.select_mode.narrow(render::FILTER)
             }
             (None, false) => self.select_mode.filter(),
         }
@@ -1034,6 +1066,15 @@ impl Editor {
                     // only puts the prompt back.
                     self.hover = None;
                     self.set_status(simulate::PROMPT);
+                } else if self.workspace == Workspace::Render {
+                    // The brush first, then the selection, as the topmost thing goes
+                    // first everywhere else.
+                    if self.render.brush.is_some() {
+                        render::arm(self, None);
+                    } else {
+                        self.selection.clear();
+                    }
+                    self.hover = None;
                 } else if self.tool.is_some() {
                     tools::cancel_tool(self);
                 } else {
@@ -1191,8 +1232,8 @@ impl Editor {
         if self.tool.is_some() || self.is_sketching() {
             return;
         }
-        if self.workspace == Workspace::Simulation {
-            self.set_status(simulate::REFUSED);
+        if !self.workspace.models() {
+            self.set_status(self.workspace.refusal());
             return;
         }
         measure::stop(self);

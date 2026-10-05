@@ -10,8 +10,13 @@
 //!
 //! * [`Camera`] — an orbit camera with the CAD convention of +Z up, all maths in `f64`.
 //! * [`Scene`] — a per-frame description of what to draw: mesh instances, line batches,
-//!   point batches, background and grid toggle. It borrows nothing from the renderer except
-//!   [`MeshHandle`]s, so the application can rebuild it cheaply every frame.
+//!   point batches, background, grid toggle and lighting. It borrows nothing from the
+//!   renderer except [`MeshHandle`]s, so the application can rebuild it cheaply every
+//!   frame. Each instance carries a [`Material`] and may be masked to some of its mesh's
+//!   faces, so one body can be drawn in several appearances.
+//! * [`lighting`] — the modelling view's [`Lighting::Studio`], and the physically shaded,
+//!   tone-mapped [`Lighting::Environment`] of a sky and distant lights that a render
+//!   workspace previews with.
 //! * [`Renderer`] — owns pipelines, GPU meshes and the depth / MSAA targets.
 //! * [`grid`] — CPU generation of the adaptive ground grid as a plain [`LineBatch`].
 //! * [`ramp`] — colour ramps for painting a scalar, a stress say, over a mesh uploaded
@@ -22,6 +27,7 @@
 pub mod camera;
 pub mod error;
 pub mod grid;
+pub mod lighting;
 pub mod ramp;
 pub mod renderer;
 pub mod scene;
@@ -29,7 +35,10 @@ pub mod silhouette;
 
 pub use camera::{Camera, Projection, ViewPreset};
 pub use error::ViewportError;
+pub use lighting::{DistantLight, EnvironmentLight, Lighting};
 pub use ramp::stress_ramp;
 pub use renderer::Renderer;
-pub use scene::{LineBatch, MeshHandle, MeshInstance, MeshStyle, PointBatch, Scene, TriBatch};
+pub use scene::{
+    LineBatch, Material, MeshHandle, MeshInstance, MeshStyle, PointBatch, Scene, TriBatch,
+};
 pub use silhouette::{Silhouette, SilhouetteCache, ViewPoint};

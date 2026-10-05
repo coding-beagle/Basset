@@ -24,6 +24,7 @@ impl Editor {
         self.commit_box = None;
         // A study was of a body of the old document, and a new document starts in Design.
         super::simulate::stop(self);
+        super::render::reset(self);
         self.workspace = super::Workspace::Design;
         self.selection.clear();
         self.apply_visibility(&Visibility::default());
@@ -57,6 +58,7 @@ impl Editor {
                 self.compare = None;
                 self.commit_box = None;
                 super::simulate::stop(self);
+                super::render::reset(self);
                 self.workspace = super::Workspace::Design;
                 self.refresh_project();
                 self.selection.clear();
@@ -241,7 +243,7 @@ impl Editor {
     }
 }
 
-fn with_extension(path: PathBuf, ext: &str) -> PathBuf {
+pub(super) fn with_extension(path: PathBuf, ext: &str) -> PathBuf {
     if path
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case(ext))

@@ -29,7 +29,8 @@ pub(crate) enum Command {
     ToggleMeasure,
     /// Go to a workspace, as its tab does; see [`Workspace`] and [`super::simulate`].
     Workspace(Workspace),
-    /// Design to Simulation and back: what one key has to mean.
+    /// Design to Simulation and back (and from Render, back to Design): what one key has
+    /// to mean.
     ToggleWorkspace,
     /// Solve the study, on a thread of its own.
     RunStudy,
@@ -37,6 +38,29 @@ pub(crate) enum Command {
     StopStudy,
     /// Write the study's results as legacy VTK, to a file the user picks.
     ExportVtk,
+    /// Arm the Render workspace's brush with an appearance, or put it down.
+    Brush(Option<Box<basset_render::Appearance>>),
+    /// Paint something with an appearance, or with `None` take its own off.
+    Paint(
+        super::render::PaintTarget,
+        Option<Box<basset_render::Appearance>>,
+    ),
+    /// Take every single-face appearance off a body.
+    ClearFaceAppearances(basset_core::BodyRef),
+    /// Replace the definition of the design's appearance of this name.
+    EditAppearance(String, Box<basset_render::Appearance>),
+    /// Take an appearance out of the design, and off everything wearing it.
+    RemoveAppearance(String),
+    /// The render's scene settings changed.
+    SetScene(Box<basset_render::SceneSettings>),
+    /// Switch the in-canvas render on or off.
+    ToggleInCanvas,
+    /// Start a final render at these settings, into the gallery.
+    StartRender(super::render::FinalSettings),
+    /// Save a gallery entry as a PNG, asking where.
+    SaveRender(usize),
+    /// Take an entry out of the gallery, stopping it if it is running.
+    RemoveRender(usize),
     New,
     Open,
     Save(bool),
@@ -982,6 +1006,24 @@ pub(crate) const BINDINGS: &[Binding] = &[
         make: || Command::ToggleWorkspace,
         enabled: ALWAYS,
     },
+    Binding {
+        id: "render.workspace",
+        label: "Render workspace",
+        group: Group::Modify,
+        chords: &[],
+        live: LiveIn::Model,
+        make: || Command::Workspace(Workspace::Render),
+        enabled: ALWAYS,
+    },
+    Binding {
+        id: "render.in_canvas",
+        label: "In-canvas render",
+        group: Group::Modify,
+        chords: &[],
+        live: LiveIn::Model,
+        make: || Command::ToggleInCanvas,
+        enabled: |e| e.workspace == Workspace::Render,
+    },
     // --- Sketch tools. Each key opens the tool the toolbar's button for that shape is
     // showing, so the key and the button draw the same thing.
     Binding {
@@ -1303,7 +1345,7 @@ pub(crate) struct Palette {
 /// palette and the overlay all ask, so none of them can list what another refuses.
 pub(crate) fn available(binding: &Binding, editor: &Editor) -> bool {
     binding.live.covers(editor.is_sketching())
-        && !(editor.workspace == Workspace::Simulation && (binding.make)().is_modelling())
+        && !(!editor.workspace.models() && (binding.make)().is_modelling())
 }
 
 /// The binding a keystroke runs, or `None` when the key means nothing right now.

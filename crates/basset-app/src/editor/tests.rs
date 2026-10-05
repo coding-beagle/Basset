@@ -6330,3 +6330,346 @@ mod study_marks {
         assert!(!frame.has_text("100 N"), "{:?}", frame.text());
     }
 }
+
+/// The Render workspace: entering it, painting with the brush, what the viewport draws,
+/// the in-canvas render, and final renders into the gallery.
+mod render_workspace {
+    use std::time::{Duration, Instant};
+
+    use basset_math::Vec3;
+    use basset_render::{Appearance, Background, Srgb, find};
+    use basset_viewport::Lighting;
+    use winit::keyboard::NamedKey;
+
+    use crate::editor::commands::Command;
+    use crate::editor::harness::{Harness, TempDir, top_face};
+    use crate::editor::render::{self, ApplyTo, FinalSettings, PaintTarget};
+    use crate::editor::tools::ToolKind;
+    use crate::editor::{Workspace, panels, scene};
+
+    fn red() -> Appearance {
+        find("Paint - Gloss Red").unwrap().clone()
+    }
+
+    /// A block in the Render workspace with the view fitted to it from above, so a
+    /// click at the middle of the top lands on the top face.
+    fn studio() -> (Harness, basset_core::BodyRef) {
+        let mut h = Harness::new();
+        let body = h.block();
+        assert!(h.click_ui("Render"), "the workspace tabs include Render");
+        assert_eq!(h.editor.workspace, Workspace::Render);
+        h.editor.look_from(basset_viewport::ViewPreset::Top);
+        h.editor.zoom_to_fit();
+        (h, body)
+    }
+
+    fn wait(h: &mut Harness, timeout: Duration, mut done: impl FnMut(&Harness) -> bool) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            h.frame();
+            if done(h) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        false
+    }
+
+    #[test]
+    fn modelling_is_refused_and_escape_does_not_leave() {
+        let (mut h, _) = studio();
+        panels::run(&mut h.editor, Command::Tool(ToolKind::Fillet));
+        assert!(h.editor.tool.is_none());
+        assert_eq!(h.editor.status, render::REFUSED);
+        h.key(NamedKey::Escape);
+        assert_eq!(h.editor.workspace, Workspace::Render);
+        assert!(h.click_ui("Design"));
+        assert_eq!(h.editor.workspace, Workspace::Design);
+    }
+
+    #[test]
+    fn a_click_with_the_brush_paints_the_body_and_undo_takes_it_off() {
+        let (mut h, body) = studio();
+        panels::run(&mut h.editor, Command::Brush(Some(Box::new(red()))));
+        h.click_world(Vec3::new(5.0, 5.0, 2.0));
+        assert_eq!(h.editor.doc.appearances().body(body).name, red().name);
+        // Painting is not a selection; the brush stays up for the next body.
+        assert!(h.editor.selection.faces.is_empty());
+        assert!(h.editor.render.brush.is_some());
+
+        h.editor.undo();
+        assert_eq!(h.editor.doc.appearances().body(body), &Appearance::DEFAULT);
+
+        // Escape puts the brush down before it does anything else.
+        h.key(NamedKey::Escape);
+        assert!(h.editor.render.brush.is_none());
+    }
+
+    #[test]
+    fn in_faces_mode_only_the_clicked_face_is_painted() {
+        let (mut h, body) = studio();
+        h.editor.render.apply_to = ApplyTo::Faces;
+        panels::run(&mut h.editor, Command::Brush(Some(Box::new(red()))));
+        h.click_world(Vec3::new(5.0, 5.0, 2.0));
+        let a = h.editor.doc.appearances();
+        assert_eq!(a.face(body, top_face(body).key).name, red().name);
+        assert!(a.body_assignment(body).is_none());
+    }
+
+    #[test]
+    fn without_a_brush_a_click_selects_and_the_panel_offers_to_take_paint_off() {
+        let (mut h, body) = studio();
+        panels::run(
+            &mut h.editor,
+            Command::Paint(PaintTarget::Body(body), Some(Box::new(red()))),
+        );
+        h.click_world(Vec3::new(5.0, 5.0, 2.0));
+        assert_eq!(h.editor.selection.faces.len(), 1);
+        let frame = h.frame();
+        assert!(frame.has_text("Selected"), "{:?}", frame.text());
+        assert!(frame.has_text(&red().name));
+    }
+
+    #[test]
+    fn the_view_is_lit_by_the_scene_and_shows_no_modelling_furniture() {
+        let (mut h, _) = studio();
+        h.editor.show_origin = true;
+        let s = scene::build(&h.editor);
+        assert!(matches!(s.lighting, Lighting::Environment(_)));
+        assert!(!s.show_grid);
+        drop(s);
+
+        let solid = basset_render::SceneSettings {
+            background: Background::Solid(Srgb::hex(0xff0000)),
+            ..basset_render::SceneSettings::default()
+        };
+        panels::run(&mut h.editor, Command::SetScene(Box::new(solid)));
+        let s = scene::build(&h.editor);
+        assert_eq!(s.background, [1.0, 0.0, 0.0, 1.0]);
+        let Lighting::Environment(env) = &s.lighting else {
+            panic!("environment lighting");
+        };
+        assert!(!env.sky_background);
+        drop(s);
+
+        h.editor.set_workspace(Workspace::Design);
+        let s = scene::build(&h.editor);
+        assert!(matches!(s.lighting, Lighting::Studio));
+        assert!(s.show_grid);
+    }
+
+    #[test]
+    fn glass_draws_translucent_and_simulation_stays_grey() {
+        let (mut h, body) = studio();
+        let glass = find("Glass - Clear").unwrap().clone();
+        panels::run(
+            &mut h.editor,
+            Command::Paint(PaintTarget::Body(body), Some(Box::new(glass))),
+        );
+        let (color, material) = render::viewport_look(h.editor.doc.appearances().body(body));
+        assert!(color[3] < 1.0, "glass is drawn see-through");
+        assert_eq!(material.roughness, 0.0);
+        assert!(render::shows_appearances(&h.editor));
+        h.editor.set_workspace(Workspace::Simulation);
+        assert!(!render::shows_appearances(&h.editor));
+    }
+
+    #[test]
+    fn the_in_canvas_render_refines_and_restarts_when_the_view_moves() {
+        let (mut h, _) = studio();
+        h.editor.render.quality = render::Quality::Draft;
+        panels::run(&mut h.editor, Command::ToggleInCanvas);
+        assert!(h.editor.render.in_canvas.is_some());
+        assert!(
+            wait(&mut h, Duration::from_secs(20), |h| h
+                .editor
+                .render
+                .in_canvas
+                .as_ref()
+                .and_then(|c| c.progress())
+                .is_some_and(|(done, _, _)| done >= 2)),
+            "passes arrive"
+        );
+        let before = h
+            .editor
+            .render
+            .in_canvas
+            .as_ref()
+            .unwrap()
+            .progress()
+            .unwrap()
+            .0;
+        h.editor.camera.orbit(0.3, 0.0);
+        h.frame();
+        let after = h
+            .editor
+            .render
+            .in_canvas
+            .as_ref()
+            .unwrap()
+            .progress()
+            .unwrap()
+            .0;
+        assert!(after < before, "a moved camera starts the picture again");
+
+        // Leaving the workspace stops it.
+        h.editor.set_workspace(Workspace::Design);
+        assert!(h.editor.render.in_canvas.is_none());
+    }
+
+    /// Draws the Render workspace's raster preview through the real renderer on a
+    /// headless GPU and writes it to the PNG `BASSET_SNAPSHOT` names: a look at the
+    /// environment shading without opening a window. Ignored, since it needs a GPU and
+    /// is for looking at rather than asserting on.
+    #[test]
+    #[ignore]
+    fn snapshot_of_the_render_viewport() {
+        let Ok(out) = std::env::var("BASSET_SNAPSHOT") else {
+            return;
+        };
+        let model = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testcases/library/models/blends.bass"
+        );
+        let mut h = Harness::open(model);
+        let body = h.bodies()[0];
+        let top = top_face(body);
+        panels::run(
+            &mut h.editor,
+            Command::Paint(
+                PaintTarget::Body(body),
+                Some(Box::new(find("Aluminium - Anodized Blue").unwrap().clone())),
+            ),
+        );
+        panels::run(
+            &mut h.editor,
+            Command::Paint(
+                PaintTarget::Face(top),
+                Some(Box::new(find("Gold - Polished").unwrap().clone())),
+            ),
+        );
+        h.editor.set_workspace(Workspace::Render);
+        h.editor.look_from(basset_viewport::ViewPreset::Isometric);
+        h.editor.zoom_to_fit();
+        h.frame();
+
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+                .expect("a GPU adapter");
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                .expect("a device");
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let size = h.editor.window_px;
+        let mut renderer = basset_viewport::Renderer::new(&device, format, 4);
+        h.editor.sync_meshes(&mut renderer, &device, &queue);
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: size[0],
+                height: size[1],
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        let row = (size[0] * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: u64::from(row * size[1]),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        let scene = h.editor.scene();
+        renderer.render(&device, &queue, &mut encoder, &view, size, &scene);
+        drop(scene);
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d {
+                width: size[0],
+                height: size[1],
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([encoder.finish()]);
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |r| r.expect("mapped"));
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let mapped = slice.get_mapped_range().expect("range");
+        let mut pixels = Vec::new();
+        for y in 0..size[1] {
+            let start = (y * row) as usize;
+            pixels.extend_from_slice(&mapped[start..start + (size[0] * 4) as usize]);
+        }
+        drop(mapped);
+        basset_render::Image {
+            width: size[0],
+            height: size[1],
+            pixels,
+            samples: 1,
+        }
+        .save_png(out)
+        .expect("writing the snapshot");
+    }
+
+    #[test]
+    fn a_final_render_lands_in_the_gallery_and_saves_as_png() {
+        let (mut h, _) = studio();
+        panels::run(
+            &mut h.editor,
+            Command::StartRender(FinalSettings {
+                width: 64,
+                height: 48,
+                samples: 4,
+            }),
+        );
+        assert_eq!(h.editor.render.gallery.len(), 1);
+        assert!(
+            wait(&mut h, Duration::from_secs(30), |h| !h
+                .editor
+                .render
+                .gallery[0]
+                .is_running()
+                && h.editor.render.gallery[0].image.is_some()),
+            "the render finishes"
+        );
+        let image = h.editor.render.gallery[0].image.clone().unwrap();
+        assert_eq!((image.width, image.height, image.samples), (64, 48, 4));
+        let frame = h.frame();
+        assert!(frame.has_text("Rendering gallery"), "{:?}", frame.text());
+
+        let dir = TempDir::new("render-save");
+        let path = dir.join("shot");
+        render::save_final_to(&mut h.editor, 0, &path);
+        let saved = std::fs::read(dir.join("shot.png")).expect("a PNG was written");
+        assert_eq!(&saved[..8], b"\x89PNG\r\n\x1a\n");
+
+        // A new document has a gallery of its own.
+        h.editor.new_document();
+        assert!(h.editor.render.gallery.is_empty());
+    }
+}
